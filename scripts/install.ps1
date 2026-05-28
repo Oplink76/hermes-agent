@@ -1844,87 +1844,6 @@ function Install-NodeDeps {
     }
 }
 
-function Initialize-ElectronBuilderCache {
-    # Pre-warm electron-builder's winCodeSign cache so its own extraction
-    # of the .7z archive never runs.
-    #
-    # Why this exists: even when no signing cert is configured (we set
-    # CSC_IDENTITY_AUTO_DISCOVERY=false below), electron-builder still
-    # invokes signtool on node-pty's bundled prebuilt binaries
-    # (winpty-agent.exe, OpenConsole.exe) because they live under
-    # asarUnpack: ['**/*.node', '**/prebuilds/**'] in apps/desktop's
-    # package.json. signtool ships inside winCodeSign-2.6.0.7z, so
-    # electron-builder fetches and extracts the archive.
-    #
-    # The archive contains macOS symbolic links under darwin/10.12/lib/
-    # (libcrypto.dylib + libssl.dylib pointing at versioned siblings).
-    # Creating symlinks on Windows requires SeCreateSymbolicLinkPrivilege,
-    # which non-admin accounts on stock Windows don't have. Result:
-    # 7-Zip exit 2 on every grandma-class box, four retries, then the
-    # whole build fails.
-    #
-    # The fix: do the extraction ourselves with -snl (don't preserve
-    # symlinks — store as resolved file content) AND -x!darwin (skip
-    # the macOS subtree entirely — we're building for Windows). With
-    # the cache directory populated, electron-builder's "is the cache
-    # present?" check passes and it never runs its own extraction.
-    #
-    # Idempotent: fast-path returns if winCodeSign-2.6.0/windows-10/x64/
-    # signtool.exe already exists. Tooling: uses 7za.exe from the
-    # 7zip-bin npm dep (which electron-builder itself depends on, so
-    # it's present after the workspace npm install completed).
-
-    $cacheRoot = "$env:LOCALAPPDATA\electron-builder\Cache\winCodeSign"
-    $extractedDir = "$cacheRoot\winCodeSign-2.6.0"
-    $sentinel = "$extractedDir\windows-10\x64\signtool.exe"
-
-    if (Test-Path $sentinel) {
-        Write-Info "electron-builder winCodeSign cache already populated"
-        return
-    }
-
-    $sevenZip = "$InstallDir\node_modules\7zip-bin\win\x64\7za.exe"
-    if (-not (Test-Path $sevenZip)) {
-        $sevenZip = "$InstallDir\apps\desktop\node_modules\7zip-bin\win\x64\7za.exe"
-    }
-    if (-not (Test-Path $sevenZip)) {
-        Write-Warn "7za.exe not found in node_modules; electron-builder may fail to extract winCodeSign"
-        return
-    }
-
-    New-Item -ItemType Directory -Force -Path $cacheRoot | Out-Null
-
-    $tmpArchive = "$env:TEMP\hermes-wincodesign-$(Get-Random).7z"
-    $url = "https://github.com/electron-userland/electron-builder-binaries/releases/download/winCodeSign-2.6.0/winCodeSign-2.6.0.7z"
-
-    Write-Info "Pre-extracting winCodeSign (skips electron-builder's broken-on-Windows extraction)..."
-    try {
-        Invoke-WebRequest -Uri $url -OutFile $tmpArchive -UseBasicParsing -ErrorAction Stop
-    } catch {
-        Write-Warn "Failed to download winCodeSign: $_"
-        return
-    }
-
-    $prevEAP = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    & $sevenZip x -y -bd -snl "-x!darwin" "-o$cacheRoot" $tmpArchive 2>&1 | ForEach-Object { "$_" }
-    $code = $LASTEXITCODE
-    $ErrorActionPreference = $prevEAP
-
-    Remove-Item -Force $tmpArchive -ErrorAction SilentlyContinue
-
-    if ($code -ne 0) {
-        Write-Warn "Pre-extraction of winCodeSign failed (7-Zip exit $code)"
-        return
-    }
-
-    if (Test-Path $sentinel) {
-        Write-Success "winCodeSign cache pre-populated at $extractedDir"
-    } else {
-        Write-Warn "winCodeSign extraction completed but expected file is missing: $sentinel"
-    }
-}
-
 function Install-Desktop {
     # Build apps/desktop into a launchable Hermes.exe. Only called from
     # Stage-Desktop, which is itself only included in the manifest when
@@ -2008,17 +1927,6 @@ function Install-Desktop {
         throw
     }
     Pop-Location
-
-    # Pre-warm electron-builder's winCodeSign cache. MUST happen after the
-    # workspace npm install (we need 7za.exe from 7zip-bin) but BEFORE
-    # `npm run pack` (electron-builder pre-fetches signtool for re-signing
-    # node-pty's bundled prebuilds; if its own 7-Zip extraction runs first
-    # we hit the symlink-privilege crash). Belt-and-suspenders with the
-    # CSC_IDENTITY_AUTO_DISCOVERY env vars below: those kill cert
-    # discovery (so no signing actually happens to OUR Hermes.exe),
-    # while the pre-extract handles the toolchain fetch that still fires
-    # for the bundled-prebuild re-sign. Both are needed.
-    Initialize-ElectronBuilderCache
 
     # 2. Build apps/desktop. `npm run pack` runs:
     #      assert-root-install + write-build-stamp + stage-native-deps +

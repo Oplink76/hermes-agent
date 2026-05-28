@@ -200,7 +200,10 @@
       "target": [
         "nsis",
         "msi"
-      ]
+      ],
+      "signtoolOptions": {
+        "sign": null
+      }
     },
     "nsis": {
       "oneClick": false,
