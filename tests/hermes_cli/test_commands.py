@@ -118,6 +118,18 @@ class TestResolveCommand:
         assert topic.name == "topic"
         assert "topic" in GATEWAY_KNOWN_COMMANDS
 
+    def test_project_workflow_commands_resolve_and_are_gateway_available(self):
+        project_create = resolve_command("project-create")
+        project_import = resolve_command("project-import")
+        assert project_create is not None
+        assert project_import is not None
+        assert project_create.name == "project-create"
+        assert project_import.name == "project-import"
+        assert "project-create" in GATEWAY_KNOWN_COMMANDS
+        assert "project-import" in GATEWAY_KNOWN_COMMANDS
+        assert project_create.args_hint.startswith("<name>")
+        assert project_import.args_hint.startswith("<path>")
+
     def test_leading_slash_stripped(self):
         assert resolve_command("/help").name == "help"
         assert resolve_command("/bg").name == "background"
@@ -260,6 +272,11 @@ class TestTelegramBotCommands:
         assert "codex_runtime" in names
         assert "codex-runtime" not in names
 
+    def test_project_workflow_commands_are_exposed_with_telegram_safe_names(self):
+        names = {name for name, _ in telegram_bot_commands()}
+        assert "project_create" in names
+        assert "project_import" in names
+
 
 class TestSlackSubcommandMap:
     def test_returns_dict(self):
@@ -316,6 +333,16 @@ class TestSlackNativeSlashes:
     def test_under_fifty_command_cap(self):
         """Slack allows at most 50 slash commands per app."""
         assert len(slack_native_slashes()) <= 50
+
+    def test_project_workflow_commands_are_slack_via_hermes_only(self):
+        names = {n for n, _d, _h in slack_native_slashes()}
+        assert "project-create" not in names
+        assert "project-import" not in names
+        assert "project_create" not in names
+        assert "project_import" not in names
+        mapping = slack_subcommand_map()
+        assert mapping["project-create"] == "/project-create"
+        assert mapping["project-import"] == "/project-import"
 
     def test_unique_names(self):
         names = [n for n, _d, _h in slack_native_slashes()]

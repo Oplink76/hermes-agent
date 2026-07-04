@@ -207,6 +207,43 @@ def _extract_text_from_slack_blocks(blocks: list) -> str:
     return "\n".join(parts)
 
 
+def _current_message_broadcast_ranges_from_slack_blocks(blocks: list) -> set[str]:
+    """Return Slack broadcast ranges present in the current message body.
+
+    Slack's rich-text payload can represent a typed ``@channel`` as a
+    ``{"type": "broadcast", "range": "channel"}`` element even when the
+    plain ``text`` field is empty or normalized. Only inspect the current
+    message's normal rich-text sections/lists: quoted or preformatted text can
+    contain an old/literal ``@channel`` and must not wake the bot fleet.
+    """
+    ranges: set[str] = set()
+    if not blocks:
+        return ranges
+
+    def _walk_inline(elements: list) -> None:
+        for el in elements or []:
+            if (el or {}).get("type") == "broadcast":
+                rng = str(el.get("range", "")).strip().lower()
+                if rng:
+                    ranges.add(rng)
+
+    def _walk_rich(elements: list) -> None:
+        for elem in elements or []:
+            elem_type = (elem or {}).get("type", "")
+            if elem_type == "rich_text_section":
+                _walk_inline(elem.get("elements", []))
+            elif elem_type == "rich_text_list":
+                _walk_rich(elem.get("elements", []))
+            elif elem_type in {"rich_text_quote", "rich_text_preformatted"}:
+                continue
+
+    for block in blocks:
+        if (block or {}).get("type") == "rich_text":
+            _walk_rich(block.get("elements", []))
+
+    return ranges
+
+
 def _serialize_slack_blocks_for_agent(blocks: list, max_chars: int = 6000) -> str:
     """Return a compact, redacted JSON view of the current message's Block Kit payload."""
     if not blocks:
@@ -2606,7 +2643,14 @@ class SlackAdapter(BasePlatformAdapter):
                 return
             elif allow_bots == "mentions":
                 text_check = event.get("text", "")
-                if self._bot_user_id and f"<@{self._bot_user_id}>" not in text_check:
+                direct_bot_mention = bool(
+                    self._bot_user_id and f"<@{self._bot_user_id}>" in text_check
+                )
+                broadcast_wake = self._slack_message_matches_broadcast_mention(
+                    text_check,
+                    event.get("blocks") or [],
+                )
+                if not direct_bot_mention and not broadcast_wake:
                     return
             # "all" falls through to process the message
             # Always ignore our own messages to prevent echo loops
@@ -2825,9 +2869,14 @@ class SlackAdapter(BasePlatformAdapter):
         #   4. There's an existing session for this thread (survives restarts)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         routing_text = original_text or ""
+        is_broadcast_wake = self._slack_message_matches_broadcast_mention(
+            routing_text,
+            event.get("blocks") or [],
+        )
         is_mentioned = bool(
             (bot_uid and f"<@{bot_uid}>" in routing_text)
             or self._slack_message_matches_mention_patterns(routing_text)
+            or is_broadcast_wake
         )
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
@@ -2868,8 +2917,13 @@ class SlackAdapter(BasePlatformAdapter):
                     return
 
         if is_mentioned:
-            # Strip the bot mention from the text
+            # Strip the bot mention / broadcast wake token from the text before
+            # handing it to the agent.
             text = text.replace(f"<@{bot_uid}>", "").strip()
+            if is_broadcast_wake:
+                text = self._strip_slack_broadcast_mentions(text)
+                if not text:
+                    text = "[Slack channel broadcast wake]"
             # Register this thread so all future messages auto-trigger the bot.
             # Skipped in strict mode: strict_mention=true bots must be
             # re-mentioned every turn, so remembering the thread would
@@ -4277,6 +4331,41 @@ class SlackAdapter(BasePlatformAdapter):
             return False
         return any(pattern.search(text) for pattern in self._slack_mention_patterns())
 
+    def _slack_broadcast_mention_ranges(self) -> set[str]:
+        """Return enabled Slack broadcast wake ranges (channel/here/everyone).
+
+        Slack broadcasts are represented as ``<!channel>``, ``<!here>``, and
+        ``<!everyone>`` in event text or as rich-text broadcast block elements.
+        They are intentionally opt-in so normal channel chatter stays quiet.
+        """
+        raw = self.config.extra.get("broadcast_mention_ranges")
+        if raw is None:
+            raw = os.getenv("SLACK_BROADCAST_MENTION_RANGES", "")
+        if isinstance(raw, list):
+            parts = raw
+        else:
+            parts = str(raw or "").replace("\n", ",").split(",")
+        ranges = {str(part).strip().lower().lstrip("@!") for part in parts if str(part).strip()}
+        if "all" in ranges or "*" in ranges:
+            ranges.update({"channel", "here", "everyone"})
+        return ranges & {"channel", "here", "everyone"}
+
+    def _slack_message_matches_broadcast_mention(self, text: str, blocks: list | None = None) -> bool:
+        """Return True when a configured Slack broadcast wake is present."""
+        ranges = self._slack_broadcast_mention_ranges()
+        if not ranges:
+            return False
+        text = text or ""
+        if any(f"<!{rng}>" in text for rng in ranges):
+            return True
+        return bool(ranges & _current_message_broadcast_ranges_from_slack_blocks(blocks or []))
+
+    def _strip_slack_broadcast_mentions(self, text: str) -> str:
+        """Remove Slack broadcast tokens before handing text to the agent."""
+        if not text:
+            return ""
+        return re.sub(r"\s*<!(?:channel|here|everyone)>\s*", " ", text).strip()
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Plugin migration glue (#41112 / #3823)
@@ -4509,6 +4598,11 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         if isinstance(frc, list):
             frc = ",".join(str(v) for v in frc)
         os.environ["SLACK_FREE_RESPONSE_CHANNELS"] = str(frc)
+    bmr = slack_cfg.get("broadcast_mention_ranges")
+    if bmr is not None and not os.getenv("SLACK_BROADCAST_MENTION_RANGES"):
+        if isinstance(bmr, list):
+            bmr = ",".join(str(v) for v in bmr)
+        os.environ["SLACK_BROADCAST_MENTION_RANGES"] = str(bmr)
     if "reactions" in slack_cfg and not os.getenv("SLACK_REACTIONS"):
         os.environ["SLACK_REACTIONS"] = str(slack_cfg["reactions"]).lower()
     ac = slack_cfg.get("allowed_channels")

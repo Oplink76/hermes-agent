@@ -1514,6 +1514,50 @@ class CLICommandsMixin:
         if output:
             print(output)
 
+    def _handle_project_workflow_command(self, cmd: str, workflow: str):
+        """Handle /project-create and /project-import by seeding an agent turn."""
+        from hermes_cli.project_workflows import (
+            build_project_create_prompt,
+            build_project_import_prompt,
+            project_workflow_usage,
+        )
+
+        parts = cmd.strip().split(None, 1)
+        raw_args = parts[1].strip() if len(parts) > 1 else ""
+        if not raw_args:
+            print(project_workflow_usage())
+            return
+        if workflow == "project-create":
+            prompt = build_project_create_prompt(raw_args)
+            label = "Project creation workflow queued"
+            visible_steps = (
+                "Expected visible steps: folder/repo/board/project setup, "
+                "then a Product Owner interview card."
+            )
+        elif workflow == "project-import":
+            prompt = build_project_import_prompt(raw_args)
+            label = "Project import workflow queued"
+            visible_steps = (
+                "Expected visible steps: markdown discovery/reads, product brief, "
+                "synthesis JSON under /tmp, then dry-run importer output."
+            )
+        else:  # pragma: no cover - defensive
+            print(project_workflow_usage())
+            return
+        print(
+            f"  {label}. Starting now as the next agent turn — not a background job.\n"
+            f"  {visible_steps}\n"
+            "  If no tool activity appears within a few seconds, the workflow did not start correctly."
+        )
+        if hasattr(self, "_pending_agent_seed"):
+            self._pending_agent_seed = prompt
+        elif hasattr(self, "_pending_input"):
+            # Fallback for older/non-interactive shells.  Keep a non-slash prefix
+            # so the seed cannot be re-dispatched as /project-create/import.
+            self._pending_input.put(f"Run this project workflow as an agent task:\n\n{prompt}")
+        else:  # pragma: no cover - defensive (no live input loop)
+            print(prompt)
+
     def _handle_skills_command(self, cmd: str):
         """Handle /skills slash command — delegates to hermes_cli.skills_hub."""
         from cli import ChatConsole

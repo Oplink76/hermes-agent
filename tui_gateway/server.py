@@ -332,7 +332,7 @@ class _SlashWorker:
             if text := line.rstrip("\n"):
                 self.stderr_tail = (self.stderr_tail + [text])[-80:]
 
-    def run(self, command: str) -> str:
+    def run_result(self, command: str) -> dict:
         if self.proc.poll() is not None:
             raise RuntimeError("slash worker exited")
 
@@ -353,11 +353,18 @@ class _SlashWorker:
                     continue
                 if not msg.get("ok"):
                     raise RuntimeError(msg.get("error", "slash worker failed"))
-                return str(msg.get("output", "")).rstrip()
+                return {
+                    "output": str(msg.get("output", "")).rstrip(),
+                    "agent_seed": str(msg.get("agent_seed") or ""),
+                }
 
             raise RuntimeError(
                 f"slash worker closed pipe{': ' + chr(10).join(self.stderr_tail[-8:]) if self.stderr_tail else ''}"
             )
+
+    def run(self, command: str) -> str:
+        """Compatibility wrapper returning only display output."""
+        return self.run_result(command).get("output", "")
 
     def close(self):
         if getattr(self, "_closed", False):
@@ -12641,11 +12648,31 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 5030, f"slash worker start failed: {e}")
 
     try:
-        output = worker.run(cmd)
+        if hasattr(worker, "run_result"):
+            worker_result = worker.run_result(cmd)
+        else:  # compatibility with tests/older injected workers
+            worker_result = {"output": worker.run(cmd), "agent_seed": ""}
+        output = str(worker_result.get("output") or "")
+        agent_seed = str(worker_result.get("agent_seed") or "")
+        warnings: list[str] = []
         warning = _mirror_slash_side_effects(params.get("session_id", ""), session, cmd)
-        payload = {"output": output or "(no output)"}
         if warning:
-            payload["warning"] = warning
+            warnings.append(warning)
+        payload = {"output": output or "(no output)"}
+        if agent_seed:
+            seed_resp = _methods["prompt.submit"](
+                f"{rid}:agent_seed",
+                {"session_id": params.get("session_id", ""), "text": agent_seed},
+            )
+            if "error" in seed_resp:
+                warnings.append(
+                    "agent workflow seed was created but could not start: "
+                    + str(seed_resp.get("error", {}).get("message") or "unknown error")
+                )
+            else:
+                payload["agent_seed_started"] = True
+        if warnings:
+            payload["warning"] = "\n".join(warnings)
         return _ok(rid, payload)
     except Exception as e:
         try:

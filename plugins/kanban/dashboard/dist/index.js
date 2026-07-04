@@ -2363,8 +2363,8 @@
       });
     }, [props.column, props.laneByProfile]);
 
-    const colHelp = getColumnHelp(t, props.column.name);
-    const colLabel = getColumnLabel(t, props.column.name);
+    const colHelp = props.column.help || getColumnHelp(t, props.column.name);
+    const colLabel = props.column.label || getColumnLabel(t, props.column.name);
 
     return h("div", {
       ref: colRef,
@@ -2475,6 +2475,61 @@
     if (age >= tier.red)   return "hermes-kanban-card--stale-red";
     if (age >= tier.amber) return "hermes-kanban-card--stale-amber";
     return "";
+  }
+
+  function provenanceBadges(task) {
+    const p = task && task.ai_provenance;
+    if (!p) return [];
+    const items = [];
+    if (p.writer_agent) items.push(["Writer", p.writer_agent]);
+    if (p.tester_agent) items.push(["Tester", p.tester_agent]);
+    if (p.reviewer_agent) items.push(["Reviewer", p.reviewer_agent]);
+    if (p.review_rule && p.review_rule.different_agent === false) {
+      items.push(["Review rule", "VIOLATION"]);
+    }
+    return items.map(function (item) {
+      const label = item[0];
+      const value = item[1];
+      return h(Badge, {
+        key: label + value,
+        variant: "outline",
+        className: cn(
+          "hermes-kanban-ai-badge",
+          value === "VIOLATION" ? "hermes-kanban-ai-badge--bad" : "",
+        ),
+        title: label + ": " + value,
+      }, label[0] + ": " + value);
+    });
+  }
+
+  function ProvenanceSection(props) {
+    const p = props.provenance;
+    if (!p) return null;
+    const rows = [];
+    if (p.writer_agent) rows.push(["Writer AI", p.writer_agent]);
+    if (p.tester_agent) rows.push(["Tester AI", p.tester_agent]);
+    if (p.reviewer_agent) rows.push(["Reviewer AI", p.reviewer_agent]);
+    if (p.review_rule) rows.push([
+      "Review rule",
+      p.review_rule.different_agent ? "passed — reviewer differs from writer" : "FAILED — reviewer matches writer",
+    ]);
+    if (p.branch) rows.push(["Branch", p.branch]);
+    if (p.worktree) rows.push(["Worktree", p.worktree]);
+    if (p.commit) rows.push(["Commit", p.commit]);
+    if (p.test_result) rows.push(["Test result", p.test_result]);
+    if (p.verdict) rows.push(["Review verdict", p.verdict]);
+    if (rows.length === 0) return null;
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head" }, "AI provenance"),
+      h("div", { className: "hermes-kanban-provenance-grid" },
+        rows.map(function (row) {
+          return h("div", { key: row[0], className: "hermes-kanban-provenance-row" },
+            h("span", { className: "hermes-kanban-provenance-label" }, row[0]),
+            h("span", { className: "hermes-kanban-provenance-value" }, row[1]),
+          );
+        }),
+      ),
+    );
   }
 
   function TaskCard(props) {
@@ -2610,6 +2665,10 @@
           ),
           h("div", { className: "hermes-kanban-card-title" },
             t.title || tx(i18n, "untitled", "(untitled)")),
+          t.ai_provenance
+            ? h("div", { className: "hermes-kanban-card-row hermes-kanban-ai-row" },
+                provenanceBadges(t))
+            : null,
           h("div", { className: "hermes-kanban-card-row hermes-kanban-card-meta" },
             t.assignee
               ? h("span", { className: "hermes-kanban-assignee",
@@ -3264,6 +3323,7 @@
         }) : null,
         t.created_by ? h(MetaRow, { label: tx(i18n, "createdBy", "Created by"), value: t.created_by }) : null,
       ),
+      h(ProvenanceSection, { provenance: t.ai_provenance }),
       h(StatusActions, {
         task: t,
         onPatch: props.onPatch,

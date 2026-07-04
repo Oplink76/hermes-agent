@@ -242,6 +242,34 @@ class TestBoardCRUD:
         assert again["description"] == "desc"
         assert again["icon"] == "📦"
 
+    def test_create_product_preset_writes_relay_style_columns(self, fresh_home):
+        meta = kb.create_board("prod", name="Product", preset="product")
+        labels = [column["label"] for column in meta["columns"]]
+        assert labels == [
+            "Backlog",
+            "Architecture",
+            "Development",
+            "Test",
+            "Review",
+            "Release / Measure",
+            "Done",
+            "Blocked",
+        ]
+        assert meta["preset"] == "product"
+        assert kb.read_board_metadata("prod")["columns"] == meta["columns"]
+
+    def test_create_task_stores_workflow_step_key(self, fresh_home):
+        with kb.connect(board="default") as conn:
+            task_id = kb.create_task(
+                conn,
+                title="User story: visible state",
+                workflow_template_id="product",
+                current_step_key="backlog",
+            )
+            task = kb.get_task(conn, task_id)
+        assert task.workflow_template_id == "product"
+        assert task.current_step_key == "backlog"
+
     def test_remove_archive(self, fresh_home):
         kb.create_board("toremove")
         res = kb.remove_board("toremove")

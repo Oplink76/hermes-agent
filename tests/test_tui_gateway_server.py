@@ -4359,6 +4359,51 @@ def test_snapshot_restore_is_blocked_from_tui_worker():
     )
 
 
+def test_slash_exec_starts_agent_seed_from_worker(monkeypatch):
+    """Desktop slash commands that seed an agent turn must not stop at the ack.
+
+    Regression for /project-import: the slash worker captured the visible
+    "workflow queued" text but the pending agent seed stayed inside the worker
+    process, so the Desktop UI showed no follow-up tool activity.
+    """
+    submitted = {}
+
+    class _Worker:
+        def run_result(self, command):
+            assert command == "/project-import /tmp/acme --name Acme"
+            return {
+                "output": "Project import workflow queued. Starting now as the next agent turn — not a background job.",
+                "agent_seed": "/project-import workflow request\n\nRaw user arguments:\n/tmp/acme --name Acme",
+            }
+
+    def _fake_prompt_submit(rid, params):
+        submitted["rid"] = rid
+        submitted["params"] = params
+        return server._ok(rid, {"status": "streaming"})
+
+    monkeypatch.setitem(server._methods, "prompt.submit", _fake_prompt_submit)
+    server._sessions["sid"] = _session(slash_worker=_Worker())
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "slash.exec",
+                "params": {
+                    "command": "/project-import /tmp/acme --name Acme",
+                    "session_id": "sid",
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert "result" in resp, resp
+    assert "Project import workflow queued" in resp["result"]["output"]
+    assert resp["result"]["agent_seed_started"] is True
+    assert submitted["params"]["session_id"] == "sid"
+    assert submitted["params"]["text"].startswith("/project-import workflow request")
+
+
 def test_command_dispatch_exec_nonzero_surfaces_error(monkeypatch):
     monkeypatch.setattr(
         server,
@@ -6599,11 +6644,16 @@ def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
         _stub_urlopen(monkeypatch, ok=False)
         with (
             patch(
-                "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=False
+                "hermes_cli.browser_connect.launch_chrome_debug",
+                return_value=types.SimpleNamespace(launched=False, hint=None),
             ),
             patch(
                 "hermes_cli.browser_connect.get_chrome_debug_candidates",
                 return_value=[],
+            ),
+            patch(
+                "hermes_cli.browser_connect.manual_chrome_debug_command",
+                return_value=None,
             ),
         ):
             resp = server.handle_request(
@@ -6655,7 +6705,8 @@ def test_browser_manage_connect_no_session_skips_progress_events(monkeypatch):
         _stub_urlopen(monkeypatch, ok=False)
         with (
             patch(
-                "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=False
+                "hermes_cli.browser_connect.launch_chrome_debug",
+                return_value=types.SimpleNamespace(launched=False, hint=None),
             ),
             patch(
                 "hermes_cli.browser_connect.get_chrome_debug_candidates",
@@ -6743,7 +6794,8 @@ def test_browser_manage_connect_default_local_retries_after_launch(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", _opener)
     with patch.dict(sys.modules, {"tools.browser_tool": fake}):
         with patch(
-            "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=True
+            "hermes_cli.browser_connect.launch_chrome_debug",
+            return_value=types.SimpleNamespace(launched=True, hint=None),
         ):
             resp = server.handle_request(
                 {"id": "1", "method": "browser.manage", "params": {"action": "connect"}}

@@ -283,6 +283,40 @@
   padding: 0.05rem 0.3rem !important;
 }
 
+.hermes-kanban-ai-row {
+  gap: 0.25rem;
+}
+.hermes-kanban-ai-badge {
+  font-size: 0.58rem !important;
+  padding: 0.05rem 0.28rem !important;
+  border-color: color-mix(in srgb, #7aa2f7 45%, var(--color-border));
+  background: color-mix(in srgb, #7aa2f7 12%, transparent);
+  color: color-mix(in srgb, var(--color-foreground) 90%, #7aa2f7);
+}
+.hermes-kanban-ai-badge--bad {
+  border-color: color-mix(in srgb, var(--color-destructive, #d14a4a) 65%, var(--color-border));
+  background: color-mix(in srgb, var(--color-destructive, #d14a4a) 14%, transparent);
+}
+
+.hermes-kanban-provenance-grid {
+  display: grid;
+  grid-template-columns: minmax(7rem, max-content) 1fr;
+  gap: 0.25rem 0.75rem;
+  font-size: 0.78rem;
+}
+.hermes-kanban-provenance-row {
+  display: contents;
+}
+.hermes-kanban-provenance-label {
+  color: var(--color-muted-foreground);
+  font-weight: 500;
+}
+.hermes-kanban-provenance-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+
 .hermes-kanban-needs-assignee {
   font-size: 0.6rem !important;
   padding: 0.05rem 0.3rem !important;

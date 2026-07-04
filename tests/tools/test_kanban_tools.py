@@ -827,6 +827,101 @@ def test_block_non_goal_mode_task_unaffected_by_new_gate(worker_env):
     assert json.loads(out).get("ok") is True
 
 
+def _make_product_worker_env(monkeypatch, tmp_path):
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "developer-profile")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "prod")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: checkout",
+            assignee="developer-profile",
+            workflow_template_id="product",
+            current_step_key="development",
+            initial_status="running",
+        )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    return tid
+
+
+def test_product_block_requires_attempted_resolutions(monkeypatch, tmp_path):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tid = _make_product_worker_env(monkeypatch, tmp_path)
+    out = kt._handle_block({"reason": "Need API credentials", "kind": "needs_input"})
+    data = json.loads(out)
+    assert "error" in data
+    assert "attempted_resolutions" in data["error"]
+
+    with kb.connect(board="prod") as conn:
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert task.status != "blocked"
+    assert not [event for event in events if event.kind == kb.PRODUCT_WORKFLOW_PRECHECK_EVENT]
+
+
+def test_product_block_first_routes_to_hermes_preflight(monkeypatch, tmp_path):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tid = _make_product_worker_env(monkeypatch, tmp_path)
+    out = kt._handle_block({
+        "reason": "Need API credentials",
+        "kind": "needs_input",
+        "attempted_resolutions": ["checked env", "checked docs"],
+    })
+    data = json.loads(out)
+    assert data["ok"] is True
+    assert data["status"] == "ready"
+    assert data["slack_subscribed"] is False
+
+    with kb.connect(board="prod") as conn:
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert task.assignee == "default"
+    assert task.current_step_key == "development"
+    assert [event.kind for event in events].count(kb.PRODUCT_WORKFLOW_PRECHECK_EVENT) == 1
+
+
+def test_product_block_second_escalates_to_slack_subscribed_block(monkeypatch, tmp_path):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kt, "_slack_escalation_channel_from_config", lambda: "C123")
+    tid = _make_product_worker_env(monkeypatch, tmp_path)
+    first = json.loads(kt._handle_block({
+        "reason": "Need API credentials",
+        "kind": "needs_input",
+        "attempted_resolutions": ["checked env"],
+    }))
+    assert first["status"] == "ready"
+    second = json.loads(kt._handle_block({
+        "reason": "Hermes could not resolve safely",
+        "kind": "needs_input",
+        "attempted_resolutions": ["searched docs", "checked local env"],
+    }))
+    assert second["ok"] is True
+    assert second["status"] == "blocked"
+    assert second["slack_subscribed"] is True
+
+    with kb.connect(board="prod") as conn:
+        task = kb.get_task(conn, tid)
+        subs = kb.list_notify_subs(conn, tid)
+    assert task.status == "blocked"
+    assert any(sub["platform"] == "slack" and sub["chat_id"] == "C123" for sub in subs)
+
+
 def test_heartbeat_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_heartbeat({"note": "progress"})

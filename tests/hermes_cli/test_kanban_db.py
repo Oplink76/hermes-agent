@@ -2574,6 +2574,317 @@ def test_list_tasks_filters_workflow_template_and_step(kanban_home):
     assert [x.id for x in by_step] == [ta]
 
 
+def test_product_completion_advances_card_to_next_role(kanban_home):
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: checkout",
+            assignee="architect-profile",
+            workflow_template_id="product",
+            current_step_key="architecture",
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Architecture settled",
+            board="prod",
+            product_role_assignees={"developer": "developer-profile"},
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        latest_run = kb.latest_run(conn, tid)
+    assert task.status == "ready"
+    assert task.current_step_key == "development"
+    assert task.assignee == "developer-profile"
+    assert latest_run.outcome == "advanced"
+    advanced = [event for event in events if event.kind == "workflow_advanced"]
+    assert advanced
+    assert advanced[-1].payload["from_step"] == "architecture"
+    assert advanced[-1].payload["to_step"] == "development"
+
+
+def test_product_test_completion_moves_to_review_status(kanban_home):
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: checkout",
+            assignee="tester-profile",
+            workflow_template_id="product",
+            current_step_key="test",
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Tests passed",
+            metadata={
+                "ai_provenance": {
+                    "tester": {"agent": "hermes", "result": "passed"},
+                }
+            },
+            board="prod",
+            product_role_assignees={"reviewer": "reviewer-profile"},
+        )
+        task = kb.get_task(conn, tid)
+    assert task.status == "review"
+    assert task.current_step_key == "review"
+    assert task.assignee == "reviewer-profile"
+
+
+def test_product_development_completion_requires_writer_provenance(kanban_home):
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: checkout",
+            assignee="developer-profile",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        with pytest.raises(kb.ProductProvenanceError, match="Development completion"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Implemented checkout",
+                board="prod",
+                product_role_assignees={"tester": "tester-profile"},
+            )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert task.current_step_key == "development"
+    assert task.assignee == "developer-profile"
+    assert any(event.kind == kb.PRODUCT_PROVENANCE_BLOCKED_EVENT for event in events)
+
+
+def test_product_development_completion_records_writer_provenance(kanban_home):
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: checkout",
+            assignee="developer-profile",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Implemented checkout",
+            metadata={
+                "ai_provenance": {
+                    "writer": {
+                        "agent": "claude-code",
+                        "model": "opus-4.8",
+                        "branch": "feature/checkout",
+                        "commit": "abc123",
+                    }
+                }
+            },
+            board="prod",
+            product_role_assignees={"tester": "tester-profile"},
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        latest = kb.latest_ai_provenance_by_task(conn, [tid])[tid]
+    assert task.current_step_key == "test"
+    assert task.assignee == "tester-profile"
+    assert latest["writer_agent"] == "claude-code"
+    assert latest["branch"] == "feature/checkout"
+    advanced = [event for event in events if event.kind == "workflow_advanced"]
+    assert advanced[-1].payload["ai_provenance"]["writer_agent"] == "claude-code"
+
+
+def test_product_review_completion_rejects_same_ai_as_writer(kanban_home):
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: checkout",
+            assignee="developer-profile",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Implemented checkout",
+            metadata={"ai_provenance": {"writer": {"agent": "Claude Code"}}},
+            board="prod",
+            product_role_assignees={"tester": "tester-profile"},
+        )
+        conn.execute(
+            "UPDATE tasks SET current_step_key='review', status='review', assignee='reviewer-profile' WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        with pytest.raises(kb.ProductProvenanceError, match="reviewer AI must differ"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Reviewed implementation",
+                metadata={"ai_provenance": {"reviewer": {"agent": "claude-code"}}},
+                board="prod",
+            )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert task.current_step_key == "review"
+    assert task.status == "review"
+    rejected = [event for event in events if event.kind == kb.PRODUCT_PROVENANCE_BLOCKED_EVENT]
+    assert rejected
+    assert rejected[-1].payload["writer_agent"] == "Claude Code"
+    assert rejected[-1].payload["reviewer_agent"] == "claude-code"
+
+
+def test_product_review_completion_accepts_different_ai_reviewer(kanban_home):
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: checkout",
+            assignee="developer-profile",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Implemented checkout",
+            metadata={"ai_provenance": {"writer": {"agent": "claude-code"}}},
+            board="prod",
+            product_role_assignees={"tester": "tester-profile"},
+        )
+        conn.execute(
+            "UPDATE tasks SET current_step_key='review', status='review', assignee='reviewer-profile' WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Reviewed implementation",
+            metadata={
+                "ai_provenance": {
+                    "reviewer": {"agent": "codex", "verdict": "approved"},
+                }
+            },
+            board="prod",
+        )
+        task = kb.get_task(conn, tid)
+        provenance = kb.latest_ai_provenance_by_task(conn, [tid])[tid]
+    assert task.current_step_key == "release_measure"
+    assert provenance["writer_agent"] == "claude-code"
+    assert provenance["reviewer_agent"] == "codex"
+    assert provenance["review_rule"]["different_agent"] is True
+
+
+def test_product_human_block_routes_to_hermes_preflight_before_blocked(kanban_home):
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: checkout",
+            assignee="developer-profile",
+            workflow_template_id="product",
+            current_step_key="development",
+            initial_status="running",
+        )
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="Need API credentials",
+            kind="needs_input",
+            attempted_resolutions=["checked env", "checked docs"],
+            board="prod",
+            human_escalation_assignee="default",
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        latest_run = kb.latest_run(conn, tid)
+    assert task.status == "ready"
+    assert task.current_step_key == "development"
+    assert task.assignee == "default"
+    assert latest_run.outcome == "preflight"
+    preflights = [event for event in events if event.kind == kb.PRODUCT_WORKFLOW_PRECHECK_EVENT]
+    assert preflights
+    assert preflights[-1].payload["original_assignee"] == "developer-profile"
+    assert preflights[-1].payload["attempted_resolutions"] == ["checked env", "checked docs"]
+
+
+def test_product_preflight_resolution_returns_card_to_original_assignee(kanban_home):
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: checkout",
+            assignee="developer-profile",
+            workflow_template_id="product",
+            current_step_key="development",
+            initial_status="running",
+        )
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="Need API credentials",
+            kind="needs_input",
+            attempted_resolutions=["checked env"],
+            board="prod",
+            human_escalation_assignee="default",
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Found internal test token path",
+            board="prod",
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        latest_run = kb.latest_run(conn, tid)
+    assert task.status == "ready"
+    assert task.current_step_key == "development"
+    assert task.assignee == "developer-profile"
+    assert latest_run.outcome == "preflight_resolved"
+    assert [event.kind for event in events].count("human_input_preflight_resolved") == 1
+
+
+def test_product_second_human_block_after_preflight_enters_blocked(kanban_home):
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: checkout",
+            assignee="developer-profile",
+            workflow_template_id="product",
+            current_step_key="development",
+            initial_status="running",
+        )
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="Need API credentials",
+            kind="needs_input",
+            attempted_resolutions=["checked env"],
+            board="prod",
+            human_escalation_assignee="default",
+        )
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="Hermes could not find a safe substitute credential",
+            kind="needs_input",
+            attempted_resolutions=["searched project docs", "checked local env"],
+            board="prod",
+            human_escalation_assignee="default",
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert task.status == "blocked"
+    assert task.current_step_key == "development"
+    blocked = [event for event in events if event.kind == "blocked"]
+    assert blocked
+    assert blocked[-1].payload["attempted_resolutions"] == ["searched project docs", "checked local env"]
+
+
 def test_list_runs_state_filter_requires_pair_and_valid_type(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="t", assignee="alice")

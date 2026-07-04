@@ -102,6 +102,86 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+# Dashboard/workflow presets.  Task state remains the generic VALID_STATUSES
+# set above; presets only describe how a board should be displayed and which
+# workflow step key a card belongs to.  This lets product boards use a
+# Relay-style visible process without inventing unsafe raw task statuses.
+GENERIC_BOARD_COLUMNS: list[dict[str, str]] = [
+    {"name": "triage", "label": "Triage", "status": "triage", "help": "Raw ideas — a specifier will flesh out the spec"},
+    {"name": "todo", "label": "Todo", "status": "todo", "help": "Waiting on dependencies or unassigned"},
+    {"name": "scheduled", "label": "Scheduled", "status": "scheduled", "help": "Waiting on a known time delay or scheduled follow-up"},
+    {"name": "ready", "label": "Ready", "status": "ready", "help": "Dependencies satisfied; assign a profile to dispatch"},
+    {"name": "running", "label": "In Progress", "status": "running", "help": "Claimed by a worker — in-flight"},
+    {"name": "blocked", "label": "Blocked", "status": "blocked", "help": "Worker asked for human input"},
+    {"name": "review", "label": "Review", "status": "review", "help": "Needs independent review"},
+    {"name": "done", "label": "Done", "status": "done", "help": "Completed"},
+]
+
+PRODUCT_BOARD_COLUMNS: list[dict[str, str]] = [
+    {
+        "name": "backlog",
+        "label": "Backlog",
+        "status": "ready",
+        "help": "Prioritized user-story cards before architecture/development starts.",
+    },
+    {
+        "name": "architecture",
+        "label": "Architecture",
+        "status": "ready",
+        "help": "Architecture child work after stories are ready.",
+    },
+    {
+        "name": "development",
+        "label": "Development",
+        "status": "ready",
+        "help": "Implementation work using branch/worktree and local AI writer.",
+    },
+    {
+        "name": "test",
+        "label": "Test",
+        "status": "ready",
+        "help": "Test/verification work from acceptance criteria.",
+    },
+    {
+        "name": "review",
+        "label": "Review",
+        "status": "review",
+        "help": "Independent reviewer pass; self-reports remain advisory.",
+    },
+    {
+        "name": "release_measure",
+        "label": "Release / Measure",
+        "status": "ready",
+        "help": "Human release/measurement gate; no auto-dispatch unless explicitly approved.",
+    },
+    {"name": "done", "label": "Done", "status": "done", "help": "Completed and verified."},
+    {"name": "blocked", "label": "Blocked", "status": "blocked", "help": "Needs human input or a real blocker cleared."},
+]
+
+BOARD_PRESETS: dict[str, list[dict[str, str]]] = {
+    "generic": GENERIC_BOARD_COLUMNS,
+    "product": PRODUCT_BOARD_COLUMNS,
+}
+
+PRODUCT_WORKFLOW_TRANSITIONS: dict[str, dict[str, Optional[str]]] = {
+    "backlog": {"next_step": "architecture", "status": "ready", "assignee_role": "architect"},
+    "architecture": {"next_step": "development", "status": "ready", "assignee_role": "developer"},
+    "development": {"next_step": "test", "status": "ready", "assignee_role": "tester"},
+    "test": {"next_step": "review", "status": "review", "assignee_role": "reviewer"},
+    # Human gate: reviewer handoff lands in Release / Measure but does not auto-dispatch.
+    "review": {"next_step": "release_measure", "status": "ready", "assignee_role": None},
+}
+PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES: dict[str, str] = {
+    "architect": "architect",
+    "developer": "developer",
+    "tester": "tester",
+    "reviewer": "reviewer",
+}
+PRODUCT_HUMAN_BLOCK_KINDS = {None, "needs_input", "capability"}
+PRODUCT_WORKFLOW_PRECHECK_EVENT = "human_input_preflight"
+PRODUCT_PROVENANCE_REQUIRED_STEPS = {"development", "test", "review"}
+PRODUCT_PROVENANCE_BLOCKED_EVENT = "completion_blocked_provenance"
+
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
@@ -674,6 +754,8 @@ def write_board_metadata(
     color: Optional[str] = None,
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
+    preset: Optional[str] = None,
+    columns: Optional[list[dict[str, str]]] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -697,6 +779,13 @@ def write_board_metadata(
         meta["archived"] = bool(archived)
     if default_workdir is not None:
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
+    if preset is not None:
+        preset_name = str(preset).strip().lower() or "generic"
+        if preset_name not in BOARD_PRESETS:
+            raise ValueError(f"unknown board preset: {preset!r}")
+        meta["preset"] = preset_name
+    if columns is not None:
+        meta["columns"] = [dict(column) for column in columns]
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -717,6 +806,7 @@ def create_board(
     icon: Optional[str] = None,
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
+    preset: Optional[str] = None,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
@@ -727,6 +817,9 @@ def create_board(
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
+    preset_name = str(preset).strip().lower() if preset is not None else None
+    if preset_name is not None and preset_name not in BOARD_PRESETS:
+        raise ValueError(f"unknown board preset: {preset!r}")
     meta = write_board_metadata(
         normed,
         name=name,
@@ -734,10 +827,669 @@ def create_board(
         icon=icon,
         color=color,
         default_workdir=default_workdir,
+        preset=preset_name,
+        columns=BOARD_PRESETS[preset_name] if preset_name else None,
     )
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
     return meta
+
+
+def product_board_metadata(board: Optional[str] = None) -> Optional[dict]:
+    """Return metadata for a product-preset board, else ``None``.
+
+    ``read_board_metadata(None)`` intentionally synthesizes the legacy default
+    board, so lifecycle callers that are operating on the *active* worker board
+    must resolve ``None`` through :func:`get_current_board` first.
+    """
+    slug = _normalize_board_slug(board) if board is not None else get_current_board()
+    meta = read_board_metadata(slug or DEFAULT_BOARD)
+    return meta if str(meta.get("preset") or "").lower() == "product" else None
+
+
+def is_product_board(board: Optional[str] = None) -> bool:
+    return product_board_metadata(board) is not None
+
+
+def _product_workflow_dict(meta: Optional[dict]) -> dict:
+    if not isinstance(meta, dict):
+        return {}
+    raw = meta.get("product_workflow") or meta.get("workflow") or {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _product_role_assignee(
+    meta: Optional[dict],
+    role: Optional[str],
+    overrides: Optional[dict[str, str]] = None,
+) -> Optional[str]:
+    if not role:
+        return None
+    merged: dict[str, str] = dict(PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES)
+    wf = _product_workflow_dict(meta)
+    meta_assignees = None
+    if isinstance(wf.get("assignees"), dict):
+        meta_assignees = wf.get("assignees")
+    elif isinstance(meta, dict) and isinstance(meta.get("assignees"), dict):
+        meta_assignees = meta.get("assignees")
+    if isinstance(meta_assignees, dict):
+        merged.update({str(k): str(v) for k, v in meta_assignees.items() if str(v).strip()})
+    if isinstance(overrides, dict):
+        merged.update({str(k): str(v) for k, v in overrides.items() if str(v).strip()})
+    assignee = str(merged.get(role) or "").strip()
+    return assignee or None
+
+
+def _column_status_for_step(meta: Optional[dict], step_key: Optional[str]) -> str:
+    if not step_key:
+        return "ready"
+    columns = meta.get("columns") if isinstance(meta, dict) else None
+    if isinstance(columns, list):
+        for col in columns:
+            if isinstance(col, dict) and col.get("name") == step_key:
+                status = str(col.get("status") or "").strip()
+                return status if status in VALID_STATUSES else "ready"
+    for col in PRODUCT_BOARD_COLUMNS:
+        if col.get("name") == step_key:
+            status = str(col.get("status") or "").strip()
+            return status if status in VALID_STATUSES else "ready"
+    return "ready"
+
+
+def _product_ai_provenance_required(meta: Optional[dict]) -> bool:
+    wf = _product_workflow_dict(meta)
+    for key in ("ai_provenance_required", "require_ai_provenance"):
+        if key in wf:
+            return wf.get(key) is not False
+    if isinstance(meta, dict):
+        for key in ("ai_provenance_required", "require_ai_provenance"):
+            if key in meta:
+                return meta.get(key) is not False
+    return True
+
+
+def _clean_agent_name(value: Any) -> Optional[str]:
+    if isinstance(value, dict):
+        for key in ("agent", "name", "tool", "provider"):
+            if value.get(key):
+                return str(value.get(key)).strip() or None
+        return None
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _agent_compare_key(value: Optional[str]) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
+def _provenance_payload(metadata: Optional[dict]) -> dict:
+    if not isinstance(metadata, dict):
+        return {}
+    raw = metadata.get("ai_provenance")
+    if isinstance(raw, dict):
+        return raw
+    # Accept a flat metadata object for CLI/manual callers while still
+    # documenting ``metadata.ai_provenance`` as the canonical shape.
+    flat_keys = {
+        "writer", "external_writer", "writer_agent", "writer_ai",
+        "tester", "tester_agent", "verifier", "verifier_agent",
+        "reviewer", "reviewer_agent", "reviewer_ai",
+    }
+    return metadata if any(key in metadata for key in flat_keys) else {}
+
+
+def _lookup_provenance_value(prov: dict, *paths: Any) -> Optional[str]:
+    for path in paths:
+        if isinstance(path, str):
+            value = prov.get(path)
+        else:
+            node: Any = prov
+            for part in path:
+                if not isinstance(node, dict) or part not in node:
+                    node = None
+                    break
+                node = node.get(part)
+            value = node
+        cleaned = _clean_agent_name(value)
+        if cleaned:
+            return cleaned
+    return None
+
+
+def _writer_agent_from_metadata(metadata: Optional[dict]) -> Optional[str]:
+    prov = _provenance_payload(metadata)
+    return _lookup_provenance_value(
+        prov,
+        ("writer", "agent"),
+        ("external_writer", "agent"),
+        ("implementation", "agent"),
+        "writer_agent",
+        "writer_ai",
+        "external_writer_agent",
+    )
+
+
+def _tester_agent_from_metadata(metadata: Optional[dict]) -> Optional[str]:
+    prov = _provenance_payload(metadata)
+    return _lookup_provenance_value(
+        prov,
+        ("tester", "agent"),
+        ("verifier", "agent"),
+        ("test", "agent"),
+        "tester_agent",
+        "verifier_agent",
+        "test_agent",
+    )
+
+
+def _reviewer_agent_from_metadata(metadata: Optional[dict]) -> Optional[str]:
+    prov = _provenance_payload(metadata)
+    return _lookup_provenance_value(
+        prov,
+        ("reviewer", "agent"),
+        ("review", "agent"),
+        "reviewer_agent",
+        "reviewer_ai",
+        "review_agent",
+    )
+
+
+def _latest_product_writer_agent(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    rows = conn.execute(
+        """
+        SELECT metadata FROM task_runs
+         WHERE task_id = ?
+           AND metadata IS NOT NULL AND metadata != ''
+         ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
+        """,
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except Exception:
+            metadata = {}
+        writer = _writer_agent_from_metadata(metadata if isinstance(metadata, dict) else {})
+        if writer:
+            return writer
+    return None
+
+
+def _record_product_provenance_rejection(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    step_key: str,
+    reason: str,
+    missing: Optional[list[str]] = None,
+    writer_agent: Optional[str] = None,
+    reviewer_agent: Optional[str] = None,
+) -> None:
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            PRODUCT_PROVENANCE_BLOCKED_EVENT,
+            {
+                "step_key": step_key,
+                "reason": reason,
+                "missing": missing or [],
+                "writer_agent": writer_agent,
+                "reviewer_agent": reviewer_agent,
+            },
+        )
+
+
+def _validate_product_ai_provenance(
+    conn: sqlite3.Connection,
+    task_id: str,
+    step_key: Optional[str],
+    metadata: Optional[dict],
+    meta: Optional[dict],
+) -> None:
+    step = str(step_key or "")
+    if step not in PRODUCT_PROVENANCE_REQUIRED_STEPS:
+        return
+    if not _product_ai_provenance_required(meta):
+        return
+    if step == "development":
+        writer = _writer_agent_from_metadata(metadata)
+        if not writer:
+            reason = (
+                "Development completion requires AI provenance: set "
+                "metadata.ai_provenance.writer.agent (or writer_agent) to "
+                "the coding AI that wrote the change."
+            )
+            _record_product_provenance_rejection(
+                conn, task_id, step_key=step, reason=reason,
+                missing=["ai_provenance.writer.agent"],
+            )
+            raise ProductProvenanceError(reason, task_id, step)
+        return
+    if step == "test":
+        tester = _tester_agent_from_metadata(metadata)
+        if not tester:
+            reason = (
+                "Test completion requires AI provenance: set "
+                "metadata.ai_provenance.tester.agent or verifier.agent to "
+                "the AI/persona that performed verification."
+            )
+            _record_product_provenance_rejection(
+                conn, task_id, step_key=step, reason=reason,
+                missing=["ai_provenance.tester.agent"],
+            )
+            raise ProductProvenanceError(reason, task_id, step)
+        return
+    if step == "review":
+        reviewer = _reviewer_agent_from_metadata(metadata)
+        supplied_writer = _writer_agent_from_metadata(metadata)
+        writer = supplied_writer or _latest_product_writer_agent(conn, task_id)
+        missing: list[str] = []
+        if not reviewer:
+            missing.append("ai_provenance.reviewer.agent")
+        if not writer:
+            missing.append("ai_provenance.writer.agent or prior development writer")
+        if missing:
+            reason = (
+                "Review completion requires AI provenance for both the "
+                "reviewer and the writer being reviewed."
+            )
+            _record_product_provenance_rejection(
+                conn, task_id, step_key=step, reason=reason,
+                missing=missing, writer_agent=writer, reviewer_agent=reviewer,
+            )
+            raise ProductProvenanceError(reason, task_id, step, missing=missing)
+        if _agent_compare_key(writer) == _agent_compare_key(reviewer):
+            reason = (
+                "Review completion rejected: reviewer AI must differ from "
+                f"writer AI (both were {reviewer!r}). Use Codex to review "
+                "Claude Code output, or Claude Code to review Codex output."
+            )
+            _record_product_provenance_rejection(
+                conn, task_id, step_key=step, reason=reason,
+                writer_agent=writer, reviewer_agent=reviewer,
+            )
+            raise ProductProvenanceError(reason, task_id, step)
+
+
+def _ai_provenance_summary_from_metadata(
+    step_key: Optional[str],
+    metadata: Optional[dict],
+) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    step = str(step_key or "")
+    out: dict[str, Any] = {}
+    writer = _writer_agent_from_metadata(metadata)
+    tester = _tester_agent_from_metadata(metadata)
+    reviewer = _reviewer_agent_from_metadata(metadata)
+    if writer:
+        out["writer_agent"] = writer
+    if tester:
+        out["tester_agent"] = tester
+    if reviewer:
+        out["reviewer_agent"] = reviewer
+    prov = _provenance_payload(metadata)
+    if isinstance(prov, dict):
+        for key in ("branch", "worktree", "commit"):
+            value = prov.get(key)
+            if value:
+                out[key] = str(value)
+        writer_obj = prov.get("writer") or prov.get("external_writer")
+        if isinstance(writer_obj, dict):
+            for key in ("model", "effort", "branch", "worktree", "commit"):
+                value = writer_obj.get(key)
+                if value and key not in out:
+                    out[key] = str(value)
+        tester_obj = prov.get("tester") or prov.get("verifier")
+        if isinstance(tester_obj, dict):
+            value = tester_obj.get("result") or tester_obj.get("verdict")
+            if value:
+                out["test_result"] = str(value)
+        reviewer_obj = prov.get("reviewer") or prov.get("review")
+        if isinstance(reviewer_obj, dict):
+            for key in ("model", "verdict", "reviewed_commit", "reviewed_branch"):
+                value = reviewer_obj.get(key)
+                if value:
+                    out[key] = str(value)
+    if out:
+        out["step_key"] = step
+    return out
+
+
+def _merge_ai_provenance_summary(
+    aggregate: dict[str, Any],
+    step_key: Optional[str],
+    metadata: Optional[dict],
+) -> None:
+    summary = _ai_provenance_summary_from_metadata(step_key, metadata)
+    if not summary:
+        return
+    step = str(step_key or summary.get("step_key") or "unknown")
+    by_step = aggregate.setdefault("by_step", {})
+    by_step[step] = summary
+    for key in (
+        "writer_agent", "tester_agent", "reviewer_agent",
+        "branch", "worktree", "commit", "test_result",
+        "verdict", "reviewed_commit", "reviewed_branch",
+    ):
+        if summary.get(key):
+            aggregate[key] = summary[key]
+    writer = aggregate.get("writer_agent")
+    reviewer = aggregate.get("reviewer_agent")
+    if writer and reviewer:
+        aggregate["review_rule"] = {
+            "writer_agent": writer,
+            "reviewer_agent": reviewer,
+            "different_agent": _agent_compare_key(writer) != _agent_compare_key(reviewer),
+        }
+
+
+def _latest_unresolved_product_preflight(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict]:
+    rows = conn.execute(
+        """
+        SELECT kind, payload FROM task_events
+         WHERE task_id = ?
+           AND kind IN (?, 'human_input_preflight_resolved', 'blocked',
+                        'block_loop_detected', 'completed', 'workflow_advanced')
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (task_id, PRODUCT_WORKFLOW_PRECHECK_EVENT),
+    ).fetchall()
+    if not rows or rows[0]["kind"] != PRODUCT_WORKFLOW_PRECHECK_EVENT:
+        return None
+    try:
+        payload = json.loads(rows[0]["payload"]) if rows[0]["payload"] else {}
+    except Exception:
+        payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _complete_product_workflow_step(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+    product_role_assignees: Optional[dict[str, str]] = None,
+) -> Optional[bool]:
+    """Handle product-board non-terminal completion.
+
+    Returns ``None`` when normal terminal completion should run. Returns a
+    boolean when the product workflow consumed the completion.
+    """
+    meta = product_board_metadata(board)
+    if meta is None:
+        return None
+
+    # Provenance rejection must happen before the mutating transaction so the
+    # audit event can commit while the card itself remains untouched.
+    pre_row = conn.execute(
+        "SELECT workflow_template_id, current_step_key FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if pre_row is None:
+        return False
+    pre_step = pre_row["current_step_key"]
+    if pre_row["workflow_template_id"] != "product" and not pre_step:
+        return None
+    if not _latest_unresolved_product_preflight(conn, task_id):
+        transition = PRODUCT_WORKFLOW_TRANSITIONS.get(str(pre_step or ""))
+        if transition is not None and transition.get("next_step"):
+            _validate_product_ai_provenance(
+                conn, task_id, pre_step, metadata, meta,
+            )
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee, workflow_template_id, current_step_key "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        step_key = row["current_step_key"]
+        if row["workflow_template_id"] != "product" and not step_key:
+            return None
+
+        preflight = _latest_unresolved_product_preflight(conn, task_id)
+        if preflight:
+            resume_step = str(preflight.get("step_key") or step_key or "backlog")
+            resume_status = str(
+                preflight.get("resume_status")
+                or _column_status_for_step(meta, resume_step)
+                or "ready"
+            )
+            if resume_status not in VALID_STATUSES or resume_status in {"running", "done", "archived", "blocked"}:
+                resume_status = _column_status_for_step(meta, resume_step)
+            original_assignee = str(preflight.get("original_assignee") or "").strip() or None
+            sql = """
+                UPDATE tasks
+                   SET status        = ?,
+                       assignee      = ?,
+                       result        = ?,
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL,
+                       block_kind    = NULL,
+                       block_recurrences = 0,
+                       workflow_template_id = 'product',
+                       current_step_key = ?
+                 WHERE id = ?
+                   AND status IN ('running', 'ready', 'blocked', 'review')
+            """ + ("" if expected_run_id is None else " AND current_run_id = ?")
+            params: tuple[Any, ...] = (
+                resume_status, original_assignee, result, resume_step, task_id,
+            ) if expected_run_id is None else (
+                resume_status, original_assignee, result, resume_step, task_id, int(expected_run_id),
+            )
+            cur = conn.execute(sql, params)
+            if cur.rowcount != 1:
+                return False
+            run_id = _end_run(
+                conn, task_id,
+                outcome="preflight_resolved",
+                status="completed",
+                summary=summary if summary is not None else result,
+                metadata=metadata,
+            )
+            if run_id is None and (summary or result or metadata):
+                run_id = _synthesize_ended_run(
+                    conn, task_id,
+                    outcome="preflight_resolved",
+                    summary=summary if summary is not None else result,
+                    metadata=metadata,
+                    step_key=resume_step,
+                )
+            _append_event(
+                conn,
+                task_id,
+                "human_input_preflight_resolved",
+                {
+                    "summary": (summary if summary is not None else result),
+                    "step_key": resume_step,
+                    "assignee": original_assignee,
+                    "status": resume_status,
+                },
+                run_id=run_id,
+            )
+            return True
+
+        transition = PRODUCT_WORKFLOW_TRANSITIONS.get(str(step_key or ""))
+        if transition is None:
+            return None
+        next_step = transition.get("next_step")
+        if not next_step:
+            return None
+        next_status = str(transition.get("status") or _column_status_for_step(meta, next_step) or "ready")
+        if next_status not in VALID_STATUSES or next_status in {"running", "done", "archived", "blocked"}:
+            next_status = _column_status_for_step(meta, next_step)
+        role = transition.get("assignee_role")
+        next_assignee = _product_role_assignee(meta, role, product_role_assignees)
+        sql = """
+            UPDATE tasks
+               SET status        = ?,
+                   assignee      = ?,
+                   result        = ?,
+                   completed_at  = NULL,
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL,
+                   block_kind    = NULL,
+                   block_recurrences = 0,
+                   workflow_template_id = 'product',
+                   current_step_key = ?
+             WHERE id = ?
+               AND status IN ('running', 'ready', 'blocked', 'review')
+        """ + ("" if expected_run_id is None else " AND current_run_id = ?")
+        params = (
+            next_status, next_assignee, result, next_step, task_id,
+        ) if expected_run_id is None else (
+            next_status, next_assignee, result, next_step, task_id, int(expected_run_id),
+        )
+        cur = conn.execute(sql, params)
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="advanced",
+            status="completed",
+            summary=summary if summary is not None else result,
+            metadata=metadata,
+        )
+        if run_id is None and (summary or result or metadata):
+            run_id = _synthesize_ended_run(
+                conn, task_id,
+                outcome="advanced",
+                summary=summary if summary is not None else result,
+                metadata=metadata,
+                step_key=step_key,
+            )
+        ev_summary = (summary if summary is not None else result) or ""
+        advanced_payload: dict[str, Any] = {
+            "from_step": step_key,
+            "to_step": next_step,
+            "status": next_status,
+            "assignee_role": role,
+            "assignee": next_assignee,
+            "summary": ev_summary.strip().splitlines()[0][:400] if ev_summary else None,
+        }
+        provenance_summary = _ai_provenance_summary_from_metadata(step_key, metadata)
+        if provenance_summary:
+            advanced_payload["ai_provenance"] = provenance_summary
+        _append_event(
+            conn,
+            task_id,
+            "workflow_advanced",
+            advanced_payload,
+            run_id=run_id,
+        )
+    _clear_failure_counter(conn, task_id)
+    recompute_ready(conn)
+    return True
+
+
+def _route_product_human_block_to_preflight(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+    reason: Optional[str] = None,
+    kind: Optional[str] = None,
+    attempted_resolutions: Optional[Iterable[str]] = None,
+    expected_run_id: Optional[int] = None,
+    human_escalation_assignee: Optional[str] = "default",
+) -> Optional[bool]:
+    """Route the first product-board human block to Hermes instead of Slack.
+
+    The next human block for the same unresolved preflight falls through to the
+    normal ``blocked`` path, which is where Slack/human notification happens.
+    """
+    if kind not in PRODUCT_HUMAN_BLOCK_KINDS:
+        return None
+    meta = product_board_metadata(board)
+    if meta is None:
+        return None
+    hermes_assignee = str(human_escalation_assignee or "default").strip() or "default"
+    attempts = [str(a).strip() for a in (attempted_resolutions or []) if str(a).strip()]
+    with write_txn(conn):
+        if _latest_unresolved_product_preflight(conn, task_id):
+            return None
+        row = conn.execute(
+            "SELECT status, assignee, workflow_template_id, current_step_key "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        step_key = row["current_step_key"] or "backlog"
+        if row["workflow_template_id"] != "product" and not step_key:
+            return None
+        resume_status = _column_status_for_step(meta, step_key)
+        if resume_status in {"running", "blocked", "done", "archived"}:
+            resume_status = "ready"
+        sql = """
+            UPDATE tasks
+               SET status        = ?,
+                   assignee      = ?,
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL,
+                   block_kind    = ?,
+                   workflow_template_id = 'product',
+                   current_step_key = ?
+             WHERE id = ?
+               AND status IN ('running', 'ready', 'review')
+        """ + ("" if expected_run_id is None else " AND current_run_id = ?")
+        params: tuple[Any, ...] = (
+            resume_status, hermes_assignee, kind, step_key, task_id,
+        ) if expected_run_id is None else (
+            resume_status, hermes_assignee, kind, step_key, task_id, int(expected_run_id),
+        )
+        cur = conn.execute(sql, params)
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="preflight",
+            status="blocked",
+            summary=reason,
+            metadata={"attempted_resolutions": attempts} if attempts else None,
+        )
+        if run_id is None and reason:
+            run_id = _synthesize_ended_run(
+                conn,
+                task_id,
+                outcome="preflight",
+                summary=reason,
+                metadata={"attempted_resolutions": attempts} if attempts else None,
+                step_key=step_key,
+            )
+        _append_event(
+            conn,
+            task_id,
+            PRODUCT_WORKFLOW_PRECHECK_EVENT,
+            {
+                "reason": reason,
+                "kind": kind,
+                "attempted_resolutions": attempts,
+                "original_assignee": row["assignee"],
+                "hermes_assignee": hermes_assignee,
+                "step_key": step_key,
+                "resume_status": resume_status,
+            },
+            run_id=run_id,
+        )
+    return True
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
@@ -2407,6 +3159,8 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    workflow_template_id: Optional[str] = None,
+    current_step_key: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2486,8 +3240,13 @@ def create_task(
                 and project_obj.primary_path
             ):
                 # Defer the concrete path to the insert loop: it's a fresh
-                # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
+                # ``<repo>/.worktrees/<task_id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
+
+    if workflow_template_id is not None:
+        workflow_template_id = str(workflow_template_id).strip() or None
+    if current_step_key is not None:
+        current_step_key = str(current_step_key).strip() or None
 
     parents = tuple(p for p in parents if p)
 
@@ -2635,8 +3394,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        workflow_template_id, current_step_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2659,6 +3419,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        workflow_template_id,
+                        current_step_key,
                     ),
                 )
                 for pid in parents:
@@ -2678,6 +3440,8 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "workflow_template_id": workflow_template_id,
+                        "current_step_key": current_step_key,
                     },
                 )
             return task_id
@@ -3193,6 +3957,7 @@ def _synthesize_ended_run(
     summary: Optional[str] = None,
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
+    step_key: Optional[str] = None,
 ) -> int:
     """Insert a zero-duration, already-closed run row.
 
@@ -3215,7 +3980,7 @@ def _synthesize_ended_run(
         (task_id,),
     ).fetchone()
     profile = trow["assignee"] if trow else None
-    step_key = trow["current_step_key"] if trow else None
+    stored_step_key = step_key if step_key is not None else (trow["current_step_key"] if trow else None)
     cur = conn.execute(
         """
         INSERT INTO task_runs (
@@ -3226,7 +3991,7 @@ def _synthesize_ended_run(
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            task_id, profile, step_key,
+            task_id, profile, stored_step_key,
             outcome, outcome,
             summary, error,
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
@@ -3975,6 +4740,23 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class ProductProvenanceError(ValueError):
+    """Raised when product-board completion lacks required AI provenance."""
+
+    def __init__(
+        self,
+        reason: str,
+        task_id: str,
+        step_key: str,
+        *,
+        missing: Optional[list[str]] = None,
+    ):
+        self.task_id = task_id
+        self.step_key = step_key
+        self.missing = list(missing or [])
+        super().__init__(reason)
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3984,6 +4766,9 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    board: Optional[str] = None,
+    product_role_assignees: Optional[dict[str, str]] = None,
+    product_workflow_enabled: bool = True,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4041,6 +4826,20 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    if product_workflow_enabled:
+        product_transition = _complete_product_workflow_step(
+            conn,
+            task_id,
+            board=board,
+            result=result,
+            summary=summary,
+            metadata=metadata,
+            expected_run_id=expected_run_id,
+            product_role_assignees=product_role_assignees,
+        )
+        if product_transition is not None:
+            return product_transition
 
     with write_txn(conn):
         if expected_run_id is None:
@@ -4544,7 +5343,10 @@ def block_task(
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    attempted_resolutions: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    board: Optional[str] = None,
+    human_escalation_assignee: Optional[str] = "default",
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -4577,8 +5379,21 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    product_preflight = _route_product_human_block_to_preflight(
+        conn,
+        task_id,
+        board=board,
+        reason=reason,
+        kind=kind,
+        attempted_resolutions=attempted_resolutions,
+        expected_run_id=expected_run_id,
+        human_escalation_assignee=human_escalation_assignee,
+    )
+    if product_preflight is not None:
+        return product_preflight
     routed_to = "blocked"
     recurrences = 0
+    attempts = [str(a).strip() for a in (attempted_resolutions or []) if str(a).strip()]
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
@@ -4608,7 +5423,7 @@ def block_task(
                        worker_pid    = NULL,
                        block_kind    = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'review')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, task_id) if expected_run_id is None
                 else (kind, task_id, int(expected_run_id)),
@@ -4626,7 +5441,7 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
-                {"reason": reason, "kind": kind}, run_id=run_id,
+                {"reason": reason, "kind": kind, "attempted_resolutions": attempts}, run_id=run_id,
             )
             routed_to = "todo"
             _blocked_task = get_task(conn, task_id)
@@ -4662,7 +5477,7 @@ def block_task(
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'review')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, recurrences, task_id) if expected_run_id is None
                 else (kind, recurrences, task_id, int(expected_run_id)),
@@ -4685,6 +5500,7 @@ def block_task(
                     "kind": kind,
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
+                    "attempted_resolutions": attempts,
                 },
                 run_id=run_id,
             )
@@ -4701,7 +5517,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'review')
                     """,
                     (kind, recurrences, task_id),
                 )
@@ -4716,7 +5532,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'review')
                        AND current_run_id = ?
                     """,
                     (kind, recurrences, task_id, int(expected_run_id)),
@@ -4738,7 +5554,7 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "blocked",
-                {"reason": reason, "kind": kind, "recurrences": recurrences},
+                {"reason": reason, "kind": kind, "recurrences": recurrences, "attempted_resolutions": attempts},
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
@@ -6618,7 +7434,7 @@ def _record_task_failure(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready')",
+                    "WHERE id = ? AND status IN ('running', 'ready', 'review')",
                     (failures, error[:500], task_id),
                 )
             else:
@@ -8721,3 +9537,41 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+def latest_ai_provenance_by_task(
+    conn: sqlite3.Connection, task_ids: Iterable[str]
+) -> dict[str, dict[str, Any]]:
+    """Batch-fetch compact AI provenance summaries for dashboard cards.
+
+    The returned shape is ``{task_id: {by_step, writer_agent, tester_agent,
+    reviewer_agent, review_rule, ...}}``. It is derived from run metadata,
+    not from model self-report prose, so a card becomes an audit ledger for
+    which AI wrote/tested/reviewed each workflow step.
+    """
+    ids = list(task_ids)
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"""
+        SELECT task_id, step_key, metadata
+          FROM task_runs
+         WHERE task_id IN ({placeholders})
+           AND metadata IS NOT NULL AND metadata != ''
+         ORDER BY COALESCE(ended_at, started_at) ASC, id ASC
+        """,
+        ids,
+    ).fetchall()
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except Exception:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            continue
+        tid = row["task_id"]
+        aggregate = out.setdefault(tid, {})
+        _merge_ai_provenance_summary(aggregate, row["step_key"], metadata)
+    return {tid: summary for tid, summary in out.items() if summary}

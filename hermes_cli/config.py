@@ -1398,6 +1398,14 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        "product_workflow": {
+            "enabled": True,
+            "assignees": {},
+            "human_escalation_profile": "default",
+            "ai_provenance_required": True,
+            "auto_subscribe_slack_on_human_block": True,
+            "slack_escalation_channel": "",
+        },
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).

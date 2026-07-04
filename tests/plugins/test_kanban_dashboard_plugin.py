@@ -79,6 +79,83 @@ def test_board_empty(client):
     assert data["latest_event_id"] == 0
 
 
+def test_product_board_uses_relay_style_columns_and_step_grouping(client):
+    kb.create_board("prod", name="Product", preset="product")
+    with kb.connect(board="prod") as conn:
+        story_id = kb.create_task(
+            conn,
+            title="User story: visible quorum state",
+            initial_status="running",
+            workflow_template_id="product",
+            current_step_key="backlog",
+        )
+        arch_id = kb.create_task(
+            conn,
+            title="Architecture: quorum state model",
+            initial_status="running",
+            workflow_template_id="product",
+            current_step_key="architecture",
+        )
+
+    r = client.get("/api/plugins/kanban/board?board=prod")
+    assert r.status_code == 200
+    columns = r.json()["columns"]
+    assert [c["label"] for c in columns] == [
+        "Backlog",
+        "Architecture",
+        "Development",
+        "Test",
+        "Review",
+        "Release / Measure",
+        "Done",
+        "Blocked",
+    ]
+    by_name = {c["name"]: c for c in columns}
+    assert [t["id"] for t in by_name["backlog"]["tasks"]] == [story_id]
+    assert [t["id"] for t in by_name["architecture"]["tasks"]] == [arch_id]
+    assert all(t["id"] != story_id for t in by_name["development"]["tasks"])
+
+
+def test_product_board_exposes_ai_provenance_on_cards_and_detail(client):
+    kb.create_board("prod", name="Product", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: audit trail",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Implemented audit trail",
+            metadata={
+                "ai_provenance": {
+                    "writer": {
+                        "agent": "claude-code",
+                        "model": "opus-4.8",
+                        "branch": "feature/audit-trail",
+                    }
+                }
+            },
+            board="prod",
+            product_role_assignees={"tester": "tester"},
+        )
+
+    board = client.get("/api/plugins/kanban/board?board=prod")
+    assert board.status_code == 200
+    cards = [task for col in board.json()["columns"] for task in col["tasks"]]
+    card = next(task for task in cards if task["id"] == tid)
+    assert card["ai_provenance"]["writer_agent"] == "claude-code"
+    assert card["ai_provenance"]["branch"] == "feature/audit-trail"
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{tid}?board=prod")
+    assert detail.status_code == 200
+    task = detail.json()["task"]
+    assert task["ai_provenance"]["by_step"]["development"]["writer_agent"] == "claude-code"
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------
@@ -245,6 +322,15 @@ def test_dashboard_initial_board_uses_backend_current_when_unpinned():
     assert "if (!storedBoard && !board && data && data.current)" in js
     assert "setBoard(data.current);" in js
     assert 'readSelectedBoard() || "default"' not in js
+
+
+def test_dashboard_column_header_prefers_backend_labels_for_product_boards():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "props.column.help || getColumnHelp(t, props.column.name)" in js
+    assert "props.column.label || getColumnLabel(t, props.column.name)" in js
 
 
 def test_dashboard_markdown_html_is_sanitized_before_render():

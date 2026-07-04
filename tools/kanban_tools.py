@@ -203,6 +203,106 @@ def _goal_judge_available() -> bool:
     return client is not None and bool(model)
 
 
+def _product_workflow_cfg() -> dict:
+    try:
+        cfg = load_config()
+        raw = cfg_get(cfg, "kanban", "product_workflow", default={})
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _product_workflow_enabled() -> bool:
+    cfg = _product_workflow_cfg()
+    return cfg.get("enabled", True) is not False
+
+
+def _product_role_assignees_from_config() -> dict[str, str]:
+    cfg = _product_workflow_cfg()
+    raw = cfg.get("assignees") if isinstance(cfg, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if str(v).strip()}
+
+
+def _product_human_escalation_profile() -> str:
+    cfg = _product_workflow_cfg()
+    return str(cfg.get("human_escalation_profile") or "default").strip() or "default"
+
+
+def _normalize_attempted_resolutions(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _slack_escalation_channel_from_config() -> Optional[str]:
+    try:
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    channel = cfg_get(
+        cfg,
+        "kanban", "product_workflow", "slack_escalation_channel",
+        default="",
+    )
+    if channel:
+        return str(channel).strip() or None
+    for path in (
+        ("gateway", "platforms", "slack", "home_channel"),
+        ("platforms", "slack", "home_channel"),
+        ("slack", "home_channel"),
+    ):
+        value = cfg_get(cfg, *path, default="")
+        if value:
+            return str(value).strip() or None
+    allowed = cfg_get(cfg, "slack", "allowed_channels", default="")
+    if isinstance(allowed, str):
+        for item in allowed.split(","):
+            item = item.strip()
+            if item:
+                return item
+    return None
+
+
+def _maybe_subscribe_slack_on_product_human_block(
+    kb: Any,
+    conn: Any,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    try:
+        cfg = load_config()
+        if cfg_get(
+            cfg,
+            "kanban", "product_workflow", "auto_subscribe_slack_on_human_block",
+            default=True,
+        ) is False:
+            return False
+        if not kb.is_product_board(board=board):
+            return False
+        channel = _slack_escalation_channel_from_config()
+        if not channel:
+            return False
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="slack",
+            chat_id=channel,
+            thread_id="",
+            notifier_profile=os.environ.get("HERMES_PROFILE") or "default",
+        )
+        return True
+    except Exception:
+        logger.warning("slack auto-subscribe for product human block failed", exc_info=True)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Runtime-activity → board-heartbeat bridge (#31752)
 # ---------------------------------------------------------------------------
@@ -629,6 +729,9 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    board=board,
+                    product_role_assignees=_product_role_assignees_from_config(),
+                    product_workflow_enabled=_product_workflow_enabled(),
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -649,6 +752,18 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"Retry kanban_complete with the same summary/metadata "
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
+                )
+            except kb.ProductProvenanceError as prov_err:
+                missing = getattr(prov_err, "missing", None) or []
+                missing_text = f" Missing: {', '.join(missing)}." if missing else ""
+                return tool_error(
+                    "kanban_complete blocked by product-board AI provenance "
+                    f"policy for step {getattr(prov_err, 'step_key', 'unknown')}: "
+                    f"{prov_err}.{missing_text} Your task is still in-flight "
+                    "(no state change). Retry kanban_complete with "
+                    "metadata.ai_provenance naming the AI that wrote/tested/"
+                    "reviewed the work; review completions must name a "
+                    "reviewer AI different from the writer AI."
                 )
             if not ok:
                 return tool_error(
@@ -680,6 +795,15 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    attempted_resolutions_raw = args.get("attempted_resolutions")
+    if attempted_resolutions_raw is not None and not isinstance(
+        attempted_resolutions_raw, (str, list, tuple)
+    ):
+        return tool_error(
+            "attempted_resolutions must be a list of short strings describing "
+            "what you already tried before asking for human input"
+        )
+    attempted_resolutions = _normalize_attempted_resolutions(attempted_resolutions_raw)
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -700,6 +824,19 @@ def _handle_block(args: dict, **kw) -> str:
         # kanban_complete, which the judge now gates.
         task = kb.get_task(conn, tid)
         if (
+            _product_workflow_enabled()
+            and kb.is_product_board(board=board)
+            and kind in kb.PRODUCT_HUMAN_BLOCK_KINDS
+            and not attempted_resolutions
+        ):
+            conn.close()
+            return tool_error(
+                "Product-board human-in-the-loop blocks require "
+                "attempted_resolutions: list the concrete alternatives you "
+                "already tried before asking Hermes/human for help. If this is "
+                "only waiting on another card, use kind='dependency' instead."
+            )
+        if (
             task
             and task.goal_mode
             and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS
@@ -717,7 +854,10 @@ def _handle_block(args: dict, **kw) -> str:
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                attempted_resolutions=attempted_resolutions,
                 expected_run_id=_worker_run_id(tid),
+                board=board,
+                human_escalation_assignee=_product_human_escalation_profile(),
             )
             if not ok:
                 return tool_error(
@@ -728,11 +868,22 @@ def _handle_block(args: dict, **kw) -> str:
             # Tell the worker where the task actually landed so it doesn't
             # assume it's sitting in 'blocked' when routing sent it elsewhere.
             landed = kb.get_task(conn, tid)
+            slack_subscribed = False
+            if (
+                landed
+                and landed.status == "blocked"
+                and _product_workflow_enabled()
+                and kind in kb.PRODUCT_HUMAN_BLOCK_KINDS
+            ):
+                slack_subscribed = _maybe_subscribe_slack_on_product_human_block(
+                    kb, conn, tid, board=board
+                )
             return _ok(
                 task_id=tid,
                 run_id=run.id if run else None,
                 status=landed.status if landed else "blocked",
                 block_kind=kind,
+                slack_subscribed=slack_subscribed,
             )
         finally:
             conn.close()
@@ -1234,7 +1385,15 @@ KANBAN_COMPLETE_SCHEMA = {
                     "Free-form dict of structured facts about this "
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
                     "\"findings\": [...]}. Surfaced to downstream "
-                    "workers alongside ``summary``."
+                    "workers alongside ``summary``. On product boards, "
+                    "Development/Test/Review completions must include "
+                    "``ai_provenance``: Development needs "
+                    "{\"writer\": {\"agent\": \"claude-code\"}}; Test needs "
+                    "{\"tester\": {\"agent\": \"hermes\", \"result\": \"passed\"}}; "
+                    "Review needs {\"reviewer\": {\"agent\": \"codex\"}, "
+                    "\"writer\": {\"agent\": \"claude-code\"}} and reviewer "
+                    "must differ from writer. Include branch/worktree/commit "
+                    "when available."
                 ),
             },
             "result": {
@@ -1296,9 +1455,12 @@ KANBAN_BLOCK_SCHEMA = {
         "needed), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
-        "``reason`` is shown to the human on the board. If a task keeps "
-        "getting unblocked and re-blocked for the same reason, it is "
-        "auto-escalated to triage. Use for genuine blockers only — don't "
+        "For product-board human/capability blocks, you must include "
+        "``attempted_resolutions`` describing the concrete alternatives you "
+        "already tried; Hermes will take the first resolution pass before any "
+        "Slack human escalation. ``reason`` is shown to the human on the board. "
+        "If a task keeps getting unblocked and re-blocked for the same reason, "
+        "it is auto-escalated to triage. Use for genuine blockers only — don't "
         "block on things you can resolve yourself."
     ),
     "parameters": {
@@ -1323,6 +1485,17 @@ KANBAN_BLOCK_SCHEMA = {
                     "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
+                ),
+            },
+            "attempted_resolutions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "For product-board human-in-the-loop blocks: the concrete "
+                    "things you already tried before asking for help. Required "
+                    "for needs_input/capability/legacy human blocks on product "
+                    "boards. Examples: checked docs, searched repo, tried "
+                    "fallback API, asked another agent via comment."
                 ),
             },
             "board": _board_schema_prop(),

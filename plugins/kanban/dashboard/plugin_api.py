@@ -152,6 +152,97 @@ BOARD_COLUMNS: list[str] = [
 ]
 
 
+def _custom_columns_for_board(board: Optional[str]) -> list[dict[str, str]]:
+    """Return board-specific display columns from board.json, if configured."""
+    try:
+        meta = kanban_db.read_board_metadata(board or kanban_db.get_current_board())
+    except Exception:
+        return []
+    raw = meta.get("columns")
+    if not isinstance(raw, list):
+        return []
+    columns: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        status = str(item.get("status") or name).strip()
+        if status not in kanban_db.VALID_STATUSES:
+            status = "ready"
+        columns.append(
+            {
+                "name": name,
+                "label": str(item.get("label") or name),
+                "status": status,
+                "help": str(item.get("help") or ""),
+            }
+        )
+        seen.add(name)
+    return columns
+
+
+def _dashboard_columns_for_board(board: Optional[str]) -> tuple[list[dict[str, str]], bool]:
+    custom = _custom_columns_for_board(board)
+    if custom:
+        return custom, True
+    return (
+        [
+            {"name": name, "label": name, "status": name, "help": ""}
+            for name in BOARD_COLUMNS
+        ],
+        False,
+    )
+
+
+def _column_name_for_task(
+    task: kanban_db.Task,
+    column_defs: list[dict[str, str]],
+    custom_columns: bool,
+) -> str:
+    names = {c["name"] for c in column_defs}
+    if not custom_columns:
+        return task.status if task.status in names else "todo"
+
+    # Terminal/human-blocked states should be visible in their terminal columns
+    # even if the card's workflow step is still e.g. development/test.
+    if task.status in {"blocked", "done", "archived", "scheduled"} and task.status in names:
+        return task.status
+    if task.current_step_key and task.current_step_key in names:
+        return task.current_step_key
+
+    title = (task.title or "").strip().lower()
+    title_prefix_map = (
+        ("user story:", "backlog"),
+        ("po interview", "po_interview"),
+        ("product brief", "product_brief"),
+        ("architecture", "architecture"),
+        ("development", "development"),
+        ("test", "test"),
+        ("review", "review"),
+        ("release", "release_measure"),
+    )
+    for prefix, column_name in title_prefix_map:
+        if title.startswith(prefix) and column_name in names:
+            return column_name
+
+    if task.status in names:
+        return task.status
+    for column in column_defs:
+        if column.get("status") == task.status:
+            return column["name"]
+    return column_defs[0]["name"] if column_defs else "todo"
+
+
+def _custom_column_by_name(board: Optional[str], name: str) -> Optional[dict[str, str]]:
+    for column in _custom_columns_for_board(board):
+        if column["name"] == name:
+            return column
+    return None
+
+
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
 
@@ -159,6 +250,7 @@ def _task_dict(
     task: kanban_db.Task,
     *,
     latest_summary: Optional[str] = None,
+    ai_provenance: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
     # Add derived age metrics so the UI can colour stale cards without
@@ -172,6 +264,7 @@ def _task_dict(
     # ``task_runs.summary`` (the kanban-worker pattern) instead of
     # ``tasks.result``. ``None`` when no run has produced a summary yet.
     d["latest_summary"] = latest_summary
+    d["ai_provenance"] = ai_provenance or None
     # Keep body short on list endpoints; full body comes from /tasks/:id.
     return d
 
@@ -449,8 +542,9 @@ def get_board(
             "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
         ).fetchone()["m"]
 
-        columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
-        if include_archived:
+        column_defs, custom_columns = _dashboard_columns_for_board(board)
+        columns: dict[str, list[dict]] = {c["name"]: [] for c in column_defs}
+        if include_archived and "archived" not in columns:
             columns["archived"] = []
 
         # Batch-fetch the latest non-null run summary per task in one
@@ -458,13 +552,18 @@ def get_board(
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        provenance_map = kanban_db.latest_ai_provenance_by_task(conn, [t.id for t in tasks])
 
         for t in tasks:
             full = summary_map.get(t.id)
             preview = (
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             )
-            d = _task_dict(t, latest_summary=preview)
+            d = _task_dict(
+                t,
+                latest_summary=preview,
+                ai_provenance=provenance_map.get(t.id),
+            )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -475,7 +574,9 @@ def get_board(
                 # needs the summary.
                 d["diagnostics"] = diags
                 d["warnings"] = _warnings_summary_from_diagnostics(diags)
-            col = t.status if t.status in columns else "todo"
+            col = _column_name_for_task(t, column_defs, custom_columns)
+            if col not in columns:
+                col = "todo" if "todo" in columns else next(iter(columns))
             columns[col].append(d)
 
         # Stable per-column ordering already applied by list_tasks
@@ -497,10 +598,14 @@ def get_board(
             )
         ]
 
+        output_columns = []
+        column_meta = {c["name"]: c for c in column_defs}
+        for name in columns.keys():
+            meta = column_meta.get(name, {"name": name, "label": name, "status": name, "help": ""})
+            output_columns.append({**meta, "tasks": columns[name]})
+
         return {
-            "columns": [
-                {"name": name, "tasks": columns[name]} for name in columns.keys()
-            ],
+            "columns": output_columns,
             "tenants": tenants,
             "assignees": assignees,
             "latest_event_id": int(latest_event_id),
@@ -545,7 +650,12 @@ def get_task(
         # operators can read the complete worker handoff without making
         # a second round-trip. Cards on /board carry a 200-char preview.
         full_summary = kanban_db.latest_summary(conn, task_id)
-        task_d = _task_dict(task, latest_summary=full_summary)
+        provenance = kanban_db.latest_ai_provenance_by_task(conn, [task_id]).get(task_id)
+        task_d = _task_dict(
+            task,
+            latest_summary=full_summary,
+            ai_provenance=provenance,
+        )
         # Attach diagnostics so the drawer's Diagnostics section can
         # render recovery actions without a second round-trip.
         diags = _compute_task_diagnostics(conn, task_ids=[task_id])
@@ -811,6 +921,8 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    workflow_template_id: Optional[str] = None
+    current_step_key: Optional[str] = None
     # Structured handoff fields — forwarded to complete_task when status
     # transitions to 'done'. Dashboard parity with ``hermes kanban
     # complete --summary ... --metadata ...``.
@@ -840,7 +952,18 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
         # --- status -------------------------------------------------------
         if payload.status is not None:
-            s = payload.status
+            requested_status = payload.status
+            custom_column = _custom_column_by_name(board, requested_status)
+            if custom_column is not None:
+                _set_workflow_direct(
+                    conn,
+                    task_id,
+                    workflow_template_id="product",
+                    current_step_key=custom_column["name"],
+                )
+                s = custom_column["status"]
+            else:
+                s = requested_status
             ok = True
             if s == "done":
                 ok = kanban_db.complete_task(
@@ -868,7 +991,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     status_code=400,
                     detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
                 )
-            elif s in ("todo", "triage", "scheduled"):
+            elif s in ("todo", "triage", "scheduled", "review"):
                 ok = _set_status_direct(conn, task_id, s)
             else:
                 raise HTTPException(status_code=400, detail=f"unknown status: {s}")
@@ -894,6 +1017,18 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     status_code=409,
                     detail=f"status transition to {s!r} not valid from current state",
                 )
+
+        if (
+            payload.workflow_template_id is not None
+            or payload.current_step_key is not None
+        ):
+            if not _set_workflow_direct(
+                conn,
+                task_id,
+                workflow_template_id=payload.workflow_template_id,
+                current_step_key=payload.current_step_key,
+            ):
+                raise HTTPException(status_code=404, detail="task not found")
 
         # --- priority -----------------------------------------------------
         if payload.priority is not None:
@@ -975,6 +1110,48 @@ def _parents_blocking_ready(
         {"id": r["id"], "title": r["title"], "status": r["status"]}
         for r in rows
     ]
+
+
+def _set_workflow_direct(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    workflow_template_id: Optional[str] = None,
+    current_step_key: Optional[str] = None,
+) -> bool:
+    workflow_value = (
+        str(workflow_template_id).strip()
+        if workflow_template_id is not None and str(workflow_template_id).strip()
+        else None
+    )
+    step_value = (
+        str(current_step_key).strip()
+        if current_step_key is not None and str(current_step_key).strip()
+        else None
+    )
+    with kanban_db.write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET workflow_template_id = COALESCE(?, workflow_template_id), "
+            "current_step_key = COALESCE(?, current_step_key) WHERE id = ?",
+            (workflow_value, step_value, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'workflow_step', ?, ?)",
+            (
+                task_id,
+                json.dumps(
+                    {
+                        "workflow_template_id": workflow_value,
+                        "current_step_key": step_value,
+                    }
+                ),
+                int(time.time()),
+            ),
+        )
+    return True
 
 
 def _set_status_direct(

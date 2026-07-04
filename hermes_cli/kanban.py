@@ -267,6 +267,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Switch to the new board after creating it")
     b_create.add_argument("--default-workdir", default=None,
                           help="Default workspace path for tasks created on this board")
+    b_create.add_argument(
+        "--preset",
+        choices=sorted(kb.BOARD_PRESETS.keys()),
+        default=None,
+        help="Visible board workflow preset. Use 'product' for Relay-style product columns.",
+    )
 
     b_rm = boards_sub.add_parser(
         "rm", aliases=["remove", "delete"],
@@ -360,6 +366,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument(
+        "--workflow-template-id",
+        default=None,
+        metavar="ID",
+        help="Optional workflow template/preset id stored on the task.",
+    )
+    p_create.add_argument(
+        "--step-key",
+        default=None,
+        dest="current_step_key",
+        metavar="KEY",
+        help="Optional workflow step key used by preset dashboards.",
+    )
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -1102,6 +1121,7 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
         icon=args.icon,
         color=args.color,
         default_workdir=args.default_workdir,
+        preset=getattr(args, "preset", None),
     )
     verb = "already exists" if already else "created"
     print(f"Board {meta['slug']!r} {verb}.")
@@ -1347,6 +1367,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            workflow_template_id=getattr(args, "workflow_template_id", None),
+            current_step_key=getattr(args, "current_step_key", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):

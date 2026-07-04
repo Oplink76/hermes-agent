@@ -77,10 +77,10 @@ def _start_parent_death_watchdog(original_ppid, parent_create_time) -> None:
     threading.Thread(target=_loop, daemon=True).start()
 
 
-def _run(cli: HermesCLI, command: str) -> str:
+def _run_result(cli: HermesCLI, command: str) -> dict:
     cmd = (command or "").strip()
     if not cmd:
-        return ""
+        return {"output": ""}
     if not cmd.startswith("/"):
         cmd = f"/{cmd}"
 
@@ -102,6 +102,13 @@ def _run(cli: HermesCLI, command: str) -> str:
         if old is not None:
             cli_mod._cprint = old
 
+    agent_seed = getattr(cli, "_pending_agent_seed", None)
+    if agent_seed:
+        try:
+            cli._pending_agent_seed = None
+        except Exception:
+            pass
+
     # Desktop chat bubbles render plain text, not ANSI. A worker-routed command
     # that emits Rich color (e.g. /journey building its own Console, which picks
     # up truecolor from the gateway's inherited COLORTERM) would otherwise leak
@@ -109,7 +116,20 @@ def _run(cli: HermesCLI, command: str) -> str:
     # as an overlay, so it never travels this path.)
     from tools.ansi_strip import strip_ansi
 
-    return strip_ansi(buf.getvalue().rstrip())
+    result = {"output": strip_ansi(buf.getvalue().rstrip())}
+    if agent_seed:
+        result["agent_seed"] = str(agent_seed)
+    return result
+
+
+def _run(cli: HermesCLI, command: str) -> str:
+    """Run a slash command and return display output.
+
+    Kept for older tests/callers.  ``_run_result`` is the structured path used
+    by the Desktop/TUI gateway so slash commands that seed an agent turn (for
+    example /project-import) are not reduced to an acknowledgement only.
+    """
+    return str(_run_result(cli, command).get("output", ""))
 
 
 def main():
@@ -143,8 +163,8 @@ def main():
         try:
             req = json.loads(line)
             rid = req.get("id")
-            out = _run(cli, req.get("command", ""))
-            sys.stdout.write(json.dumps({"id": rid, "ok": True, "output": out}) + "\n")
+            result = _run_result(cli, req.get("command", ""))
+            sys.stdout.write(json.dumps({"id": rid, "ok": True, **result}) + "\n")
             sys.stdout.flush()
         except Exception as e:
             sys.stdout.write(json.dumps({"id": rid, "ok": False, "error": str(e)}) + "\n")

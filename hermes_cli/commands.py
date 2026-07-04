@@ -210,6 +210,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
                             "archive", "tail", "dispatch", "stats", "notify-subscribe",
                             "notify-list", "notify-unsubscribe", "log", "runs",
                             "heartbeat", "assignees", "context", "specify", "gc")),
+    CommandDef("project-create", "Create a product project: folder, GitHub repo, Kanban board, Project record, and PO interview",
+               "Tools & Skills", aliases=("project_create",),
+               args_hint="<name> [--path PATH] [--owner ORG] [--repo NAME] [--public|--private]"),
+    CommandDef("project-import", "Import an existing project through AI synthesis, dry-run, and user-story-only Kanban proposal",
+               "Tools & Skills", aliases=("project_import",),
+               args_hint="<path> [--name PROJECT_NAME] [--dry-run|--apply-after-approval]"),
     CommandDef("reload", "Reload .env variables into the running session", "Tools & Skills",
                cli_only=True),
     CommandDef("reload-mcp", "Reload MCP servers from config", "Tools & Skills",
@@ -1163,7 +1169,14 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug"})
+#   - project-create/project-import: high-value workflows still available as
+#     /hermes project-create and /hermes project-import on Slack to avoid
+#     displacing existing native slots at the cap; underscore aliases are also
+#     excluded so they cannot leak if the native registry drops below 50.
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "credits", "billing", "moa", "debug",
+    "project-create", "project-import", "project_create", "project_import",
+})
 
 
 def _sanitize_slack_name(raw: str) -> str:
