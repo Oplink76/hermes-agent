@@ -35,6 +35,9 @@ def test_project_create_slash_sets_agent_seed_and_informative_ack(capsys):
     assert "Do not do project work that is not represented on the Kanban board" in queued
     assert "Product Brief" in queued
     assert "MVP Brief" in queued
+    assert "Product Owner work must run through the `productowner`" in queued
+    assert "Hermes profile" in queued
+    assert "Assign it to the `productowner` Hermes profile" in queued
     assert "do not create a story card" in queued
     assert "ask breakdown questions" in queued
     assert "branch -> commit -> review -> merge" in queued
@@ -64,6 +67,8 @@ def test_project_import_slash_sets_agent_seed_and_informative_ack(capsys):
     assert "initial import is read-only/dry-run" in queued
     assert "MVP/Product Briefs" in queued
     assert "story_contract" in queued
+    assert "Product Owner interpretation must run through" in queued
+    assert "`productowner` Hermes profile" in queued
     assert "broad_product_surface" in queued
     assert "branch -> commit -> review -> merge" in queued
     assert "different AI reviewer" in queued

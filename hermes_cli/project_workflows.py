@@ -60,6 +60,13 @@ def build_project_create_prompt(raw_args: str | None) -> str:
         create the Hermes Project record, and create the initial Product Owner interview card.
 
         Hard process rules:
+        - Role routing: the slash-command receiver may scaffold/orchestrate the
+          workflow, but Product Owner work must run through the `productowner`
+          Hermes profile. Do not impersonate Product Owner from the default
+          session. Product Owner interview, Product Brief/MVP Brief capture,
+          story breakdown, story refinement, and story-card creation/review
+          should be assigned to or launched as `productowner`; record that actor
+          in Kanban traceability where supported.
         - Do not do project work that is not represented on the Kanban board,
           unless Ole explicitly overrides that rule for a good reason.
         - If an override is necessary, state the reason before doing the work and
@@ -116,6 +123,10 @@ def build_project_create_prompt(raw_args: str | None) -> str:
            user's active/default board unless explicitly requested.
         7. Create/bind the Hermes Project record to the folder and board.
         8. Create the initial Product Owner interview card on the project board.
+           Assign it to the `productowner` Hermes profile so the Relay/Hermes
+           role worker picks it up. The current/default session should only
+           scaffold the card and record traceability, not conduct the PO
+           interview itself unless Ole explicitly overrides role routing.
            The card must ask for product intent, target user, problem, outcome,
            constraints, non-goals, and first story candidates. It must also
            instruct the future PO interviewer to produce/record Product Brief or
@@ -172,6 +183,12 @@ def build_project_import_prompt(raw_args: str | None) -> str:
         - Do not run --apply during this initial import workflow.
         - Do not create a board, project, Kanban cards, or repo docs during the
           dry run.
+        - Role routing: the slash-command receiver may orchestrate discovery and
+          dry-run mechanics, but Product Owner interpretation must run through
+          the `productowner` Hermes profile. Product Brief/MVP Brief synthesis,
+          PO questions, story breakdown, story refinement, and valid story-card
+          proposal/application should be assigned to or launched as
+          `productowner`; do not impersonate PO from the default session.
         - Do not do project work that is not represented on the Kanban board,
           unless Ole explicitly overrides that rule for a good reason.
         - Maintain a Traceability log in the session output: who did what, which
@@ -220,7 +237,10 @@ def build_project_import_prompt(raw_args: str | None) -> str:
            signals, missing or uncertain capabilities. Do not perform a code
            quality review and do not turn TODOs/stubs into Kanban cards.
         6. Draft a Product Brief: name, personas, problem, intended outcome,
-           current state, non-goals, assumptions, evidence.
+           current state, non-goals, assumptions, evidence. This Product Owner
+           synthesis must be performed by the `productowner` profile or handed
+           off to a `productowner` Kanban/import task when the workflow creates
+           durable board state.
         7. Ask Product Owner questions only if concrete user stories, product
            outcomes, acceptance criteria, scope, or personas are blocked.
            Questions must use `clarify` with 2-4 clickable choices and an

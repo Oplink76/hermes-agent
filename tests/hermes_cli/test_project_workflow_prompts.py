@@ -37,6 +37,12 @@ def test_project_create_prompt_enforces_kanban_traceability_and_clickable_po_que
     assert "create the Hermes Kanban board" in prompt
     assert "create the Hermes Project record" in prompt
     assert "Product Owner interview" in prompt
+    assert "Product Owner work must run through the `productowner`" in prompt
+    assert "Hermes profile" in prompt
+    assert "Do not impersonate Product Owner from the default" in prompt
+    assert "session" in prompt
+    assert "Assign it to the `productowner` Hermes profile" in prompt
+    assert "role worker picks it up" in prompt
     assert "Do not do project work that is not represented on the Kanban board" in prompt
     assert "unless Ole explicitly overrides that rule" in prompt
     assert "good reason" in prompt
@@ -65,6 +71,11 @@ def test_project_import_prompt_matches_verified_ai_synthesis_flow_and_blocks_app
     assert "session 20260702_185339_fa62d5" in prompt
     assert "DRY RUN ONLY" in prompt
     assert "Do not run --apply" in prompt
+    assert "Product Owner interpretation must run through" in prompt
+    assert "`productowner` Hermes profile" in prompt
+    assert "do not impersonate PO from the default session" in prompt
+    assert "Product Owner" in prompt
+    assert "synthesis must be performed by the `productowner` profile" in prompt
     assert "Markdown Understanding Ledger" in prompt
     assert "read and understand all non-excluded markdown files" in prompt
     assert "code current-state-vs-product-goal" in prompt
