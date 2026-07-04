@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -4719,6 +4720,93 @@ def test_product_backlog_completion_advances_to_architecture(kanban_home, monkey
     assert '\"from_step\": \"backlog\"' in advanced[0]["payload"]
     assert '\"to_step\": \"architecture\"' in advanced[0]["payload"]
     assert '\"assignee\": \"architect\"' in advanced[0]["payload"]
+
+
+def test_product_release_measure_can_satisfy_dependencies_for_autonomous_boards(kanban_home, monkeypatch):
+    """Autonomous product boards must not stall child coding at Release/Measure.
+
+    Release / Measure remains visible as a product bucket, but boards that opt
+    into autonomous dependency flow should let dependent Architecture/Developer
+    work continue once a parent reaches that bucket.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    board = "autonomous-product"
+    kb.create_board(board, name="Autonomous Product", preset="product")
+    meta_path = kb.board_metadata_path(board)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta.setdefault("product_workflow", {})["release_measure_unblocks_dependents"] = True
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    with kb.connect(board=board) as conn:
+        parent = kb.create_task(conn, title="Story: approved prerequisite")
+        child = kb.create_task(conn, title="Story: next autonomous slice", assignee="architect")
+        kb.link_tasks(conn, parent, child)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workflow_template_id = 'product', status = 'ready', "
+                "current_step_key = 'release_measure', assignee = NULL WHERE id = ?",
+                (parent,),
+            )
+            conn.execute(
+                "UPDATE tasks SET workflow_template_id = 'product', status = 'todo', "
+                "current_step_key = 'architecture' WHERE id = ?",
+                (child,),
+            )
+
+        promoted = kb.recompute_ready(conn)
+        claimed = kb.claim_task(conn, child)
+
+        child_task = kb.get_task(conn, child)
+        events = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id",
+            (child,),
+        ).fetchall()
+
+    assert promoted == 1
+    assert claimed is not None
+    assert child_task.status == "running"
+    assert child_task.assignee == "architect"
+    assert not [e for e in events if e["kind"] == "claim_rejected"]
+
+
+def test_product_release_measure_still_blocks_dependencies_without_autonomy_opt_in(kanban_home, monkeypatch):
+    """Legacy/product boards keep the explicit human release gate by default."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    board = "manual-release-product"
+    kb.create_board(board, name="Manual Release Product", preset="product")
+
+    with kb.connect(board=board) as conn:
+        parent = kb.create_task(conn, title="Story: release gate")
+        child = kb.create_task(conn, title="Story: blocked child", assignee="architect")
+        kb.link_tasks(conn, parent, child)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workflow_template_id = 'product', status = 'ready', "
+                "current_step_key = 'release_measure', assignee = NULL WHERE id = ?",
+                (parent,),
+            )
+            conn.execute(
+                "UPDATE tasks SET workflow_template_id = 'product', status = 'ready', "
+                "current_step_key = 'architecture' WHERE id = ?",
+                (child,),
+            )
+
+        promoted = kb.recompute_ready(conn)
+        claimed = kb.claim_task(conn, child)
+        child_task = kb.get_task(conn, child)
+        events = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id",
+            (child,),
+        ).fetchall()
+
+    assert promoted == 0
+    assert claimed is None
+    assert child_task.status == "todo"
+    rejected = [e for e in events if e["kind"] == "claim_rejected"]
+    assert rejected
+    assert '\"reason\": \"parents_not_done\"' in rejected[-1]["payload"]
 
 
 def test_connect_pragmas_applied_on_reconnect(tmp_path):

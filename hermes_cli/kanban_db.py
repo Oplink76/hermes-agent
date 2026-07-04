@@ -858,6 +858,69 @@ def _product_workflow_dict(meta: Optional[dict]) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
+def _board_slug_for_connection(conn: sqlite3.Connection) -> str:
+    """Best-effort board slug for an open kanban DB connection.
+
+    Most lifecycle helpers receive only a sqlite connection. Resolve the board
+    from SQLite's ``main`` database path so board-level workflow policy still
+    applies when callers use ``connect(board=...)`` without setting
+    ``HERMES_KANBAN_BOARD``.
+    """
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+        main = next((row for row in rows if row["name"] == "main"), None)
+        filename = str(main["file"] if main is not None else "").strip()
+        if filename:
+            db_path = Path(filename).expanduser().resolve(strict=False)
+            if db_path == kanban_db_path(DEFAULT_BOARD).resolve(strict=False):
+                return DEFAULT_BOARD
+            root = boards_root().resolve(strict=False)
+            if db_path.name == "kanban.db" and db_path.parent.parent == root:
+                slug = _normalize_board_slug(db_path.parent.name)
+                if slug:
+                    return slug
+    except Exception:
+        pass
+    return get_current_board()
+
+
+def _product_release_measure_unblocks_dependents(meta: Optional[dict]) -> bool:
+    """Return True when Release / Measure counts as dependency-satisfied.
+
+    Some product boards are intended to run fully autonomously overnight: the
+    Release / Measure bucket remains visible for audit/measurement, but should
+    not freeze downstream architecture/development cards. Keep the old human
+    gate as the default and require an explicit board opt-in.
+    """
+    wf = _product_workflow_dict(meta)
+    keys = (
+        "release_measure_unblocks_dependents",
+        "release_measure_satisfies_dependencies",
+        "autonomous_dependency_flow",
+    )
+    for key in keys:
+        if key in wf:
+            return wf.get(key) is not False
+    if isinstance(meta, dict):
+        for key in keys:
+            if key in meta:
+                return meta.get(key) is not False
+    return False
+
+
+def _dependency_parent_satisfied(row: sqlite3.Row, *, release_measure_unblocks: bool) -> bool:
+    status = row["status"]
+    if status in ("done", "archived"):
+        return True
+    if not release_measure_unblocks:
+        return False
+    return (
+        status == "ready"
+        and row["workflow_template_id"] == "product"
+        and row["current_step_key"] == "release_measure"
+    )
+
+
 def _product_role_assignee(
     meta: Optional[dict],
     role: Optional[str],
@@ -4046,7 +4109,12 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote ``todo`` tasks when all parents are dependency-satisfied.
+
+    By default a parent is satisfied only when ``done`` or ``archived``. Product
+    boards may explicitly opt into autonomous dependency flow, where a parent
+    in the visible ``release_measure`` step also satisfies children so coding
+    work does not stall at a release/measurement audit lane.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
@@ -4076,6 +4144,8 @@ def recompute_ready(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    board_meta = product_board_metadata(_board_slug_for_connection(conn))
+    release_measure_unblocks = _product_release_measure_unblocks_dependents(board_meta)
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
@@ -4092,12 +4162,12 @@ def recompute_ready(
                 # this predicate back).
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.status, t.workflow_template_id, t.current_step_key FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if all(_dependency_parent_satisfied(p, release_measure_unblocks=release_measure_unblocks) for p in parents):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -4149,22 +4219,24 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    board_meta = product_board_metadata(_board_slug_for_connection(conn))
+    release_measure_unblocks = _product_release_measure_unblocks_dependents(board_meta)
     with write_txn(conn):
         # Structural invariant: never transition ready -> running while any
-        # parent is not yet 'done'. This is the single enforcement point
+        # parent is not dependency-satisfied. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
         # release_stale_claims, manual SQL) set status='ready'. If a racy
         # writer promoted a task with undone parents, demote it back to
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
+        parents = conn.execute(
+            "SELECT p.status, p.workflow_template_id, p.current_step_key FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            "WHERE l.child_id = ?",
             (task_id,),
-        ).fetchone()
-        if undone:
+        ).fetchall()
+        if any(not _dependency_parent_satisfied(p, release_measure_unblocks=release_measure_unblocks) for p in parents):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
