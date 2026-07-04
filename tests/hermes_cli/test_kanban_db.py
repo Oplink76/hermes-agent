@@ -4671,6 +4671,56 @@ def test_connect_sets_synchronous_full(tmp_path):
     assert row[0] == 2, f"expected synchronous=2 (FULL), got {row[0]}"
 
 
+def test_product_backlog_completion_advances_to_architecture(kanban_home, monkeypatch):
+    """PO completion on a product Backlog card hands the same card to Architect.
+
+    Regression guard for product boards where a Product Owner worker marked a
+    backlog story ``done`` instead of moving it to the Architecture step. The
+    story card must stay alive as the same task, switch step key, and dispatch
+    to the architect role.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    board = "product-handoff"
+    kb.create_board(board, name="Product Handoff", preset="product")
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(conn, title="Story: choose a board", assignee="productowner")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workflow_template_id = 'product', "
+                "current_step_key = 'backlog' WHERE id = ?",
+                (tid,),
+            )
+        claimed = kb.claim_task(conn, tid)
+
+        ok = kb.complete_task(
+            conn,
+            tid,
+            summary="Product Owner confirms this story is ready for Architecture.",
+            expected_run_id=claimed.current_run_id,
+            board=board,
+        )
+
+        task = kb.get_task(conn, tid)
+        events = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id",
+            (tid,),
+        ).fetchall()
+
+    assert ok is True
+    assert task.status == "ready"
+    assert task.assignee == "architect"
+    assert task.workflow_template_id == "product"
+    assert task.current_step_key == "architecture"
+    assert task.completed_at is None
+    advanced = [e for e in events if e["kind"] == "workflow_advanced"]
+    assert len(advanced) == 1
+    assert '\"from_step\": \"backlog\"' in advanced[0]["payload"]
+    assert '\"to_step\": \"architecture\"' in advanced[0]["payload"]
+    assert '\"assignee\": \"architect\"' in advanced[0]["payload"]
+
+
 def test_connect_pragmas_applied_on_reconnect(tmp_path):
     """All three pragmas must be re-applied on every connect(), not just the first."""
     db_path = tmp_path / "kanban.db"

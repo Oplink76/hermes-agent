@@ -1403,6 +1403,55 @@ def test_unblock_rejects_non_blocked_task(monkeypatch, worker_env):
     assert json.loads(out).get("error")
 
 
+def test_worker_product_complete_uses_env_board_for_backlog_handoff(monkeypatch, tmp_path):
+    """kanban_complete must use the dispatcher's HERMES_KANBAN_BOARD.
+
+    Product workers normally call kanban_complete without an explicit board arg.
+    If the tool connects to the right DB via env but passes board=None into the
+    product workflow layer, Backlog completion can fall through to normal
+    terminal ``done``. This regression keeps the Product Owner → Architect
+    handoff alive for dispatcher-spawned workers.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "productowner")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    board = "product-tool-handoff"
+    kb.create_board(board, name="Product Tool Handoff", preset="product")
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(conn, title="Story: select active board", assignee="productowner")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workflow_template_id = 'product', "
+                "current_step_key = 'backlog' WHERE id = ?",
+                (tid,),
+            )
+        claimed = kb.claim_task(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+
+    out = json.loads(kt._handle_complete({"summary": "PO says this is ready."}))
+    assert out["ok"] is True
+
+    with kb.connect(board=board) as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "ready"
+    assert task.assignee == "architect"
+    assert task.workflow_template_id == "product"
+    assert task.current_step_key == "architecture"
+
+
 def test_worker_lifecycle_through_tools(worker_env):
     """Drive the full claim -> heartbeat -> comment -> complete lifecycle
     exclusively through the tools, then verify the DB state matches what
