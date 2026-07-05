@@ -135,6 +135,7 @@ def test_product_board_exposes_ai_provenance_on_cards_and_detail(client):
                     "writer": {
                         "agent": "claude-code",
                         "model": "opus-4.8",
+                        "toolchain": "claude-code",
                         "branch": "feature/audit-trail",
                     }
                 }
@@ -149,11 +150,102 @@ def test_product_board_exposes_ai_provenance_on_cards_and_detail(client):
     card = next(task for task in cards if task["id"] == tid)
     assert card["ai_provenance"]["writer_agent"] == "claude-code"
     assert card["ai_provenance"]["branch"] == "feature/audit-trail"
+    assert card["ai_provenance"]["by_step"]["development"]["model"] == "opus-4.8"
+    assert card["ai_provenance"]["by_step"]["development"]["toolchain"] == "claude-code"
 
     detail = client.get(f"/api/plugins/kanban/tasks/{tid}?board=prod")
     assert detail.status_code == 200
     task = detail.json()["task"]
     assert task["ai_provenance"]["by_step"]["development"]["writer_agent"] == "claude-code"
+
+
+def test_product_task_detail_ai_provenance_includes_read_only_evidence(client):
+    kb.create_board("prod", name="Product", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: provenance evidence",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Implemented provenance evidence panel",
+            metadata={
+                "ai_provenance": {
+                    "writer": {
+                        "agent": "claude-code",
+                        "model": "claude-opus-4.8",
+                        "toolchain": "claude-code",
+                        "branch": "feature/provenance-evidence",
+                        "commit": "abc1234",
+                    }
+                }
+            },
+            board="prod",
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Verification: pytest tests/plugins/test_kanban_dashboard_plugin.py -q passed",
+            metadata={
+                "ai_provenance": {
+                    "tester": {
+                        "agent": "codex",
+                        "model": "gpt-5",
+                        "toolchain": "codex-cli",
+                        "result": "passed",
+                    }
+                }
+            },
+            board="prod",
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Review: no blocking findings",
+            metadata={
+                "ai_provenance": {
+                    "reviewer": {
+                        "agent": "codex-review",
+                        "model": "gpt-5",
+                        "toolchain": "codex-cli",
+                        "verdict": "approved",
+                    }
+                }
+            },
+            board="prod",
+        )
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{tid}?board=prod")
+    assert detail.status_code == 200
+    evidence = detail.json()["task"]["ai_provenance"]
+
+    assert evidence["writer_agent"] == "claude-code"
+    assert evidence["tester_agent"] == "codex"
+    assert evidence["reviewer_agent"] == "codex-review"
+    assert evidence["model"] == "gpt-5"
+    assert evidence["toolchain"] == "codex-cli"
+    assert evidence["branch"] == "feature/provenance-evidence"
+    assert evidence["commit"] == "abc1234"
+    assert evidence["verification_summary"] == (
+        "Verification: pytest tests/plugins/test_kanban_dashboard_plugin.py -q passed"
+    )
+    assert evidence["by_step"]["development"]["summary"] == (
+        "Implemented provenance evidence panel"
+    )
+    assert evidence["by_step"]["development"]["model"] == "claude-opus-4.8"
+    assert evidence["by_step"]["development"]["toolchain"] == "claude-code"
+    assert evidence["by_step"]["test"]["verification_summary"] == (
+        "Verification: pytest tests/plugins/test_kanban_dashboard_plugin.py -q passed"
+    )
+    assert evidence["by_step"]["test"]["model"] == "gpt-5"
+    assert evidence["by_step"]["test"]["toolchain"] == "codex-cli"
+    assert evidence["by_step"]["review"]["summary"] == "Review: no blocking findings"
+    assert evidence["by_step"]["review"]["model"] == "gpt-5"
+    assert evidence["by_step"]["review"]["toolchain"] == "codex-cli"
 
 
 # ---------------------------------------------------------------------------
@@ -1133,6 +1225,21 @@ def test_dashboard_done_actions_prompt_for_completion_summary():
     assert "result: summary" in bundle
     assert "body: JSON.stringify(patch)" in bundle
     assert "body: JSON.stringify(finalPatch)" in bundle
+
+
+def test_dashboard_ai_provenance_detail_section_lists_evidence_fields():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = (
+        repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    ).read_text()
+
+    assert "function roleStepModelToolchainRows" in bundle
+    assert "Development model / toolchain" in bundle
+    assert "Test model / toolchain" in bundle
+    assert "Review model / toolchain" in bundle
+    assert "Branch / commit" in bundle
+    assert "Verification summary" in bundle
+    assert "evidenceByStep" in bundle
 
 
 def test_dashboard_surfaces_ready_blocked_error_inline():

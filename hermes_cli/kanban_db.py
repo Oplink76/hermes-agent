@@ -1021,6 +1021,36 @@ def _lookup_provenance_value(prov: dict, *paths: Any) -> Optional[str]:
     return None
 
 
+def _clean_provenance_text(value: Any) -> Optional[str]:
+    if isinstance(value, dict):
+        for key in ("toolchain", "tool", "provider", "model", "name"):
+            if value.get(key):
+                return str(value.get(key)).strip() or None
+        return None
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _lookup_provenance_text(prov: dict, *paths: Any) -> Optional[str]:
+    for path in paths:
+        if isinstance(path, str):
+            value = prov.get(path)
+        else:
+            node: Any = prov
+            for part in path:
+                if not isinstance(node, dict) or part not in node:
+                    node = None
+                    break
+                node = node.get(part)
+            value = node
+        cleaned = _clean_provenance_text(value)
+        if cleaned:
+            return cleaned
+    return None
+
+
 def _writer_agent_from_metadata(metadata: Optional[dict]) -> Optional[str]:
     prov = _provenance_payload(metadata)
     return _lookup_provenance_value(
@@ -1180,6 +1210,7 @@ def _validate_product_ai_provenance(
 def _ai_provenance_summary_from_metadata(
     step_key: Optional[str],
     metadata: Optional[dict],
+    run_summary: Optional[str] = None,
 ) -> dict[str, Any]:
     if not isinstance(metadata, dict):
         return {}
@@ -1196,27 +1227,65 @@ def _ai_provenance_summary_from_metadata(
         out["reviewer_agent"] = reviewer
     prov = _provenance_payload(metadata)
     if isinstance(prov, dict):
+        model = _lookup_provenance_text(
+            prov,
+            "model",
+            ("writer", "model"),
+            ("external_writer", "model"),
+            ("tester", "model"),
+            ("verifier", "model"),
+            ("reviewer", "model"),
+            ("review", "model"),
+        )
+        toolchain = _lookup_provenance_text(
+            prov,
+            "toolchain",
+            ("writer", "toolchain"),
+            ("external_writer", "toolchain"),
+            ("tester", "toolchain"),
+            ("verifier", "toolchain"),
+            ("reviewer", "toolchain"),
+            ("review", "toolchain"),
+            "tool",
+            ("writer", "tool"),
+            ("tester", "tool"),
+            ("reviewer", "tool"),
+        )
+        if model:
+            out["model"] = model
+        if toolchain:
+            out["toolchain"] = toolchain
         for key in ("branch", "worktree", "commit"):
             value = prov.get(key)
             if value:
                 out[key] = str(value)
         writer_obj = prov.get("writer") or prov.get("external_writer")
         if isinstance(writer_obj, dict):
-            for key in ("model", "effort", "branch", "worktree", "commit"):
+            for key in ("model", "toolchain", "effort", "branch", "worktree", "commit"):
                 value = writer_obj.get(key)
                 if value and key not in out:
                     out[key] = str(value)
         tester_obj = prov.get("tester") or prov.get("verifier")
         if isinstance(tester_obj, dict):
+            for key in ("model", "toolchain"):
+                value = tester_obj.get(key)
+                if value and key not in out:
+                    out[key] = str(value)
             value = tester_obj.get("result") or tester_obj.get("verdict")
             if value:
                 out["test_result"] = str(value)
         reviewer_obj = prov.get("reviewer") or prov.get("review")
         if isinstance(reviewer_obj, dict):
-            for key in ("model", "verdict", "reviewed_commit", "reviewed_branch"):
+            for key in ("model", "toolchain", "verdict", "reviewed_commit", "reviewed_branch"):
                 value = reviewer_obj.get(key)
                 if value:
                     out[key] = str(value)
+    if run_summary:
+        summary_text = str(run_summary).strip()
+        if summary_text:
+            out["summary"] = summary_text
+            if step == "test" or tester or out.get("test_result"):
+                out["verification_summary"] = summary_text
     if out:
         out["step_key"] = step
     return out
@@ -1226,8 +1295,9 @@ def _merge_ai_provenance_summary(
     aggregate: dict[str, Any],
     step_key: Optional[str],
     metadata: Optional[dict],
+    run_summary: Optional[str] = None,
 ) -> None:
-    summary = _ai_provenance_summary_from_metadata(step_key, metadata)
+    summary = _ai_provenance_summary_from_metadata(step_key, metadata, run_summary)
     if not summary:
         return
     step = str(step_key or summary.get("step_key") or "unknown")
@@ -1235,11 +1305,13 @@ def _merge_ai_provenance_summary(
     by_step[step] = summary
     for key in (
         "writer_agent", "tester_agent", "reviewer_agent",
-        "branch", "worktree", "commit", "test_result",
+        "model", "toolchain", "branch", "worktree", "commit", "test_result",
         "verdict", "reviewed_commit", "reviewed_branch",
     ):
         if summary.get(key):
             aggregate[key] = summary[key]
+    if summary.get("verification_summary"):
+        aggregate["verification_summary"] = summary["verification_summary"]
     writer = aggregate.get("writer_agent")
     reviewer = aggregate.get("reviewer_agent")
     if writer and reviewer:
@@ -9732,7 +9804,10 @@ def latest_summaries(
 
 
 def latest_ai_provenance_by_task(
-    conn: sqlite3.Connection, task_ids: Iterable[str]
+    conn: sqlite3.Connection,
+    task_ids: Iterable[str],
+    *,
+    include_summaries: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Batch-fetch compact AI provenance summaries for dashboard cards.
 
@@ -9747,7 +9822,8 @@ def latest_ai_provenance_by_task(
     placeholders = ",".join("?" for _ in ids)
     rows = conn.execute(
         f"""
-        SELECT task_id, step_key, metadata
+        SELECT task_id, step_key, metadata,
+               {'summary' if include_summaries else 'NULL'} AS run_summary
           FROM task_runs
          WHERE task_id IN ({placeholders})
            AND metadata IS NOT NULL AND metadata != ''
@@ -9765,5 +9841,10 @@ def latest_ai_provenance_by_task(
             continue
         tid = row["task_id"]
         aggregate = out.setdefault(tid, {})
-        _merge_ai_provenance_summary(aggregate, row["step_key"], metadata)
+        _merge_ai_provenance_summary(
+            aggregate,
+            row["step_key"],
+            metadata,
+            row["run_summary"],
+        )
     return {tid: summary for tid, summary in out.items() if summary}

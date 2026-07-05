@@ -2502,22 +2502,67 @@
     });
   }
 
+  const ROLE_STEP_PROVENANCE_LABELS = [
+    { key: "development", modelToolchainLabel: "Development model / toolchain" },
+    { key: "test", modelToolchainLabel: "Test model / toolchain" },
+    { key: "review", modelToolchainLabel: "Review model / toolchain" },
+  ];
+
+  function joinEvidenceParts(parts, sep) {
+    return parts.filter(function (part) { return !!part; }).join(sep);
+  }
+
+  function roleStepModelToolchainRows(provenance) {
+    const evidenceByStep = provenance && provenance.by_step ? provenance.by_step : {};
+    const rows = [];
+    ROLE_STEP_PROVENANCE_LABELS.forEach(function (roleStep) {
+      const step = evidenceByStep[roleStep.key];
+      if (!step) return;
+      const modelToolchain = joinEvidenceParts([step.model, step.toolchain], " / ");
+      if (modelToolchain) {
+        rows.push([roleStep.modelToolchainLabel, modelToolchain]);
+      }
+    });
+    return rows;
+  }
+
   function ProvenanceSection(props) {
     const p = props.provenance;
     if (!p) return null;
+    const evidenceByStep = p.by_step || {};
+    const stepLabel = function (stepKey) {
+      return String(stepKey || "unknown").replace(/_/g, " ").replace(/\b\w/g, function (ch) {
+        return ch.toUpperCase();
+      });
+    };
     const rows = [];
     if (p.writer_agent) rows.push(["Writer AI", p.writer_agent]);
     if (p.tester_agent) rows.push(["Tester AI", p.tester_agent]);
     if (p.reviewer_agent) rows.push(["Reviewer AI", p.reviewer_agent]);
+    const roleModelToolchainRows = roleStepModelToolchainRows(p);
+    roleModelToolchainRows.forEach(function (row) { rows.push(row); });
+    if (roleModelToolchainRows.length === 0) {
+      const modelToolchain = joinEvidenceParts([p.model, p.toolchain], " / ");
+      if (modelToolchain) rows.push(["Model / toolchain", modelToolchain]);
+    }
+    const branchCommit = joinEvidenceParts([p.branch, p.commit], " @ ");
+    if (branchCommit) rows.push(["Branch / commit", branchCommit]);
+    if (p.verification_summary) rows.push(["Verification summary", p.verification_summary]);
     if (p.review_rule) rows.push([
       "Review rule",
       p.review_rule.different_agent ? "passed — reviewer differs from writer" : "FAILED — reviewer matches writer",
     ]);
-    if (p.branch) rows.push(["Branch", p.branch]);
+    if (p.branch && !branchCommit) rows.push(["Branch", p.branch]);
     if (p.worktree) rows.push(["Worktree", p.worktree]);
-    if (p.commit) rows.push(["Commit", p.commit]);
+    if (p.commit && !branchCommit) rows.push(["Commit", p.commit]);
     if (p.test_result) rows.push(["Test result", p.test_result]);
     if (p.verdict) rows.push(["Review verdict", p.verdict]);
+    Object.keys(evidenceByStep).forEach(function (stepKey) {
+      const step = evidenceByStep[stepKey];
+      if (!step || !step.summary) return;
+      if (step.summary === p.verification_summary) return;
+      rows.push([stepLabel(stepKey) + " summary", step.summary]);
+    });
     if (rows.length === 0) return null;
     return h("div", { className: "hermes-kanban-section" },
       h("div", { className: "hermes-kanban-section-head" }, "AI provenance"),

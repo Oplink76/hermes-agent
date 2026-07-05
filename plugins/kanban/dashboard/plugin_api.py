@@ -650,7 +650,9 @@ def get_task(
         # operators can read the complete worker handoff without making
         # a second round-trip. Cards on /board carry a 200-char preview.
         full_summary = kanban_db.latest_summary(conn, task_id)
-        provenance = kanban_db.latest_ai_provenance_by_task(conn, [task_id]).get(task_id)
+        provenance = kanban_db.latest_ai_provenance_by_task(
+            conn, [task_id], include_summaries=True,
+        ).get(task_id)
         task_d = _task_dict(
             task,
             latest_summary=full_summary,
