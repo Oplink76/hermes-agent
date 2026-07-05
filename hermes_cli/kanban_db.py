@@ -7401,6 +7401,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
         for tid, pid, claimer, protocol_violation, error_text in crash_details:
+            if protocol_violation and _adjudicate_clean_exit(conn, tid):
+                # Worker exited 0 without a terminal call but left completion
+                # evidence — Hermes advanced the card to the next role instead
+                # of tripping the breaker. Don't count a failure.
+                continue
             fp = _error_fingerprint(error_text)
             is_systemic = (
                 not protocol_violation
@@ -7426,6 +7431,121 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
     return crashed
+
+
+_COMPLETION_EVIDENCE_RE = re.compile(
+    r"handoff|approv|verif|accepted|review (?:required|pass)"
+    r"|ready for (?:architecture|development|test|review|release)"
+    r"|tests?\s+(?:pass|green)|implementation (?:complete|done)",
+    re.IGNORECASE,
+)
+
+
+def _has_completion_evidence(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the worker left a terminal-intent comment (handoff / approval /
+    verification). Distinguishes a worker that finished its work but forgot the
+    terminal tool call from one that bailed with nothing done."""
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? "
+        "ORDER BY created_at DESC, id DESC LIMIT 5",
+        (task_id,),
+    ).fetchall()
+    return any(_COMPLETION_EVIDENCE_RE.search(row["body"] or "") for row in rows)
+
+
+def _adjudicated_into_current_step(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the card's most recent transition was itself an adjudicated
+    advance. Guards against chaining auto-advances with no genuine worker
+    completion in between — after one adjudicated hop, the next clean-exit blocks
+    for a human instead of racing the card forward on nothing but comments."""
+    row = conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? "
+        "AND kind IN ('workflow_advanced', 'adjudicated_advance', 'completed') "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row is not None and row["kind"] == "adjudicated_advance"
+
+
+_ADJUDICATION_PROVENANCE_ROLE = {
+    "development": "writer",
+    "test": "tester",
+    "review": "reviewer",
+}
+
+
+def _reconstructed_adjudication_provenance(
+    step_key: Optional[str], assignee: Optional[str]
+) -> Optional[dict]:
+    """Rebuild AI provenance from the profile Hermes assigned to run this step.
+
+    The assignee is Hermes's own spawn record, so this is Hermes inspecting its
+    own state — authoritative, unlike a worker's self-reported provenance. The
+    provenance-gated steps (development/test/review) can then advance instead of
+    blocking just because the worker forgot to declare who it was.
+    """
+    agent = (assignee or "").strip()
+    role = _ADJUDICATION_PROVENANCE_ROLE.get(str(step_key or ""))
+    if not agent or role is None:
+        return None
+    return {"ai_provenance": {role: {"agent": agent, "source": "hermes_adjudicated"}}}
+
+
+def _adjudicate_clean_exit(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Decide a clean-exit-without-terminal-call on a product board.
+
+    Instead of blindly tripping the circuit breaker, inspect the card: if it is
+    a product-workflow card that reached its step through a real completion and
+    the worker left completion evidence, advance it to the next role (who then
+    independently verifies) rather than fast-blocking finished work. Returns
+    True when the card was advanced; False falls through to the normal block.
+    Advancing can never loop: each hop moves the workflow strictly forward.
+    """
+    board = _board_slug_for_connection(conn)
+    if product_board_metadata(board) is None:
+        return False
+    if _adjudicated_into_current_step(conn, task_id):
+        return False
+    if not _has_completion_evidence(conn, task_id):
+        return False
+    row = conn.execute(
+        "SELECT current_step_key, assignee FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    metadata = _reconstructed_adjudication_provenance(
+        row["current_step_key"], row["assignee"],
+    )
+    try:
+        advanced = _complete_product_workflow_step(
+            conn,
+            task_id,
+            board=board,
+            metadata=metadata,
+            summary=(
+                "Adjudicated advance: worker exited without calling "
+                "kanban_complete/kanban_block but left completion evidence; "
+                "Hermes advanced the card to the next role for verification."
+            ),
+        )
+    except Exception:
+        # Provenance rejection or any advance error -> stay conservative and
+        # let the normal fast-block path handle it.
+        return False
+    if not advanced:
+        return False
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "adjudicated_advance",
+            {
+                "reason": "clean_exit_without_terminal_call",
+                "evidence": "completion_comment",
+            },
+        )
+    return True
 
 
 def _record_task_failure(

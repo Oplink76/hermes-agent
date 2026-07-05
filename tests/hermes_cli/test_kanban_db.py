@@ -5215,3 +5215,170 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Clean-exit adjudication: a worker that finishes its work but exits without
+# calling kanban_complete / kanban_block should NOT be fast-blocked as a
+# protocol violation when it left completion evidence. Instead Hermes advances
+# the card to the next role (who independently verifies), matching the rule
+# that Hermes inspects state itself rather than trusting the terminal call.
+# ---------------------------------------------------------------------------
+
+
+def _make_running_product_card(conn, _kb, *, step, assignee="worker-profile", worker_pid=91001):
+    host = _kb._claimer_id().split(":", 1)[0]
+    tid = kb.create_task(
+        conn,
+        title=f"User story: {step}",
+        assignee=assignee,
+        workflow_template_id="product",
+        current_step_key=step,
+    )
+    conn.execute(
+        "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? WHERE id=?",
+        (worker_pid, f"{host}:w", tid),
+    )
+    conn.commit()
+    return tid
+
+
+def _add_handoff_comment(conn, tid, body="Architecture handoff — ready for development. Approved."):
+    conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+        (tid, "worker-profile", body, int(time.time())),
+    )
+    conn.commit()
+
+
+def test_detect_crashed_workers_adjudicates_clean_exit_with_evidence(
+    kanban_home, monkeypatch,
+):
+    """Clean-exit worker + completion evidence -> advance, not fast-block."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
+
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = _make_running_product_card(conn, _kb, step="architecture")
+        _add_handoff_comment(conn, tid)
+
+        kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+        kinds = [event.kind for event in kb.list_events(conn, tid)]
+
+    assert task.status == "ready", f"expected advanced (ready), got {task.status}"
+    assert task.current_step_key == "development"
+    assert "workflow_advanced" in kinds
+    assert "adjudicated_advance" in kinds
+
+
+def test_detect_crashed_workers_adjudicates_provenance_gated_step(
+    kanban_home, monkeypatch,
+):
+    """A provenance-gated step (development) still advances: Hermes reconstructs
+    provenance from the assignee it spawned, rather than blocking finished work."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
+
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = _make_running_product_card(
+            conn, _kb, step="development", assignee="developer",
+        )
+        _add_handoff_comment(
+            conn, tid,
+            body="Development handoff — implementation complete, ready for test.",
+        )
+
+        kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+
+    assert task.status == "ready", (
+        f"expected advanced, got step={task.current_step_key} status={task.status}"
+    )
+    assert task.current_step_key == "test"
+
+
+def test_detect_crashed_workers_clean_exit_without_evidence_still_blocks(
+    kanban_home, monkeypatch,
+):
+    """No completion evidence -> the fast-block is preserved. A worker that
+    bailed with nothing done must not be advanced."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
+
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = _make_running_product_card(conn, _kb, step="architecture")
+        # deliberately NO handoff comment
+        kb.detect_crashed_workers(conn)
+        task = kb.get_task(conn, tid)
+
+    assert task.status == "blocked"
+    assert task.current_step_key == "architecture"
+
+
+def test_detect_crashed_workers_does_not_chain_adjudicated_advances(
+    kanban_home, monkeypatch,
+):
+    """After one adjudicated advance, a second clean-exit at the new step blocks
+    for a human instead of racing the card forward on comments alone."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
+
+    host = _kb._claimer_id().split(":", 1)[0]
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = _make_running_product_card(conn, _kb, step="architecture")
+        _add_handoff_comment(conn, tid)
+
+        # First clean-exit -> adjudicated advance to development.
+        kb.detect_crashed_workers(conn)
+        assert kb.get_task(conn, tid).current_step_key == "development"
+
+        # Development worker also clean-exits, with a comment, but no genuine
+        # completion happened in between.
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? WHERE id=?",
+            (91002, f"{host}:w2", tid),
+        )
+        _add_handoff_comment(conn, tid, body="Development handoff — ready for test. Approved.")
+        conn.commit()
+
+        kb.detect_crashed_workers(conn)
+        task = kb.get_task(conn, tid)
+
+    assert task.status == "blocked", f"chained advance should block, got {task.status}"
+    assert task.current_step_key == "development"
+
+
+def test_detect_crashed_workers_nonzero_exit_unaffected_by_adjudication(
+    kanban_home, monkeypatch,
+):
+    """A normal (nonzero) crash keeps isolated-retry semantics — adjudication
+    only applies to clean-exit protocol violations, never touches real crashes."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("nonzero_exit", 1))
+
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = _make_running_product_card(conn, _kb, step="development", assignee="developer")
+        _add_handoff_comment(conn, tid)  # evidence present, but this is NOT a clean exit
+        kb.detect_crashed_workers(conn)
+        task = kb.get_task(conn, tid)
+
+    assert task.current_step_key == "development"
+    assert task.status == "ready"
