@@ -707,6 +707,37 @@ def project_for_path(
     return get_project(conn, best_pid)
 
 
+def is_kanban_governed(project: Optional[Project]) -> bool:
+    """True when a Project has its own non-default Kanban board binding."""
+    if project is None or project.archived:
+        return False
+    board = (project.board_slug or "").strip().lower()
+    return bool(board and board != "default")
+
+
+def governance_for_path(
+    conn: sqlite3.Connection, path: str, *, include_archived: bool = False
+) -> dict:
+    """Resolve project governance for a filesystem path.
+
+    This is the preflight primitive for coding-action guards: if ``governed``
+    is true, local todo/chat state is subordinate to ``board_slug`` and agents
+    must inspect/dispatch through that board before editing, branching,
+    committing, PRing, merging, or deploying.
+    """
+    project = project_for_path(conn, path, include_archived=include_archived)
+    governed = is_kanban_governed(project)
+    return {
+        "governed": governed,
+        "reason": "project_board_binding" if governed else None,
+        "project_id": project.id if project else None,
+        "project_slug": project.slug if project else None,
+        "project_name": project.name if project else None,
+        "board_slug": project.board_slug if project else None,
+        "primary_path": project.primary_path if project else None,
+    }
+
+
 # Deterministic branch slug: lowercase, separators collapsed, capped.
 _BRANCH_SAFE_RE = re.compile(r"[^a-z0-9._-]+")
 

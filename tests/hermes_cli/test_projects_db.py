@@ -134,6 +134,37 @@ def test_project_for_path_skips_archived(conn):
     assert pdb.project_for_path(conn, "/www/app/src").id == pid
 
 
+def test_governance_for_path_detects_non_default_board_binding(conn):
+    pdb.create_project(
+        conn,
+        name="The Trading Company",
+        folders=["/repos/trading"],
+        board_slug="the-trading-company",
+    )
+
+    governance = pdb.governance_for_path(conn, "/repos/trading/src/app.py")
+
+    assert governance["governed"] is True
+    assert governance["reason"] == "project_board_binding"
+    assert governance["project_slug"] == "the-trading-company"
+    assert governance["board_slug"] == "the-trading-company"
+
+
+def test_governance_for_path_does_not_treat_default_board_as_project_framework(conn):
+    pdb.create_project(
+        conn,
+        name="Legacy Default Board Project",
+        folders=["/repos/legacy"],
+        board_slug="default",
+    )
+
+    governance = pdb.governance_for_path(conn, "/repos/legacy/file.py")
+
+    assert governance["governed"] is False
+    assert governance["reason"] is None
+    assert governance["board_slug"] == "default"
+
+
 def test_active_pointer(conn):
     pid = pdb.create_project(conn, name="P")
     assert pdb.get_active_id(conn) is None

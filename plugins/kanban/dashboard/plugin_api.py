@@ -592,6 +592,8 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
+    workflow_template_id: Optional[str] = None
+    current_step_key: Optional[str] = None
 
 
 @router.post("/tasks")
@@ -616,6 +618,9 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
+            workflow_template_id=payload.workflow_template_id,
+            current_step_key=payload.current_step_key,
+            board=board,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -848,6 +853,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
+                    board=board,
                 )
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
@@ -1191,6 +1197,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             result=payload.result,
                             summary=payload.summary,
                             metadata=payload.metadata,
+                            board=board,
                         )
                     elif s == "blocked":
                         ok = kanban_db.block_task(conn, tid)

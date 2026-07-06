@@ -629,6 +629,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    board=board,
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -885,6 +886,8 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    workflow_template_id = args.get("workflow_template_id")
+    current_step_key = args.get("current_step_key")
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -933,6 +936,9 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                board=board,
+                workflow_template_id=workflow_template_id,
+                current_step_key=current_step_key,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1539,6 +1545,27 @@ KANBAN_CREATE_SCHEMA = {
                     "continuation turns the worker may take before the task "
                     "is blocked for review. Ignored unless goal_mode is "
                     "true. Defaults to the goal-engine default (20)."
+                ),
+            },
+            "workflow_template_id": {
+                "type": "string",
+                "enum": ["product"],
+                "description": (
+                    "Optional workflow template. Product/Relay boards use "
+                    "'product' so role completions advance the same story "
+                    "through architecture/development/test/review/release_measure."
+                ),
+            },
+            "current_step_key": {
+                "type": "string",
+                "enum": [
+                    "backlog", "architecture", "development", "test",
+                    "review", "release_measure", "done",
+                ],
+                "description": (
+                    "Current product workflow step. On product boards this is "
+                    "auto-inferred for role assignees (architect/developer/tester/reviewer) "
+                    "or User Story titles, but orchestrators should pass it explicitly."
                 ),
             },
             "board": _board_schema_prop(),

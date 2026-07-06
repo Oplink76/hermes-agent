@@ -136,6 +136,36 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
+PRODUCT_WORKFLOW_TEMPLATE_ID = "product"
+PRODUCT_WORKFLOW_STEPS = (
+    "backlog",
+    "architecture",
+    "development",
+    "test",
+    "review",
+    "release_measure",
+    "done",
+)
+PRODUCT_WORKFLOW_STEP_SET = frozenset(PRODUCT_WORKFLOW_STEPS)
+PRODUCT_WORKFLOW_NEXT_STEP = {
+    step: PRODUCT_WORKFLOW_STEPS[idx + 1]
+    for idx, step in enumerate(PRODUCT_WORKFLOW_STEPS[:-1])
+}
+PRODUCT_WORKFLOW_ROLE_TO_STEP = {
+    "productowner": "backlog",
+    "architect": "architecture",
+    "developer": "development",
+    "tester": "test",
+    "reviewer": "review",
+}
+PRODUCT_WORKFLOW_STEP_TO_ROLE = {
+    "backlog": "productowner",
+    "architecture": "architect",
+    "development": "developer",
+    "test": "tester",
+    "review": "reviewer",
+}
+
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Fire a kanban lifecycle plugin hook, fully best-effort.
@@ -707,6 +737,68 @@ def write_board_metadata(
     )
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
+
+
+def _is_product_board_metadata(meta: Optional[dict]) -> bool:
+    """Return True when board metadata opts into the product/Relay workflow."""
+    if not isinstance(meta, dict):
+        return False
+    preset = str(meta.get("preset") or meta.get("workflow") or "").strip().lower()
+    return preset in {"product", "relay"} or isinstance(meta.get("product_workflow"), dict)
+
+
+def _product_workflow_assignees(meta: Optional[dict]) -> dict[str, str]:
+    workflow = meta.get("product_workflow") if isinstance(meta, dict) else None
+    raw = workflow.get("assignees") if isinstance(workflow, dict) else None
+    configured = raw if isinstance(raw, dict) else {}
+    merged: dict[str, str] = {}
+    for step, fallback in PRODUCT_WORKFLOW_STEP_TO_ROLE.items():
+        value = configured.get(fallback) or fallback
+        if value:
+            merged[step] = str(value).strip()
+    release_value = (
+        configured.get("release_measure")
+        or configured.get("release")
+        or configured.get("release_manager")
+    )
+    if release_value:
+        merged["release_measure"] = str(release_value).strip()
+    return merged
+
+
+def _product_step_status(meta: Optional[dict], step: str) -> str:
+    """Resolve a product workflow step to the board column status."""
+    if step == "done":
+        return "done"
+    columns = meta.get("columns") if isinstance(meta, dict) else None
+    if isinstance(columns, list):
+        for col in columns:
+            if not isinstance(col, dict):
+                continue
+            if str(col.get("name") or "").strip() == step:
+                status = str(col.get("status") or "ready").strip()
+                return status if status in VALID_STATUSES else "ready"
+    if step == "review":
+        return "review"
+    return "ready"
+
+
+def _looks_like_product_story(title: str) -> bool:
+    lowered = (title or "").strip().lower()
+    return lowered.startswith(("user story:", "story:", "user story -", "story -"))
+
+
+def _infer_product_step(
+    *, title: str, assignee: Optional[str], explicit_step: Optional[str]
+) -> Optional[str]:
+    if explicit_step:
+        return explicit_step
+    role = (assignee or "").strip().lower()
+    if role in PRODUCT_WORKFLOW_ROLE_TO_STEP:
+        return PRODUCT_WORKFLOW_ROLE_TO_STEP[role]
+    if _looks_like_product_story(title):
+        return "backlog"
+    return None
 
 
 def create_board(
@@ -2407,6 +2499,8 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    workflow_template_id: Optional[str] = None,
+    current_step_key: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2553,6 +2647,54 @@ def create_task(
 
     now = int(time.time())
 
+    board_slug = board if board else get_current_board()
+    board_meta = read_board_metadata(board_slug)
+    workflow_template_id = (
+        str(workflow_template_id).strip() if workflow_template_id is not None else None
+    ) or None
+    current_step_key = (
+        str(current_step_key).strip() if current_step_key is not None else None
+    ) or None
+
+    if current_step_key and current_step_key not in PRODUCT_WORKFLOW_STEP_SET:
+        raise ValueError(
+            f"current_step_key must be one of {sorted(PRODUCT_WORKFLOW_STEP_SET)}"
+        )
+    if workflow_template_id == PRODUCT_WORKFLOW_TEMPLATE_ID:
+        inferred = _infer_product_step(
+            title=title, assignee=assignee, explicit_step=current_step_key
+        )
+        if not inferred:
+            raise ValueError(
+                "product workflow tasks require current_step_key, or an assignee/title "
+                "that implies a product step"
+            )
+        current_step_key = inferred
+    elif workflow_template_id is None and _is_product_board_metadata(board_meta):
+        inferred = _infer_product_step(
+            title=title, assignee=assignee, explicit_step=current_step_key
+        )
+        if inferred:
+            workflow_template_id = PRODUCT_WORKFLOW_TEMPLATE_ID
+            current_step_key = inferred
+    elif current_step_key:
+        raise ValueError("current_step_key requires workflow_template_id='product'")
+
+    # Product/Relay cards are repo-governed work, not scratch notes. When the
+    # board advertises a default repo and the caller did not explicitly choose a
+    # persistent workspace/project, anchor the card to that repo so worker output,
+    # branches, and release evidence remain traceable to the governed project.
+    if (
+        workflow_template_id == PRODUCT_WORKFLOW_TEMPLATE_ID
+        and workspace_kind == "scratch"
+        and workspace_path is None
+        and project_repo is None
+    ):
+        board_default = board_meta.get("default_workdir")
+        if board_default:
+            workspace_kind = "dir"
+            workspace_path = str(board_default)
+
     # Resolve workspace_path from board-level default_workdir when the
     # caller did not specify one explicitly. Board defaults represent
     # persistent project checkouts, so only persistent workspace kinds may
@@ -2610,6 +2752,13 @@ def create_task(
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
+                if (
+                    workflow_template_id == PRODUCT_WORKFLOW_TEMPLATE_ID
+                    and current_step_key
+                    and task_status == "ready"
+                ):
+                    task_status = _product_step_status(board_meta, current_step_key)
+
                 # Project-linked worktree: a fresh worktree dir under the repo
                 # plus a deterministic branch (project slug + task id). Together
                 # these kill the random ``wt/<task-id>`` worker fallback and the
@@ -2635,8 +2784,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        workflow_template_id, current_step_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2659,6 +2809,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        workflow_template_id,
+                        current_step_key,
                     ),
                 )
                 for pid in parents:
@@ -2678,6 +2830,8 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "workflow_template_id": workflow_template_id,
+                        "current_step_key": current_step_key,
                     },
                 )
             return task_id
@@ -2705,6 +2859,127 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Task.from_row(row) if row else None
+
+
+def _repair_product_workflow_metadata_if_needed(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+    actor: str = "framework",
+) -> Optional[dict[str, Any]]:
+    """Repair legacy/plain role cards on product boards before they dispatch.
+
+    Regression target: product-board stories mistakenly created as plain
+    ``assignee=architect`` tasks with NULL workflow fields. On a board whose
+    metadata opts into ``preset=product`` / ``product_workflow``, infer the
+    missing product step from the assignee/title and persist an audit event.
+    Returns the repair metadata when a repair happened, ``None`` otherwise.
+    Caller must already hold any desired write transaction.
+    """
+    board_slug = board if board else get_current_board()
+    meta = read_board_metadata(board_slug)
+    if not _is_product_board_metadata(meta):
+        return None
+    row = conn.execute(
+        "SELECT id, title, assignee, status, workflow_template_id, current_step_key, "
+        "workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    workflow_template = (row["workflow_template_id"] or "").strip() or None
+    current_step = (row["current_step_key"] or "").strip() or None
+    if workflow_template and workflow_template != PRODUCT_WORKFLOW_TEMPLATE_ID:
+        return None
+    if workflow_template == PRODUCT_WORKFLOW_TEMPLATE_ID and current_step in PRODUCT_WORKFLOW_STEP_SET:
+        return None
+    inferred = _infer_product_step(
+        title=row["title"] or "",
+        assignee=row["assignee"],
+        explicit_step=current_step if current_step in PRODUCT_WORKFLOW_STEP_SET else None,
+    )
+    if not inferred:
+        return None
+    updates = ["workflow_template_id = ?", "current_step_key = ?"]
+    params: list[Any] = [PRODUCT_WORKFLOW_TEMPLATE_ID, inferred]
+    target_status = _product_step_status(meta, inferred)
+    if row["status"] in {"ready", "review"} and target_status != row["status"]:
+        updates.append("status = ?")
+        params.append(target_status)
+    if row["workspace_kind"] == "scratch" and not row["workspace_path"]:
+        board_default = meta.get("default_workdir")
+        if board_default:
+            updates.append("workspace_kind = ?")
+            updates.append("workspace_path = ?")
+            params.extend(["dir", str(board_default)])
+    params.append(task_id)
+    conn.execute(
+        f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?",
+        tuple(params),
+    )
+    payload = {
+        "workflow_template_id": PRODUCT_WORKFLOW_TEMPLATE_ID,
+        "current_step_key": inferred,
+        "reason": "product_board_missing_workflow_metadata",
+        "actor": actor,
+    }
+    _append_event(conn, task_id, "workflow_repaired", payload)
+    return payload
+
+
+def _product_workflow_completion_target(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Return the next product workflow target for a completing task.
+
+    ``None`` means ordinary terminal completion. For product cards, a worker
+    completing ``architecture`` should advance the same story card to
+    ``development`` instead of making the card terminal ``done``.
+    """
+    board_slug = board if board else get_current_board()
+    meta = read_board_metadata(board_slug)
+    product_board = _is_product_board_metadata(meta)
+    row = conn.execute(
+        "SELECT id, workflow_template_id, current_step_key FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    workflow_template = (row["workflow_template_id"] or "").strip() or None
+    step = (row["current_step_key"] or "").strip() or None
+    if workflow_template != PRODUCT_WORKFLOW_TEMPLATE_ID:
+        if not product_board:
+            return None
+        _repair_product_workflow_metadata_if_needed(
+            conn, task_id, board=board_slug, actor="completion_preflight"
+        )
+        row = conn.execute(
+            "SELECT workflow_template_id, current_step_key FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        workflow_template = (row["workflow_template_id"] or "").strip() or None
+        step = (row["current_step_key"] or "").strip() or None
+    if workflow_template != PRODUCT_WORKFLOW_TEMPLATE_ID:
+        return None
+    if step not in PRODUCT_WORKFLOW_STEP_SET:
+        return None
+    next_step = PRODUCT_WORKFLOW_NEXT_STEP.get(step)
+    if not next_step:
+        return None
+    assignees = _product_workflow_assignees(meta)
+    return {
+        "workflow_template_id": PRODUCT_WORKFLOW_TEMPLATE_ID,
+        "from_step": step,
+        "next_step": next_step,
+        "status": _product_step_status(meta, next_step),
+        "assignee": assignees.get(next_step),
+    }
 
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
@@ -3375,6 +3650,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -3385,6 +3661,9 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        _repair_product_workflow_metadata_if_needed(
+            conn, task_id, board=board, actor="claim_preflight"
+        )
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -3984,6 +4263,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    board: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4043,7 +4323,41 @@ def complete_task(
         verified_cards = []
 
     with write_txn(conn):
-        if expected_run_id is None:
+        workflow_target = _product_workflow_completion_target(conn, task_id, board=board)
+        terminal_done = not workflow_target or workflow_target.get("next_step") == "done"
+        target_status = "done" if terminal_done else str(workflow_target.get("status") or "ready")
+        target_completed_at = now if terminal_done else None
+        if workflow_target:
+            update_sql = """
+                UPDATE tasks
+                   SET status       = ?,
+                       result       = ?,
+                       completed_at = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL,
+                       block_kind   = NULL,
+                       block_recurrences = 0,
+                       workflow_template_id = ?,
+                       current_step_key = ?,
+                       assignee = ?
+                 WHERE id = ?
+                   AND status IN ('running', 'ready', 'blocked', 'review')
+            """
+            params: tuple[Any, ...] = (
+                target_status,
+                result,
+                target_completed_at,
+                PRODUCT_WORKFLOW_TEMPLATE_ID,
+                workflow_target["next_step"],
+                workflow_target.get("assignee"),
+                task_id,
+            )
+            if expected_run_id is not None:
+                update_sql += " AND current_run_id = ?"
+                params = params + (int(expected_run_id),)
+            cur = conn.execute(update_sql, params)
+        elif expected_run_id is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -4082,7 +4396,7 @@ def complete_task(
             return False
         run_id = _end_run(
             conn, task_id,
-            outcome="completed", status="done",
+            outcome="completed", status=target_status,
             summary=summary if summary is not None else result,
             metadata=metadata,
         )
@@ -4109,6 +4423,13 @@ def complete_task(
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
+        if workflow_target:
+            completed_payload["workflow"] = {
+                "template_id": PRODUCT_WORKFLOW_TEMPLATE_ID,
+                "from_step": workflow_target.get("from_step"),
+                "next_step": workflow_target.get("next_step"),
+                "terminal": terminal_done,
+            }
         # Carry artifact paths in the event payload so the gateway
         # notifier can upload them as native attachments alongside the
         # completion message. Workers pass these via
@@ -4128,6 +4449,19 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        if workflow_target:
+            _append_event(
+                conn, task_id, "workflow_advanced",
+                {
+                    "template_id": PRODUCT_WORKFLOW_TEMPLATE_ID,
+                    "from_step": workflow_target.get("from_step"),
+                    "to_step": workflow_target.get("next_step"),
+                    "status": target_status,
+                    "assignee": workflow_target.get("assignee"),
+                    "terminal": terminal_done,
+                },
+                run_id=run_id,
+            )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -4154,10 +4488,16 @@ def complete_task(
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
-    # Recompute ready status for dependents (separate txn so children see done).
-    recompute_ready(conn)
-    # Clean up the scratch workspace and any stale tmux session for the worker.
-    _cleanup_workspace(conn, task_id)
+    # Recompute ready status for dependents only when this card is truly
+    # terminal. Product workflow step completion advances the same story card;
+    # dependents must not unblock until the story reaches ``done``.
+    if terminal_done:
+        recompute_ready(conn)
+    # Clean up the scratch workspace and any stale tmux session only for
+    # terminal completion. Intermediate product-workflow handoffs must preserve
+    # the workspace/evidence for the next role.
+    if terminal_done:
+        _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",
@@ -7252,7 +7592,7 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds, board=board)
         if claimed is None:
             continue
         try:

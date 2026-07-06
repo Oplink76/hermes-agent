@@ -360,6 +360,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument("--workflow-template-id", default=None,
+                          choices=[kb.PRODUCT_WORKFLOW_TEMPLATE_ID],
+                          help="Workflow template for governed product/Relay cards.")
+    p_create.add_argument("--step-key", default=None, dest="current_step_key",
+                          choices=sorted(kb.PRODUCT_WORKFLOW_STEP_SET),
+                          help="Current product workflow step for governed cards.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -1347,6 +1353,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            workflow_template_id=getattr(args, "workflow_template_id", None),
+            current_step_key=getattr(args, "current_step_key", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):

@@ -8,6 +8,7 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import time
@@ -189,6 +190,88 @@ def test_board_query_param_default_overrides_current_board_pointer(client):
         for task in column["tasks"]
     }
     assert pinned_ids == {default_task["id"]}
+
+
+def _write_product_board(board: str, default_workdir: Path, *, release_assignee: str | None = None) -> None:
+    kb.create_board(board, name="Product Board", default_workdir=str(default_workdir))
+    meta = kb.read_board_metadata(board)
+    meta.pop("db_path", None)
+    meta["preset"] = "product"
+    meta["columns"] = [
+        {"name": "architecture", "status": "ready"},
+        {"name": "development", "status": "ready"},
+        {"name": "test", "status": "ready"},
+        {"name": "review", "status": "review"},
+        {"name": "release_measure", "status": "ready"},
+        {"name": "done", "status": "done"},
+    ]
+    assignees = {
+        "architect": "architect",
+        "developer": "developer",
+        "tester": "tester",
+        "reviewer": "reviewer",
+    }
+    if release_assignee:
+        assignees["release_measure"] = release_assignee
+    meta["product_workflow"] = {"assignees": assignees}
+    kb.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+
+
+def test_dashboard_create_on_product_board_uses_selected_board_metadata(
+    client, tmp_path
+):
+    board = "product-board"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_product_board(board, repo)
+    kb.set_current_board("default")
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks?board={board}",
+        json={"title": "User story: dashboard-created", "assignee": "architect"},
+    )
+
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["workflow_template_id"] == kb.PRODUCT_WORKFLOW_TEMPLATE_ID
+    assert task["current_step_key"] == "architecture"
+    assert task["workspace_kind"] == "dir"
+    assert task["workspace_path"] == str(repo)
+
+
+def test_dashboard_done_on_product_board_uses_selected_board_for_handoff(
+    client, tmp_path
+):
+    board = "product-board"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_product_board(board, repo, release_assignee="releasebot")
+    kb.set_current_board("default")
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: dashboard-completed",
+            assignee="architect",
+            board=board,
+        )
+        for _ in range(3):
+            assert kb.claim_task(conn, tid, board=board)
+            assert kb.complete_task(conn, tid, summary="step done", board=board)
+        review_task = kb.get_task(conn, tid)
+        assert review_task.status == "review"
+        assert review_task.current_step_key == "review"
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}?board={board}",
+        json={"status": "done", "summary": "dashboard review done"},
+    )
+
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["status"] == "ready"
+    assert task["current_step_key"] == "release_measure"
+    assert task["assignee"] == "releasebot"
 
 
 def test_dashboard_select_filters_use_sdk_value_change_handler():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -2572,6 +2573,177 @@ def test_list_tasks_filters_workflow_template_and_step(kanban_home):
         by_step = kb.list_tasks(conn, current_step_key="step_x")
     assert {x.id for x in by_wf} == {ta, tb}
     assert [x.id for x in by_step] == [ta]
+
+
+def _write_product_board(
+    board: str,
+    default_workdir: Path,
+    *,
+    release_assignee: str | None = None,
+) -> None:
+    kb.create_board(board, name="Product Board", default_workdir=str(default_workdir))
+    meta = kb.read_board_metadata(board)
+    meta.pop("db_path", None)
+    meta["preset"] = "product"
+    meta["columns"] = [
+        {"name": "backlog", "status": "ready"},
+        {"name": "architecture", "status": "ready"},
+        {"name": "development", "status": "ready"},
+        {"name": "test", "status": "ready"},
+        {"name": "review", "status": "review"},
+        {"name": "release_measure", "status": "ready"},
+        {"name": "done", "status": "done"},
+    ]
+    assignees = {
+        "productowner": "productowner",
+        "architect": "architect",
+        "developer": "developer",
+        "tester": "tester",
+        "reviewer": "reviewer",
+    }
+    if release_assignee:
+        assignees["release_measure"] = release_assignee
+    meta["product_workflow"] = {"assignees": assignees}
+    kb.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+
+
+def test_product_board_role_story_creation_gets_workflow_metadata_and_repo_link(
+    kanban_home, tmp_path
+):
+    board = "product-board"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_product_board(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: Safe paper order evidence",
+            assignee="architect",
+            board=board,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task.workflow_template_id == kb.PRODUCT_WORKFLOW_TEMPLATE_ID
+    assert task.current_step_key == "architecture"
+    assert task.workspace_kind == "dir"
+    assert task.workspace_path == str(repo)
+    assert task.status == "ready"
+
+
+def test_product_workflow_completion_advances_architect_card_not_terminal_done(
+    kanban_home, tmp_path
+):
+    board = "product-board"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_product_board(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: Existing cron wrappers become API clients",
+            assignee="architect",
+            board=board,
+        )
+        claimed = kb.claim_task(conn, tid, board=board)
+        assert claimed is not None
+        assert kb.complete_task(conn, tid, summary="Architecture complete", board=board)
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        run = kb.latest_run(conn, tid)
+
+    assert task.status == "ready"
+    assert task.completed_at is None
+    assert task.workflow_template_id == kb.PRODUCT_WORKFLOW_TEMPLATE_ID
+    assert task.current_step_key == "development"
+    assert task.assignee == "developer"
+    assert run.outcome == "completed"
+    assert run.step_key == "architecture"
+    assert any(e.kind == "workflow_advanced" for e in events)
+
+
+def test_product_workflow_honors_configured_release_measure_assignee(
+    kanban_home, tmp_path
+):
+    board = "product-board"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_product_board(board, repo, release_assignee="releasebot")
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: Full workflow chain",
+            assignee="architect",
+            board=board,
+        )
+        # architecture -> development
+        assert kb.claim_task(conn, tid, board=board)
+        assert kb.complete_task(conn, tid, summary="architecture done", board=board)
+        assert kb.get_task(conn, tid).assignee == "developer"
+        # development -> test
+        assert kb.claim_task(conn, tid, board=board)
+        assert kb.complete_task(conn, tid, summary="development done", board=board)
+        assert kb.get_task(conn, tid).assignee == "tester"
+        # test -> review
+        assert kb.claim_task(conn, tid, board=board)
+        assert kb.complete_task(conn, tid, summary="test done", board=board)
+        review_task = kb.get_task(conn, tid)
+        assert review_task.status == "review"
+        assert review_task.assignee == "reviewer"
+        # review -> release_measure honors configured assignee.
+        assert kb.claim_review_task(conn, tid)
+        assert kb.complete_task(conn, tid, summary="review done", board=board)
+        release_task = kb.get_task(conn, tid)
+        assert release_task.status == "ready"
+        assert release_task.current_step_key == "release_measure"
+        assert release_task.assignee == "releasebot"
+        # release_measure -> done.
+        assert kb.claim_task(conn, tid, board=board)
+        assert kb.complete_task(conn, tid, summary="released", board=board)
+        final_task = kb.get_task(conn, tid)
+
+    assert final_task.status == "done"
+    assert final_task.current_step_key == "done"
+    assert final_task.assignee is None
+    assert final_task.completed_at is not None
+
+
+def test_product_board_claim_repairs_legacy_plain_architect_story(
+    kanban_home, tmp_path
+):
+    board = "product-board"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_product_board(board, repo)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: Legacy card",
+            assignee="architect",
+            board=board,
+        )
+        # Simulate the Trading Company regression: a plain architect card with
+        # NULL workflow fields slipped onto a product board before this fix.
+        conn.execute(
+            "UPDATE tasks SET workflow_template_id=NULL, current_step_key=NULL, "
+            "workspace_kind='scratch', workspace_path=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        claimed = kb.claim_task(conn, tid, board=board)
+        repaired = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert claimed is not None
+    assert repaired.workflow_template_id == kb.PRODUCT_WORKFLOW_TEMPLATE_ID
+    assert repaired.current_step_key == "architecture"
+    assert repaired.workspace_kind == "dir"
+    assert repaired.workspace_path == str(repo)
+    assert any(e.kind == "workflow_repaired" for e in events)
 
 
 def test_list_runs_state_filter_requires_pair_and_valid_type(kanban_home):
