@@ -1880,6 +1880,32 @@ def test_respawn_guard_recent_success(kanban_home):
     assert reason == "recent_success"
 
 
+def test_respawn_guard_advanced_outcome_does_not_park_pipeline(kanban_home):
+    """A product-workflow step-advance (outcome='advanced') must NOT trip the
+    recent_success guard — otherwise every pipeline hop parks the card for the
+    full guard window. This is the regression that stalled the Trading Company
+    board when a parallel branch stamped step-advances as 'completed'."""
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: pipeline hop",
+            assignee="architect-profile",
+            workflow_template_id="product",
+            current_step_key="architecture",
+        )
+        # Advancing the step records a run — it must be outcome='advanced',
+        # which the guard ignores, so the next role can spawn immediately.
+        assert kb.complete_task(
+            conn, tid, summary="architecture done", board="prod",
+            product_role_assignees={"developer": "developer-profile"},
+        )
+        latest = kb.latest_run(conn, tid)
+        reason = kb.check_respawn_guard(conn, tid)
+    assert latest.outcome == "advanced", "step-advance must not be 'completed'"
+    assert reason is None, f"pipeline card wrongly parked: {reason}"
+
+
 def test_respawn_guard_stale_success_not_guarded(kanban_home):
     """A completed run outside the guard window does not block re-spawn."""
     with kb.connect() as conn:
