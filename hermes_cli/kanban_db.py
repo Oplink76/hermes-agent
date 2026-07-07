@@ -1097,28 +1097,44 @@ def _apply_v2_flags_for_status(
 
 def migrate_cards_to_v2_flags(conn: sqlite3.Connection, *, board: Optional[str] = None) -> int:
     """Phase 6 migration primitive: reconcile every existing card's
-    ``(running, blocked)`` flags to MATCH its current legacy ``status``, the
-    inverse of :func:`_legacy_status`.
+    ``(phase, running, blocked)`` state to MATCH its current legacy
+    ``status``, the inverse of :func:`_legacy_status`. Reconciles two things,
+    in the SAME ``write_txn``:
 
-    A board's cards accumulate real statuses (running/blocked/ready/...) over
-    time, but the flag columns default to 0 -- so without this, flipping a
-    board to ``handoff_v2`` would leave an already-running card reading
-    ``status='running', running=0``, a direct disagreement with
-    :func:`_legacy_status`. This applies the same mapping as CR2's
-    :func:`_apply_v2_flags_for_status` (via the shared :func:`_v2_flags_for_status`)
-    to every card on the board via a direct ``UPDATE``.
+    1. ``(running, blocked)`` flags -- a board's cards accumulate real
+       statuses (running/blocked/ready/...) over time, but the flag columns
+       default to 0, so without this, flipping a board to ``handoff_v2``
+       would leave an already-running card reading ``status='running',
+       running=0``, a direct disagreement with :func:`_legacy_status`. This
+       applies the same mapping as CR2's :func:`_apply_v2_flags_for_status`
+       (via the shared :func:`_v2_flags_for_status`) to every card via a
+       direct ``UPDATE``.
+    2. ``current_step_key`` (phase) for terminal ``done`` cards only -- a
+       dry run on a copy of a production board found real cards with
+       ``status='done'`` still parked at a non-done phase (e.g.
+       ``'release_measure'``), legacy completions that predate the "done
+       ⟹ phase=done" rule; their derived ``_legacy_status`` reads something
+       other than ``'done'``. A single bulk ``UPDATE`` advances
+       ``current_step_key`` to ``'done'`` for every ``status='done'`` card
+       not already there. No other status's phase is touched --
+       running/ready/blocked/review/todo/archived cards keep their workflow
+       position exactly as-is -- and ``status`` itself is never written by
+       this function.
 
     Deliberately NOT gated on :func:`_handoff_v2_enabled` -- this function
     *is* the migration, and may be run just before or just after the
-    board.json ``handoff_v2`` flip. It only ever writes the running/blocked
-    columns, never ``status`` or ``current_step_key``, so it is additive,
-    idempotent (a second run recomputes the same flags), and reversible (the
-    flags are simply ignored again if the board reverts to legacy). Runs in
-    one ``write_txn``. ``board`` is accepted for parity with sibling
-    connection-scoped helpers; a connection is already scoped to a single
-    board's tasks table, so it does not filter here.
+    board.json ``handoff_v2`` flip. It never writes ``status``, so it is
+    additive, idempotent (a second run recomputes the same flags, and a done
+    card already at phase 'done' is left unchanged), and reversible-ish: the
+    flags are simply ignored again if the board reverts to legacy, and
+    setting a completed card's phase to 'done' is just its correct terminal
+    position, so nothing is lost either way. Runs in one ``write_txn``.
+    ``board`` is accepted for parity with sibling connection-scoped helpers;
+    a connection is already scoped to a single board's tasks table, so it
+    does not filter here.
 
-    Returns the number of cards reconciled.
+    Returns the number of cards whose flags were reconciled (the phase-for-
+    done fixup is a secondary bulk statement and is not separately counted).
     """
     del board  # unused: conn is already scoped to one board's tasks table
     updated = 0
@@ -1131,6 +1147,10 @@ def migrate_cards_to_v2_flags(conn: sqlite3.Connection, *, board: Optional[str] 
                 (running, blocked, row["id"]),
             )
             updated += cur.rowcount
+        conn.execute(
+            "UPDATE tasks SET current_step_key = 'done' "
+            "WHERE status = 'done' AND current_step_key IS NOT 'done'"
+        )
     return updated
 
 

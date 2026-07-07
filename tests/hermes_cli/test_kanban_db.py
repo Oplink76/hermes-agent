@@ -9599,3 +9599,120 @@ def test_migrate_cards_to_v2_flags_does_not_touch_status_or_phase(kanban_home, m
         ).fetchone())
 
     assert after == before
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 T6.1 (extended): migrate_cards_to_v2_flags also reconciles PHASE for
+# terminal 'done' cards -- a dry run on a copy of a production board found
+# real cards with status='done' still parked at a non-done phase (legacy
+# completions predating the "done ⟹ phase=done" rule), whose _legacy_status
+# read something other than 'done'.
+# ---------------------------------------------------------------------------
+
+def test_migrate_cards_to_v2_flags_reconciles_phase_for_done(kanban_home, monkeypatch):
+    """A legacy 'done' card stuck at a non-done phase (the real dry-run
+    finding) gets its current_step_key advanced to 'done' too, not just its
+    flags -- so _legacy_status agrees with the stored status again."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "migrate-cards-done-phase"
+    kb.create_board(board, name="Migrate Done Phase", preset="product")
+    meta = kb.read_board_metadata(board)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn, title="legacy-done-card", workflow_template_id="product",
+            current_step_key="release_measure",
+        )
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid,))
+
+        kb.migrate_cards_to_v2_flags(conn, board=board)
+
+        row = dict(conn.execute(
+            "SELECT status, current_step_key, running, blocked FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone())
+
+    assert row["status"] == "done"
+    assert row["current_step_key"] == "done"
+    assert (row["running"], row["blocked"]) == (0, 0)
+    assert kb._legacy_status(row, meta) == "done"
+
+
+@pytest.mark.parametrize(
+    "status,step_key",
+    [
+        ("ready", "development"),
+        ("running", "development"),
+        ("blocked", "development"),
+        ("review", "review"),
+        ("todo", "development"),
+        ("archived", "release_measure"),
+    ],
+)
+def test_migrate_cards_to_v2_flags_leaves_non_done_phase_untouched(
+    kanban_home, monkeypatch, status, step_key
+):
+    """Only status='done' cards get their phase moved -- every other status
+    (including archived, which is out-of-band, not a workflow phase) keeps
+    its current_step_key exactly as-is."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = f"migrate-cards-phase-untouched-{status}"
+    kb.create_board(board, name="Migrate Phase Untouched", preset="product")
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn, title=f"card-{status}", workflow_template_id="product",
+            current_step_key=step_key,
+        )
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
+
+        kb.migrate_cards_to_v2_flags(conn, board=board)
+
+        row = dict(conn.execute(
+            "SELECT status, current_step_key FROM tasks WHERE id = ?", (tid,),
+        ).fetchone())
+
+    assert row["status"] == status
+    assert row["current_step_key"] == step_key
+
+
+def test_migrate_cards_to_v2_flags_phase_for_done_idempotent(kanban_home, monkeypatch):
+    """A done card already at phase 'done' is unchanged, and running the
+    migration a second time is a no-op for the phase fixup too."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "migrate-cards-done-phase-idempotent"
+    kb.create_board(board, name="Migrate Done Phase Idempotent", preset="product")
+
+    with kb.connect(board=board) as conn:
+        tid_already_done = kb.create_task(
+            conn, title="already-done-card", workflow_template_id="product",
+            current_step_key="done",
+        )
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid_already_done,))
+        tid_legacy_done = kb.create_task(
+            conn, title="legacy-done-card", workflow_template_id="product",
+            current_step_key="release_measure",
+        )
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid_legacy_done,))
+
+        kb.migrate_cards_to_v2_flags(conn, board=board)
+        first = {
+            tid: dict(conn.execute(
+                "SELECT status, current_step_key, running, blocked FROM tasks WHERE id = ?",
+                (tid,),
+            ).fetchone())
+            for tid in (tid_already_done, tid_legacy_done)
+        }
+
+        kb.migrate_cards_to_v2_flags(conn, board=board)
+        second = {
+            tid: dict(conn.execute(
+                "SELECT status, current_step_key, running, blocked FROM tasks WHERE id = ?",
+                (tid,),
+            ).fetchone())
+            for tid in (tid_already_done, tid_legacy_done)
+        }
+
+    assert second == first
+    assert second[tid_already_done]["current_step_key"] == "done"
+    assert second[tid_legacy_done]["current_step_key"] == "done"
