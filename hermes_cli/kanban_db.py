@@ -2067,7 +2067,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Orthogonal handoff_v2 state-model flags. ``phase`` (the card's single
+    -- position, canonically ``current_step_key`` above) plus these two
+    -- independent booleans replace the old single-``status`` enum. Neither
+    -- writers nor gating consult these yet (added in T1.2/T1.3/T1.4) — this
+    -- migration only makes the columns exist.
+    running               INTEGER NOT NULL DEFAULT 0,
+    blocked               INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2876,6 +2883,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "tasks",
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "running" not in cols:
+        # Orthogonal handoff_v2 state-model flag. Existing rows default to 0
+        # (not running), which matches their pre-migration behaviour.
+        _add_column_if_missing(
+            conn, "tasks", "running", "running INTEGER NOT NULL DEFAULT 0"
+        )
+
+    if "blocked" not in cols:
+        # Orthogonal handoff_v2 state-model flag. Existing rows default to 0
+        # (not blocked), which matches their pre-migration behaviour.
+        _add_column_if_missing(
+            conn, "tasks", "blocked", "blocked INTEGER NOT NULL DEFAULT 0"
         )
 
     # Indexes over additive ``tasks`` columns must be created after the

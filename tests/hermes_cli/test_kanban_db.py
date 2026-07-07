@@ -209,6 +209,77 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_events_run" in indexes
 
 
+def test_fresh_db_has_running_and_blocked_columns(kanban_home):
+    """New handoff_v2 state-model flags exist on brand-new DBs (T1.1)."""
+    with kb.connect() as conn:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    assert "running" in cols
+    assert "blocked" in cols
+
+
+def test_legacy_db_gains_running_and_blocked_columns_without_data_loss(tmp_path):
+    """Legacy DBs missing ``running``/``blocked`` must migrate cleanly (T1.1).
+
+    Mirrors ``test_connect_migrates_legacy_db_before_optional_column_indexes``:
+    build a pre-migration ``tasks`` shape, insert a real row, then run the
+    migration path via ``kb.connect`` and assert the columns exist, default to
+    0, and the pre-existing row/data survive. Also asserts the migration is
+    idempotent by connecting a second time.
+    """
+    db_path = tmp_path / "legacy-kanban.db"
+    conn = sqlite3.connect(str(db_path))
+    # Pre-handoff_v2 ``tasks`` shape: missing running, blocked.
+    conn.execute("""
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER
+        )
+    """)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('legacy', 'old board task', 'ready', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    with kb.connect(db_path) as migrated:
+        cols = {row["name"] for row in migrated.execute("PRAGMA table_info(tasks)")}
+        row = migrated.execute(
+            "SELECT title, status, created_at, running, blocked FROM tasks "
+            "WHERE id = 'legacy'"
+        ).fetchone()
+
+    assert "running" in cols
+    assert "blocked" in cols
+    # Pre-existing row and its original data are intact.
+    assert row["title"] == "old board task"
+    assert row["status"] == "ready"
+    assert row["created_at"] == 1
+    # New columns default to 0 on the pre-existing row.
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+
+    # Idempotent: connecting again does not error or duplicate columns.
+    with kb.connect(db_path) as migrated_again:
+        cols_again = [
+            row["name"] for row in migrated_again.execute("PRAGMA table_info(tasks)")
+        ]
+    assert cols_again.count("running") == 1
+    assert cols_again.count("blocked") == 1
+
+
 # ---------------------------------------------------------------------------
 # Task creation + status inference
 # ---------------------------------------------------------------------------
