@@ -7086,14 +7086,30 @@ def reconcile(
     # Step 1: reclaim running cards whose worker died. One CAS UPDATE per
     # card, in its own transaction -- never spawned this pass.
     # ``worker_pid IS NOT NULL`` matches detect_crashed_workers' convention
-    # (kanban_db.py ~7791): a card claimed but not yet pid-stamped (the brief
-    # window between claim_task and _set_worker_pid inside _spawn_one_v2) has
-    # no pid to check yet and must not be mistaken for a dead worker.
+    # (kanban_db.py ~7904, query ~7944): a card claimed but not yet
+    # pid-stamped (the brief window between claim_task and _set_worker_pid
+    # inside _spawn_one_v2) has no pid to check yet and must not be mistaken
+    # for a dead worker.
     running_rows = conn.execute(
-        "SELECT id, worker_pid, claim_lock FROM tasks "
+        "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
         "WHERE status = 'running' AND worker_pid IS NOT NULL"
     ).fetchall()
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     for row in running_rows:
+        # Only check liveness for claims owned by this host -- a remote
+        # host's PID is meaningless to a local _pid_alive check (mirrors
+        # detect_crashed_workers).
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+        # Skip liveness check inside the launch-window grace period so a
+        # freshly-spawned worker isn't reclaimed before its PID is visible
+        # on /proc (mirrors detect_crashed_workers).
+        started_at = row["started_at"] if "started_at" in row.keys() else None
+        if started_at is not None:
+            grace = _resolve_crash_grace_seconds()
+            if time.time() - started_at < grace:
+                continue
         if _pid_alive(row["worker_pid"]):
             continue
         task_id = row["id"]

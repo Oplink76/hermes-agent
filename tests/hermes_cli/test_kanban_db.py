@@ -3336,6 +3336,8 @@ def test_reconcile_recovers_dead_pid_then_spawns_next_pass_bounded(
         return 4242
 
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    host = kb._claimer_id().split(":", 1)[0]
+    stale_started_at = int(time.time()) - 3600  # past the crash grace window
 
     with kb.connect(board=board) as conn:
         tid = kb.create_task(
@@ -3346,9 +3348,9 @@ def test_reconcile_recovers_dead_pid_then_spawns_next_pass_bounded(
             workspace_path=str(repo),
         )
         conn.execute(
-            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? "
-            "WHERE id=?",
-            (99999, "deadhost:w0", tid),
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=?, "
+            "started_at=? WHERE id=?",
+            (99999, f"{host}:w0", stale_started_at, tid),
         )
         conn.commit()
 
@@ -3385,6 +3387,8 @@ def test_reconcile_no_thrash_on_healthy_running_card(kanban_home, tmp_path, monk
         return 4242
 
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    host = kb._claimer_id().split(":", 1)[0]
+    stale_started_at = int(time.time()) - 3600  # past the crash grace window
 
     with kb.connect(board=board) as conn:
         tid = kb.create_task(
@@ -3395,9 +3399,9 @@ def test_reconcile_no_thrash_on_healthy_running_card(kanban_home, tmp_path, monk
             workspace_path=str(repo),
         )
         conn.execute(
-            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? "
-            "WHERE id=?",
-            (os.getpid(), "livehost:w0", tid),
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=?, "
+            "started_at=? WHERE id=?",
+            (os.getpid(), f"{host}:w0", stale_started_at, tid),
         )
         conn.commit()
 
@@ -3406,6 +3410,106 @@ def test_reconcile_no_thrash_on_healthy_running_card(kanban_home, tmp_path, monk
 
     assert first.reclaimed == [] and first.spawned == []
     assert second.reclaimed == [] and second.spawned == []
+    assert spawns == []
+
+
+def test_reconcile_honors_crash_grace_period(kanban_home, tmp_path, monkeypatch):
+    """A dead-reading PID whose worker just started (within the crash grace
+    window) must NOT be reclaimed -- mirrors detect_crashed_workers' grace
+    logic (#T3.2 review finding). Without this, reconcile's poll cadence can
+    misclassify a freshly-spawned healthy worker as dead before its PID is
+    visible on /proc, reintroducing the exact respawn churn reconcile exists
+    to prevent."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-reconcile-grace"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    spawns: list[str] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 4242
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.delenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", raising=False)
+    host = kb._claimer_id().split(":", 1)[0]
+
+    now = 5_000_000.0
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="developer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=?, "
+            "started_at=? WHERE id=?",
+            (99999, f"{host}:w0", int(now), tid),
+        )
+        conn.commit()
+
+        # Just started (started_at == now): inside the grace window, so no
+        # reclaim despite the dead-reading pid.
+        within_grace = kb.reconcile(conn, board=board, spawn_fn=fake_spawn)
+        assert within_grace.reclaimed == []
+        assert within_grace.spawned == []
+        assert spawns == []
+        card = kb.get_task(conn, tid)
+        assert card.status == "running"
+
+        # Past the default 30s grace window: now reclaim proceeds as before.
+        monkeypatch.setattr(kb.time, "time", lambda: now + 60)
+        past_grace = kb.reconcile(conn, board=board, spawn_fn=fake_spawn)
+        assert past_grace.reclaimed == [tid]
+        assert past_grace.spawned == []
+        card = kb.get_task(conn, tid)
+        assert card.status == "ready"
+
+
+def test_reconcile_skips_liveness_check_for_other_host_claim(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """A running card claimed by a different host is never reclaimed --
+    ``_pid_alive`` checks the LOCAL process table, so a remote host's pid is
+    meaningless (mirrors detect_crashed_workers' host-ownership guard)."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-reconcile-other-host"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    spawns: list[str] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 4242
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    stale_started_at = int(time.time()) - 3600  # past the crash grace window
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="developer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=?, "
+            "started_at=? WHERE id=?",
+            (99999, "some-other-host:w0", stale_started_at, tid),
+        )
+        conn.commit()
+
+        result = kb.reconcile(conn, board=board, spawn_fn=fake_spawn)
+
+    assert result.reclaimed == []
+    assert result.spawned == []
     assert spawns == []
 
 
