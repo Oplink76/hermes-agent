@@ -6718,6 +6718,92 @@ def set_branch_name(
         )
 
 
+def _commit_worker_diff(
+    conn: sqlite3.Connection, task_id: str, *, message: Optional[str] = None
+) -> Optional[str]:
+    """Commit a card's worktree, source-only, and return the new SHA.
+
+    Stages with ``git add -A`` (honors ``.gitignore`` — gitignored runtime
+    dirs like ``dashboard/``/``state/`` are never staged; never ``-f``).
+    Returns ``None`` if there's no ``workspace_path``, the path isn't a git
+    repo, there's nothing to commit (clean tree), or any git call fails.
+    This is load-bearing for T2.2: no commit means the card does not advance.
+    """
+    row = conn.execute(
+        "SELECT title, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return None
+    workspace_path: Optional[str] = row["workspace_path"]
+    if not workspace_path:
+        return None
+    repo_root = _git_toplevel(Path(workspace_path))
+    if repo_root is None:
+        return None
+
+    try:
+        add_result = subprocess.run(
+            ["git", "-C", str(repo_root), "add", "-A"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    if add_result.returncode != 0:
+        return None
+
+    try:
+        diff_result = subprocess.run(
+            ["git", "-C", str(repo_root), "diff", "--cached", "--quiet"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    if diff_result.returncode == 0:
+        # Nothing staged — clean tree, nothing to commit.
+        return None
+
+    if message is not None:
+        commit_message = message
+    else:
+        title: Optional[str] = row["title"]
+        commit_message = f"handoff: {title} ({task_id})" if title else f"handoff: {task_id}"
+
+    try:
+        commit_result = subprocess.run(
+            ["git", "-C", str(repo_root), "commit", "-m", commit_message],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    if commit_result.returncode != 0:
+        return None
+
+    try:
+        sha_result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    if sha_result.returncode != 0:
+        return None
+    sha = (sha_result.stdout or "").strip()
+    return sha or None
+
+
 # ---------------------------------------------------------------------------
 def schedule_task(
     conn: sqlite3.Connection,

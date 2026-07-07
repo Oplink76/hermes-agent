@@ -2766,6 +2766,103 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
 
 
 # ---------------------------------------------------------------------------
+# _commit_worker_diff (Phase 2 atomic commit-first handoff)
+# ---------------------------------------------------------------------------
+
+def _head_sha(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def test_commit_worker_diff_dirty_worktree_returns_sha_and_cleans_tree(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="ship it", workspace_kind="worktree", workspace_path=str(repo)
+        )
+        (repo / "src.py").write_text("print('hi')\n", encoding="utf-8")
+        sha = kb._commit_worker_diff(conn, tid)
+
+    assert sha is not None
+    assert len(sha) == 40
+    assert all(c in "0123456789abcdef" for c in sha)
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert status == ""
+    assert _head_sha(repo) == sha
+
+
+def test_commit_worker_diff_nothing_to_commit_returns_none(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="ship it", workspace_kind="worktree", workspace_path=str(repo)
+        )
+        before = _head_sha(repo)
+        result = kb._commit_worker_diff(conn, tid)
+
+    assert result is None
+    assert _head_sha(repo) == before
+
+
+def test_commit_worker_diff_no_repo_returns_none(kanban_home, tmp_path):
+    not_a_repo = tmp_path / "not-a-repo"
+    not_a_repo.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="ship it", workspace_kind="dir", workspace_path=str(not_a_repo)
+        )
+        result = kb._commit_worker_diff(conn, tid)
+
+    assert result is None
+
+
+def test_commit_worker_diff_missing_workspace_path_returns_none(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="no workspace")
+        result = kb._commit_worker_diff(conn, tid)
+
+    assert result is None
+
+
+def test_commit_worker_diff_respects_gitignore(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / ".gitignore").write_text("state/\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", ".gitignore"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "add gitignore"], check=True, capture_output=True, text=True)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="ship it", workspace_kind="worktree", workspace_path=str(repo)
+        )
+        state_dir = repo / "state"
+        state_dir.mkdir()
+        (state_dir / "runtime.json").write_text("{}\n", encoding="utf-8")
+        (repo / "feature.py").write_text("x = 1\n", encoding="utf-8")
+        sha = kb._commit_worker_diff(conn, tid)
+
+    assert sha is not None
+    show = subprocess.run(
+        ["git", "-C", str(repo), "show", "--stat", "--name-only", sha],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert "feature.py" in show
+    assert "state/runtime.json" not in show
+    ls_files = subprocess.run(
+        ["git", "-C", str(repo), "ls-files"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert "state/runtime.json" not in ls_files
+
+
+# ---------------------------------------------------------------------------
 # Scratch cleanup containment (#28818)
 # ---------------------------------------------------------------------------
 
