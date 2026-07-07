@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -1778,6 +1778,71 @@ def _route_product_human_block_to_preflight(
             run_id=run_id,
         )
     return True
+
+
+def resolve_or_block(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+    reason: Optional[str] = None,
+    kind: Optional[str] = None,
+    attempted_resolutions: Optional[Iterable[str]] = None,
+    expected_run_id: Optional[int] = None,
+    notify_fn: Optional[Callable[[str, Optional[str], Optional[str]], Any]] = None,
+) -> Optional[str]:
+    """Resolution chain for a handoff_v2 worker that hit an obstacle.
+
+    Tries tiers in order before paging a human: (1) transient / dependency
+    waits self-clear via cooldown -- no ``blocked`` flag, no Slack; (2) a real
+    obstacle first routes to the Hermes ``default`` resolver via
+    :func:`_route_product_human_block_to_preflight` (reused, not
+    reimplemented); (3) only when ``default`` also fails (a preflight for
+    this task was already unresolved) does the card become ``blocked`` --
+    ``running`` is cleared first to keep the limbo invariant, then ``blocked``
+    is set and a ``blocked`` task_event is emitted (the gateway notifier turns
+    that event into Slack in production; ``notify_fn``, if given, is an
+    additional synchronous hook fired only on this final outcome).
+
+    Returns ``"cooldown"``, ``"routed_to_default"``, or ``"blocked"`` on a
+    handoff_v2 board. Returns ``None`` on a non-v2 board -- callers fall back
+    to :func:`block_task` for those.
+    """
+    meta = product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta):
+        return None
+
+    if kind in ("transient", "dependency"):
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "resolve_cooldown", {"reason": reason, "kind": kind},
+            )
+        return "cooldown"
+
+    routed = _route_product_human_block_to_preflight(
+        conn,
+        task_id,
+        board=board,
+        reason=reason,
+        kind=kind,
+        attempted_resolutions=attempted_resolutions,
+        expected_run_id=expected_run_id,
+        human_escalation_assignee="default",
+    )
+    if routed is not None:
+        return "routed_to_default"
+
+    # ``default`` already had its chance (an unresolved preflight exists) and
+    # did not resolve it -- escalate to a human. Clear ``running`` first so
+    # the limbo invariant holds (a card can never be both running and
+    # blocked; see ``_assert_card_consistent``).
+    set_running(conn, task_id, False, board=board)
+    set_blocked(conn, task_id, True, board=board, reason=reason)
+    with write_txn(conn):
+        _append_event(conn, task_id, "blocked", {"reason": reason, "kind": kind})
+    if notify_fn is not None:
+        notify_fn(task_id, reason, board)
+    return "blocked"
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:

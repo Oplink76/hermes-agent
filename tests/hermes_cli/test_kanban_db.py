@@ -6633,3 +6633,128 @@ def test_handoff_v2_flag_defaults_off_and_reads_meta(kanban_home):
     assert kb._handoff_v2_enabled({}) is False
     assert kb._handoff_v2_enabled({"product_workflow": {"handoff_v2": True}}) is True
     assert kb._handoff_v2_enabled({"product_workflow": {"handoff_v2": False}}) is False
+
+
+# ---------------------------------------------------------------------------
+# resolve_or_block -- default resolver then blocked+Slack chain (T3.3)
+# ---------------------------------------------------------------------------
+
+def test_resolve_or_block_transient_returns_cooldown_no_block_no_slack(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-resolve-transient"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+    notify = unittest.mock.Mock()
+
+    with kb.connect(board=board) as conn:
+        kb.set_running(conn, tid, True, board=board)
+        outcome = kb.resolve_or_block(
+            conn, tid,
+            board=board,
+            reason="rate limited",
+            kind="transient",
+            notify_fn=notify,
+        )
+        row = conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        events = kb.list_events(conn, tid)
+
+    assert outcome == "cooldown"
+    assert row["blocked"] == 0
+    notify.assert_not_called()
+    assert not [e for e in events if e.kind == "blocked"]
+
+
+def test_resolve_or_block_first_obstacle_routes_to_default_no_slack(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-resolve-first"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+    notify = unittest.mock.Mock()
+
+    with kb.connect(board=board) as conn:
+        kb.set_running(conn, tid, True, board=board)
+        outcome = kb.resolve_or_block(
+            conn, tid,
+            board=board,
+            reason="need API credentials",
+            kind="needs_input",
+            attempted_resolutions=["checked env"],
+            notify_fn=notify,
+        )
+        task = kb.get_task(conn, tid)
+        row = conn.execute(
+            "SELECT blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert outcome == "routed_to_default"
+    assert task.assignee == "default"
+    assert row["blocked"] == 0
+    notify.assert_not_called()
+
+
+def test_resolve_or_block_second_unresolved_blocks_and_notifies(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-resolve-second"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+    notify = unittest.mock.Mock()
+
+    with kb.connect(board=board) as conn:
+        kb.set_running(conn, tid, True, board=board)
+        first = kb.resolve_or_block(
+            conn, tid,
+            board=board,
+            reason="need API credentials",
+            kind="needs_input",
+            attempted_resolutions=["checked env"],
+            notify_fn=notify,
+        )
+        assert first == "routed_to_default"
+
+        # Simulate the ``default`` resolver's worker picking the card back up
+        # and running into the same unresolved obstacle.
+        kb.set_running(conn, tid, True, board=board)
+        outcome = kb.resolve_or_block(
+            conn, tid,
+            board=board,
+            reason="default could not find a substitute credential",
+            kind="needs_input",
+            attempted_resolutions=["searched project docs"],
+            notify_fn=notify,
+        )
+        task = kb.get_task(conn, tid)
+        row = conn.execute(
+            "SELECT running, blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        events = kb.list_events(conn, tid)
+
+    assert outcome == "blocked"
+    assert row["running"] == 0
+    assert row["blocked"] == 1
+    assert task.status == "blocked"
+    blocked_events = [e for e in events if e.kind == "blocked"]
+    assert len(blocked_events) == 1
+    notify.assert_called_once_with(
+        tid, "default could not find a substitute credential", board,
+    )
+
+
+def test_resolve_or_block_legacy_board_returns_none(kanban_home):
+    notify = unittest.mock.Mock()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Legacy task", assignee="alice")
+        before = dict(conn.execute(
+            "SELECT status, running, blocked, assignee FROM tasks WHERE id = ?", (tid,),
+        ).fetchone())
+        outcome = kb.resolve_or_block(
+            conn, tid, reason="whatever", kind="needs_input", notify_fn=notify,
+        )
+        after = dict(conn.execute(
+            "SELECT status, running, blocked, assignee FROM tasks WHERE id = ?", (tid,),
+        ).fetchone())
+
+    assert outcome is None
+    notify.assert_not_called()
+    assert after == before
