@@ -3487,6 +3487,75 @@ def test_complete_task_v2_no_diff_does_not_complete(kanban_home, tmp_path, monke
     assert not any(event.kind == "workflow_advanced" for event in events)
 
 
+def test_complete_task_v2_with_unresolved_preflight_resumes_instead_of_handoff(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """A v2 card with an unresolved product preflight (the T3.3 obstacle chain
+    routed it to the ``default`` resolver via ``resolve_or_block`` /
+    ``block_task``) must RESUME to its original assignee/step when that
+    resolver's turn ends via ``complete_task`` -- NOT be treated as real work
+    and routed through the commit-first ``handoff()``, even though a diff is
+    sitting uncommitted in the worktree.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-complete-task-preflight"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="developer-profile",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="Need API credentials",
+            kind="needs_input",
+            attempted_resolutions=["checked env"],
+            board=board,
+            human_escalation_assignee="default",
+        )
+        blocked_card = _card_snapshot(conn, tid)
+        assert blocked_card["assignee"] == "default"
+        assert blocked_card["current_step_key"] == "development"
+
+        # A stray uncommitted diff is present in the worktree -- if the
+        # buggy v2 branch fired here, it would wrongly commit it and
+        # advance the card, mistaking obstacle-resolution for real work.
+        (repo / "src.py").write_text("print('hi')\n", encoding="utf-8")
+
+        result = kb.complete_task(
+            conn,
+            tid,
+            summary="Found internal test token path",
+            board=board,
+        )
+
+        card = _card_snapshot(conn, tid)
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        head = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    assert result is True
+    assert card["current_step_key"] == "development"
+    assert card["assignee"] == "developer-profile"
+    assert task.status == "ready"
+    assert not any(event.kind == "handoff" for event in events)
+    assert [event.kind for event in events].count("human_input_preflight_resolved") == 1
+    # The legacy resume path never touches git -- the stray diff is still
+    # sitting there uncommitted (it was NOT swept into a handoff commit).
+    assert head != ""
+
+
 def test_complete_task_v2_terminal_release_measure_completes_to_done(kanban_home):
     """v2 terminal step (release_measure, no transition) still completes to
     ``done`` via the existing legacy terminal path -- no handoff advance.

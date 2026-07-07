@@ -5218,9 +5218,23 @@ def complete_task(
             ).fetchone()
             step_key = row["current_step_key"] if row is not None else None
             transition = PRODUCT_WORKFLOW_TRANSITIONS.get(str(step_key or ""))
-            if transition is not None and transition.get("next_step"):
-                # Non-terminal v2 step: route through the atomic commit-first
-                # handoff() (Phase 2) instead of the legacy advance below.
+            has_unresolved_preflight = bool(
+                _latest_unresolved_product_preflight(conn, task_id)
+            )
+            if (
+                transition is not None
+                and transition.get("next_step")
+                and not has_unresolved_preflight
+            ):
+                # Non-terminal v2 step, and no obstacle-resolution preflight
+                # pending: route through the atomic commit-first handoff()
+                # (Phase 2) instead of the legacy advance below. When a
+                # preflight IS pending, obstacle-resolution (not real work)
+                # just completed -- fall through to the legacy path below,
+                # which resumes the card to its original assignee/step
+                # (mirrors the ordering in `_complete_product_workflow_step`
+                # at line ~1533: preflight check before consulting the
+                # transition table).
                 advanced = handoff(
                     conn, task_id, board=board, summary=summary, metadata=metadata,
                 )
