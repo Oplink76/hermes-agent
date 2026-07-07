@@ -1438,3 +1438,59 @@ def is_gateway_running(
 ) -> bool:
     """Check if the gateway daemon is currently running."""
     return get_running_pid(pid_path, cleanup_stale=cleanup_stale) is not None
+
+
+def default_resolver_health(
+    *,
+    profile_name: str = "default",
+    is_running_fn=None,
+    profiles_fn=None,
+) -> dict:
+    """Report liveness of the `default` resolver's gateway process.
+
+    "default" is overloaded: it names both the resolver's kanban assignee
+    string and the conventional profile whose gateway spawns that resolver
+    as a worker. This checks the latter — the `default` profile's gateway
+    process — since "is the `default` gateway alive" is the right proxy for
+    "can the resolver run."
+
+    ``is_running_fn`` defaults to :func:`is_gateway_running` and
+    ``profiles_fn`` defaults to ``hermes_cli.profiles.list_profiles``; both
+    are injectable for unit testing without real pidfiles/profiles.
+    """
+    try:
+        from hermes_cli.profiles import list_profiles
+
+        resolved_profiles_fn = profiles_fn or list_profiles
+        profile = next(
+            (p for p in resolved_profiles_fn() if p.name == profile_name),
+            None,
+        )
+    except Exception:
+        profile = None
+
+    if profile is None:
+        return {
+            "resolver": profile_name,
+            "alive": False,
+            "reason": "profile_missing",
+            "pid_path": None,
+        }
+
+    try:
+        pid_path = profile.path / "gateway.pid"
+        resolved_is_running_fn = is_running_fn or is_gateway_running
+        alive = bool(resolved_is_running_fn(pid_path))
+        return {
+            "resolver": profile_name,
+            "alive": alive,
+            "reason": "running" if alive else "gateway_not_running",
+            "pid_path": str(pid_path),
+        }
+    except Exception:
+        return {
+            "resolver": profile_name,
+            "alive": False,
+            "reason": "error",
+            "pid_path": None,
+        }
