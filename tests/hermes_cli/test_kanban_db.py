@@ -2601,6 +2601,13 @@ def test_list_tasks_filters_workflow_template_and_step(kanban_home):
     assert [x.id for x in by_step] == [ta]
 
 
+def test_handoff_v2_flag_defaults_off_and_reads_meta(kanban_home):
+    import hermes_cli.kanban_db as kb
+    assert kb._handoff_v2_enabled({}) is False
+    assert kb._handoff_v2_enabled({"product_workflow": {"handoff_v2": True}}) is True
+    assert kb._handoff_v2_enabled({"product_workflow": {"handoff_v2": False}}) is False
+
+
 def test_product_completion_advances_card_to_next_role(kanban_home):
     kb.create_board("prod", preset="product")
     with kb.connect(board="prod") as conn:
