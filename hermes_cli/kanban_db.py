@@ -1780,6 +1780,15 @@ def _route_product_human_block_to_preflight(
         cur = conn.execute(sql, params)
         if cur.rowcount != 1:
             return False
+        # v2 flag maintenance: the worker that hit the obstacle has stopped,
+        # but ``default`` hasn't given up yet -- clear ``running`` only.
+        # ``blocked`` stays 0. Direct UPDATE (no _sync_legacy_status): the
+        # explicit ``resume_status`` above already accounts for cases the
+        # sync seam does not (e.g. a column status of "running").
+        if _handoff_v2_enabled(meta):
+            conn.execute(
+                "UPDATE tasks SET running = 0 WHERE id = ?", (task_id,),
+            )
         run_id = _end_run(
             conn, task_id,
             outcome="preflight",
@@ -1812,71 +1821,6 @@ def _route_product_human_block_to_preflight(
             run_id=run_id,
         )
     return True
-
-
-def resolve_or_block(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    board: Optional[str] = None,
-    reason: Optional[str] = None,
-    kind: Optional[str] = None,
-    attempted_resolutions: Optional[Iterable[str]] = None,
-    expected_run_id: Optional[int] = None,
-    notify_fn: Optional[Callable[[str, Optional[str], Optional[str]], Any]] = None,
-) -> Optional[str]:
-    """Resolution chain for a handoff_v2 worker that hit an obstacle.
-
-    Tries tiers in order before paging a human: (1) transient / dependency
-    waits self-clear via cooldown -- no ``blocked`` flag, no Slack; (2) a real
-    obstacle first routes to the Hermes ``default`` resolver via
-    :func:`_route_product_human_block_to_preflight` (reused, not
-    reimplemented); (3) only when ``default`` also fails (a preflight for
-    this task was already unresolved) does the card become ``blocked`` --
-    ``running`` is cleared first to keep the limbo invariant, then ``blocked``
-    is set and a ``blocked`` task_event is emitted (the gateway notifier turns
-    that event into Slack in production; ``notify_fn``, if given, is an
-    additional synchronous hook fired only on this final outcome).
-
-    Returns ``"cooldown"``, ``"routed_to_default"``, or ``"blocked"`` on a
-    handoff_v2 board. Returns ``None`` on a non-v2 board -- callers fall back
-    to :func:`block_task` for those.
-    """
-    meta = product_board_metadata(board)
-    if meta is None or not _handoff_v2_enabled(meta):
-        return None
-
-    if kind in ("transient", "dependency"):
-        with write_txn(conn):
-            _append_event(
-                conn, task_id, "resolve_cooldown", {"reason": reason, "kind": kind},
-            )
-        return "cooldown"
-
-    routed = _route_product_human_block_to_preflight(
-        conn,
-        task_id,
-        board=board,
-        reason=reason,
-        kind=kind,
-        attempted_resolutions=attempted_resolutions,
-        expected_run_id=expected_run_id,
-        human_escalation_assignee="default",
-    )
-    if routed is not None:
-        return "routed_to_default"
-
-    # ``default`` already had its chance (an unresolved preflight exists) and
-    # did not resolve it -- escalate to a human. Clear ``running`` first so
-    # the limbo invariant holds (a card can never be both running and
-    # blocked; see ``_assert_card_consistent``).
-    set_running(conn, task_id, False, board=board)
-    set_blocked(conn, task_id, True, board=board, reason=reason)
-    with write_txn(conn):
-        _append_event(conn, task_id, "blocked", {"reason": reason, "kind": kind})
-    if notify_fn is not None:
-        notify_fn(task_id, reason, board)
-    return "blocked"
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
@@ -5867,6 +5811,7 @@ def block_task(
     )
     if product_preflight is not None:
         return product_preflight
+    meta = product_board_metadata(board)
     routed_to = "blocked"
     recurrences = 0
     attempts = [str(a).strip() for a in (attempted_resolutions or []) if str(a).strip()]
@@ -5906,6 +5851,16 @@ def block_task(
             )
             if cur.rowcount != 1:
                 return False
+            # v2 flag maintenance: a dependency wait is neither running nor
+            # blocked -- (0, 0) -- but ``status`` here is the explicit
+            # 'todo' just set above, so a direct UPDATE (no
+            # _sync_legacy_status) so it isn't clobbered back to a derived
+            # column status.
+            if _handoff_v2_enabled(meta):
+                conn.execute(
+                    "UPDATE tasks SET running = 0, blocked = 0 WHERE id = ?",
+                    (task_id,),
+                )
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -5960,6 +5915,14 @@ def block_task(
             )
             if cur.rowcount != 1:
                 return False
+            # v2 flag maintenance: triage (like todo) is neither running nor
+            # blocked -- direct UPDATE, no _sync_legacy_status (would
+            # clobber the explicit 'triage' status).
+            if _handoff_v2_enabled(meta):
+                conn.execute(
+                    "UPDATE tasks SET running = 0, blocked = 0 WHERE id = ?",
+                    (task_id,),
+                )
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -6015,6 +5978,10 @@ def block_task(
                 )
             if cur.rowcount != 1:
                 return False
+            # v2 seam: the 'blocked' landing is flag-derivable, so route
+            # through _apply_v2_flags (sync gives 'blocked' -- consistent
+            # with the status just set above).
+            _apply_v2_flags(conn, task_id, meta, running=False, blocked=True)
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -6126,6 +6093,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
+    meta = product_board_metadata(_board_slug_for_connection(conn))
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
@@ -6175,6 +6143,15 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        # v2 flag maintenance: a just-unblocked card is idle -- (0, 0) --
+        # regardless of whether it lands in 'todo' or 'ready'. Direct
+        # UPDATE, no _sync_legacy_status (it may land in 'todo', which the
+        # sync seam cannot derive).
+        if _handoff_v2_enabled(meta):
+            conn.execute(
+                "UPDATE tasks SET running = 0, blocked = 0 WHERE id = ?",
+                (task_id,),
+            )
         _append_event(
             conn, task_id, "unblocked",
             {"status": new_status} if new_status != "ready" else None,

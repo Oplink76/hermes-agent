@@ -3821,8 +3821,8 @@ def test_complete_task_v2_with_unresolved_preflight_resumes_instead_of_handoff(
     kanban_home, tmp_path, monkeypatch,
 ):
     """A v2 card with an unresolved product preflight (the T3.3 obstacle chain
-    routed it to the ``default`` resolver via ``resolve_or_block`` /
-    ``block_task``) must RESUME to its original assignee/step when that
+    routed it to the ``default`` resolver via ``block_task``) must RESUME
+    to its original assignee/step when that
     resolver's turn ends via ``complete_task`` -- NOT be treated as real work
     and routed through the commit-first ``handoff()``, even though a diff is
     sitting uncommitted in the worktree.
@@ -7454,128 +7454,162 @@ def test_handoff_v2_flag_defaults_off_and_reads_meta(kanban_home):
 
 
 # ---------------------------------------------------------------------------
-# resolve_or_block -- default resolver then blocked+Slack chain (T3.3)
+# block_task / unblock_task -- v2 flag maintenance through the REAL worker
+# block seam (R2; remediation of Codex-confirmed P1c)
 # ---------------------------------------------------------------------------
 
-def test_resolve_or_block_transient_returns_cooldown_no_block_no_slack(kanban_home, monkeypatch):
+def test_block_task_v2_board_sets_blocked_flag_via_real_entry(kanban_home, monkeypatch):
+    """The REAL worker block path (block_task) -- not a helper -- must set
+    blocked=1 and clear running on the final ``blocked`` landing. First call
+    (kind="needs_input") routes to the Hermes ``default`` preflight and only
+    clears ``running``; the second call (same unresolved preflight) lands in
+    ``blocked`` and is where the P1c flag gap lived."""
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
-    board = "v2-resolve-transient"
+    board = "v2-block-blocked"
     _v2_product_board(board)
     tid = _seed_v2_card(board, step="development")
-    notify = unittest.mock.Mock()
+    meta = kb.read_board_metadata(board)
 
     with kb.connect(board=board) as conn:
-        kb.set_running(conn, tid, True, board=board)
-        outcome = kb.resolve_or_block(
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="host:1") is not None
+
+        first = kb.block_task(
+            conn, tid, reason="need API credentials", kind="needs_input", board=board,
+        )
+        row_after_first = conn.execute(
+            "SELECT running, blocked, assignee FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+        second = kb.block_task(
             conn, tid,
+            reason="default could not find a substitute credential",
+            kind="needs_input",
             board=board,
-            reason="rate limited",
-            kind="transient",
-            notify_fn=notify,
         )
         row = conn.execute(
             "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
         ).fetchone()
-        events = kb.list_events(conn, tid)
 
-    assert outcome == "cooldown"
-    assert row["blocked"] == 0
-    notify.assert_not_called()
-    assert not [e for e in events if e.kind == "blocked"]
+    assert first is True
+    assert row_after_first["running"] == 0
+    assert row_after_first["blocked"] == 0
+    assert row_after_first["assignee"] == "default"
+
+    assert second is True
+    assert row["running"] == 0
+    assert row["blocked"] == 1
+    assert row["status"] == "blocked"
+    assert row["status"] == kb._legacy_status(row, meta)
 
 
-def test_resolve_or_block_first_obstacle_routes_to_default_no_slack(kanban_home, monkeypatch):
+def test_block_task_v2_board_clears_running_flag_on_running_card(kanban_home, monkeypatch):
+    """A running (flag=1) v2 card that blocks must not end up in limbo --
+    running must clear when blocked is set. Uses kind="transient" (not a
+    PRODUCT_HUMAN_BLOCK_KINDS member) to land directly in ``blocked``,
+    bypassing the preflight detour so this isolates the blocked-landing seam."""
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
-    board = "v2-resolve-first"
+    board = "v2-block-running-clears"
     _v2_product_board(board)
     tid = _seed_v2_card(board, step="development")
-    notify = unittest.mock.Mock()
+    meta = kb.read_board_metadata(board)
 
     with kb.connect(board=board) as conn:
-        kb.set_running(conn, tid, True, board=board)
-        outcome = kb.resolve_or_block(
-            conn, tid,
-            board=board,
-            reason="need API credentials",
-            kind="needs_input",
-            attempted_resolutions=["checked env"],
-            notify_fn=notify,
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="host:1") is not None
+        pre = conn.execute(
+            "SELECT running, blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert pre["running"] == 1
+
+        outcome = kb.block_task(
+            conn, tid, reason="rate limited", kind="transient", board=board,
         )
-        task = kb.get_task(conn, tid)
         row = conn.execute(
-            "SELECT blocked FROM tasks WHERE id = ?", (tid,),
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
         ).fetchone()
 
-    assert outcome == "routed_to_default"
-    assert task.assignee == "default"
-    assert row["blocked"] == 0
-    notify.assert_not_called()
+    assert outcome is True
+    assert row["running"] == 0
+    assert row["blocked"] == 1
+    assert row["status"] == "blocked"
+    assert row["status"] == kb._legacy_status(row, meta)
 
 
-def test_resolve_or_block_second_unresolved_blocks_and_notifies(kanban_home, monkeypatch):
+def test_block_task_v2_board_dependency_lands_todo_without_clobbering_status(kanban_home, monkeypatch):
+    """A dependency block must land status='todo' with flags (0, 0) -- and
+    critically must NOT call the sync seam, which would clobber the explicit
+    'todo' status back to a derived column status."""
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
-    board = "v2-resolve-second"
+    board = "v2-block-dependency"
     _v2_product_board(board)
     tid = _seed_v2_card(board, step="development")
-    notify = unittest.mock.Mock()
 
     with kb.connect(board=board) as conn:
-        kb.set_running(conn, tid, True, board=board)
-        first = kb.resolve_or_block(
-            conn, tid,
-            board=board,
-            reason="need API credentials",
-            kind="needs_input",
-            attempted_resolutions=["checked env"],
-            notify_fn=notify,
-        )
-        assert first == "routed_to_default"
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="host:1") is not None
 
-        # Simulate the ``default`` resolver's worker picking the card back up
-        # and running into the same unresolved obstacle.
-        kb.set_running(conn, tid, True, board=board)
-        outcome = kb.resolve_or_block(
-            conn, tid,
-            board=board,
-            reason="default could not find a substitute credential",
-            kind="needs_input",
-            attempted_resolutions=["searched project docs"],
-            notify_fn=notify,
+        outcome = kb.block_task(
+            conn, tid, reason="waiting on parent", kind="dependency", board=board,
         )
-        task = kb.get_task(conn, tid)
+        row = conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert outcome is True
+    assert row["status"] == "todo"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+
+
+def test_unblock_task_v2_board_clears_blocked_and_running_flags(kanban_home, monkeypatch):
+    """A blocked v2 card, once unblocked through the real entry point, must
+    have both flags cleared -- an unblocked card is idle, not running."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-unblock-clears"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+
+    with kb.connect(board=board) as conn:
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="host:1") is not None
+        assert kb.block_task(
+            conn, tid, reason="rate limited", kind="transient", board=board,
+        ) is True
+        blocked_row = conn.execute(
+            "SELECT blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert blocked_row["blocked"] == 1
+
+        assert kb.unblock_task(conn, tid) is True
+        row = conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert row["blocked"] == 0
+    assert row["running"] == 0
+    assert row["status"] in ("todo", "ready")
+
+
+def test_block_task_legacy_board_does_not_touch_flags(kanban_home):
+    """Legacy (non-v2) boards: block_task/unblock_task must remain
+    byte-for-byte unchanged -- neither flag is touched."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Legacy task", assignee="alice")
+        assert kb.block_task(conn, tid, reason="need input") is True
+        row = conn.execute(
+            "SELECT status, running, blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert row["status"] == "blocked"
+        assert row["running"] == 0
+        assert row["blocked"] == 0
+
+        assert kb.unblock_task(conn, tid) is True
         row = conn.execute(
             "SELECT running, blocked FROM tasks WHERE id = ?", (tid,),
         ).fetchone()
-        events = kb.list_events(conn, tid)
-
-    assert outcome == "blocked"
-    assert row["running"] == 0
-    assert row["blocked"] == 1
-    assert task.status == "blocked"
-    blocked_events = [e for e in events if e.kind == "blocked"]
-    assert len(blocked_events) == 1
-    notify.assert_called_once_with(
-        tid, "default could not find a substitute credential", board,
-    )
-
-
-def test_resolve_or_block_legacy_board_returns_none(kanban_home):
-    notify = unittest.mock.Mock()
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="Legacy task", assignee="alice")
-        before = dict(conn.execute(
-            "SELECT status, running, blocked, assignee FROM tasks WHERE id = ?", (tid,),
-        ).fetchone())
-        outcome = kb.resolve_or_block(
-            conn, tid, reason="whatever", kind="needs_input", notify_fn=notify,
-        )
-        after = dict(conn.execute(
-            "SELECT status, running, blocked, assignee FROM tasks WHERE id = ?", (tid,),
-        ).fetchone())
-
-    assert outcome is None
-    notify.assert_not_called()
-    assert after == before
+        assert row["running"] == 0
+        assert row["blocked"] == 0
 
 
 # ---------------------------------------------------------------------------
