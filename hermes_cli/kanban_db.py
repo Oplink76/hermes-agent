@@ -6967,7 +6967,7 @@ def merge_epic_to_main(
             _fail("merge conflict")
             return "conflict"
 
-        status_result = _run(["status", "--porcelain"])
+        status_result = _run(["status", "--porcelain", "--untracked-files=no"])
         clean = bool(
             status_result is not None
             and status_result.returncode == 0

@@ -7149,6 +7149,62 @@ def test_merge_epic_to_main_happy_path_merges_and_never_pushes(kanban_home, tmp_
     assert status.stdout.strip() == "", "working tree must be clean after merge"
 
 
+def test_merge_epic_to_main_untracked_sibling_worktree_still_merges(kanban_home, tmp_path, monkeypatch):
+    """Dogfood repro: a story worktree lives at ``<repo>/.worktrees/<story_id>``
+    and is NOT gitignored, so it shows up as ``?? .worktrees/`` in
+    ``git status --porcelain`` on main. That untracked entry must NOT trip
+    the post-merge cleanliness check -- only tracked/conflicted state should.
+    """
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-merge-untracked-worktree"
+    _v2_product_board_with_repo(board, repo)
+    epic, children = _make_epic_with_children(board)
+    with kb.connect(board=board) as conn:
+        for child in children:
+            _set_task_status(conn, child, "done")
+
+    epic_branch = kb.epic_branch_for(epic)
+    epic_sha = _make_epic_branch(repo, epic_branch)
+
+    # Real linked worktree at <repo>/.worktrees/story, exactly as v2 story
+    # dispatch creates it -- untracked from main's point of view.
+    worktree_branch = "wt/story-1"
+    worktree_path = repo / ".worktrees" / "story-1"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", worktree_branch, str(worktree_path), "main"],
+        check=True, capture_output=True, text=True,
+    )
+
+    # Sanity-check the repro premise before exercising the fix.
+    dirty_status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True,
+    )
+    assert "?? .worktrees/" in dirty_status.stdout, "expected the sibling worktree to be untracked on main"
+    clean_status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True,
+    )
+    assert clean_status.stdout.strip() == "", "tracked-only status must be clean"
+
+    calls = _record_git_calls(monkeypatch)
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        result = kb.merge_epic_to_main(
+            conn, epic, board=board, verify_fn=lambda b: True, notify_fn=notify,
+        )
+
+    assert result == "merged"
+    notify.assert_not_called()
+    _assert_no_push(calls)
+    assert not any("reset" in cmd for cmd in calls), "clean-but-untracked main must not trigger a reset"
+
+    ancestor = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", epic_sha, "main"],
+        capture_output=True, text=True,
+    )
+    assert ancestor.returncode == 0, "main must contain the epic's commit"
+
+
 def test_merge_epic_to_main_conflict_aborts_blocks_and_never_pushes(kanban_home, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
