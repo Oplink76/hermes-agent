@@ -7048,6 +7048,141 @@ def merge_epic_to_main(
         return "verify_failed"
 
 
+def _integrate_story_fail_safe(
+    conn: sqlite3.Connection,
+    story_id: str,
+    reason: str,
+    *,
+    board: Optional[str],
+    notify_fn: Optional[Callable[[str, str, Optional[str]], None]],
+) -> None:
+    """Block the STORY + emit an event + notify. Never raises.
+
+    Mirrors :func:`_merge_epic_fail_safe`, but a failed story->epic
+    integration merge blocks the STORY (the thing whose merge failed), not
+    the epic -- the epic branch itself is left untouched on a conflict.
+    """
+    try:
+        set_running(conn, story_id, False, board=board)
+        set_blocked(conn, story_id, True, board=board, reason=reason)
+        with write_txn(conn):
+            _append_event(
+                conn, story_id, "blocked",
+                {"reason": reason, "kind": "story_integration_failed"},
+            )
+    except Exception:
+        pass
+    if notify_fn is not None:
+        try:
+            notify_fn(story_id, reason, board)
+        except Exception:
+            pass
+
+
+def integrate_story_to_epic(
+    conn: sqlite3.Connection,
+    story_id: str,
+    *,
+    board: Optional[str] = None,
+    notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
+) -> Optional[str]:
+    """Merge a Done story's branch into its epic's integration branch, LOCALLY.
+
+    Phase 4 branches each v2 story off its epic's integration branch
+    (:func:`_story_base_branch`) onto its own branch, but nothing merges a
+    completed story's commits BACK into the epic branch -- so a downstream
+    sibling story never sees an upstream story's work, and
+    :func:`merge_epic_to_main` has nothing real to carry to main. This
+    closes that gap; it is called on story completion and from the bounded
+    :func:`reconcile` safety net (W3).
+
+    Returns ``None`` on a non-``handoff_v2`` board, a story with no epic
+    parent, or when the repo / epic branch / story branch can't be resolved
+    (no git mutation in any of these cases -- mirrors
+    :func:`merge_epic_to_main`'s ``"not_ready"`` short-circuits, collapsed to
+    ``None`` here since there's no separate not-ready state to report);
+    ``"already_integrated"`` when the story branch is already an ancestor of
+    the epic branch (idempotent -- no re-merge); ``"conflict"`` when the
+    merge fails (aborted; the STORY -- not the epic -- is blocked and
+    ``notify_fn`` invoked, mirroring :func:`_merge_epic_fail_safe`'s
+    fail-safe pattern via :func:`_integrate_story_fail_safe`); ``"integrated"``
+    on success.
+
+    The merge happens in a DEDICATED epic worktree
+    (``<repo_root>/.worktrees/epic-<epic_id>``) -- never in ``repo_root``'s
+    own checkout -- so this never disturbs whatever branch ``repo_root`` (or
+    any other card's worktree) happens to have checked out.
+    """
+    # =========================================================================
+    # LOCAL only -- never `git push` / touch origin. Production deploys and
+    # `git push origin` are HUMAN-ONLY. This function must NEVER call
+    # `git push`, and must NEVER import or call web_git.py's push helpers
+    # (`_review_push` / `review_push` / `review_create_pr`). Only local git
+    # verbs below: merge-base, worktree add, merge, merge --abort.
+    # =========================================================================
+    meta = product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta):
+        return None
+
+    parents = parent_ids(conn, story_id)
+    if not parents:
+        return None
+    epic_id = parents[0]
+
+    try:
+        board_default = str(meta.get("default_workdir") or "").strip()
+        repo_root = _git_toplevel(Path(board_default).expanduser()) if board_default else None
+        if repo_root is None:
+            return None
+        epic_branch = epic_branch_for(epic_id)
+        story = get_task(conn, story_id)
+        story_branch = (story.branch_name or "").strip() if story is not None else ""
+        if (
+            not story_branch
+            or not _git_branch_exists(repo_root, epic_branch)
+            or not _git_branch_exists(repo_root, story_branch)
+        ):
+            return None
+    except Exception:
+        return None
+
+    def _run(args: list[str], *, cwd: Path, timeout: int = 60):
+        try:
+            return subprocess.run(
+                ["git", "-C", str(cwd), *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except Exception:
+            return None
+
+    try:
+        ancestor_result = _run(
+            ["merge-base", "--is-ancestor", story_branch, epic_branch], cwd=repo_root,
+        )
+        if ancestor_result is not None and ancestor_result.returncode == 0:
+            return "already_integrated"
+
+        epic_worktree = repo_root / ".worktrees" / f"epic-{epic_id}"
+        _ensure_git_worktree(repo_root, epic_worktree, epic_branch)
+
+        merge_result = _run(
+            ["merge", "--no-ff", story_branch, "-m", f"integrate story {story_id}"],
+            cwd=epic_worktree, timeout=120,
+        )
+        if merge_result is None or merge_result.returncode != 0:
+            _run(["merge", "--abort"], cwd=epic_worktree)
+            reason = "story→epic merge conflict"
+            _integrate_story_fail_safe(conn, story_id, reason, board=board, notify_fn=notify_fn)
+            return "conflict"
+
+        return "integrated"
+    except Exception:
+        return None
+
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
@@ -7452,6 +7587,10 @@ class ReconcileResult:
     spawned: list[str] = field(default_factory=list)
     """Task ids spawned this pass via :func:`_spawn_one_v2` (claim-CAS makes
     this fire-once)."""
+    integrated: list[str] = field(default_factory=list)
+    """Story task ids merged into their epic's integration branch this pass
+    via :func:`integrate_story_to_epic` (at most one per pass -- see the
+    added step at the end of :func:`reconcile`'s docstring)."""
 
 
 def reconcile(
@@ -7490,6 +7629,15 @@ def reconcile(
     ready+idle) -- never more than one action, never a spawn storm. Running
     ``reconcile`` repeatedly over a healthy (live-PID) running card does
     nothing on every pass.
+
+    3. **Story->epic integration (W3).** At most ONE ``done`` story whose
+       branch is not yet an ancestor of its epic's integration branch is
+       merged in via :func:`integrate_story_to_epic` this pass -- the safety
+       net for the same reason steps 1-2 exist: nothing else guarantees a
+       completed story's commits land in the epic branch. Bounded to one per
+       pass (mirroring the one-action discipline above); already-integrated
+       stories are skipped without counting against the bound, so this step
+       still fires on the first genuinely unintegrated candidate.
 
     Non-v2 boards return an empty ``ReconcileResult`` (a no-op); legacy
     boards keep using ``dispatch_once`` unchanged.
@@ -7570,6 +7718,21 @@ def reconcile(
         )
         if pid_or_none is not None:
             result.spawned.append(task_id)
+
+    # Step 3: integrate at most one un-integrated Done story into its epic
+    # branch this pass (W3). Scans done cards in completion order;
+    # "already_integrated" / no-epic-parent / unresolvable cards are skipped
+    # (not counted as this pass's action) so a real integration can still
+    # happen this pass even if earlier done cards are already merged.
+    done_rows = conn.execute(
+        "SELECT id FROM tasks WHERE status = 'done' ORDER BY completed_at ASC"
+    ).fetchall()
+    for row in done_rows:
+        story_id = row["id"]
+        outcome = integrate_story_to_epic(conn, story_id, board=board)
+        if outcome == "integrated":
+            result.integrated.append(story_id)
+            break
 
     return result
 

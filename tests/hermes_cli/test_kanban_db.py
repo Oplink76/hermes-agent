@@ -4118,6 +4118,37 @@ def test_reconcile_spawns_stranded_ready_card_idempotently(kanban_home, tmp_path
     assert spawns == [tid]  # spawn count stays <= 1 across both passes
 
 
+def test_reconcile_integrates_one_done_unintegrated_story_per_pass(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """A v2 done+unintegrated story is merged into its epic branch once; a
+    second pass sees it's already integrated and does not re-merge it."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-integrate"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
+
+    with kb.connect(board=board) as conn:
+        first = kb.reconcile(conn, board=board)
+    assert first.integrated == [story]
+
+    ancestor = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", story_sha, epic_branch],
+        capture_output=True, text=True,
+    )
+    assert ancestor.returncode == 0, "epic branch must contain the story's commit"
+
+    calls = _record_git_calls(monkeypatch)
+    with kb.connect(board=board) as conn:
+        second = kb.reconcile(conn, board=board)
+    assert second.integrated == []
+    assert not any("merge" in cmd and "--no-ff" in cmd for cmd in calls), (
+        "second pass must not re-merge an already-integrated story"
+    )
+
+
 def test_reconcile_legacy_board_is_noop(kanban_home, monkeypatch):
     """Non-v2 (legacy) boards never use reconcile -- empty result, spawn_fn never called."""
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
@@ -7692,6 +7723,223 @@ def test_merge_epic_to_main_non_v2_board_returns_none(kanban_home, tmp_path, mon
         result = kb.merge_epic_to_main(
             conn, epic, board=board, verify_fn=lambda b: True, notify_fn=notify,
         )
+
+    assert result is None
+    assert calls == []
+    notify.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# integrate_story_to_epic -- Hermes-run LOCAL merge of a Done story's branch
+# into its epic's integration branch (W3).
+#
+# THE HARD BOUNDARY: this function must never `git push` / touch origin.
+# Every test below records the git subcommands actually executed (real
+# subprocess, real temp git repos) and asserts none of them is "push".
+# ---------------------------------------------------------------------------
+
+def _make_story_branch(repo: Path, story_branch: str, *, from_branch: str) -> str:
+    """Branch ``story_branch`` off ``from_branch`` and add a unique commit.
+    Returns the new commit sha. Leaves ``from_branch`` checked out."""
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", story_branch, from_branch],
+        check=True, capture_output=True, text=True,
+    )
+    sha = _commit_file(repo, "story_work.txt", "story work\n", "story commit")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", from_branch],
+        check=True, capture_output=True, text=True,
+    )
+    return sha
+
+
+def _make_epic_and_done_story(board: str, repo: Path) -> tuple[str, str, str, str]:
+    """Create an epic + a Done story with a real branch off the epic branch.
+
+    Returns ``(epic, story, epic_branch, story_sha)``.
+    """
+    with kb.connect(board=board) as conn:
+        epic = kb.create_task(conn, title="Epic", board=board)
+    epic_branch = kb.epic_branch_for(epic)
+    _make_epic_branch(repo, epic_branch)
+
+    story_branch = f"story/{epic}-s1"
+    story_sha = _make_story_branch(repo, story_branch, from_branch=epic_branch)
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "main"], check=True, capture_output=True, text=True,
+    )
+
+    with kb.connect(board=board) as conn:
+        story = kb.create_task(
+            conn, title="Story", board=board, parents=[epic],
+            workspace_kind="worktree", workspace_path=str(repo),
+            branch_name=story_branch,
+        )
+        _set_task_status(conn, story, "done")
+    return epic, story, epic_branch, story_sha
+
+
+def test_integrate_story_to_epic_merges_and_never_pushes(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-integrate-happy"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
+
+    calls = _record_git_calls(monkeypatch)
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        result = kb.integrate_story_to_epic(conn, story, board=board, notify_fn=notify)
+
+    assert result == "integrated"
+    notify.assert_not_called()
+    _assert_no_push(calls)
+
+    ancestor = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", story_sha, epic_branch],
+        capture_output=True, text=True,
+    )
+    assert ancestor.returncode == 0, "epic branch must contain the story's commit"
+
+    current_branch = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--show-current"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assert current_branch == "main", "repo_root's checkout must be undisturbed"
+
+
+def test_integrate_story_to_epic_idempotent_second_call_is_noop(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-integrate-idempotent"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
+
+    with kb.connect(board=board) as conn:
+        first = kb.integrate_story_to_epic(conn, story, board=board)
+    assert first == "integrated"
+
+    calls = _record_git_calls(monkeypatch)
+    with kb.connect(board=board) as conn:
+        second = kb.integrate_story_to_epic(conn, story, board=board)
+
+    assert second == "already_integrated"
+    assert not any("merge" in cmd and "--no-ff" in cmd for cmd in calls), (
+        "must not re-merge an already-integrated story"
+    )
+    _assert_no_push(calls)
+
+
+def test_integrate_story_to_epic_conflict_aborts_blocks_story_and_never_pushes(
+    kanban_home, tmp_path, monkeypatch,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-integrate-conflict"
+    _v2_product_board_with_repo(board, repo)
+
+    with kb.connect(board=board) as conn:
+        epic = kb.create_task(conn, title="Epic", board=board)
+    epic_branch = kb.epic_branch_for(epic)
+    _make_epic_branch(repo, epic_branch)
+
+    # Epic branch and story branch both modify the same file differently so
+    # the merge conflicts.
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", epic_branch], check=True,
+        capture_output=True, text=True,
+    )
+    _commit_file(repo, "shared.txt", "epic version\n", "epic edits shared")
+    story_branch = f"story/{epic}-s1"
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", story_branch, epic_branch],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "reset", "--hard", "HEAD~1"], check=True,
+        capture_output=True, text=True,
+    )
+    _commit_file(repo, "shared.txt", "story version\n", "story edits shared")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "main"], check=True, capture_output=True, text=True,
+    )
+
+    with kb.connect(board=board) as conn:
+        story = kb.create_task(
+            conn, title="Story", board=board, parents=[epic],
+            workspace_kind="worktree", workspace_path=str(repo),
+            branch_name=story_branch,
+        )
+        _set_task_status(conn, story, "done")
+
+    calls = _record_git_calls(monkeypatch)
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        result = kb.integrate_story_to_epic(conn, story, board=board, notify_fn=notify)
+
+    assert result == "conflict"
+    _assert_no_push(calls)
+    notify.assert_called_once()
+
+    epic_worktree = repo / ".worktrees" / f"epic-{epic}"
+    status = subprocess.run(
+        ["git", "-C", str(epic_worktree), "status", "--porcelain"],
+        capture_output=True, text=True,
+    )
+    assert status.stdout.strip() == "", "merge --abort must leave the epic worktree clean"
+
+    with kb.connect(board=board) as conn:
+        row = conn.execute("SELECT blocked FROM tasks WHERE id = ?", (story,)).fetchone()
+    assert row["blocked"] == 1
+
+    current_branch = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--show-current"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assert current_branch == "main", "repo_root's checkout must be undisturbed"
+
+
+def test_integrate_story_to_epic_non_v2_board_returns_none(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "legacy-integrate-board"
+    kb.create_board(board, name="Legacy Board", default_workdir=str(repo))
+    with kb.connect(board=board) as conn:
+        epic = kb.create_task(conn, title="Epic", board=board)
+        story = kb.create_task(
+            conn, title="Story", board=board, parents=[epic],
+            workspace_kind="worktree", workspace_path=str(repo),
+            branch_name="story/s1",
+        )
+        _set_task_status(conn, story, "done")
+
+    calls = _record_git_calls(monkeypatch)
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        result = kb.integrate_story_to_epic(conn, story, board=board, notify_fn=notify)
+
+    assert result is None
+    assert calls == []
+    notify.assert_not_called()
+
+
+def test_integrate_story_to_epic_no_epic_parent_returns_none(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-integrate-no-parent"
+    _v2_product_board_with_repo(board, repo)
+    with kb.connect(board=board) as conn:
+        story = kb.create_task(
+            conn, title="Lonely Story", board=board,
+            workspace_kind="worktree", workspace_path=str(repo),
+            branch_name="story/lonely",
+        )
+        _set_task_status(conn, story, "done")
+
+    calls = _record_git_calls(monkeypatch)
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        result = kb.integrate_story_to_epic(conn, story, board=board, notify_fn=notify)
 
     assert result is None
     assert calls == []
