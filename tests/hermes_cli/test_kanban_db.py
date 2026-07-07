@@ -39,6 +39,17 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
+def _commit_file(repo: Path, name: str, content: str, message: str) -> str:
+    """Write + commit a file on whatever branch is currently checked out in
+    ``repo``; returns the new commit sha."""
+    (repo / name).write_text(content, encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", name], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", message], check=True, capture_output=True, text=True)
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
 # ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------
@@ -2763,6 +2774,209 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
     assert listed.count(f"worktree {expected}\n") == 1
     assert f"worktree {expected}/.worktrees/{tid}" not in listed
     assert f"branch refs/heads/{actual_branch}" in listed
+
+
+# ---------------------------------------------------------------------------
+# Epic-branch base ref threading for v2 story worktrees (T4.1)
+# ---------------------------------------------------------------------------
+
+def test_ensure_git_worktree_base_param_branches_off_given_branch(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    subprocess.run(["git", "-C", str(repo), "branch", "feat"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "checkout", "feat"], check=True, capture_output=True, text=True)
+    feat_sha = _commit_file(repo, "feat.txt", "feat\n", "feat commit")
+    subprocess.run(["git", "-C", str(repo), "checkout", "main"], check=True, capture_output=True, text=True)
+
+    target = repo / ".worktrees" / "story1"
+    kb._ensure_git_worktree(repo, target, "story1", base="feat")
+
+    assert (target / "feat.txt").exists()
+    subprocess.run(
+        ["git", "-C", str(target), "merge-base", "--is-ancestor", feat_sha, "HEAD"],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def test_ensure_git_worktree_default_base_still_branches_off_head(tmp_path):
+    """Legacy call sites (no ``base`` kwarg) keep branching off HEAD, byte-for-byte."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    subprocess.run(["git", "-C", str(repo), "branch", "feat"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "checkout", "feat"], check=True, capture_output=True, text=True)
+    _commit_file(repo, "feat.txt", "feat\n", "feat commit")
+    subprocess.run(["git", "-C", str(repo), "checkout", "main"], check=True, capture_output=True, text=True)
+    head_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    target = repo / ".worktrees" / "story-legacy"
+    kb._ensure_git_worktree(repo, target, "story-legacy")
+
+    assert not (target / "feat.txt").exists()
+    worktree_head = subprocess.run(
+        ["git", "-C", str(target), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert worktree_head == head_sha
+
+
+def test_epic_branch_for_naming():
+    assert kb.epic_branch_for("epic-123") == "epic/epic-123"
+
+
+def test_ensure_epic_branch_creates_off_head_idempotently(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    epic_branch = kb.epic_branch_for("epic-1")
+
+    kb._ensure_epic_branch(repo, epic_branch)
+    assert kb._git_branch_exists(repo, epic_branch)
+    head_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    branch_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", epic_branch], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert branch_sha == head_sha
+
+    # Idempotent: calling again does not error or move the branch.
+    kb._ensure_epic_branch(repo, epic_branch)
+    branch_sha_again = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", epic_branch], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert branch_sha_again == head_sha
+
+
+def test_story_base_branch_v2_story_with_epic_parent_returns_epic_branch(kanban_home):
+    board = "v2-story-base-branch"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        epic = kb.create_task(conn, title="Epic", board=board)
+        story = kb.create_task(conn, title="Story", board=board, parents=[epic])
+        result = kb._story_base_branch(conn, story, board=board)
+    assert result == kb.epic_branch_for(epic)
+
+
+def test_story_base_branch_no_parent_returns_none(kanban_home):
+    board = "v2-story-base-branch-no-parent"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        story = kb.create_task(conn, title="Story", board=board)
+        result = kb._story_base_branch(conn, story, board=board)
+    assert result is None
+
+
+def test_story_base_branch_non_v2_board_returns_none(kanban_home):
+    board = "legacy-story-base-branch"
+    kb.create_board(board, name="Legacy Board", preset="product")
+    with kb.connect(board=board) as conn:
+        epic = kb.create_task(conn, title="Epic", board=board)
+        story = kb.create_task(conn, title="Story", board=board, parents=[epic])
+        result = kb._story_base_branch(conn, story, board=board)
+    assert result is None
+
+
+def test_resolve_worktree_workspace_default_base_branch_none_uses_head(kanban_home, tmp_path):
+    """Legacy call sites (no ``base_branch`` kwarg) keep branching off HEAD."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    head_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ship", workspace_kind="worktree", workspace_path=str(repo))
+        task = kb.get_task(conn, t)
+        assert task is not None
+        ws, _branch = kb._resolve_worktree_workspace(task)
+    ws_head = subprocess.run(
+        ["git", "-C", str(ws), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert ws_head == head_sha
+
+
+def test_story_worktree_branches_off_epic_branch_contains_upstream_commit(kanban_home, tmp_path):
+    """The plan's key test: a downstream story's worktree must contain the
+    upstream story's committed code, proven by branching off the epic branch."""
+    board = "v2-epic-branching"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+
+    with kb.connect(board=board) as conn:
+        epic = kb.create_task(conn, title="Epic", board=board)
+        epic_branch = kb.epic_branch_for(epic)
+
+    # Simulate an upstream story's integrated commit landing on the epic branch.
+    kb._ensure_epic_branch(repo, epic_branch)
+    subprocess.run(["git", "-C", str(repo), "checkout", epic_branch], check=True, capture_output=True, text=True)
+    upstream_sha = _commit_file(repo, "upstream.txt", "upstream story code\n", "upstream story")
+    subprocess.run(["git", "-C", str(repo), "checkout", "main"], check=True, capture_output=True, text=True)
+
+    with kb.connect(board=board) as conn:
+        story = kb.create_task(
+            conn, title="Story", board=board, parents=[epic],
+            workspace_kind="worktree", workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, story)
+        assert task is not None
+        ws, _branch = kb._resolve_worktree_workspace(
+            task, board=board, base_branch=epic_branch,
+        )
+
+    assert (ws / "upstream.txt").exists()
+    subprocess.run(
+        ["git", "-C", str(ws), "merge-base", "--is-ancestor", upstream_sha, "HEAD"],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def test_spawn_one_v2_wires_story_base_branch_to_epic(kanban_home, tmp_path, monkeypatch):
+    """_spawn_one_v2 (the v2 spawn path) computes _story_base_branch and threads
+    it into _resolve_worktree_workspace, so a v2 story's worktree lands on top
+    of its epic branch -- without touching the live dispatch loop."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-spawn-epic-branch"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    import hermes_cli.profiles as profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+
+    with kb.connect(board=board) as conn:
+        epic = kb.create_task(conn, title="Epic", board=board)
+        epic_branch = kb.epic_branch_for(epic)
+        kb.complete_task(conn, epic, result="epic scaffold", board=board)
+
+    kb._ensure_epic_branch(repo, epic_branch)
+    subprocess.run(["git", "-C", str(repo), "checkout", epic_branch], check=True, capture_output=True, text=True)
+    upstream_sha = _commit_file(repo, "upstream.txt", "upstream story code\n", "upstream story")
+    subprocess.run(["git", "-C", str(repo), "checkout", "main"], check=True, capture_output=True, text=True)
+
+    spawns: list[tuple[str, str]] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append((task.id, workspace))
+        return 4242
+
+    with kb.connect(board=board) as conn:
+        story = kb.create_task(
+            conn, title="Story", board=board, parents=[epic],
+            assignee="developer", workspace_kind="worktree", workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, story)
+        assert task is not None and task.status == "ready", (
+            "story with a done epic parent should be immediately ready"
+        )
+        pid = kb._spawn_one_v2(conn, story, board=board, spawn_fn=fake_spawn)
+
+    assert pid == 4242
+    assert len(spawns) == 1
+    ws = Path(spawns[0][1])
+    assert (ws / "upstream.txt").exists()
+    subprocess.run(
+        ["git", "-C", str(ws), "merge-base", "--is-ancestor", upstream_sha, "HEAD"],
+        check=True, capture_output=True, text=True,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -6600,8 +6600,64 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+def epic_branch_for(epic_id: str) -> str:
+    """Deterministic integration branch name for an epic's story worktrees."""
+    return f"epic/{epic_id}"
+
+
+def _ensure_epic_branch(repo_root: Path, epic_branch: str) -> None:
+    """Create ``epic_branch`` off the repo's current ``HEAD`` if it doesn't
+    already exist. Idempotent; a no-op when the branch is already there.
+
+    Defensive subprocess idiom (mirrors ``_git_branch_exists`` et al.): any
+    failure is swallowed here rather than raised. If branch creation
+    genuinely failed, the caller's subsequent ``_ensure_git_worktree(...,
+    base=epic_branch)`` will fail loudly (missing base ref) and that error
+    surfaces through the normal worktree-creation failure path instead.
+    """
+    if _git_branch_exists(repo_root, epic_branch):
+        return
+    try:
+        subprocess.run(
+            ["git", "-C", str(repo_root), "branch", epic_branch, "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
+def _story_base_branch(
+    conn: sqlite3.Connection, task_id: str, *, board: Optional[str] = None
+) -> Optional[str]:
+    """The base branch a v2 story's worktree should branch off, or ``None``.
+
+    ``None`` (legacy behavior, base defaults to ``HEAD``) unless the board has
+    opted into ``handoff_v2`` AND the task has an epic parent. A story has one
+    epic in the intended model; if multiple parents are linked, the first
+    (lowest ``parent_id``, per :func:`parent_ids`'s deterministic ordering) wins.
+    """
+    meta = product_board_metadata(board)
+    if not _handoff_v2_enabled(meta):
+        return None
+    parents = parent_ids(conn, task_id)
+    if not parents:
+        return None
+    return epic_branch_for(parents[0])
+
+
+def _ensure_git_worktree(
+    repo_root: Path, target: Path, branch_name: str, *, base: str = "HEAD"
+) -> None:
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    ``base`` is the ref a brand-new ``branch_name`` is created from (default
+    ``HEAD``, i.e. legacy behavior). Callers threading an epic branch as
+    ``base`` are responsible for ensuring it exists first (see
+    :func:`_ensure_epic_branch`).
+    """
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
@@ -6614,7 +6670,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     else:
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), base,
         ]
     result = subprocess.run(
         cmd,
@@ -6631,7 +6687,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
 
 
 def _resolve_worktree_workspace(
-    task: Task, *, board: Optional[str] = None
+    task: Task, *, board: Optional[str] = None, base_branch: Optional[str] = None
 ) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``.
 
@@ -6642,8 +6698,16 @@ def _resolve_worktree_workspace(
     working directory (which is whatever directory the gateway happened to be
     launched from, e.g. the Hermes checkout). If no anchor is configured
     anywhere, we fail loudly rather than guess.
+
+    ``base_branch`` (v2 only; ``None`` for every live dispatch call site today)
+    is the ref a brand-new worktree branch should be created from -- e.g. an
+    epic's integration branch, so a story's worktree contains a previously-
+    integrated sibling story's code. ``None`` preserves legacy behavior
+    (branch off ``HEAD``). When set, the epic branch is created first (off the
+    repo's current ``HEAD``) if it doesn't exist yet.
     """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    base = base_branch or "HEAD"
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
@@ -6670,7 +6734,9 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        if base_branch is not None:
+            _ensure_epic_branch(repo_root, base_branch)
+        _ensure_git_worktree(repo_root, target, branch_name, base=base)
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -6688,7 +6754,9 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        if base_branch is not None:
+            _ensure_epic_branch(repo_root, base_branch)
+        _ensure_git_worktree(repo_root, target, branch_name, base=base)
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -6697,7 +6765,9 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    if base_branch is not None:
+        _ensure_epic_branch(repo_root, base_branch)
+    _ensure_git_worktree(repo_root, requested, branch_name, base=base)
     return requested, branch_name
 
 
@@ -6979,7 +7049,10 @@ def _spawn_one_v2(
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
-            workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+            base_branch = _story_base_branch(conn, task_id, board=board)
+            workspace, resolved_branch_name = _resolve_worktree_workspace(
+                claimed, board=board, base_branch=base_branch
+            )
         else:
             workspace = resolve_workspace(claimed, board=board)
     except Exception as exc:
