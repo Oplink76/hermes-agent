@@ -41,8 +41,8 @@ def _fake_kb(*, v2_enabled: bool, dispatch_result=object(), reconcile_side_effec
     def _handoff_v2_enabled(meta):
         return v2_enabled
 
-    def reconcile(conn, *, board):
-        calls.append(("reconcile", conn, board))
+    def reconcile(conn, *, board, spawn_ready=True):
+        calls.append(("reconcile", conn, board, spawn_ready))
         if reconcile_side_effect is not None:
             raise reconcile_side_effect
 
@@ -66,8 +66,10 @@ def test_v2_board_calls_reconcile_after_dispatch_once():
         "reconcile must run after dispatch_once, not before/instead"
     )
     reconcile_call = next(c for c in calls if c[0] == "reconcile")
-    assert reconcile_call == ("reconcile", conn, "epics"), (
-        "reconcile must run on the SAME conn dispatch_once used, for the same board"
+    assert reconcile_call == ("reconcile", conn, "epics", False), (
+        "reconcile must run on the SAME conn dispatch_once used, for the same "
+        "board, with spawn_ready=False -- dispatch_once is the tick's sole "
+        "capped spawn owner (Codex re-review P1)"
     )
 
 
@@ -108,3 +110,89 @@ def test_dispatch_once_result_returned_unchanged_for_v2_board():
     result = _dispatch_once_then_reconcile(kb, conn, "epics", max_spawn=5)
 
     assert result is sentinel_result
+
+
+# ---------------------------------------------------------------------------
+# Real-kanban_db regression test (Codex re-review P1): the gateway tick must
+# never spawn past max_spawn.
+#
+# ``dispatch_once`` honors ``max_spawn`` (a live concurrency cap), but
+# ``reconcile()``'s ready-spawn step (step 2) spawned EVERY ready+assigned
+# card with no cap awareness. Wiring reconcile() in after dispatch_once
+# (CR4) therefore let the tick over-spawn past max_spawn: on a v2 board with
+# 2 ready cards and max_spawn=1, dispatch_once spawns 1 (honoring the cap),
+# then reconcile spawned the 2nd.
+#
+# The CR4 test above uses a fully mocked ``kb`` module (asserts call order
+# only) and cannot see this -- it never runs the real dispatch_once/reconcile
+# interaction with caps. This test uses the REAL ``hermes_cli.kanban_db``
+# (real dispatch_once + real reconcile) with only the process-spawn side
+# effect faked out, per Codex's explicit ask.
+# ---------------------------------------------------------------------------
+
+def _v2_product_board(name: str) -> None:
+    """Create a product-preset board with the ``handoff_v2`` opt-in flag set.
+
+    Mirrors ``tests/hermes_cli/test_kanban_db.py``'s helper of the same
+    name -- duplicated here (rather than imported) to keep this file's
+    real-kanban_db test self-contained and independent of that file's
+    module-level fixtures.
+    """
+    import json as _json
+
+    from hermes_cli import kanban_db as _kb
+
+    _kb.create_board(name, name="V2 Board", preset="product")
+    meta_path = _kb.board_metadata_path(name)
+    meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+    meta.setdefault("product_workflow", {})["handoff_v2"] = True
+    meta_path.write_text(_json.dumps(meta), encoding="utf-8")
+
+
+def test_gateway_tick_real_kanban_db_never_spawns_past_max_spawn(monkeypatch):
+    """Regression: with 2 ready+assigned cards and max_spawn=1, the gateway
+    tick (dispatch_once then reconcile) must spawn exactly ONE card, not
+    two. Without the fix (reconcile's ready-spawn step running unconditionally
+    after dispatch_once), this spawns 2.
+    """
+    from hermes_cli import kanban_db as real_kb
+    from hermes_cli import profiles
+
+    board = "v2-gateway-max-spawn"
+    _v2_product_board(board)
+
+    # The profile-existence gate only applies inside dispatch_once's own
+    # ready-loop (not reconcile's _spawn_one_v2); patch it so dispatch_once
+    # actually spawns its one permitted card instead of bucketing it as
+    # non-spawnable.
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+
+    spawns: list[str] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 4242
+
+    # Both dispatch_once and reconcile fall back to this module-level
+    # default spawner whenever no explicit spawn_fn is supplied -- patching
+    # it here means the fake applies uniformly to whichever of the two
+    # actually ends up spawning a given card, without depending on whether
+    # the gateway wrapper threads a spawn_fn through to reconcile.
+    monkeypatch.setattr(real_kb, "_default_spawn", fake_spawn)
+
+    with real_kb.connect(board=board) as conn:
+        t1 = real_kb.create_task(conn, title="Story 1", assignee="developer")
+        t2 = real_kb.create_task(conn, title="Story 2", assignee="developer")
+
+        _dispatch_once_then_reconcile(real_kb, conn, board, max_spawn=1)
+
+        running = [
+            tid for tid in (t1, t2)
+            if real_kb.get_task(conn, tid).status == "running"
+        ]
+
+    assert len(running) == 1, (
+        f"expected exactly ONE card running under max_spawn=1, got {running} "
+        f"running (spawns recorded: {spawns})"
+    )
+    assert len(spawns) == 1

@@ -7941,6 +7941,7 @@ def reconcile(
     spawn_fn=None,
     ttl_seconds: Optional[int] = None,
     failure_limit: Optional[int] = None,
+    spawn_ready: bool = True,
 ) -> ReconcileResult:
     """Bounded safety-net poller for handoff_v2 boards (T3.2).
 
@@ -7963,7 +7964,20 @@ def reconcile(
        tick. A live-PID running card gets no action.
     2. **Stranded-ready spawn.** Any ``ready``+unclaimed+assigned card that
        was **not** re-idled in step 1 this pass is spawned once via
-       :func:`_spawn_one_v2` (the claim CAS makes this fire-once).
+       :func:`_spawn_one_v2` (the claim CAS makes this fire-once). Skipped
+       entirely when ``spawn_ready=False`` (Codex re-review P1): unlike
+       ``dispatch_once``, this step has no ``max_spawn`` / concurrency-cap
+       awareness -- it is only safe to run standalone (dogfood / the tests
+       below), never after ``dispatch_once`` in the same tick, since
+       ``dispatch_once`` already spawns ready v2 cards under its caps and a
+       second, uncapped spawn pass immediately after it would spawn past
+       the live concurrency cap. The live gateway tick therefore calls
+       ``reconcile(..., spawn_ready=False)`` -- see
+       :func:`gateway.kanban_watchers._dispatch_once_then_reconcile` --
+       leaving ``dispatch_once`` as the tick's sole capped spawn owner and
+       reconcile's job (there) to just recover + integrate. A re-idled or
+       stranded ready card is still picked up (capped) by ``dispatch_once``
+       on its next tick.
 
     A dead-PID running card therefore converges in two passes: pass 1
     reclaims it (zero spawns that pass), pass 2 spawns it (now
@@ -8038,7 +8052,10 @@ def reconcile(
         result.reclaimed.append(task_id)
 
     # Step 2: spawn stranded ready+idle cards, excluding this pass's
-    # reclaims -- the one-action-per-card rule that prevents thrash.
+    # reclaims -- the one-action-per-card rule that prevents thrash. Skipped
+    # entirely when spawn_ready=False (see the docstring's Codex re-review
+    # P1 note) -- this step has no max_spawn awareness, so it must never run
+    # after dispatch_once in the same tick.
     reclaimed_ids = set(result.reclaimed)
     ready_rows = conn.execute(
         """
@@ -8049,7 +8066,7 @@ def reconcile(
            AND assignee != ''
          ORDER BY priority DESC, created_at ASC
         """
-    ).fetchall()
+    ).fetchall() if spawn_ready else []
     for row in ready_rows:
         task_id = row["id"]
         if task_id in reclaimed_ids:

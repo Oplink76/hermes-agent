@@ -4574,6 +4574,63 @@ def test_reconcile_legacy_board_is_noop(kanban_home, monkeypatch):
     assert spawns == []
 
 
+def test_reconcile_spawn_ready_false_recovers_and_integrates_but_skips_spawn(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """``spawn_ready=False`` skips ONLY step 2 (the stranded-ready spawn
+    loop) -- step 1 (dead-worker recovery) and step 3 (story->epic
+    integration) still run. This is the mode the gateway tick uses
+    (Codex re-review P1): dispatch_once is already the tick's sole capped
+    spawn owner, so reconcile in the tick must only recover + integrate,
+    never spawn an arbitrary ready card."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-spawn-ready-false"
+    _v2_product_board_with_repo(board, repo)
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    host = kb._claimer_id().split(":", 1)[0]
+    stale_started_at = int(time.time()) - 3600  # past the crash grace window
+
+    spawns: list[str] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 4242
+
+    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
+
+    with kb.connect(board=board) as conn:
+        dead_tid = kb.create_task(conn, title="Dead worker story", assignee="developer")
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=?, "
+            "started_at=? WHERE id=?",
+            (99999, f"{host}:w0", stale_started_at, dead_tid),
+        )
+        conn.commit()
+        ready_tid = kb.create_task(conn, title="Stranded ready story", assignee="developer")
+
+        result = kb.reconcile(conn, board=board, spawn_fn=fake_spawn, spawn_ready=False)
+
+        dead_card = kb.get_task(conn, dead_tid)
+        ready_card = kb.get_task(conn, ready_tid)
+
+    assert result.reclaimed == [dead_tid], "recovery (step 1) still runs"
+    assert result.spawned == [], "the ready-spawn step (step 2) is skipped"
+    assert spawns == []
+    assert result.integrated == [story], "story integration (step 3) still runs"
+
+    assert dead_card.status == "ready", "dead-pid card was still re-idled"
+    assert ready_card.status == "ready", "stranded ready card was NOT spawned"
+
+    ancestor = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", story_sha, epic_branch],
+        capture_output=True, text=True,
+    )
+    assert ancestor.returncode == 0, "epic branch must still contain the story's commit"
+
+
 # ---------------------------------------------------------------------------
 # Scratch cleanup containment (#28818)
 # ---------------------------------------------------------------------------

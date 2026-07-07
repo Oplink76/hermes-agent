@@ -104,6 +104,18 @@ def _dispatch_once_then_reconcile(_kb, conn, slug: str, **dispatch_kwargs) -> "O
     story->epic integration step and its own bounded recovery pass. This is
     the seam that wires that in (CR4 / Codex P1-P2).
 
+    ``reconcile`` is called with ``spawn_ready=False`` (Codex re-review P1):
+    ``dispatch_once`` already spawns all ready v2 cards live, capped by
+    ``max_spawn`` / ``max_in_progress`` / per-profile caps / the respawn
+    guard / the failure limit. ``reconcile()``'s own ready-spawn step has
+    none of that cap awareness, so running it uncapped right after
+    ``dispatch_once`` let the tick spawn past the live concurrency cap (2
+    ready cards + max_spawn=1 spawned 2, not 1). ``dispatch_once`` remains
+    the tick's sole capped spawn owner; reconcile here only recovers
+    dead-worker cards and integrates finished stories. A re-idled or
+    stranded ready card is still picked up (capped) by ``dispatch_once`` on
+    its next tick.
+
     Legacy (non-v2) boards: ``reconcile`` is never called; this is
     ``dispatch_once`` unchanged.
 
@@ -121,7 +133,7 @@ def _dispatch_once_then_reconcile(_kb, conn, slug: str, **dispatch_kwargs) -> "O
     try:
         meta = _kb.product_board_metadata(slug)
         if _kb._handoff_v2_enabled(meta):
-            _kb.reconcile(conn, board=slug)
+            _kb.reconcile(conn, board=slug, spawn_ready=False)
     except Exception:
         logger.exception(
             "kanban dispatcher: reconcile failed on board %s (safety net; "
