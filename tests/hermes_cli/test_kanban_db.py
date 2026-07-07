@@ -3163,6 +3163,158 @@ def test_handoff_provenance_failure_raises_and_leaves_card_untouched(kanban_home
 
 
 # ---------------------------------------------------------------------------
+# spawn_after_handoff — event-driven fire-once spawn consumer (T3.1)
+# ---------------------------------------------------------------------------
+
+def test_spawn_after_handoff_fire_once_spawns_the_handed_off_card(kanban_home, tmp_path, monkeypatch):
+    """One handoff -> spawn_after_handoff spawns the next-role agent exactly once."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-spawn-fire-once"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    spawns: list[tuple[str, str]] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append((task.id, workspace))
+        return 4242
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        conn.execute("UPDATE tasks SET running = 1 WHERE id = ?", (tid,))
+        (repo / "src.py").write_text("print('hi')\n", encoding="utf-8")
+
+        result = kb.handoff(
+            conn, tid, board=board, summary="Implemented checkout",
+            metadata={"ai_provenance": {"writer": {"agent": "hermes"}}},
+        )
+        assert result is True
+
+        spawned_ids = kb.spawn_after_handoff(conn, board=board, spawn_fn=fake_spawn)
+
+        task = kb.get_task(conn, tid)
+
+    assert spawned_ids == [tid]
+    assert len(spawns) == 1
+    assert spawns[0][0] == tid
+    assert task is not None
+    assert task.status == "running"
+    assert task.worker_pid == 4242
+    assert task.assignee == "tester"
+
+
+def test_spawn_after_handoff_second_pass_spawns_nothing(kanban_home, tmp_path, monkeypatch):
+    """Regression guard: a second pass over an already-claimed card is a no-op (claim-CAS)."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-spawn-no-respawn"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    spawns: list[tuple[str, str]] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append((task.id, workspace))
+        return 4242
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        conn.execute("UPDATE tasks SET running = 1 WHERE id = ?", (tid,))
+        (repo / "src.py").write_text("print('hi')\n", encoding="utf-8")
+
+        result = kb.handoff(
+            conn, tid, board=board,
+            metadata={"ai_provenance": {"writer": {"agent": "hermes"}}},
+        )
+        assert result is True
+
+        first = kb.spawn_after_handoff(conn, board=board, spawn_fn=fake_spawn)
+        second = kb.spawn_after_handoff(conn, board=board, spawn_fn=fake_spawn)
+
+    assert first == [tid]
+    assert second == []
+    assert len(spawns) == 1  # spawn count stays <= 1 across both passes
+
+
+def test_spawn_after_handoff_terminal_review_handoff_spawns_nothing(kanban_home, tmp_path, monkeypatch):
+    """A review -> release_measure handoff leaves assignee=NULL: not a candidate, no spawn."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-spawn-terminal"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    spawns: list[tuple[str, str]] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append((task.id, workspace))
+        return 4242
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="reviewer",
+            workflow_template_id="product",
+            current_step_key="review",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        (repo / "notes.md").write_text("looks good\n", encoding="utf-8")
+
+        result = kb.handoff(
+            conn, tid, board=board,
+            metadata={
+                "ai_provenance": {
+                    "writer": {"agent": "hermes"},
+                    "reviewer": {"agent": "codex"},
+                }
+            },
+        )
+        assert result is True
+
+        card = _card_snapshot(conn, tid)
+        assert card["assignee"] is None
+
+        spawned_ids = kb.spawn_after_handoff(conn, board=board, spawn_fn=fake_spawn)
+
+    assert spawned_ids == []
+    assert spawns == []
+
+
+def test_spawn_after_handoff_legacy_board_is_noop(kanban_home, monkeypatch):
+    """Non-v2 (legacy) boards never use spawn_after_handoff -- returns [], spawn_fn never called."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    spawns: list[tuple[str, str]] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append((task.id, workspace))
+        return 4242
+
+    with kb.connect() as conn:
+        kb.create_task(conn, title="legacy card", assignee="developer")
+
+        spawned_ids = kb.spawn_after_handoff(conn, spawn_fn=fake_spawn)
+
+    assert spawned_ids == []
+    assert spawns == []
+
+
+# ---------------------------------------------------------------------------
 # Scratch cleanup containment (#28818)
 # ---------------------------------------------------------------------------
 

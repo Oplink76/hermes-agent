@@ -6879,6 +6879,116 @@ def handoff(
     return True
 
 
+def spawn_after_handoff(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    spawn_fn=None,
+    ttl_seconds: Optional[int] = None,
+    failure_limit: Optional[int] = None,
+) -> list[str]:
+    """Event-driven fire-once spawn consumer for handoff_v2 boards (T3.1).
+
+    Reacts to ``handoff`` task_events rather than polling: a candidate is a
+    card whose *most recent* event is ``handoff`` and that is currently
+    spawnable (``status='ready'``, unclaimed, and has a next-role assignee --
+    the terminal review -> release_measure handoff clears ``assignee`` so it
+    is correctly never a candidate). Non-v2 boards return ``[]`` -- those
+    keep using the existing time-polling dispatcher, untouched.
+
+    Fire-once is guaranteed by :func:`claim_task`'s ``ready -> running`` CAS:
+    a second call over a card already claimed (now ``running``) finds
+    ``claim_task`` returns ``None`` and skips it, so calling this function
+    repeatedly over the same handoff is safe and idempotent.
+
+    This deliberately duplicates the claim -> resolve-workspace -> spawn
+    recipe used by the ready-queue loop in :func:`_dispatch_once_locked`
+    (kanban_db.py ~8670-8730) rather than calling it, so that the live,
+    heavily-guarded dispatch loop remains byte-for-byte unchanged (spawn-
+    storm history makes that loop deliberately not-to-be-touched). See the
+    ready loop for the canonical version of this recipe; keep the two in
+    sync by hand if the primitives' contracts change.
+    """
+    meta = product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta):
+        return []
+
+    rows = conn.execute(
+        """
+        SELECT t.id AS id
+          FROM tasks t
+          JOIN task_events e
+            ON e.id = (
+                SELECT id FROM task_events
+                 WHERE task_id = t.id
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+            )
+         WHERE e.kind = 'handoff'
+           AND t.status = 'ready'
+           AND t.claim_lock IS NULL
+           AND t.assignee IS NOT NULL
+           AND t.assignee != ''
+         ORDER BY t.priority DESC, t.created_at ASC
+        """
+    ).fetchall()
+
+    spawned_ids: list[str] = []
+    for row in rows:
+        task_id = row["id"]
+        claimed = claim_task(conn, task_id, ttl_seconds=ttl_seconds)
+        if claimed is None:
+            # Already claimed (or no longer ready) -- the CAS fire-once
+            # guarantee: nothing to do on this or any later pass.
+            continue
+        try:
+            resolved_branch_name = None
+            if claimed.workspace_kind == "worktree":
+                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+            else:
+                workspace = resolve_workspace(claimed, board=board)
+        except Exception as exc:
+            _record_spawn_failure(
+                conn, claimed.id, f"workspace: {exc}",
+                failure_limit=failure_limit,
+            )
+            continue
+        # Persist the resolved workspace path so the worker can cd there.
+        set_workspace_path(conn, claimed.id, str(workspace))
+        if claimed.workspace_kind == "worktree":
+            set_branch_name(
+                conn, claimed.id,
+                resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
+            )
+        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        try:
+            # Back-compat: older spawn_fn signatures accept only
+            # (task, workspace). Introspect and pass `board` only when
+            # supported -- mirrors the ready loop's same accommodation.
+            import inspect
+            try:
+                sig = inspect.signature(_spawn)
+                if "board" in sig.parameters:
+                    pid = _spawn(claimed, str(workspace), board=board)
+                else:
+                    pid = _spawn(claimed, str(workspace))
+            except (TypeError, ValueError):
+                pid = _spawn(claimed, str(workspace))
+            if pid:
+                _set_worker_pid(conn, claimed.id, int(pid))
+            # NOTE: intentionally do NOT reset consecutive_failures here --
+            # matches the ready loop's rule (a successful spawn doesn't
+            # prove the run will succeed; see _dispatch_once_locked).
+            spawned_ids.append(claimed.id)
+        except Exception as exc:
+            _record_spawn_failure(
+                conn, claimed.id, str(exc),
+                failure_limit=failure_limit,
+            )
+
+    return spawned_ids
+
+
 # ---------------------------------------------------------------------------
 def schedule_task(
     conn: sqlite3.Connection,
