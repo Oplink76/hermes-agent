@@ -1056,6 +1056,36 @@ def _apply_v2_flags(
     _sync_legacy_status(conn, task_id, meta)
 
 
+def _apply_v2_flags_for_status(
+    conn: sqlite3.Connection,
+    task_id: str,
+    new_status: str,
+    *,
+    board: Optional[str] = None,
+    meta: Optional[dict] = None,
+) -> None:
+    """Set the v2 running/blocked flags to MATCH a directly-written legacy
+    status, for manual/dashboard/schedule/archive transitions. v2-gated (no-op
+    on legacy boards). Runs in the caller's write_txn. Does NOT re-derive
+    status (scheduled/archived/todo/triage are not flag-derivable -- the
+    caller's explicit status stands); this only keeps the flags from
+    disagreeing with it.
+    """
+    meta = meta or product_board_metadata(board or _board_slug_for_connection(conn))
+    if meta is None or not _handoff_v2_enabled(meta):
+        return
+    if new_status == "running":
+        running, blocked = 1, 0
+    elif new_status == "blocked":
+        running, blocked = 0, 1
+    else:
+        running, blocked = 0, 0
+    conn.execute(
+        "UPDATE tasks SET running = ?, blocked = ? WHERE id = ?",
+        (running, blocked, task_id),
+    )
+
+
 def set_phase(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6511,6 +6541,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        _apply_v2_flags_for_status(conn, task_id, "archived")
         # If archive happened while a run was still in flight (e.g. user
         # archived a running task from the dashboard), close that run with
         # outcome='reclaimed' so attempt history isn't orphaned.
@@ -8079,6 +8110,7 @@ def schedule_task(
         cur = conn.execute(sql, params)
         if cur.rowcount != 1:
             return False
+        _apply_v2_flags_for_status(conn, task_id, "scheduled")
         run_id = _end_run(
             conn, task_id,
             outcome="scheduled", status="scheduled",

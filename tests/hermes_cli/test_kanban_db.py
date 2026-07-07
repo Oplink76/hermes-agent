@@ -8256,6 +8256,280 @@ def test_complete_task_legacy_board_terminal_flags_stay_zero(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# CR2: direct/manual status writers maintain the v2 flags (state drift, P2)
+#
+# Dashboard drag-drop (_set_status_direct), schedule_task, and archive_task
+# all write ``status`` directly instead of going through claim_task/
+# complete_task/block_task's flag-maintaining seams. On a handoff_v2 board
+# that left running=1 (or blocked=1) after a manual/schedule/archive
+# transition off of ``running``, disagreeing with the freshly-written
+# status. _apply_v2_flags_for_status is the mapping helper that fixes this:
+# it sets flags to MATCH the directly-written status (no re-derivation),
+# and is v2-gated so legacy boards are untouched.
+# ---------------------------------------------------------------------------
+
+def test_apply_v2_flags_for_status_running_sets_running_clears_blocked(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-flags-for-status-running"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+
+    with kb.connect(board=board) as conn:
+        conn.execute(
+            "UPDATE tasks SET running = 0, blocked = 1 WHERE id = ?", (tid,),
+        )
+        with kb.write_txn(conn):
+            kb._apply_v2_flags_for_status(conn, tid, "running", board=board)
+        row = conn.execute(
+            "SELECT running, blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert row["running"] == 1
+    assert row["blocked"] == 0
+
+
+def test_apply_v2_flags_for_status_blocked_sets_blocked_clears_running(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-flags-for-status-blocked"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+
+    with kb.connect(board=board) as conn:
+        conn.execute(
+            "UPDATE tasks SET running = 1, blocked = 0 WHERE id = ?", (tid,),
+        )
+        with kb.write_txn(conn):
+            kb._apply_v2_flags_for_status(conn, tid, "blocked", board=board)
+        row = conn.execute(
+            "SELECT running, blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert row["running"] == 0
+    assert row["blocked"] == 1
+
+
+@pytest.mark.parametrize(
+    "new_status", ["ready", "todo", "review", "scheduled", "archived", "done", "triage"],
+)
+def test_apply_v2_flags_for_status_other_statuses_clear_both_flags(
+    kanban_home, monkeypatch, new_status,
+):
+    """Any status other than running/blocked clears both flags -- these
+    statuses are not flag-derivable, so the helper does not try to
+    re-derive them; it only zeroes the running/blocked pair."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = f"v2-flags-for-status-other-{new_status}"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+
+    with kb.connect(board=board) as conn:
+        conn.execute(
+            "UPDATE tasks SET running = 1, blocked = 1 WHERE id = ?", (tid,),
+        )
+        with kb.write_txn(conn):
+            kb._apply_v2_flags_for_status(conn, tid, new_status, board=board)
+        row = conn.execute(
+            "SELECT running, blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+
+
+def test_apply_v2_flags_for_status_legacy_board_is_noop(kanban_home):
+    """meta=None (legacy board) -- flags must be untouched."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Legacy task")
+        conn.execute(
+            "UPDATE tasks SET running = 1, blocked = 0 WHERE id = ?", (tid,),
+        )
+        before = dict(conn.execute(
+            "SELECT status, running, blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone())
+        with kb.write_txn(conn):
+            kb._apply_v2_flags_for_status(conn, tid, "ready")
+        after = dict(conn.execute(
+            "SELECT status, running, blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone())
+
+    assert after == before
+
+
+def test_apply_v2_flags_for_status_noop_when_not_handoff_v2_enabled(kanban_home, monkeypatch):
+    """A product-preset board that hasn't opted into handoff_v2 also no-ops."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "product-no-v2-flags-for-status"
+    kb.create_board(board, name="Product No V2", preset="product")
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn, title="Story", workflow_template_id="product", current_step_key="development",
+        )
+        conn.execute(
+            "UPDATE tasks SET running = 1, blocked = 0 WHERE id = ?", (tid,),
+        )
+        before = dict(conn.execute(
+            "SELECT status, running, blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone())
+        with kb.write_txn(conn):
+            kb._apply_v2_flags_for_status(conn, tid, "ready", board=board)
+        after = dict(conn.execute(
+            "SELECT status, running, blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone())
+
+    assert after == before
+
+
+@pytest.mark.parametrize("new_status", ["ready", "todo", "review"])
+def test_set_status_direct_v2_board_off_running_clears_running_flag(
+    kanban_home, monkeypatch, new_status,
+):
+    """Dashboard drag-drop running->{ready,todo,review} on a v2 card must
+    clear the running flag so status and flags agree."""
+    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = f"v2-set-status-direct-off-running-{new_status}"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+
+    with kb.connect(board=board) as conn:
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="host:1") is not None
+        pre = conn.execute("SELECT running FROM tasks WHERE id = ?", (tid,)).fetchone()
+        assert pre["running"] == 1
+
+        assert _set_status_direct(conn, tid, new_status) is True
+        row = conn.execute(
+            "SELECT status, running, blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    # todo/review aren't flag-derivable (only running/blocked/ready are), so
+    # the invariant here is direct: status stands as written, flags cleared.
+    assert row["status"] == new_status
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+
+
+def test_set_status_direct_v2_board_running_to_blocked_sets_blocked_flag(kanban_home, monkeypatch):
+    """Dashboard drag-drop running->blocked on a v2 card must set blocked=1,
+    running=0."""
+    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-set-status-direct-running-to-blocked"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+    meta = kb.read_board_metadata(board)
+
+    with kb.connect(board=board) as conn:
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="host:1") is not None
+
+        assert _set_status_direct(conn, tid, "blocked") is True
+        row = conn.execute(
+            "SELECT status, running, blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert row["status"] == "blocked"
+    assert row["running"] == 0
+    assert row["blocked"] == 1
+    assert row["status"] == kb._legacy_status(row, meta)
+
+
+def test_set_status_direct_legacy_board_flags_stay_zero(kanban_home):
+    """Legacy board: _set_status_direct behavior is unchanged; flags stay 0."""
+    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        assert _set_status_direct(conn, tid, "ready") is True
+        row = conn.execute(
+            "SELECT status, running, blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert row["status"] == "ready"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+
+
+def test_schedule_task_v2_board_running_card_clears_flags(kanban_home, monkeypatch):
+    """schedule_task on a running v2 card must clear running/blocked --
+    'scheduled' is not flag-derivable, so status stands and flags follow."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-schedule-clears-flags"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+
+    with kb.connect(board=board) as conn:
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="host:1") is not None
+        pre = conn.execute("SELECT running FROM tasks WHERE id = ?", (tid,)).fetchone()
+        assert pre["running"] == 1
+
+        assert kb.schedule_task(conn, tid, reason="parked") is True
+        row = conn.execute(
+            "SELECT status, running, blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert row["status"] == "scheduled"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+
+
+def test_schedule_task_legacy_board_flags_unchanged(kanban_home):
+    """Legacy board: schedule_task behavior/flags unchanged (stay 0)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="delayed recheck", assignee="ops")
+        assert kb.schedule_task(conn, t, reason="run next week") is True
+        row = conn.execute(
+            "SELECT status, running, blocked FROM tasks WHERE id = ?", (t,),
+        ).fetchone()
+
+    assert row["status"] == "scheduled"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+
+
+def test_archive_task_v2_board_running_card_clears_flags(kanban_home, monkeypatch):
+    """archive_task on a running v2 card must clear running/blocked --
+    'archived' is not flag-derivable, so status stands and flags follow."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-archive-clears-flags"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+
+    with kb.connect(board=board) as conn:
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="host:1") is not None
+        pre = conn.execute("SELECT running FROM tasks WHERE id = ?", (tid,)).fetchone()
+        assert pre["running"] == 1
+
+        assert kb.archive_task(conn, tid) is True
+        row = conn.execute(
+            "SELECT status, running, blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert row["status"] == "archived"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+
+
+def test_archive_task_legacy_board_flags_unchanged(kanban_home):
+    """Legacy board: archive_task behavior/flags unchanged (stay 0)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        assert kb.archive_task(conn, tid) is True
+        row = conn.execute(
+            "SELECT status, running, blocked FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert row["status"] == "archived"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+
+
+# ---------------------------------------------------------------------------
 # epic_ready -- all stories done + suite green gate (T4.2)
 # ---------------------------------------------------------------------------
 

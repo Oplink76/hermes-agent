@@ -1209,6 +1209,7 @@ def _set_status_direct(
         )
         if cur.rowcount != 1:
             return False
+        kanban_db._apply_v2_flags_for_status(conn, task_id, new_status)
         run_id = None
         if was_running and new_status != "running" and prev["current_run_id"]:
             run_id = kanban_db._end_run(
