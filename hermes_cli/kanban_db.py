@@ -6879,6 +6879,86 @@ def handoff(
     return True
 
 
+def _spawn_one_v2(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+    spawn_fn=None,
+    ttl_seconds: Optional[int] = None,
+    failure_limit: Optional[int] = None,
+) -> Optional[int]:
+    """Claim -> resolve-workspace -> spawn recipe shared by the v2 spawn
+    consumers (:func:`spawn_after_handoff`, T3.1, and :func:`reconcile`,
+    T3.2).
+
+    This deliberately duplicates the claim -> resolve-workspace -> spawn
+    recipe used by the ready-queue loop in :func:`_dispatch_once_locked`
+    (kanban_db.py ~8780-8825) rather than calling it, so that the live,
+    heavily-guarded dispatch loop remains byte-for-byte unchanged (spawn-
+    storm history makes that loop deliberately not-to-be-touched). See the
+    ready loop for the canonical version of this recipe; keep the two in
+    sync by hand if the primitives' contracts change.
+
+    Returns the spawned pid (``0`` if the spawn succeeded but ``spawn_fn``
+    returned a falsy pid) if the card was claimed and no exception was
+    raised, or ``None`` if the claim CAS lost the race (already claimed / no
+    longer ready) or the spawn attempt failed (a spawn failure is recorded
+    via :func:`_record_spawn_failure` in that case).
+    """
+    claimed = claim_task(conn, task_id, ttl_seconds=ttl_seconds)
+    if claimed is None:
+        # Already claimed (or no longer ready) -- the CAS fire-once
+        # guarantee: nothing to do on this or any later pass.
+        return None
+    try:
+        resolved_branch_name = None
+        if claimed.workspace_kind == "worktree":
+            workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+        else:
+            workspace = resolve_workspace(claimed, board=board)
+    except Exception as exc:
+        _record_spawn_failure(
+            conn, claimed.id, f"workspace: {exc}",
+            failure_limit=failure_limit,
+        )
+        return None
+    # Persist the resolved workspace path so the worker can cd there.
+    set_workspace_path(conn, claimed.id, str(workspace))
+    if claimed.workspace_kind == "worktree":
+        set_branch_name(
+            conn, claimed.id,
+            resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
+        )
+    _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+    _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+    try:
+        # Back-compat: older spawn_fn signatures accept only
+        # (task, workspace). Introspect and pass `board` only when
+        # supported -- mirrors the ready loop's same accommodation.
+        import inspect
+        try:
+            sig = inspect.signature(_spawn)
+            if "board" in sig.parameters:
+                pid = _spawn(claimed, str(workspace), board=board)
+            else:
+                pid = _spawn(claimed, str(workspace))
+        except (TypeError, ValueError):
+            pid = _spawn(claimed, str(workspace))
+        if pid:
+            _set_worker_pid(conn, claimed.id, int(pid))
+        # NOTE: intentionally do NOT reset consecutive_failures here --
+        # matches the ready loop's rule (a successful spawn doesn't
+        # prove the run will succeed; see _dispatch_once_locked).
+        return int(pid) if pid else 0
+    except Exception as exc:
+        _record_spawn_failure(
+            conn, claimed.id, str(exc),
+            failure_limit=failure_limit,
+        )
+        return None
+
+
 def spawn_after_handoff(
     conn: sqlite3.Connection,
     *,
@@ -6901,13 +6981,9 @@ def spawn_after_handoff(
     ``claim_task`` returns ``None`` and skips it, so calling this function
     repeatedly over the same handoff is safe and idempotent.
 
-    This deliberately duplicates the claim -> resolve-workspace -> spawn
-    recipe used by the ready-queue loop in :func:`_dispatch_once_locked`
-    (kanban_db.py ~8670-8730) rather than calling it, so that the live,
-    heavily-guarded dispatch loop remains byte-for-byte unchanged (spawn-
-    storm history makes that loop deliberately not-to-be-touched). See the
-    ready loop for the canonical version of this recipe; keep the two in
-    sync by hand if the primitives' contracts change.
+    The per-card claim -> resolve-workspace -> spawn recipe lives in
+    :func:`_spawn_one_v2`, shared with the slow-poller safety net
+    (:func:`reconcile`, T3.2).
     """
     meta = product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
@@ -6936,57 +7012,134 @@ def spawn_after_handoff(
     spawned_ids: list[str] = []
     for row in rows:
         task_id = row["id"]
-        claimed = claim_task(conn, task_id, ttl_seconds=ttl_seconds)
-        if claimed is None:
-            # Already claimed (or no longer ready) -- the CAS fire-once
-            # guarantee: nothing to do on this or any later pass.
-            continue
-        try:
-            resolved_branch_name = None
-            if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
-            else:
-                workspace = resolve_workspace(claimed, board=board)
-        except Exception as exc:
-            _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
-                failure_limit=failure_limit,
-            )
-            continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
-            set_branch_name(
-                conn, claimed.id,
-                resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
-            )
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
-        try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Introspect and pass `board` only when
-            # supported -- mirrors the ready loop's same accommodation.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
-            # NOTE: intentionally do NOT reset consecutive_failures here --
-            # matches the ready loop's rule (a successful spawn doesn't
-            # prove the run will succeed; see _dispatch_once_locked).
-            spawned_ids.append(claimed.id)
-        except Exception as exc:
-            _record_spawn_failure(
-                conn, claimed.id, str(exc),
-                failure_limit=failure_limit,
-            )
+        pid_or_none = _spawn_one_v2(
+            conn, task_id, board=board, spawn_fn=spawn_fn,
+            ttl_seconds=ttl_seconds, failure_limit=failure_limit,
+        )
+        if pid_or_none is not None:
+            spawned_ids.append(task_id)
 
     return spawned_ids
+
+
+@dataclass
+class ReconcileResult:
+    """Outcome of a single :func:`reconcile` pass over a handoff_v2 board.
+
+    Bounded to ONE action per card per pass -- see ``reconcile``'s docstring.
+    """
+
+    reclaimed: list[str] = field(default_factory=list)
+    """Task ids whose dead-worker ``running`` card was re-idled back to
+    ``ready`` this pass. NOT spawned this pass -- see the one-action-per-card
+    rule that prevents thrashing."""
+    spawned: list[str] = field(default_factory=list)
+    """Task ids spawned this pass via :func:`_spawn_one_v2` (claim-CAS makes
+    this fire-once)."""
+
+
+def reconcile(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    spawn_fn=None,
+    ttl_seconds: Optional[int] = None,
+    failure_limit: Optional[int] = None,
+) -> ReconcileResult:
+    """Bounded safety-net poller for handoff_v2 boards (T3.2).
+
+    The fast path (:func:`spawn_after_handoff`, T3.1) is event-driven and
+    reacts immediately to a ``handoff``. ``reconcile`` is the SLOW safety
+    net -- meant to run on a poll cadence -- that recovers v2 cards that
+    fell through the fast path: a ``running`` card whose worker died, or a
+    ``ready``+idle card that was never spawned.
+
+    Takes **at most ONE action per card per pass** -- this is the direct
+    regression guard against the multi-spawn storm. Two independent steps,
+    applied in order, act on disjoint sets of cards:
+
+    1. **Dead-worker recovery.** Any ``running`` card whose ``worker_pid``
+       is no longer alive (:func:`_pid_alive`) is re-idled to ``ready`` via
+       a CAS UPDATE (``status='running' AND claim_lock IS ?``), and a
+       ``reconcile_reclaimed`` event is recorded. It is **not** spawned this
+       pass -- recovery and spawn are kept in separate passes so a single
+       dead worker can never trigger more than one DB-mutating action per
+       tick. A live-PID running card gets no action.
+    2. **Stranded-ready spawn.** Any ``ready``+unclaimed+assigned card that
+       was **not** re-idled in step 1 this pass is spawned once via
+       :func:`_spawn_one_v2` (the claim CAS makes this fire-once).
+
+    A dead-PID running card therefore converges in two passes: pass 1
+    reclaims it (zero spawns that pass), pass 2 spawns it (now
+    ready+idle) -- never more than one action, never a spawn storm. Running
+    ``reconcile`` repeatedly over a healthy (live-PID) running card does
+    nothing on every pass.
+
+    Non-v2 boards return an empty ``ReconcileResult`` (a no-op); legacy
+    boards keep using ``dispatch_once`` unchanged.
+    """
+    result = ReconcileResult()
+    meta = product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta):
+        return result
+
+    # Step 1: reclaim running cards whose worker died. One CAS UPDATE per
+    # card, in its own transaction -- never spawned this pass.
+    # ``worker_pid IS NOT NULL`` matches detect_crashed_workers' convention
+    # (kanban_db.py ~7791): a card claimed but not yet pid-stamped (the brief
+    # window between claim_task and _set_worker_pid inside _spawn_one_v2) has
+    # no pid to check yet and must not be mistaken for a dead worker.
+    running_rows = conn.execute(
+        "SELECT id, worker_pid, claim_lock FROM tasks "
+        "WHERE status = 'running' AND worker_pid IS NOT NULL"
+    ).fetchall()
+    for row in running_rows:
+        if _pid_alive(row["worker_pid"]):
+            continue
+        task_id = row["id"]
+        with write_txn(conn):
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'ready', claim_lock = NULL,
+                       claim_expires = NULL, worker_pid = NULL
+                 WHERE id = ? AND status = 'running' AND claim_lock IS ?
+                """,
+                (task_id, row["claim_lock"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            _append_event(
+                conn, task_id, "reconcile_reclaimed",
+                {"reason": "dead_worker_pid", "worker_pid": row["worker_pid"]},
+            )
+        result.reclaimed.append(task_id)
+
+    # Step 2: spawn stranded ready+idle cards, excluding this pass's
+    # reclaims -- the one-action-per-card rule that prevents thrash.
+    reclaimed_ids = set(result.reclaimed)
+    ready_rows = conn.execute(
+        """
+        SELECT id FROM tasks
+         WHERE status = 'ready'
+           AND claim_lock IS NULL
+           AND assignee IS NOT NULL
+           AND assignee != ''
+         ORDER BY priority DESC, created_at ASC
+        """
+    ).fetchall()
+    for row in ready_rows:
+        task_id = row["id"]
+        if task_id in reclaimed_ids:
+            continue
+        pid_or_none = _spawn_one_v2(
+            conn, task_id, board=board, spawn_fn=spawn_fn,
+            ttl_seconds=ttl_seconds, failure_limit=failure_limit,
+        )
+        if pid_or_none is not None:
+            result.spawned.append(task_id)
+
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -3315,6 +3315,155 @@ def test_spawn_after_handoff_legacy_board_is_noop(kanban_home, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# reconcile() -- bounded safety-net poller for handoff_v2 boards (T3.2)
+# ---------------------------------------------------------------------------
+
+def test_reconcile_recovers_dead_pid_then_spawns_next_pass_bounded(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """Dead-PID running card: pass 1 reclaims only (0 spawns); pass 2 spawns
+    only (having become ready+idle). Never more than one action per pass --
+    the direct regression guard against the multi-spawn storm."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-reconcile-dead-pid"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    spawns: list[str] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 4242
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="developer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? "
+            "WHERE id=?",
+            (99999, "deadhost:w0", tid),
+        )
+        conn.commit()
+
+        pass1 = kb.reconcile(conn, board=board, spawn_fn=fake_spawn)
+        assert pass1.reclaimed == [tid]
+        assert pass1.spawned == []
+        assert spawns == []  # zero spawns this pass -- the anti-storm guard
+
+        card = kb.get_task(conn, tid)
+        assert card.status == "ready"
+        assert card.claim_lock is None
+        assert card.worker_pid is None
+
+        pass2 = kb.reconcile(conn, board=board, spawn_fn=fake_spawn)
+        assert pass2.reclaimed == []
+        assert pass2.spawned == [tid]
+        assert spawns == [tid]  # exactly one spawn total, on pass 2
+
+        card = kb.get_task(conn, tid)
+        assert card.status == "running"
+
+
+def test_reconcile_no_thrash_on_healthy_running_card(kanban_home, tmp_path, monkeypatch):
+    """A running card with a LIVE pid gets no action -- repeatedly."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-reconcile-healthy"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    spawns: list[str] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 4242
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="developer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? "
+            "WHERE id=?",
+            (os.getpid(), "livehost:w0", tid),
+        )
+        conn.commit()
+
+        first = kb.reconcile(conn, board=board, spawn_fn=fake_spawn)
+        second = kb.reconcile(conn, board=board, spawn_fn=fake_spawn)
+
+    assert first.reclaimed == [] and first.spawned == []
+    assert second.reclaimed == [] and second.spawned == []
+    assert spawns == []
+
+
+def test_reconcile_spawns_stranded_ready_card_idempotently(kanban_home, tmp_path, monkeypatch):
+    """A ready+idle+spawnable card gets spawned once; a second pass (now
+    running) is a no-op via the claim CAS."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-reconcile-stranded-ready"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    spawns: list[str] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return os.getpid()  # a real, live pid so the second pass's own
+        # dead-worker-recovery step doesn't reclaim it out from under us
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="developer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        assert kb.get_task(conn, tid).status == "ready"
+
+        first = kb.reconcile(conn, board=board, spawn_fn=fake_spawn)
+        second = kb.reconcile(conn, board=board, spawn_fn=fake_spawn)
+
+    assert first.reclaimed == []
+    assert first.spawned == [tid]
+    assert second.reclaimed == []
+    assert second.spawned == []
+    assert spawns == [tid]  # spawn count stays <= 1 across both passes
+
+
+def test_reconcile_legacy_board_is_noop(kanban_home, monkeypatch):
+    """Non-v2 (legacy) boards never use reconcile -- empty result, spawn_fn never called."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    spawns: list[str] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 4242
+
+    with kb.connect() as conn:
+        kb.create_task(conn, title="legacy card", assignee="developer")
+
+        result = kb.reconcile(conn, spawn_fn=fake_spawn)
+
+    assert result.reclaimed == []
+    assert result.spawned == []
+    assert spawns == []
+
+
+# ---------------------------------------------------------------------------
 # Scratch cleanup containment (#28818)
 # ---------------------------------------------------------------------------
 
