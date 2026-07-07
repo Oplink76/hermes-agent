@@ -9443,3 +9443,159 @@ def test_deploy_epic_default_ops_client_raises_not_implemented(kanban_home, tmp_
         row = conn.execute("SELECT blocked FROM tasks WHERE id = ?", (epic,)).fetchone()
     assert row["blocked"] == 1
     notify.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 T6.1: migrate_cards_to_v2_flags -- reconcile existing cards' flags
+# to their legacy status when a board flips to handoff_v2.
+#
+# A board's existing cards have real statuses (running/blocked/ready/...) but
+# the running/blocked flag columns default to 0, so an already-running card
+# would read status='running', running=0 -- a direct disagreement with
+# _legacy_status. migrate_cards_to_v2_flags is the inverse of _legacy_status:
+# it sets every card's flags to MATCH its status, using the same mapping as
+# CR2's _apply_v2_flags_for_status (now shared via _v2_flags_for_status).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "status,expected_running,expected_blocked",
+    [
+        ("running", 1, 0),
+        ("blocked", 0, 1),
+        ("ready", 0, 0),
+        ("todo", 0, 0),
+        ("review", 0, 0),
+        ("scheduled", 0, 0),
+        ("archived", 0, 0),
+        ("done", 0, 0),
+        ("triage", 0, 0),
+    ],
+)
+def test_v2_flags_for_status_mapping(status, expected_running, expected_blocked):
+    assert kb._v2_flags_for_status(status) == (expected_running, expected_blocked)
+
+
+def test_migrate_cards_to_v2_flags_reconciles_mixed_board(kanban_home, monkeypatch):
+    """Seed a mixed-status board with flags left at their 0 default (as if
+    handoff_v2 had just been flipped on), migrate, and assert every card's
+    flags now agree with its status via _legacy_status.
+
+    For the non-flag-derivable statuses (ready/todo/review/done/scheduled/
+    archived), ``_legacy_status`` falls through to the column status for the
+    card's ``current_step_key`` -- so each such card is seeded with a custom
+    column whose status matches, letting ``_legacy_status`` round-trip back
+    to the original status once flags are reconciled. running/blocked cards
+    round-trip via flag precedence regardless of column.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "migrate-cards-mixed"
+    kb.create_board(board, name="Migrate Mixed", preset="product")
+    meta_path = kb.board_metadata_path(board)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["columns"] = [
+        {"name": "development", "status": "ready"},
+        {"name": "ready", "status": "ready"},
+        {"name": "todo", "status": "todo"},
+        {"name": "review", "status": "review"},
+        {"name": "done", "status": "done"},
+        {"name": "scheduled", "status": "scheduled"},
+        {"name": "archived", "status": "archived"},
+    ]
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    meta = kb.read_board_metadata(board)
+
+    statuses = ["running", "blocked", "ready", "todo", "review", "done", "scheduled", "archived"]
+    with kb.connect(board=board) as conn:
+        ids = []
+        for status in statuses:
+            step_key = "development" if status in ("running", "blocked") else status
+            tid = kb.create_task(
+                conn, title=f"card-{status}", workflow_template_id="product",
+                current_step_key=step_key,
+            )
+            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
+            ids.append(tid)
+
+        count = kb.migrate_cards_to_v2_flags(conn, board=board)
+
+        rows = conn.execute(
+            "SELECT id, status, running, blocked, current_step_key FROM tasks "
+            "WHERE id IN ({})".format(",".join("?" * len(ids))),
+            ids,
+        ).fetchall()
+
+    assert count == len(statuses)
+    assert len(rows) == len(statuses)
+    for row in rows:
+        expected_running, expected_blocked = kb._v2_flags_for_status(row["status"])
+        assert row["running"] == expected_running
+        assert row["blocked"] == expected_blocked
+        assert kb._legacy_status(row, meta) == row["status"]
+
+
+def test_migrate_cards_to_v2_flags_idempotent(kanban_home, monkeypatch):
+    """Running the migration a second time leaves flags unchanged and the
+    consistency invariant intact."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "migrate-cards-idempotent"
+    kb.create_board(board, name="Migrate Idempotent", preset="product")
+    meta = kb.read_board_metadata(board)
+
+    with kb.connect(board=board) as conn:
+        tid_running = kb.create_task(
+            conn, title="running-card", workflow_template_id="product",
+            current_step_key="development",
+        )
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid_running,))
+        tid_blocked = kb.create_task(
+            conn, title="blocked-card", workflow_template_id="product",
+            current_step_key="development",
+        )
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid_blocked,))
+
+        kb.migrate_cards_to_v2_flags(conn, board=board)
+        first = {
+            tid: dict(conn.execute(
+                "SELECT status, running, blocked FROM tasks WHERE id = ?", (tid,),
+            ).fetchone())
+            for tid in (tid_running, tid_blocked)
+        }
+
+        kb.migrate_cards_to_v2_flags(conn, board=board)
+        second = {
+            tid: dict(conn.execute(
+                "SELECT status, running, blocked FROM tasks WHERE id = ?", (tid,),
+            ).fetchone())
+            for tid in (tid_running, tid_blocked)
+        }
+
+    assert second == first
+    for tid in (tid_running, tid_blocked):
+        row = second[tid]
+        assert kb._legacy_status(row, meta) == row["status"]
+
+
+def test_migrate_cards_to_v2_flags_does_not_touch_status_or_phase(kanban_home, monkeypatch):
+    """The migration only ever writes running/blocked -- status and
+    current_step_key must be byte-for-byte unchanged."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "migrate-cards-preserves-status"
+    kb.create_board(board, name="Migrate Preserves Status", preset="product")
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn, title="card", workflow_template_id="product",
+            current_step_key="development",
+        )
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
+        before = dict(conn.execute(
+            "SELECT status, current_step_key FROM tasks WHERE id = ?", (tid,),
+        ).fetchone())
+
+        kb.migrate_cards_to_v2_flags(conn, board=board)
+
+        after = dict(conn.execute(
+            "SELECT status, current_step_key FROM tasks WHERE id = ?", (tid,),
+        ).fetchone())
+
+    assert after == before

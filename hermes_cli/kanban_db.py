@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional, Protocol
+from typing import Any, Callable, Iterable, Optional, Protocol, Tuple
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -1056,6 +1056,20 @@ def _apply_v2_flags(
     _sync_legacy_status(conn, task_id, meta)
 
 
+def _v2_flags_for_status(status: str) -> Tuple[int, int]:
+    """Pure mapping: legacy ``status`` -> the ``(running, blocked)`` flag pair
+    that agrees with it. This is the inverse of :func:`_legacy_status`'s
+    blocked > running precedence, and the single source of truth for that
+    mapping -- shared by :func:`_apply_v2_flags_for_status` (single-card,
+    v2-gated) and :func:`migrate_cards_to_v2_flags` (bulk reconciliation).
+    """
+    if status == "running":
+        return (1, 0)
+    if status == "blocked":
+        return (0, 1)
+    return (0, 0)
+
+
 def _apply_v2_flags_for_status(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1074,16 +1088,50 @@ def _apply_v2_flags_for_status(
     meta = meta or product_board_metadata(board or _board_slug_for_connection(conn))
     if meta is None or not _handoff_v2_enabled(meta):
         return
-    if new_status == "running":
-        running, blocked = 1, 0
-    elif new_status == "blocked":
-        running, blocked = 0, 1
-    else:
-        running, blocked = 0, 0
+    running, blocked = _v2_flags_for_status(new_status)
     conn.execute(
         "UPDATE tasks SET running = ?, blocked = ? WHERE id = ?",
         (running, blocked, task_id),
     )
+
+
+def migrate_cards_to_v2_flags(conn: sqlite3.Connection, *, board: Optional[str] = None) -> int:
+    """Phase 6 migration primitive: reconcile every existing card's
+    ``(running, blocked)`` flags to MATCH its current legacy ``status``, the
+    inverse of :func:`_legacy_status`.
+
+    A board's cards accumulate real statuses (running/blocked/ready/...) over
+    time, but the flag columns default to 0 -- so without this, flipping a
+    board to ``handoff_v2`` would leave an already-running card reading
+    ``status='running', running=0``, a direct disagreement with
+    :func:`_legacy_status`. This applies the same mapping as CR2's
+    :func:`_apply_v2_flags_for_status` (via the shared :func:`_v2_flags_for_status`)
+    to every card on the board via a direct ``UPDATE``.
+
+    Deliberately NOT gated on :func:`_handoff_v2_enabled` -- this function
+    *is* the migration, and may be run just before or just after the
+    board.json ``handoff_v2`` flip. It only ever writes the running/blocked
+    columns, never ``status`` or ``current_step_key``, so it is additive,
+    idempotent (a second run recomputes the same flags), and reversible (the
+    flags are simply ignored again if the board reverts to legacy). Runs in
+    one ``write_txn``. ``board`` is accepted for parity with sibling
+    connection-scoped helpers; a connection is already scoped to a single
+    board's tasks table, so it does not filter here.
+
+    Returns the number of cards reconciled.
+    """
+    del board  # unused: conn is already scoped to one board's tasks table
+    updated = 0
+    with write_txn(conn):
+        rows = conn.execute("SELECT id, status FROM tasks").fetchall()
+        for row in rows:
+            running, blocked = _v2_flags_for_status(row["status"])
+            cur = conn.execute(
+                "UPDATE tasks SET running = ?, blocked = ? WHERE id = ?",
+                (running, blocked, row["id"]),
+            )
+            updated += cur.rowcount
+    return updated
 
 
 def set_phase(
