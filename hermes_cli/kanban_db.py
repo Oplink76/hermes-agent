@@ -2026,6 +2026,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- them; the dispatcher doesn't consult them for routing yet.
     workflow_template_id TEXT,
     current_step_key     TEXT,
+    -- v2 state model: nullable, default 0.
+    running              INTEGER DEFAULT 0,
+    blocked              INTEGER DEFAULT 0,
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
@@ -2823,6 +2826,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "current_step_key", "current_step_key TEXT"
         )
+    if "running" not in cols:
+        _add_column_if_missing(conn, "tasks", "running", "running INTEGER DEFAULT 0")
+    if "blocked" not in cols:
+        _add_column_if_missing(conn, "tasks", "blocked", "blocked INTEGER DEFAULT 0")
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
         # worker via --skills. NULL is fine for existing rows.

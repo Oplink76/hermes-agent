@@ -209,6 +209,70 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_events_run" in indexes
 
 
+def test_fresh_db_has_running_and_blocked_columns(kanban_home):
+    """Fresh DBs must have the v2 state-model ``running``/``blocked`` columns."""
+    with kb.connect() as conn:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    assert {"running", "blocked"} <= cols
+
+
+def test_connect_migrates_legacy_db_gains_running_and_blocked_columns(tmp_path):
+    """Legacy DBs missing ``running``/``blocked`` must gain them without data loss."""
+    db_path = tmp_path / "legacy-kanban.db"
+    conn = sqlite3.connect(str(db_path))
+    # Pre-v2 ``tasks`` shape: missing running, blocked.
+    conn.execute("""
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER
+        )
+    """)
+    # ``_migrate_add_optional_columns`` unconditionally runs PRAGMA on
+    # ``task_events`` for run_id back-fill; give it a pre-#17805 shape.
+    conn.execute("""
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('legacy', 'old board task', 'ready', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    with kb.connect(db_path) as migrated:
+        task_columns = {
+            row["name"] for row in migrated.execute("PRAGMA table_info(tasks)")
+        }
+        row = migrated.execute(
+            "SELECT id, title, running, blocked FROM tasks WHERE id = 'legacy'"
+        ).fetchone()
+
+    assert {"running", "blocked"} <= task_columns
+    assert row is not None
+    assert row["id"] == "legacy"
+    assert row["title"] == "old board task"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Task creation + status inference
 # ---------------------------------------------------------------------------
