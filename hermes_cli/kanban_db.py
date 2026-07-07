@@ -5211,6 +5211,38 @@ def complete_task(
         verified_cards = []
 
     if product_workflow_enabled:
+        meta = product_board_metadata(board)
+        if meta is not None and _handoff_v2_enabled(meta):
+            row = conn.execute(
+                "SELECT current_step_key FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            step_key = row["current_step_key"] if row is not None else None
+            transition = PRODUCT_WORKFLOW_TRANSITIONS.get(str(step_key or ""))
+            if transition is not None and transition.get("next_step"):
+                # Non-terminal v2 step: route through the atomic commit-first
+                # handoff() (Phase 2) instead of the legacy advance below.
+                advanced = handoff(
+                    conn, task_id, board=board, summary=summary, metadata=metadata,
+                )
+                if not advanced:
+                    # Commit-first gate failed (no committed diff) or
+                    # provenance/board state changed underneath us -- do NOT
+                    # fall through to the terminal-done UPDATE, which would
+                    # wrongly mark an un-committed card done.
+                    return False
+                with write_txn(conn):
+                    _end_run(
+                        conn, task_id,
+                        outcome="advanced",
+                        status="completed",
+                        summary=summary if summary is not None else result,
+                        metadata=metadata,
+                    )
+                return True
+            # Terminal / non-advancing v2 step (e.g. release_measure, or no
+            # transition at all): fall through to the existing legacy path
+            # unchanged -- release_measure -> done stays the human gate.
+
         product_transition = _complete_product_workflow_step(
             conn,
             task_id,

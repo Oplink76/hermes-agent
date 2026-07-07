@@ -3377,6 +3377,180 @@ def test_handoff_provenance_failure_raises_and_leaves_card_untouched(kanban_home
 
 
 # ---------------------------------------------------------------------------
+# complete_task -> handoff() routing on handoff_v2 boards (W1)
+# ---------------------------------------------------------------------------
+
+def test_complete_task_v2_non_terminal_routes_to_commit_first_handoff(kanban_home, tmp_path, monkeypatch):
+    """A real v2 worker's non-terminal completion routes through ``handoff()``:
+    dirty worktree -> committed, card advances, exactly one ``handoff`` event,
+    ``running`` cleared, and the run is ended cleanly (no dangling open run).
+    """
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-complete-task-happy"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run_id_before = claimed.current_run_id
+        assert run_id_before is not None
+        kb.set_running(conn, tid, True, board=board)
+        (repo / "src.py").write_text("print('hi')\n", encoding="utf-8")
+
+        result = kb.complete_task(
+            conn,
+            tid,
+            summary="Implemented checkout",
+            board=board,
+            metadata={"ai_provenance": {"writer": {"agent": "hermes"}}},
+        )
+
+        card = _card_snapshot(conn, tid)
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        closed_run = kb.get_run(conn, run_id_before)
+
+    assert result is True
+    assert card["current_step_key"] == "test"
+    assert card["assignee"] == "tester"
+    assert card["running"] == 0
+
+    handoff_events = [event for event in events if event.kind == "handoff"]
+    assert len(handoff_events) == 1
+    assert handoff_events[0].payload["from_step"] == "development"
+    assert handoff_events[0].payload["to_step"] == "test"
+    sha = handoff_events[0].payload["sha"]
+    assert sha and len(sha) == 40
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert head == sha
+
+    # Run bookkeeping: no dangling open run.
+    assert task.current_run_id is None
+    assert closed_run is not None
+    assert closed_run.ended_at is not None
+    assert closed_run.outcome == "advanced"
+    assert closed_run.status == "completed"
+
+
+def test_complete_task_v2_no_diff_does_not_complete(kanban_home, tmp_path, monkeypatch):
+    """A v2 completion with a clean worktree (no committed diff) returns
+    False and does NOT complete or advance the card -- the commit-first
+    gate reaches real workers via ``complete_task``.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-complete-task-no-diff"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        before = _card_snapshot(conn, tid)
+
+        result = kb.complete_task(
+            conn,
+            tid,
+            summary="Nothing changed",
+            board=board,
+            metadata={"ai_provenance": {"writer": {"agent": "hermes"}}},
+        )
+
+        after = _card_snapshot(conn, tid)
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert result is False
+    assert after == before
+    assert after["current_step_key"] == "development"
+    assert task.status != "done"
+    assert not any(event.kind == "handoff" for event in events)
+    assert not any(event.kind == "workflow_advanced" for event in events)
+
+
+def test_complete_task_v2_terminal_release_measure_completes_to_done(kanban_home):
+    """v2 terminal step (release_measure, no transition) still completes to
+    ``done`` via the existing legacy terminal path -- no handoff advance.
+    """
+    board = "v2-complete-task-terminal"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            workflow_template_id="product",
+            current_step_key="release_measure",
+        )
+
+        result = kb.complete_task(
+            conn,
+            tid,
+            summary="Released and measured",
+            board=board,
+        )
+
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert result is True
+    assert task.status == "done"
+    assert not any(event.kind == "handoff" for event in events)
+
+
+def test_complete_task_legacy_board_unchanged(kanban_home):
+    """Non-v2 product boards keep using the legacy advance path unchanged
+    (mirrors ``test_product_completion_advances_card_to_next_role``).
+    """
+    kb.create_board("prod-w1-legacy", preset="product")
+    with kb.connect(board="prod-w1-legacy") as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: checkout",
+            assignee="architect-profile",
+            workflow_template_id="product",
+            current_step_key="architecture",
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Architecture settled",
+            board="prod-w1-legacy",
+            product_role_assignees={"developer": "developer-profile"},
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        latest_run = kb.latest_run(conn, tid)
+    assert task.status == "ready"
+    assert task.current_step_key == "development"
+    assert task.assignee == "developer-profile"
+    assert latest_run.outcome == "advanced"
+    advanced = [event for event in events if event.kind == "workflow_advanced"]
+    assert advanced
+    assert advanced[-1].payload["from_step"] == "architecture"
+    assert advanced[-1].payload["to_step"] == "development"
+    assert not any(event.kind == "handoff" for event in events)
+
+
+# ---------------------------------------------------------------------------
 # spawn_after_handoff — event-driven fire-once spawn consumer (T3.1)
 # ---------------------------------------------------------------------------
 
