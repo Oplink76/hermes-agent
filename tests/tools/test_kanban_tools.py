@@ -1578,6 +1578,19 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "Do not shell out" in prompt or "tools — they work" in prompt
 
 
+def test_kanban_guidance_states_commit_first_handoff_contract():
+    """On handoff_v2 boards, kanban_complete routes to the commit-first
+    handoff() which commits the worker's diff for them. The prompt must
+    say so, or a worker that manually `git commit`s leaves a clean tree
+    that the commit-first gate can't advance."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+    lowered = KANBAN_GUIDANCE.lower()
+    assert "commit-first" in lowered or "commit first" in lowered
+    assert "uncommitted" in lowered
+    assert "git commit" in lowered
+    assert "git push" in lowered or "push" in lowered
+
+
 def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     """Sanity: the guidance block stays lean so it doesn't blow up the
     cached prompt.
@@ -1587,7 +1600,10 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     details (workspace kinds, deliverable artifacts, created-card claims,
     profile discovery) when the standalone kanban-worker / kanban-orchestrator
     skills were removed and folded into this always-injected guidance, so the
-    ceiling is sized to fit that content with a little headroom.
+    ceiling is sized to fit that content with a little headroom. It was bumped
+    again to fit the commit-first handoff contract note (step 5): on
+    product/handoff boards `kanban_complete` commits the worker's diff for
+    them, so the guidance must say so explicitly.
     """
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
     home = tmp_path / ".hermes"
@@ -1597,7 +1613,7 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 5_500, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 5_800, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 
