@@ -2672,6 +2672,21 @@ def test_handoff_v2_flag_defaults_off_and_reads_meta(kanban_home):
     assert kb._handoff_v2_enabled({"product_workflow": {"handoff_v2": False}}) is False
 
 
+def test_legacy_status_maps_phase_and_flags_by_precedence():
+    assert kb._legacy_status({"current_step_key": "development", "running": 1, "blocked": 0}) == "running"
+    assert kb._legacy_status({"current_step_key": "development", "running": 0, "blocked": 1}) == "blocked"
+    assert kb._legacy_status({"current_step_key": "done", "running": 0, "blocked": 0}) == "done"
+    assert kb._legacy_status({"current_step_key": "review", "running": 0, "blocked": 0}) == "review"
+    assert kb._legacy_status({"current_step_key": "architecture", "running": 0, "blocked": 0}) == "ready"
+    assert kb._legacy_status({"current_step_key": "backlog", "running": 0, "blocked": 0}) == "ready"
+    # precedence: blocked beats running
+    assert kb._legacy_status({"current_step_key": "development", "running": 1, "blocked": 1}) == "blocked"
+    # precedence: done phase beats running
+    assert kb._legacy_status({"current_step_key": "done", "running": 1, "blocked": 0}) == "done"
+    # None-tolerance: treat None as falsy
+    assert kb._legacy_status({"current_step_key": "development", "running": None, "blocked": None}) == "ready"
+
+
 def test_product_completion_advances_card_to_next_role(kanban_home):
     kb.create_board("prod", preset="product")
     with kb.connect(board="prod") as conn:

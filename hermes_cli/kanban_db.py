@@ -964,6 +964,26 @@ def _column_status_for_step(meta: Optional[dict], step_key: Optional[str]) -> st
     return "ready"
 
 
+def _legacy_status(row: Any) -> str:
+    """Compute the legacy ``status`` string from ``(phase, running, blocked)``.
+
+    Pure computed view: precedence is ``blocked`` > phase ``done`` >
+    ``running`` > phase ``review`` > ``ready``. Kept faithful to the legacy
+    status semantics so terminal-bucket detection (``blocked``/``done``) and
+    other status-driven consumers keep working under the v2 state model.
+    """
+    phase = str(row["current_step_key"] or "")
+    if bool(row["blocked"]):
+        return "blocked"
+    if phase == "done":
+        return "done"
+    if bool(row["running"]):
+        return "running"
+    if phase == "review":
+        return "review"
+    return "ready"
+
+
 def _product_ai_provenance_required(meta: Optional[dict]) -> bool:
     wf = _product_workflow_dict(meta)
     for key in ("ai_provenance_required", "require_ai_provenance"):
