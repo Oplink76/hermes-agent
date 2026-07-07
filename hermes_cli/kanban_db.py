@@ -984,6 +984,44 @@ def _legacy_status(row: Any, meta: Optional[dict] = None) -> str:
     return _column_status_for_step(meta, step_key)
 
 
+def _assert_card_consistent(row: Any) -> None:
+    """Raise ``ValueError`` iff a card's flags represent an impossible state.
+
+    Under the handoff_v2 state model ``(phase, running, blocked)``, ``phase``
+    is a single field so it can't disagree with itself; the one remaining
+    representable contradiction is a card that is both ``running`` (actively
+    executing) and ``blocked`` (escalated to a human) at the same time. Every
+    other combination -- running-only, blocked-only, neither -- is valid
+    regardless of phase, so this deliberately does not validate ``phase``.
+    """
+    keys = row.keys()
+    running = row["running"] if "running" in keys else None
+    blocked = row["blocked"] if "blocked" in keys else None
+    if running and blocked:
+        if "id" in keys:
+            raise ValueError(f"card {row['id']} cannot be both running and blocked")
+        raise ValueError("card cannot be both running and blocked")
+
+
+def _sync_legacy_status(conn: sqlite3.Connection, task_id: str, meta: Optional[dict]) -> None:
+    """Read back a card's canonical state, enforce the invariant, and store
+    the derived legacy ``status`` column.
+
+    Shared by :func:`set_phase`, :func:`set_running`, and :func:`set_blocked`
+    so the running/blocked invariant is enforced in exactly one place. Must
+    be called from inside the caller's ``write_txn`` block: a raised
+    ``ValueError`` here rolls back the whole transaction, so the write that
+    would have created the contradiction is never committed.
+    """
+    row = conn.execute(
+        "SELECT current_step_key, running, blocked FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    _assert_card_consistent(row)
+    status = _legacy_status(row, meta)
+    conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+
+
 def set_phase(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1009,12 +1047,7 @@ def set_phase(
         )
         if cur.rowcount != 1:
             return False
-        row = conn.execute(
-            "SELECT current_step_key, running, blocked FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        status = _legacy_status(row, meta)
-        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+        _sync_legacy_status(conn, task_id, meta)
     return True
 
 
@@ -1041,12 +1074,7 @@ def set_running(
         )
         if cur.rowcount != 1:
             return False
-        row = conn.execute(
-            "SELECT current_step_key, running, blocked FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        status = _legacy_status(row, meta)
-        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+        _sync_legacy_status(conn, task_id, meta)
     return True
 
 
@@ -1080,12 +1108,7 @@ def set_blocked(
         )
         if cur.rowcount != 1:
             return False
-        row = conn.execute(
-            "SELECT current_step_key, running, blocked FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        status = _legacy_status(row, meta)
-        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+        _sync_legacy_status(conn, task_id, meta)
     return True
 
 

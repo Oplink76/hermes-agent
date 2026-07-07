@@ -443,25 +443,12 @@ def test_set_blocked_false_clears_back_to_phase_status(kanban_home, monkeypatch)
     assert row["status"] == "ready"
 
 
-def test_set_running_and_blocked_precedence_matches_legacy_status(kanban_home, monkeypatch):
-    """blocked flag set while running is still true: status follows blocked
-    (matching ``_legacy_status`` precedence: blocked > running > column)."""
-    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
-    board = "v2-precedence"
-    _v2_product_board(board)
-    tid = _seed_v2_card(board, step="development")
-
-    with kb.connect(board=board) as conn:
-        kb.set_running(conn, tid, True, board=board)
-        kb.set_blocked(conn, tid, True, board=board)
-        row = conn.execute(
-            "SELECT running, blocked, status FROM tasks WHERE id = ?",
-            (tid,),
-        ).fetchone()
-
-    assert row["running"] == 1
-    assert row["blocked"] == 1
-    assert row["status"] == "blocked"
+# NOTE: test_set_running_and_blocked_precedence_matches_legacy_status (T1.3)
+# is superseded by T1.4's _assert_card_consistent invariant: a card can no
+# longer be both running and blocked, so that scenario now raises + rolls
+# back instead of committing "blocked" precedence. See
+# test_set_blocked_after_running_raises_limbo_and_leaves_card_unchanged below,
+# which covers the identical setup and asserts the new behavior.
 
 
 def test_set_phase_legacy_board_is_noop(kanban_home):
@@ -559,6 +546,83 @@ def test_set_blocked_missing_task_returns_false(kanban_home, monkeypatch):
     with kb.connect(board=board) as conn:
         result = kb.set_blocked(conn, "does-not-exist", True, board=board)
     assert result is False
+
+
+# ---------------------------------------------------------------------------
+# _assert_card_consistent invariant -- limbo is unrepresentable (T1.4)
+# ---------------------------------------------------------------------------
+
+def test_assert_card_consistent_running_only_is_valid():
+    assert kb._assert_card_consistent({"running": 1, "blocked": 0}) is None
+
+
+def test_assert_card_consistent_blocked_only_is_valid():
+    assert kb._assert_card_consistent({"running": 0, "blocked": 1}) is None
+
+
+def test_assert_card_consistent_neither_is_valid():
+    assert kb._assert_card_consistent({"running": 0, "blocked": 0}) is None
+
+
+def test_assert_card_consistent_running_and_blocked_raises():
+    with pytest.raises(ValueError, match="running and blocked"):
+        kb._assert_card_consistent({"running": 1, "blocked": 1})
+
+
+def test_set_blocked_after_running_raises_limbo_and_leaves_card_unchanged(kanban_home, monkeypatch):
+    """A running card cannot also become blocked: set_blocked(True) must
+    raise ValueError, and (because the assert runs inside write_txn) the
+    transaction rolls back -- the card is byte-for-byte unchanged."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-limbo-running-then-blocked"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+
+    with kb.connect(board=board) as conn:
+        kb.set_running(conn, tid, True, board=board)
+        before = dict(conn.execute(
+            "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone())
+
+        with pytest.raises(ValueError, match="running and blocked"):
+            kb.set_blocked(conn, tid, True, board=board)
+
+        after = dict(conn.execute(
+            "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone())
+
+    assert after == before
+    assert after["running"] == 1
+    assert after["blocked"] == 0
+
+
+def test_set_running_after_blocked_raises_limbo_and_leaves_card_unchanged(kanban_home, monkeypatch):
+    """Symmetric case: a blocked card cannot also become running."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-limbo-blocked-then-running"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+
+    with kb.connect(board=board) as conn:
+        kb.set_blocked(conn, tid, True, board=board)
+        before = dict(conn.execute(
+            "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone())
+
+        with pytest.raises(ValueError, match="running and blocked"):
+            kb.set_running(conn, tid, True, board=board)
+
+        after = dict(conn.execute(
+            "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone())
+
+    assert after == before
+    assert after["blocked"] == 1
+    assert after["running"] == 0
 
 
 # ---------------------------------------------------------------------------
