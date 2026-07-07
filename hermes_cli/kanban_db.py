@@ -984,6 +984,111 @@ def _legacy_status(row: Any, meta: Optional[dict] = None) -> str:
     return _column_status_for_step(meta, step_key)
 
 
+def set_phase(
+    conn: sqlite3.Connection,
+    task_id: str,
+    phase: str,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    """Move a handoff_v2 card's canonical phase (``current_step_key``).
+
+    No-ops (returns ``False``) on non-handoff_v2 boards — those keep using
+    the existing status-based writers. Also returns ``False`` if
+    ``task_id`` doesn't exist. On success, re-derives and stores the legacy
+    ``status`` column via :func:`_legacy_status` so old consumers reading
+    ``status`` directly stay correct.
+    """
+    meta = product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta):
+        return False
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET current_step_key = ? WHERE id = ?",
+            (phase, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        row = conn.execute(
+            "SELECT current_step_key, running, blocked FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        status = _legacy_status(row, meta)
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+    return True
+
+
+def set_running(
+    conn: sqlite3.Connection,
+    task_id: str,
+    running: bool,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    """Set the canonical ``running`` flag on a handoff_v2 card.
+
+    See :func:`set_phase` for the v2-gating / legacy no-op / missing-task
+    contract; behaves identically, mutating ``running`` instead of
+    ``current_step_key``.
+    """
+    meta = product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta):
+        return False
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET running = ? WHERE id = ?",
+            (1 if running else 0, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        row = conn.execute(
+            "SELECT current_step_key, running, blocked FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        status = _legacy_status(row, meta)
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+    return True
+
+
+def set_blocked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    blocked: bool,
+    *,
+    board: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
+    """Set the canonical ``blocked`` flag on a handoff_v2 card.
+
+    See :func:`set_phase` for the v2-gating / legacy no-op / missing-task
+    contract; behaves identically, mutating ``blocked`` instead of
+    ``current_step_key``.
+
+    ``reason`` is accepted for interface parity with the eventual
+    block-reason/event plumbing, but is intentionally NOT persisted here.
+    Full block-reason routing (where it's stored, how it surfaces to
+    consumers) is Phase 3 (T1.4+) scope; inventing ad hoc storage for it now
+    would just be thrown away.
+    """
+    meta = product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta):
+        return False
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET blocked = ? WHERE id = ?",
+            (1 if blocked else 0, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        row = conn.execute(
+            "SELECT current_step_key, running, blocked FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        status = _legacy_status(row, meta)
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+    return True
+
+
 def _product_ai_provenance_required(meta: Optional[dict]) -> bool:
     wf = _product_workflow_dict(meta)
     for key in ("ai_provenance_required", "require_ai_provenance"):

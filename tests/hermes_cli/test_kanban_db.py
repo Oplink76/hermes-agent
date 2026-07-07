@@ -340,6 +340,228 @@ def test_legacy_status_accepts_real_sqlite_row(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# set_phase / set_running / set_blocked writers (T1.3)
+# ---------------------------------------------------------------------------
+
+def _v2_product_board(name: str) -> None:
+    """Create a product-preset board with the ``handoff_v2`` opt-in flag set."""
+    kb.create_board(name, name="V2 Board", preset="product")
+    meta_path = kb.board_metadata_path(name)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta.setdefault("product_workflow", {})["handoff_v2"] = True
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+
+def _seed_v2_card(board: str, *, step: str = "development") -> str:
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            workflow_template_id="product",
+            current_step_key=step,
+        )
+    return tid
+
+
+def test_set_phase_v2_board_updates_step_and_syncs_status(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-phase"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+    meta = kb.read_board_metadata(board)
+
+    with kb.connect(board=board) as conn:
+        result = kb.set_phase(conn, tid, "review", board=board)
+        row = conn.execute(
+            "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+
+    assert result is True
+    assert row["current_step_key"] == "review"
+    assert row["status"] == "review"
+    assert row["status"] == kb._legacy_status(row, meta)
+
+
+def test_set_running_v2_board_sets_flag_and_syncs_status(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-running"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+    meta = kb.read_board_metadata(board)
+
+    with kb.connect(board=board) as conn:
+        result = kb.set_running(conn, tid, True, board=board)
+        row = conn.execute(
+            "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+
+    assert result is True
+    assert row["running"] == 1
+    assert row["status"] == "running"
+    assert row["status"] == kb._legacy_status(row, meta)
+
+
+def test_set_blocked_v2_board_sets_flag_and_syncs_status(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-blocked"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+    meta = kb.read_board_metadata(board)
+
+    with kb.connect(board=board) as conn:
+        result = kb.set_blocked(conn, tid, True, board=board, reason="waiting on human")
+        row = conn.execute(
+            "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+
+    assert result is True
+    assert row["blocked"] == 1
+    assert row["status"] == "blocked"
+    assert row["status"] == kb._legacy_status(row, meta)
+
+
+def test_set_blocked_false_clears_back_to_phase_status(kanban_home, monkeypatch):
+    """set_blocked(False) after a block clears back to the phase's base status."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-unblock"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+
+    with kb.connect(board=board) as conn:
+        kb.set_blocked(conn, tid, True, board=board)
+        result = kb.set_blocked(conn, tid, False, board=board)
+        row = conn.execute(
+            "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+
+    assert result is True
+    assert row["blocked"] == 0
+    assert row["status"] == "ready"
+
+
+def test_set_running_and_blocked_precedence_matches_legacy_status(kanban_home, monkeypatch):
+    """blocked flag set while running is still true: status follows blocked
+    (matching ``_legacy_status`` precedence: blocked > running > column)."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-precedence"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+
+    with kb.connect(board=board) as conn:
+        kb.set_running(conn, tid, True, board=board)
+        kb.set_blocked(conn, tid, True, board=board)
+        row = conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+
+    assert row["running"] == 1
+    assert row["blocked"] == 1
+    assert row["status"] == "blocked"
+
+
+def test_set_phase_legacy_board_is_noop(kanban_home):
+    """Legacy (non-v2) boards must be byte-for-byte unchanged."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Legacy task")
+        before = dict(conn.execute(
+            "SELECT current_step_key, status, running, blocked FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone())
+        result = kb.set_phase(conn, tid, "review")
+        after = dict(conn.execute(
+            "SELECT current_step_key, status, running, blocked FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone())
+
+    assert result is False
+    assert after == before
+
+
+def test_set_running_legacy_board_is_noop(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Legacy task")
+        before = dict(conn.execute(
+            "SELECT current_step_key, status, running, blocked FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone())
+        result = kb.set_running(conn, tid, True)
+        after = dict(conn.execute(
+            "SELECT current_step_key, status, running, blocked FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone())
+
+    assert result is False
+    assert after == before
+
+
+def test_set_blocked_legacy_board_is_noop(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Legacy task")
+        before = dict(conn.execute(
+            "SELECT current_step_key, status, running, blocked FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone())
+        result = kb.set_blocked(conn, tid, True, reason="whatever")
+        after = dict(conn.execute(
+            "SELECT current_step_key, status, running, blocked FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone())
+
+    assert result is False
+    assert after == before
+
+
+def test_set_phase_product_board_without_handoff_v2_is_noop(kanban_home, monkeypatch):
+    """A product-preset board that has NOT opted into handoff_v2 also no-ops."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "product-no-v2"
+    kb.create_board(board, name="Product No V2", preset="product")
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn, title="Story", workflow_template_id="product", current_step_key="development",
+        )
+        result = kb.set_phase(conn, tid, "review", board=board)
+        row = conn.execute(
+            "SELECT current_step_key FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+
+    assert result is False
+    assert row["current_step_key"] == "development"
+
+
+def test_set_phase_missing_task_returns_false(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-missing-phase"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        result = kb.set_phase(conn, "does-not-exist", "review", board=board)
+    assert result is False
+
+
+def test_set_running_missing_task_returns_false(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-missing-running"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        result = kb.set_running(conn, "does-not-exist", True, board=board)
+    assert result is False
+
+
+def test_set_blocked_missing_task_returns_false(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-missing-blocked"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        result = kb.set_blocked(conn, "does-not-exist", True, board=board)
+    assert result is False
+
+
+# ---------------------------------------------------------------------------
 # Task creation + status inference
 # ---------------------------------------------------------------------------
 
