@@ -6804,6 +6804,81 @@ def _commit_worker_diff(
     return sha or None
 
 
+def handoff(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> bool:
+    """Atomically advance a handoff_v2 product card, gated on a committed diff.
+
+    Self-contained v2 path (T2.2-T2.4): does NOT call or mutate
+    ``_complete_product_workflow_step`` / :func:`complete_task` -- those
+    remain the legacy completion path, byte-for-byte unchanged.
+
+    Order: gate on ``handoff_v2`` -> resolve the current step's transition
+    (no transition, e.g. the terminal ``release_measure`` step, means no
+    auto-advance -- returns ``False``, nothing touched) -> validate AI
+    provenance (raises :class:`ProductProvenanceError` on failure, card
+    untouched) -> commit-first gate via :func:`_commit_worker_diff` (no SHA
+    means no advance) -> one atomic transaction: advance the phase, clear
+    ``running``, retag the assignee, sync the legacy ``status``, and emit
+    exactly one ``handoff`` event carrying the commit SHA.
+
+    Returns ``False`` (no mutation) when the board isn't handoff_v2, the
+    card doesn't exist, its current step has no advancing transition, or
+    the commit-first gate yields no SHA.
+    """
+    meta = product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta):
+        return False
+
+    row = conn.execute(
+        "SELECT current_step_key FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    step = row["current_step_key"]
+    transition = PRODUCT_WORKFLOW_TRANSITIONS.get(str(step or ""))
+    if not transition or not transition.get("next_step"):
+        return False
+
+    _validate_product_ai_provenance(conn, task_id, step, metadata, meta)
+
+    sha = _commit_worker_diff(conn, task_id)
+    if sha is None:
+        return False
+
+    next_step = transition["next_step"]
+    next_role = transition.get("assignee_role")
+    next_assignee = _product_role_assignee(meta, next_role)
+
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET current_step_key = ?, running = 0, assignee = ?, result = ? "
+            "WHERE id = ?",
+            (next_step, next_assignee, summary, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _sync_legacy_status(conn, task_id, meta)
+        _append_event(
+            conn,
+            task_id,
+            "handoff",
+            {
+                "from_step": step,
+                "to_step": next_step,
+                "sha": sha,
+                "assignee": next_assignee,
+                "summary": summary,
+            },
+        )
+    return True
+
+
 # ---------------------------------------------------------------------------
 def schedule_task(
     conn: sqlite3.Connection,

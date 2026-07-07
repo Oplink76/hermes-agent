@@ -2863,6 +2863,253 @@ def test_commit_worker_diff_respects_gitignore(kanban_home, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# handoff() -- atomic commit-first advance (T2.2-T2.4)
+# ---------------------------------------------------------------------------
+
+def _card_snapshot(conn: sqlite3.Connection, task_id: str) -> dict:
+    return dict(conn.execute(
+        "SELECT current_step_key, running, blocked, status, assignee, result "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone())
+
+
+def test_handoff_commit_first_gate_blocks_advance_on_clean_tree(kanban_home, tmp_path, monkeypatch):
+    """T2.2: no committed diff (clean tree) -> False, card untouched, no event."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-handoff-gate"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        before = _card_snapshot(conn, tid)
+
+        result = kb.handoff(
+            conn, tid, board=board,
+            metadata={"ai_provenance": {"writer": {"agent": "hermes"}}},
+        )
+
+        after = _card_snapshot(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert result is False
+    assert after == before
+    assert after["current_step_key"] == "development"
+    assert not any(event.kind == "handoff" for event in events)
+
+
+def test_handoff_happy_path_commits_advances_and_emits_one_event(kanban_home, tmp_path, monkeypatch):
+    """T2.3: dirty worktree + provenance -> commits, advances, retags, syncs status, one event."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-handoff-happy"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        conn.execute("UPDATE tasks SET running = 1 WHERE id = ?", (tid,))
+        (repo / "src.py").write_text("print('hi')\n", encoding="utf-8")
+
+        result = kb.handoff(
+            conn, tid, board=board, summary="Implemented checkout",
+            metadata={"ai_provenance": {"writer": {"agent": "hermes"}}},
+        )
+
+        card = _card_snapshot(conn, tid)
+        events = kb.list_events(conn, tid)
+        meta = kb.read_board_metadata(board)
+
+    assert result is True
+    assert card["current_step_key"] == "test"
+    assert card["assignee"] == "tester"
+    assert card["running"] == 0
+    assert card["result"] == "Implemented checkout"
+    assert card["status"] == kb._legacy_status(card, meta)
+
+    handoff_events = [event for event in events if event.kind == "handoff"]
+    assert len(handoff_events) == 1
+    payload = handoff_events[0].payload
+    assert payload["from_step"] == "development"
+    assert payload["to_step"] == "test"
+    assert payload["assignee"] == "tester"
+    assert payload["summary"] == "Implemented checkout"
+    sha = payload["sha"]
+    assert sha and len(sha) == 40
+
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert head == sha
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert status == ""
+
+
+def test_handoff_terminal_review_advances_with_no_next_assignee(kanban_home, tmp_path, monkeypatch):
+    """T2.4a: review -> release_measure advances with assignee None, one event."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-handoff-review"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="reviewer",
+            workflow_template_id="product",
+            current_step_key="review",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        (repo / "notes.md").write_text("looks good\n", encoding="utf-8")
+
+        result = kb.handoff(
+            conn, tid, board=board,
+            metadata={
+                "ai_provenance": {
+                    "writer": {"agent": "hermes"},
+                    "reviewer": {"agent": "codex"},
+                }
+            },
+        )
+
+        card = _card_snapshot(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert result is True
+    assert card["current_step_key"] == "release_measure"
+    assert card["assignee"] is None
+    handoff_events = [event for event in events if event.kind == "handoff"]
+    assert len(handoff_events) == 1
+    assert handoff_events[0].payload["to_step"] == "release_measure"
+    assert handoff_events[0].payload["assignee"] is None
+
+
+def test_handoff_terminal_release_measure_does_not_auto_advance(kanban_home, tmp_path, monkeypatch):
+    """T2.4b: release_measure has no transition -> False, nothing committed, no event."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-handoff-terminal"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            workflow_template_id="product",
+            current_step_key="release_measure",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        # Dirty tree present: if handoff mistakenly committed first, this
+        # would prove the bug (HEAD would move even without a transition).
+        (repo / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+        before_head = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        before = _card_snapshot(conn, tid)
+
+        result = kb.handoff(conn, tid, board=board)
+
+        after = _card_snapshot(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert result is False
+    assert after == before
+    after_head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert after_head == before_head
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert status.strip() != ""  # still dirty -- never staged/committed
+    assert not any(event.kind == "handoff" for event in events)
+
+
+def test_handoff_non_v2_board_is_noop(kanban_home, monkeypatch):
+    """Non-v2 (legacy) boards never use handoff() -- False, no mutation (T2.5 guarantee)."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "product-no-v2-handoff"
+    kb.create_board(board, name="Product No V2", preset="product")
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        before = _card_snapshot(conn, tid)
+
+        result = kb.handoff(
+            conn, tid, board=board,
+            metadata={"ai_provenance": {"writer": {"agent": "hermes"}}},
+        )
+
+        after = _card_snapshot(conn, tid)
+
+    assert result is False
+    assert after == before
+
+
+def test_handoff_provenance_failure_raises_and_leaves_card_untouched(kanban_home, tmp_path, monkeypatch):
+    """Provenance gate runs before commit-first: raises, nothing committed or mutated."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-handoff-provenance"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        (repo / "src.py").write_text("print('hi')\n", encoding="utf-8")
+        before = _card_snapshot(conn, tid)
+
+        with pytest.raises(kb.ProductProvenanceError, match="Development completion"):
+            kb.handoff(conn, tid, board=board)
+
+        after = _card_snapshot(conn, tid)
+
+    assert after == before
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert status.strip() != ""  # never staged/committed
+
+
+# ---------------------------------------------------------------------------
 # Scratch cleanup containment (#28818)
 # ---------------------------------------------------------------------------
 
