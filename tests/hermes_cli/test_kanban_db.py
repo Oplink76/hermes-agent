@@ -281,6 +281,65 @@ def test_legacy_db_gains_running_and_blocked_columns_without_data_loss(tmp_path)
 
 
 # ---------------------------------------------------------------------------
+# _legacy_status computed view (T1.2)
+# ---------------------------------------------------------------------------
+
+def test_legacy_status_running_flag_wins_over_idle_column(kanban_home):
+    row = {"current_step_key": "development", "running": 1, "blocked": 0}
+    assert kb._legacy_status(row) == "running"
+
+
+def test_legacy_status_blocked_flag_set(kanban_home):
+    row = {"current_step_key": "development", "running": 0, "blocked": 1}
+    assert kb._legacy_status(row) == "blocked"
+
+
+def test_legacy_status_blocked_wins_over_running(kanban_home):
+    """Precedence: blocked beats running when both flags are truthy."""
+    row = {"current_step_key": "development", "running": 1, "blocked": 1}
+    assert kb._legacy_status(row) == "blocked"
+
+
+def test_legacy_status_done_column(kanban_home):
+    row = {"current_step_key": "done", "running": 0, "blocked": 0}
+    assert kb._legacy_status(row) == "done"
+
+
+def test_legacy_status_review_column(kanban_home):
+    row = {"current_step_key": "review", "running": 0, "blocked": 0}
+    assert kb._legacy_status(row) == "review"
+
+
+def test_legacy_status_idle_non_terminal_is_ready(kanban_home):
+    row = {"current_step_key": "development", "running": 0, "blocked": 0}
+    assert kb._legacy_status(row) == "ready"
+
+
+def test_legacy_status_meta_none_uses_product_template_defaults(kanban_home):
+    """meta=None falls through to the product-template defaults, same as
+    ``_column_status_for_step`` does on its own."""
+    row = {"current_step_key": "review", "running": 0, "blocked": 0}
+    assert kb._legacy_status(row, meta=None) == "review"
+
+
+def test_legacy_status_honors_custom_meta_column_status(kanban_home):
+    """A board with a custom column status in ``meta`` is honored, proving
+    ``meta`` is actually consulted via ``_column_status_for_step``."""
+    meta = {"columns": [{"name": "triage", "status": "triage"}]}
+    row = {"current_step_key": "triage", "running": 0, "blocked": 0}
+    assert kb._legacy_status(row, meta=meta) == "triage"
+
+
+def test_legacy_status_accepts_real_sqlite_row(kanban_home):
+    """The helper must also accept a real ``sqlite3.Row``, not just a dict."""
+    with kb.connect() as conn:
+        row = conn.execute(
+            "SELECT 'development' AS current_step_key, 1 AS running, 0 AS blocked"
+        ).fetchone()
+    assert kb._legacy_status(row) == "running"
+
+
+# ---------------------------------------------------------------------------
 # Task creation + status inference
 # ---------------------------------------------------------------------------
 

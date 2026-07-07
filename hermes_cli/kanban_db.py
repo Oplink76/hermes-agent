@@ -964,6 +964,26 @@ def _column_status_for_step(meta: Optional[dict], step_key: Optional[str]) -> st
     return "ready"
 
 
+def _legacy_status(row: Any, meta: Optional[dict] = None) -> str:
+    """Compute the legacy ``status`` string from handoff_v2 state.
+
+    ``(current_step_key, running, blocked)`` is the canonical card state;
+    this derives the old ``status`` view for existing consumers. Precedence:
+    blocked > running > column status for the current phase. Does not
+    reconstruct dependency-gated ``"todo"`` — that remains owned by the
+    existing dependency-gating code path.
+    """
+    keys = row.keys()
+    blocked = row["blocked"] if "blocked" in keys else None
+    if blocked:
+        return "blocked"
+    running = row["running"] if "running" in keys else None
+    if running:
+        return "running"
+    step_key = row["current_step_key"] if "current_step_key" in keys else None
+    return _column_status_for_step(meta, step_key)
+
+
 def _product_ai_provenance_required(meta: Optional[dict]) -> bool:
     wf = _product_workflow_dict(meta)
     for key in ("ai_provenance_required", "require_ai_provenance"):
