@@ -858,6 +858,11 @@ def _product_workflow_dict(meta: Optional[dict]) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
+def _handoff_v2_enabled(board_meta: Optional[dict]) -> bool:
+    wf = _product_workflow_dict(board_meta)
+    return wf.get("handoff_v2") is True
+
+
 def _board_slug_for_connection(conn: sqlite3.Connection) -> str:
     """Best-effort board slug for an open kanban DB connection.
 

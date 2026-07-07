@@ -5408,3 +5408,10 @@ def test_detect_crashed_workers_nonzero_exit_unaffected_by_adjudication(
 
     assert task.current_step_key == "development"
     assert task.status == "ready"
+
+
+def test_handoff_v2_flag_defaults_off_and_reads_meta(kanban_home):
+    import hermes_cli.kanban_db as kb
+    assert kb._handoff_v2_enabled({}) is False
+    assert kb._handoff_v2_enabled({"product_workflow": {"handoff_v2": True}}) is True
+    assert kb._handoff_v2_enabled({"product_workflow": {"handoff_v2": False}}) is False
