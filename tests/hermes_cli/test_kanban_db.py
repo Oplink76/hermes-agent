@@ -3949,6 +3949,196 @@ def test_complete_task_legacy_board_unchanged(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# handoff() honors expected_run_id — stale reclaimed worker cannot advance
+# (Codex P1: complete_task's v2 routing used to call handoff() without the
+# worker's run id, so a RECLAIMED worker could still commit + advance.)
+# ---------------------------------------------------------------------------
+
+def test_complete_task_v2_stale_reclaimed_worker_cannot_advance(kanban_home, tmp_path, monkeypatch):
+    """Real path: claim a v2 card, write a dirty diff, RECLAIM the claim
+    (operator-driven, same as the dashboard recovery flow), then the OLD
+    run's worker calls ``complete_task(..., expected_run_id=<old run id>)``.
+
+    Must return False: no advance (current_step_key unchanged), no commit
+    (HEAD unmoved, worktree still dirty), and no ``handoff`` event -- the
+    ownership was revoked out from under it.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-stale-reclaim"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        stale_run_id = claimed.current_run_id
+        assert stale_run_id is not None
+        kb.set_running(conn, tid, True, board=board)
+        (repo / "src.py").write_text("print('hi')\n", encoding="utf-8")
+
+        before_head = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        # Operator (or crash detector) reclaims the claim -- ownership is
+        # revoked, current_run_id cleared, card back to ready.
+        assert kb.reclaim_task(conn, tid, reason="test reclaim") is True
+        reclaimed_card = kb.get_task(conn, tid)
+        assert reclaimed_card.current_run_id is None
+        assert reclaimed_card.status == "ready"
+
+        # The stale worker (still holding the OLD run id) tries to complete.
+        result = kb.complete_task(
+            conn,
+            tid,
+            summary="Implemented checkout",
+            board=board,
+            expected_run_id=stale_run_id,
+            metadata={"ai_provenance": {"writer": {"agent": "hermes"}}},
+        )
+
+        card = _card_snapshot(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert result is False
+    assert card["current_step_key"] == "development"
+    assert not any(event.kind == "handoff" for event in events)
+
+    after_head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert after_head == before_head
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert status.strip() != ""  # still dirty -- never staged/committed
+
+
+def test_complete_task_v2_owning_worker_still_advances_with_expected_run_id(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """The current run's worker (expected_run_id == current_run_id, status
+    running) must still commit + advance exactly as before -- passing
+    expected_run_id must not regress the happy path.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-owning-worker"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        kb.set_running(conn, tid, True, board=board)
+        (repo / "src.py").write_text("print('hi')\n", encoding="utf-8")
+
+        result = kb.complete_task(
+            conn,
+            tid,
+            summary="Implemented checkout",
+            board=board,
+            expected_run_id=run_id,
+            metadata={"ai_provenance": {"writer": {"agent": "hermes"}}},
+        )
+
+        card = _card_snapshot(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert result is True
+    assert card["current_step_key"] == "test"
+    assert card["assignee"] == "tester"
+    handoff_events = [event for event in events if event.kind == "handoff"]
+    assert len(handoff_events) == 1
+
+
+def test_handoff_cas_race_loses_ownership_between_commit_and_advance(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """CAS on the advance UPDATE: even when the precheck passed, if
+    ownership changes in the gap between the commit-first gate and the
+    final advance (a competing reclaim races in), the advance must refuse
+    (rowcount != 1) and emit no event. The diff is already committed at
+    the git level by this point (can't be undone), but the DB/card must
+    not advance nor record a handoff.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-handoff-cas-race"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        kb.set_running(conn, tid, True, board=board)
+        (repo / "src.py").write_text("print('hi')\n", encoding="utf-8")
+
+        real_commit = kb._commit_worker_diff
+
+        def _racing_commit(conn_, task_id_, *args, **kwargs):
+            sha = real_commit(conn_, task_id_, *args, **kwargs)
+            # Simulate a competing reclaim landing in the window between
+            # the commit-first gate and the advance UPDATE below.
+            conn_.execute(
+                "UPDATE tasks SET current_run_id = NULL, status = 'ready' "
+                "WHERE id = ?",
+                (task_id_,),
+            )
+            return sha
+
+        monkeypatch.setattr(kb, "_commit_worker_diff", _racing_commit)
+
+        result = kb.handoff(
+            conn, tid, board=board, expected_run_id=run_id,
+            metadata={"ai_provenance": {"writer": {"agent": "hermes"}}},
+        )
+
+        card = _card_snapshot(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert result is False
+    assert card["current_step_key"] == "development"
+    assert not any(event.kind == "handoff" for event in events)
+
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert status == ""  # the commit itself DID happen -- git can't undo it
+
+
+# ---------------------------------------------------------------------------
 # spawn_after_handoff — event-driven fire-once spawn consumer (T3.1)
 # ---------------------------------------------------------------------------
 

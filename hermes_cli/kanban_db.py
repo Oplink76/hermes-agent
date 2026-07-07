@@ -5238,6 +5238,7 @@ def complete_task(
                 # transition table).
                 advanced = handoff(
                     conn, task_id, board=board, summary=summary, metadata=metadata,
+                    expected_run_id=expected_run_id,
                 )
                 if not advanced:
                     # Commit-first gate failed (no committed diff) or
@@ -7647,6 +7648,7 @@ def handoff(
     board: Optional[str] = None,
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Atomically advance a handoff_v2 product card, gated on a committed diff.
 
@@ -7658,27 +7660,42 @@ def handoff(
     (no transition, e.g. the terminal ``release_measure`` step, means no
     auto-advance -- returns ``False``, nothing touched) -> validate AI
     provenance (raises :class:`ProductProvenanceError` on failure, card
-    untouched) -> commit-first gate via :func:`_commit_worker_diff` (no SHA
-    means no advance) -> one atomic transaction: advance the phase, clear
-    ``running``, retag the assignee, sync the legacy ``status``, and emit
-    exactly one ``handoff`` event carrying the commit SHA.
+    untouched) -> when ``expected_run_id`` is given, a run-ownership
+    precondition check (before the commit, so a reclaimed worker can't
+    create a stale commit) -> commit-first gate via
+    :func:`_commit_worker_diff` (no SHA means no advance) -> one atomic
+    transaction: advance the phase, clear ``running``, retag the assignee,
+    sync the legacy ``status``, and emit exactly one ``handoff`` event
+    carrying the commit SHA. The advance UPDATE re-checks run ownership
+    via a CAS (``AND current_run_id = ?``) to guard the window between the
+    precondition check and the write.
 
     Returns ``False`` (no mutation) when the board isn't handoff_v2, the
-    card doesn't exist, its current step has no advancing transition, or
-    the commit-first gate yields no SHA.
+    card doesn't exist, its current step has no advancing transition, the
+    commit-first gate yields no SHA, or (when ``expected_run_id`` is given)
+    the card's run ownership was lost before the commit or before the
+    advance.
     """
     meta = product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return False
 
     row = conn.execute(
-        "SELECT current_step_key FROM tasks WHERE id = ?", (task_id,),
+        "SELECT current_step_key, status, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if row is None:
         return False
     step = row["current_step_key"]
     transition = PRODUCT_WORKFLOW_TRANSITIONS.get(str(step or ""))
     if not transition or not transition.get("next_step"):
+        return False
+
+    if expected_run_id is not None and (
+        row["status"] != "running" or row["current_run_id"] != expected_run_id
+    ):
+        # Ownership was reclaimed out from under this worker -- refuse
+        # before the commit-first gate so we never create a stale commit.
         return False
 
     _validate_product_ai_provenance(conn, task_id, step, metadata, meta)
@@ -7692,11 +7709,16 @@ def handoff(
     next_assignee = _product_role_assignee(meta, next_role)
 
     with write_txn(conn):
-        cur = conn.execute(
+        sql = (
             "UPDATE tasks SET current_step_key = ?, running = 0, assignee = ?, result = ? "
-            "WHERE id = ?",
-            (next_step, next_assignee, summary, task_id),
+            "WHERE id = ?"
+        ) + ("" if expected_run_id is None else " AND status = 'running' AND current_run_id = ?")
+        params = (
+            (next_step, next_assignee, summary, task_id)
+            if expected_run_id is None
+            else (next_step, next_assignee, summary, task_id, int(expected_run_id))
         )
+        cur = conn.execute(sql, params)
         if cur.rowcount != 1:
             return False
         _sync_legacy_status(conn, task_id, meta)
