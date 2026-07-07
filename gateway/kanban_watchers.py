@@ -94,6 +94,43 @@ def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     return handle, "held"
 
 
+def _dispatch_once_then_reconcile(_kb, conn, slug: str, **dispatch_kwargs) -> "Optional[object]":
+    """Run one dispatch_once tick, then — for handoff_v2 boards only — run
+    ``reconcile()`` on the same connection immediately after.
+
+    ``dispatch_once`` already drives the v2 happy path live (it spawns ready
+    v2 cards via claim-CAS and recovers crashed/stale workers), so the piece
+    genuinely missing from the live gateway is ``reconcile()``'s
+    story->epic integration step and its own bounded recovery pass. This is
+    the seam that wires that in (CR4 / Codex P1-P2).
+
+    Legacy (non-v2) boards: ``reconcile`` is never called; this is
+    ``dispatch_once`` unchanged.
+
+    Returns ``dispatch_once``'s result unchanged — reconcile does not
+    participate in the tick's return/telemetry contract, it's a
+    side-effecting safety net layered on top.
+
+    Defensive: an exception raised by ``reconcile`` is logged and swallowed
+    here so it can never break the tick or clobber the already-computed
+    dispatch_once result. Exceptions from ``dispatch_once`` itself are not
+    caught here — they propagate to the caller's existing corrupt-DB /
+    generic-exception handling, unchanged.
+    """
+    result = _kb.dispatch_once(conn, board=slug, **dispatch_kwargs)
+    try:
+        meta = _kb.product_board_metadata(slug)
+        if _kb._handoff_v2_enabled(meta):
+            _kb.reconcile(conn, board=slug)
+    except Exception:
+        logger.exception(
+            "kanban dispatcher: reconcile failed on board %s (safety net; "
+            "dispatch_once result unaffected)",
+            slug,
+        )
+    return result
+
+
 def _release_singleton_lock(handle) -> None:
     """Release a dispatcher singleton lock acquired via :func:`_acquire_singleton_lock`."""
     if handle is None:
@@ -1013,9 +1050,10 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
-                return _kb.dispatch_once(
+                return _dispatch_once_then_reconcile(
+                    _kb,
                     conn,
-                    board=slug,
+                    slug,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
