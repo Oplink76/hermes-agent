@@ -6972,3 +6972,88 @@ def test_resolve_or_block_legacy_board_returns_none(kanban_home):
     assert outcome is None
     notify.assert_not_called()
     assert after == before
+
+
+# ---------------------------------------------------------------------------
+# epic_ready -- all stories done + suite green gate (T4.2)
+# ---------------------------------------------------------------------------
+
+def _make_epic_with_children(board: str, *, n_children: int = 2) -> tuple[str, list[str]]:
+    with kb.connect(board=board) as conn:
+        epic = kb.create_task(conn, title="Epic", board=board)
+        children = [
+            kb.create_task(conn, title=f"Story {i}", board=board, parents=[epic])
+            for i in range(n_children)
+        ]
+    return epic, children
+
+
+def test_epic_ready_not_all_children_done_returns_false_verify_not_called(kanban_home):
+    board = "v2-epic-ready-not-all-done"
+    _v2_product_board(board)
+    epic, children = _make_epic_with_children(board)
+    with kb.connect(board=board) as conn:
+        _set_task_status(conn, children[0], "done")
+        # children[1] stays in its default (not-done) status.
+        verify = unittest.mock.Mock(return_value=True)
+        result = kb.epic_ready(conn, epic, board=board, verify_fn=verify)
+
+    assert result is False
+    verify.assert_not_called()
+
+
+def test_epic_ready_all_done_verify_true_returns_true(kanban_home):
+    board = "v2-epic-ready-all-done-true"
+    _v2_product_board(board)
+    epic, children = _make_epic_with_children(board)
+    with kb.connect(board=board) as conn:
+        for child in children:
+            _set_task_status(conn, child, "done")
+        seen_branches: list[str] = []
+
+        def verify(eb: str) -> bool:
+            seen_branches.append(eb)
+            return True
+
+        result = kb.epic_ready(conn, epic, board=board, verify_fn=verify)
+
+    assert result is True
+    assert seen_branches == [kb.epic_branch_for(epic)]
+
+
+def test_epic_ready_all_done_verify_false_returns_false(kanban_home):
+    board = "v2-epic-ready-all-done-false"
+    _v2_product_board(board)
+    epic, children = _make_epic_with_children(board)
+    with kb.connect(board=board) as conn:
+        for child in children:
+            _set_task_status(conn, child, "done")
+        result = kb.epic_ready(conn, epic, board=board, verify_fn=lambda eb: False)
+
+    assert result is False
+
+
+def test_epic_ready_no_children_returns_false_verify_not_called(kanban_home):
+    board = "v2-epic-ready-no-children"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        epic = kb.create_task(conn, title="Lonely Epic", board=board)
+        verify = unittest.mock.Mock(return_value=True)
+        result = kb.epic_ready(conn, epic, board=board, verify_fn=verify)
+
+    assert result is False
+    verify.assert_not_called()
+
+
+def test_epic_ready_non_v2_board_returns_false_verify_not_called(kanban_home):
+    board = "legacy-epic-ready"
+    kb.create_board(board, name="Legacy Board", preset="product")
+    with kb.connect(board=board) as conn:
+        epic = kb.create_task(conn, title="Epic", board=board)
+        kb.create_task(conn, title="Story", board=board, parents=[epic])
+        _set_task_status(conn, epic, "done")
+        verify = unittest.mock.Mock(return_value=True)
+        result = kb.epic_ready(conn, epic, board=board, verify_fn=verify)
+
+    assert result is False
+    verify.assert_not_called()

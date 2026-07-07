@@ -6771,6 +6771,82 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
+def _default_epic_verify(epic_branch: str) -> bool:
+    """Run the project's test suite against ``epic_branch`` and report green.
+
+    The real (slow) verify path for :func:`epic_ready`. Resolves the active
+    board's repo root the same way :func:`_resolve_worktree_workspace` does
+    (board ``default_workdir`` -> :func:`_git_toplevel`), materializes/locates
+    a worktree checked out to ``epic_branch``, then shells out to
+    ``scripts/run_tests.sh`` in that worktree.
+
+    Defensive: any exception, or a missing ``run_tests.sh``, means "not
+    green" -- this never raises. Exercised by the dogfood checkpoint, not by
+    unit tests (which inject ``verify_fn`` instead).
+    """
+    try:
+        board_default = (
+            read_board_metadata(get_current_board()).get("default_workdir") or ""
+        ).strip()
+        if not board_default:
+            return False
+        repo_root = _git_toplevel(Path(board_default).expanduser())
+        if repo_root is None:
+            return False
+        _ensure_epic_branch(repo_root, epic_branch)
+        target = repo_root / ".worktrees" / f"epic-verify-{epic_branch.replace('/', '-')}"
+        _ensure_git_worktree(repo_root, target, epic_branch)
+        script = target / "scripts" / "run_tests.sh"
+        if not script.exists():
+            return False
+        result = subprocess.run(
+            ["bash", "scripts/run_tests.sh"],
+            cwd=target,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def epic_ready(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    *,
+    board: Optional[str] = None,
+    verify_fn: Optional[Callable[[str], bool]] = None,
+) -> bool:
+    """Whether ``epic_id`` is ready to merge its branch to main.
+
+    ``True`` only when: the board has opted into ``handoff_v2``; the epic
+    has at least one child; every child is strictly ``status == 'done'``
+    (the softer release_measure-unblocks relaxation used elsewhere for
+    dependency satisfaction does NOT apply here -- a story sitting in the
+    human release gate is not done); AND the suite is green on the epic's
+    integration branch.
+
+    Cheap checks short-circuit before the expensive suite verification --
+    ``verify_fn`` is not called unless every child is done. ``verify_fn(
+    epic_branch) -> bool`` is the injectable suite-green probe, defaulting to
+    :func:`_default_epic_verify` (the real, slow suite run).
+    """
+    meta = product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta):
+        return False
+    children = child_ids(conn, epic_id)
+    if not children:
+        return False
+    for child_id in children:
+        child = get_task(conn, child_id)
+        if child is None or child.status != "done":
+            return False
+    verify = verify_fn or _default_epic_verify
+    return bool(verify(epic_branch_for(epic_id)))
+
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
