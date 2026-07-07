@@ -2979,6 +2979,119 @@ def test_spawn_one_v2_wires_story_base_branch_to_epic(kanban_home, tmp_path, mon
     )
 
 
+def test_spawn_one_v2_success_sets_running_flag(kanban_home, tmp_path, monkeypatch):
+    """W2: a successful _spawn_one_v2 spawn sets the v2 running flag (not just
+    legacy status='running' via claim_task), closing the flag lifecycle."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-spawn-sets-running"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+
+    def fake_spawn(task, workspace, board=None):
+        return 4242
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            board=board,
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        pid = kb._spawn_one_v2(conn, tid, board=board, spawn_fn=fake_spawn)
+        task = kb.get_task(conn, tid)
+        row = conn.execute(
+            "SELECT running, status FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+
+    assert pid == 4242
+    assert task is not None and task.worker_pid == 4242
+    assert row["running"] == 1
+    assert row["status"] == "running"
+
+
+def test_spawn_one_v2_failure_does_not_set_running_flag(kanban_home, tmp_path, monkeypatch):
+    """W2: a failed spawn attempt must NOT set running=1 -- only the success
+    path (a real pid stamped) sets the flag; failures go through
+    _record_spawn_failure and stay unclaimed/not-running."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-spawn-failure-no-running"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+
+    def boom(task, workspace, board=None):
+        raise RuntimeError("spawn failed")
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            board=board,
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        pid = kb._spawn_one_v2(conn, tid, board=board, spawn_fn=boom)
+        row = conn.execute(
+            "SELECT running, status FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+
+    assert pid is None
+    assert row["running"] == 0
+    assert row["status"] != "running"
+
+
+def test_spawn_then_handoff_running_flag_round_trip(kanban_home, tmp_path, monkeypatch):
+    """W2 lifecycle: spawn sets running=1 (via _spawn_one_v2), then handoff
+    clears it back to running=0 on the same card -- the full set/clear
+    round-trip the running flag is meant to support."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-spawn-handoff-roundtrip"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+
+    def fake_spawn(task, workspace, board=None):
+        return 4242
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            board=board,
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        kb._spawn_one_v2(conn, tid, board=board, spawn_fn=fake_spawn)
+        after_spawn = conn.execute(
+            "SELECT running FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+
+        spawned_workspace = Path(kb.get_task(conn, tid).workspace_path)
+        (spawned_workspace / "src.py").write_text("print('hi')\n", encoding="utf-8")
+        result = kb.handoff(
+            conn, tid, board=board, summary="Implemented checkout",
+            metadata={"ai_provenance": {"writer": {"agent": "hermes"}}},
+        )
+        after_handoff = conn.execute(
+            "SELECT running FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+
+    assert after_spawn["running"] == 1
+    assert result is True
+    assert after_handoff["running"] == 0
+
+
 # ---------------------------------------------------------------------------
 # _commit_worker_diff (Phase 2 atomic commit-first handoff)
 # ---------------------------------------------------------------------------

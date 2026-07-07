@@ -7362,6 +7362,7 @@ def _spawn_one_v2(
             pid = _spawn(claimed, str(workspace))
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
+            set_running(conn, claimed.id, True, board=board)
         # NOTE: intentionally do NOT reset consecutive_failures here --
         # matches the ready loop's rule (a successful spawn doesn't
         # prove the run will succeed; see _dispatch_once_locked).
