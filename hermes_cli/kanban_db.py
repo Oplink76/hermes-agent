@@ -1022,6 +1022,40 @@ def _sync_legacy_status(conn: sqlite3.Connection, task_id: str, meta: Optional[d
     conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
 
 
+def _apply_v2_flags(
+    conn: sqlite3.Connection,
+    task_id: str,
+    meta: Optional[dict],
+    *,
+    running: Optional[bool] = None,
+    blocked: Optional[bool] = None,
+) -> None:
+    """v2 seam: set the given running/blocked flag(s) then re-derive legacy
+    status via _sync_legacy_status (which asserts the limbo invariant). No-op
+    if meta is not a handoff_v2 board. Call from WITHIN the caller's write_txn.
+
+    This is the ONE seam every v2 writer that mutates the canonical
+    ``(running, blocked)`` flags goes through -- ``claim_task`` here, and
+    the block/terminal/reclaim remediation to follow -- so status and flags
+    can never drift apart on a handoff_v2 board.
+    """
+    if meta is None or not _handoff_v2_enabled(meta):
+        return
+    sets = []
+    params: list = []
+    if running is not None:
+        sets.append("running = ?")
+        params.append(1 if running else 0)
+    if blocked is not None:
+        sets.append("blocked = ?")
+        params.append(1 if blocked else 0)
+    if not sets:
+        return
+    params.append(task_id)
+    conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", params)
+    _sync_legacy_status(conn, task_id, meta)
+
+
 def set_phase(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2019,6 +2053,11 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Canonical handoff_v2 state flags (see ``_apply_v2_flags`` /
+    # ``_legacy_status``). Always False on legacy (non-v2) boards and on
+    # rows read before these columns existed.
+    running: bool = False
+    blocked: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -2103,6 +2142,8 @@ class Task:
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
+            running=bool(row["running"]) if "running" in keys else False,
+            blocked=bool(row["blocked"]) if "blocked" in keys else False,
         )
 
 
@@ -4593,6 +4634,12 @@ def claim_task(
         )
         if cur.rowcount != 1:
             return None
+        # v2 seam: every claim (ready-queue dispatch, _spawn_one_v2, any
+        # future caller) maintains the canonical running flag here -- the
+        # single point that used to be missed by the live gateway, which
+        # calls claim_task directly rather than through _spawn_one_v2.
+        # No-op on legacy (non-handoff_v2) boards.
+        _apply_v2_flags(conn, task_id, board_meta, running=True, blocked=False)
         # Look up the current task row so we can populate the run with
         # its assignee / step / runtime cap.
         trow = conn.execute(
@@ -7735,7 +7782,6 @@ def _spawn_one_v2(
             pid = _spawn(claimed, str(workspace))
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
-            set_running(conn, claimed.id, True, board=board)
         # NOTE: intentionally do NOT reset consecutive_failures here --
         # matches the ready loop's rule (a successful spawn doesn't
         # prove the run will succeed; see _dispatch_once_locked).

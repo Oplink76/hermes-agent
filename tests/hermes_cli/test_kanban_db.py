@@ -2980,8 +2980,11 @@ def test_spawn_one_v2_wires_story_base_branch_to_epic(kanban_home, tmp_path, mon
 
 
 def test_spawn_one_v2_success_sets_running_flag(kanban_home, tmp_path, monkeypatch):
-    """W2: a successful _spawn_one_v2 spawn sets the v2 running flag (not just
-    legacy status='running' via claim_task), closing the flag lifecycle."""
+    """A successful _spawn_one_v2 spawn ends with the v2 running flag set.
+    R1 update: the flag is now set by claim_task (the seam _spawn_one_v2
+    calls internally), not by a separate set_running() call in this
+    function -- see test_claim_task_v2_board_sets_running_flag_and_consistent_status
+    for direct coverage of that seam."""
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     board = "v2-spawn-sets-running"
     _v2_product_board(board)
@@ -3015,9 +3018,14 @@ def test_spawn_one_v2_success_sets_running_flag(kanban_home, tmp_path, monkeypat
 
 
 def test_spawn_one_v2_failure_does_not_set_running_flag(kanban_home, tmp_path, monkeypatch):
-    """W2: a failed spawn attempt must NOT set running=1 -- only the success
-    path (a real pid stamped) sets the flag; failures go through
-    _record_spawn_failure and stay unclaimed/not-running."""
+    """R1 update: claim_task (not _spawn_one_v2) is now the sole setter of
+    the v2 running flag, so it flips to 1 as soon as the card is claimed --
+    before the spawn attempt even runs. A failed spawn then goes through
+    _record_spawn_failure, which flips legacy ``status`` back to 'ready'
+    directly (bypassing the v2 seam) but does not reset ``running``; closing
+    that status/flag gap on the failure path is out of scope here (it
+    belongs to the terminal/reclaim remediation, R3). This test now pins the
+    documented gap rather than asserting the old (pre-R1) behavior."""
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     board = "v2-spawn-failure-no-running"
     _v2_product_board(board)
@@ -3044,7 +3052,9 @@ def test_spawn_one_v2_failure_does_not_set_running_flag(kanban_home, tmp_path, m
         ).fetchone()
 
     assert pid is None
-    assert row["running"] == 0
+    # Set by claim_task at claim time; _record_spawn_failure (R3 scope)
+    # doesn't reset it on the failure path -- see docstring above.
+    assert row["running"] == 1
     assert row["status"] != "running"
 
 
@@ -3090,6 +3100,213 @@ def test_spawn_then_handoff_running_flag_round_trip(kanban_home, tmp_path, monke
     assert after_spawn["running"] == 1
     assert result is True
     assert after_handoff["running"] == 0
+
+
+# ---------------------------------------------------------------------------
+# R1: claim_task maintains the v2 running flag (state-model integrity)
+#
+# The v2 running flag used to be set only by _spawn_one_v2 -- a path the
+# LIVE gateway never calls (it spawns via dispatch_once -> claim_task
+# directly). So a gateway-spawned v2 card ended up status='running',
+# running=0: flags and status disagreeing, the exact defect the v2 state
+# model exists to prevent. _apply_v2_flags is the single in-txn seam that
+# fixes this; claim_task is its first (and, after this task, only) caller
+# for the running flag on the claim path.
+# ---------------------------------------------------------------------------
+
+def test_apply_v2_flags_sets_flag_and_syncs_status(kanban_home, monkeypatch):
+    """Direct unit coverage of the seam helper: sets the requested flag(s)
+    and re-derives legacy status via _sync_legacy_status."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-apply-flags"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+    meta = kb.read_board_metadata(board)
+
+    with kb.connect(board=board) as conn:
+        with kb.write_txn(conn):
+            kb._apply_v2_flags(conn, tid, meta, running=True, blocked=False)
+        row = conn.execute(
+            "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+
+    assert row["running"] == 1
+    assert row["blocked"] == 0
+    assert row["status"] == "running"
+    assert row["status"] == kb._legacy_status(row, meta)
+
+
+def test_apply_v2_flags_legacy_board_is_noop(kanban_home):
+    """meta=None (legacy board) -- flags and status must be untouched."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Legacy task")
+        before = dict(conn.execute(
+            "SELECT current_step_key, status, running, blocked FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone())
+        with kb.write_txn(conn):
+            kb._apply_v2_flags(conn, tid, None, running=True, blocked=True)
+        after = dict(conn.execute(
+            "SELECT current_step_key, status, running, blocked FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone())
+
+    assert after == before
+
+
+def test_apply_v2_flags_noop_when_not_handoff_v2_enabled(kanban_home, monkeypatch):
+    """A product-preset board that hasn't opted into handoff_v2 also no-ops."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "product-no-v2-apply-flags"
+    kb.create_board(board, name="Product No V2", preset="product")
+    meta = kb.read_board_metadata(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn, title="Story", workflow_template_id="product", current_step_key="development",
+        )
+        before = dict(conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone())
+        with kb.write_txn(conn):
+            kb._apply_v2_flags(conn, tid, meta, running=True, blocked=True)
+        after = dict(conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone())
+
+    assert after == before
+
+
+def test_claim_task_v2_board_sets_running_flag_and_consistent_status(kanban_home, monkeypatch):
+    """claim_task itself (not _spawn_one_v2) must set running=1 on a v2
+    board's card -- this is the fix for the gateway-bypasses-the-flag gap."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-claim-sets-running"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+    meta = kb.read_board_metadata(board)
+
+    with kb.connect(board=board) as conn:
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        claimed = kb.claim_task(conn, tid, claimer="host:1")
+        row = conn.execute(
+            "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+
+    assert claimed is not None
+    assert row["running"] == 1
+    assert row["blocked"] == 0
+    assert row["status"] == "running"
+    assert row["status"] == kb._legacy_status(row, meta)
+
+
+def test_claim_task_legacy_board_does_not_touch_flags(kanban_home):
+    """Legacy (non-v2) boards: claim_task must remain byte-for-byte
+    unchanged -- neither running nor blocked is touched by the claim."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Legacy task", assignee="alice")
+        claimed = kb.claim_task(conn, tid, claimer="host:1")
+        row = conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert claimed is not None
+    assert row["status"] == "running"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+
+
+def test_dispatch_once_gateway_spawn_sets_running_flag(kanban_home, tmp_path, monkeypatch):
+    """THE key integration test: drive the REAL dispatch_once -> claim_task
+    live-gateway path (not _spawn_one_v2, not set_running directly) on a v2
+    board and prove the claimed card's running flag and legacy status agree.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    board = "v2-dispatch-sets-running"
+    _v2_product_board(board)
+    meta = kb.read_board_metadata(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append((task.id, workspace))
+        return 4242
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            board=board,
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, board=board)
+
+        row = conn.execute(
+            "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+
+    assert len(spawns) == 1
+    assert spawns[0][0] == tid
+    assert {s[0] for s in result.spawned} == {tid}
+    assert row["running"] == 1
+    assert row["blocked"] == 0
+    assert row["status"] == "running"
+    assert row["status"] == kb._legacy_status(row, meta), (
+        "flags and status must not disagree on a live v2 board"
+    )
+
+
+def test_task_from_row_exposes_running_and_blocked(kanban_home, monkeypatch):
+    """get_task/Task.from_row surfaces running/blocked reflecting the row."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-task-exposes-flags"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+
+    with kb.connect(board=board) as conn:
+        conn.execute(
+            "UPDATE tasks SET running = 1, blocked = 0 WHERE id = ?", (tid,)
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task.running is True
+    assert task.blocked is False
+
+
+def test_task_from_row_defaults_flags_false_when_columns_absent():
+    """Defensive mapping: a row lacking running/blocked columns (e.g. an
+    older schema snapshot) defaults both to False rather than raising."""
+    row = {
+        "id": "t1",
+        "title": "T",
+        "body": None,
+        "assignee": None,
+        "status": "ready",
+        "priority": 0,
+        "created_by": None,
+        "created_at": 0,
+        "started_at": None,
+        "completed_at": None,
+        "workspace_kind": "inline",
+        "workspace_path": None,
+        "claim_lock": None,
+        "claim_expires": None,
+    }
+    task = kb.Task.from_row(row)
+    assert task.running is False
+    assert task.blocked is False
 
 
 # ---------------------------------------------------------------------------
