@@ -921,6 +921,26 @@ def _dependency_parent_satisfied(row: sqlite3.Row, *, release_measure_unblocks: 
     )
 
 
+_DEP_GATE_EXEMPT_STEPS = frozenset({"backlog", "architecture"})
+
+
+def _dependency_gate_applies(
+    workflow_template_id: Any, current_step_key: Any
+) -> bool:
+    """Whether unmet parent dependencies should hold this CHILD task.
+
+    Architecture (design) work depends on the upstream's *contract* — the story
+    and its acceptance criteria — not the upstream's merged code. So a product
+    card may run architecture in parallel with an upstream that is still being
+    built; the dependency gate is skipped while it sits at ``backlog`` /
+    ``architecture`` and enforced from ``development`` onward (where it builds on
+    real upstream code). Non-product cards keep the blanket gate.
+    """
+    if str(workflow_template_id or "") != "product":
+        return True
+    return str(current_step_key or "") not in _DEP_GATE_EXEMPT_STEPS
+
+
 def _product_role_assignee(
     meta: Optional[dict],
     role: Optional[str],
@@ -4221,7 +4241,8 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, "
+            "current_step_key, workflow_template_id "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -4239,7 +4260,13 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(_dependency_parent_satisfied(p, release_measure_unblocks=release_measure_unblocks) for p in parents):
+            gate_applies = _dependency_gate_applies(
+                row["workflow_template_id"], row["current_step_key"]
+            )
+            if not gate_applies or all(
+                _dependency_parent_satisfied(p, release_measure_unblocks=release_measure_unblocks)
+                for p in parents
+            ):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -4302,13 +4329,24 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+        child = conn.execute(
+            "SELECT workflow_template_id, current_step_key FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        gate_applies = _dependency_gate_applies(
+            child["workflow_template_id"] if child else None,
+            child["current_step_key"] if child else None,
+        )
         parents = conn.execute(
             "SELECT p.status, p.workflow_template_id, p.current_step_key FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
             "WHERE l.child_id = ?",
             (task_id,),
         ).fetchall()
-        if any(not _dependency_parent_satisfied(p, release_measure_unblocks=release_measure_unblocks) for p in parents):
+        if gate_applies and any(
+            not _dependency_parent_satisfied(p, release_measure_unblocks=release_measure_unblocks)
+            for p in parents
+        ):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",

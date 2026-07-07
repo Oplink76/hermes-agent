@@ -325,6 +325,69 @@ def test_recompute_ready_cascades_through_chain(kanban_home):
         assert kb.get_task(conn, c).status == "ready"
 
 
+def test_dependency_gate_skips_architecture_but_holds_development(kanban_home):
+    """Phase-aware deps: a product card runs architecture in parallel with an
+    unfinished upstream (design depends on the contract, not the merged code),
+    but development still waits for the parent to finish."""
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        parent = kb.create_task(
+            conn, title="upstream", assignee="developer",
+            workflow_template_id="product", current_step_key="development",
+        )
+        child = kb.create_task(
+            conn, title="downstream", assignee="architect", parents=[parent],
+            workflow_template_id="product", current_step_key="architecture",
+        )
+        assert kb.get_task(conn, parent).status != "done"
+
+        kb.recompute_ready(conn)
+        arch_status = kb.get_task(conn, child).status
+
+        # Same child, now at development, must be held again.
+        conn.execute(
+            "UPDATE tasks SET status='todo', current_step_key='development' WHERE id=?",
+            (child,),
+        )
+        conn.commit()
+        kb.recompute_ready(conn)
+        dev_status = kb.get_task(conn, child).status
+
+    assert arch_status == "ready", "architecture should proceed despite unmet parent"
+    assert dev_status == "todo", "development must wait for the parent"
+
+
+def test_claim_task_phase_aware_dependency_gate(kanban_home):
+    """claim_task must not demote a product architecture card for an unmet
+    parent, but must still demote a development card."""
+    kb.create_board("prod", preset="product")
+    with kb.connect(board="prod") as conn:
+        parent = kb.create_task(
+            conn, title="upstream", assignee="developer",
+            workflow_template_id="product", current_step_key="development",
+        )
+        child = kb.create_task(
+            conn, title="downstream", assignee="architect", parents=[parent],
+            workflow_template_id="product", current_step_key="architecture",
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        conn.commit()
+        claimed_arch = kb.claim_task(conn, child)
+
+        # Reset the same child to development/ready and re-claim → must demote.
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_step_key='development', "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (child,),
+        )
+        conn.commit()
+        claimed_dev = kb.claim_task(conn, child)
+        dev_status = kb.get_task(conn, child).status
+
+    assert claimed_arch is not None, "architecture card must be claimable despite unmet parent"
+    assert claimed_dev is None and dev_status == "todo", "development card must be demoted for unmet parent"
+
+
 def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
     """blocked tasks with all parents done should be promoted to ready,
     unless the circuit-breaker failure limit has been reached."""
@@ -4797,7 +4860,13 @@ def test_product_release_measure_can_satisfy_dependencies_for_autonomous_boards(
 
 
 def test_product_release_measure_still_blocks_dependencies_without_autonomy_opt_in(kanban_home, monkeypatch):
-    """Legacy/product boards keep the explicit human release gate by default."""
+    """Legacy/product boards keep the explicit human release gate by default.
+
+    Checked at the development phase: the dependency gate is phase-aware
+    (architecture may proceed against the upstream contract), so a child that is
+    actually gated must be past architecture — a development child with an
+    un-opted-in release_measure parent still waits.
+    """
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     board = "manual-release-product"
@@ -4805,7 +4874,7 @@ def test_product_release_measure_still_blocks_dependencies_without_autonomy_opt_
 
     with kb.connect(board=board) as conn:
         parent = kb.create_task(conn, title="Story: release gate")
-        child = kb.create_task(conn, title="Story: blocked child", assignee="architect")
+        child = kb.create_task(conn, title="Story: blocked child", assignee="developer")
         kb.link_tasks(conn, parent, child)
         with kb.write_txn(conn):
             conn.execute(
@@ -4815,7 +4884,7 @@ def test_product_release_measure_still_blocks_dependencies_without_autonomy_opt_
             )
             conn.execute(
                 "UPDATE tasks SET workflow_template_id = 'product', status = 'ready', "
-                "current_step_key = 'architecture' WHERE id = ?",
+                "current_step_key = 'development' WHERE id = ?",
                 (child,),
             )
 
