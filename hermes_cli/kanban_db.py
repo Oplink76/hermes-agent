@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, Protocol
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -7182,6 +7182,243 @@ def integrate_story_to_epic(
         return "integrated"
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# deploy_epic / notify_operations -- Hermes-run test->preprod deploy of a
+# merged epic via an injected Ops API client, smoke-gated, then one
+# #operations release notice (Phase 5, T5.1-T5.3).
+#
+# THE HARD BOUNDARY: this loop deploys test + pre-prod ONLY -- NEVER
+# production, and NEVER `git push` / touches a git remote or origin. The
+# real container Ops API adapter (HTTP/gh, feat/container-ops-api / PR #3)
+# is deliberately not built here; ``ops_client`` must be injected, and the
+# default stub below raises rather than silently no-op'ing.
+# ---------------------------------------------------------------------------
+
+_DEPLOYABLE_ENVS = {"test", "preprod"}
+
+
+class OpsClient(Protocol):
+    """Container Ops API surface Hermes deploys through.
+
+    Concrete real implementation lives in feat/container-ops-api / PR #3 --
+    out of scope here. Tests inject a mock; production code must inject a
+    real client explicitly (see :class:`_DefaultOpsClient`).
+    """
+
+    def build_roll(self, env: str) -> Any:
+        """Build/refresh the container(s) for ``env``. Raise on failure."""
+        ...
+
+    def smoke(self, env: str) -> bool:
+        """Smoke/verify ``env``. ``True`` means healthy."""
+        ...
+
+
+class _DefaultOpsClient:
+    """Stub Ops client used when no ``ops_client`` is injected.
+
+    Both methods raise ``NotImplementedError`` -- the real HTTP/gh adapter
+    is deferred to ``feat/container-ops-api`` (PR #3) and is intentionally
+    NOT built by this task. Any caller relying on the default in
+    production gets a loud, immediate failure instead of a silent no-op;
+    tests always inject a mock ``ops_client``.
+    """
+
+    def build_roll(self, env: str) -> Any:
+        raise NotImplementedError(
+            "real Ops API adapter not wired — see feat/container-ops-api / PR #3"
+        )
+
+    def smoke(self, env: str) -> bool:
+        raise NotImplementedError(
+            "real Ops API adapter not wired — see feat/container-ops-api / PR #3"
+        )
+
+
+def _commit_range_for_epic(
+    conn: sqlite3.Connection, epic_id: str, board: Optional[str]
+) -> Optional[str]:
+    """Best-effort ``pre_sha..HEAD`` commit range for the #operations notice.
+
+    ``pre_sha`` comes from the epic's latest ``epic_merged`` event (recorded
+    by :func:`merge_epic_to_main`); HEAD is resolved via a single LOCAL
+    ``git rev-parse main`` -- no remote/origin touched. Returns ``None`` if
+    either half can't be resolved (best-effort, per the brief).
+    """
+    pre_sha: Optional[str] = None
+    for event in reversed(list_events(conn, epic_id)):
+        if event.kind == "epic_merged" and isinstance(event.payload, dict):
+            candidate = event.payload.get("pre_sha")
+            if candidate:
+                pre_sha = str(candidate)
+                break
+    if not pre_sha:
+        return None
+    try:
+        meta = product_board_metadata(board)
+        board_default = str((meta or {}).get("default_workdir") or "").strip()
+        repo_root = _git_toplevel(Path(board_default).expanduser()) if board_default else None
+        if repo_root is None:
+            return None
+        head_result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "main"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if head_result.returncode != 0:
+            return None
+        head_sha = (head_result.stdout or "").strip()
+        if not head_sha:
+            return None
+    except Exception:
+        return None
+    return f"{pre_sha[:12]}..{head_sha[:12]}"
+
+
+def notify_operations(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    *,
+    board: Optional[str] = None,
+    envs_status: list[dict],
+    failure: bool = False,
+    reason: Optional[str] = None,
+    notify_fn: Optional[Callable[[dict], None]] = None,
+) -> dict:
+    """Build ONE #operations release/page message for ``epic_id`` and post it.
+
+    Contains the epic title, stories shipped (id + title, via
+    :func:`child_ids` / :func:`get_task`), the best-effort commit range
+    (:func:`_commit_range_for_epic`), and the per-env build/smoke
+    ``envs_status``. On ``failure`` the message additionally carries
+    ``reason`` (this is the page). Calls ``notify_fn(message)`` if provided
+    (the real Slack #operations hook wiring is separate and out of scope);
+    any ``notify_fn`` exception is swallowed so a broken notifier can never
+    blow up the deploy. Returns the message dict either way.
+    """
+    epic = get_task(conn, epic_id)
+    epic_title = epic.title if epic is not None else epic_id
+    stories = []
+    for child_id in child_ids(conn, epic_id):
+        child = get_task(conn, child_id)
+        stories.append({"id": child_id, "title": child.title if child is not None else None})
+
+    message: dict = {
+        "channel": "#operations",
+        "epic_id": epic_id,
+        "epic_title": epic_title,
+        "stories": stories,
+        "commit_range": _commit_range_for_epic(conn, epic_id, board),
+        "envs_status": envs_status,
+        "failure": failure,
+        "reason": reason if failure else None,
+    }
+    if notify_fn is not None:
+        try:
+            notify_fn(message)
+        except Exception:
+            pass
+    return message
+
+
+def deploy_epic(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    *,
+    board: Optional[str] = None,
+    envs: tuple[str, ...] = ("test", "preprod"),
+    ops_client: Optional[OpsClient] = None,
+    notify_fn: Optional[Callable[[dict], None]] = None,
+) -> Optional[dict]:
+    """Deploy a merged epic to ``envs`` (default test then preprod) via the
+    injected Ops API client, smoke-gated, then post one #operations notice.
+
+    Returns ``None`` on a non-``handoff_v2`` board (nothing to do here).
+    Deploys ``envs`` IN ORDER (test before preprod): for each env,
+    ``ops_client.build_roll(env)`` then (if built) ``ops_client.smoke(env)``.
+    The first build/smoke failure STOPS the loop -- no later env is ever
+    deployed (this is the "test smoke fails -> do not proceed to preprod"
+    gate) -- blocks the epic (:func:`set_running` False + :func:`set_blocked`
+    True), emits a ``deploy_failed`` event, pages #operations via
+    :func:`notify_operations` (``failure=True``), and returns the message.
+    On full success, emits a ``deployed`` event, posts one release notice
+    via :func:`notify_operations` (``failure=False``), and returns the
+    message.
+    """
+    # =========================================================================
+    # BOUNDARY (T5.3): test + pre-prod ONLY -- NEVER production, and NEVER
+    # `git push` / any git remote-or-origin verb. This function only calls
+    # the injected `ops_client` and (via notify_operations ->
+    # _commit_range_for_epic) reads git LOCALLY (`rev-parse main`) for the
+    # commit range. Production deploys and `git push origin` remain
+    # HUMAN-ONLY and are simply not reachable from this code path.
+    # =========================================================================
+    meta = product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta):
+        return None
+
+    unsupported = [env for env in envs if env not in _DEPLOYABLE_ENVS]
+    if unsupported:
+        raise ValueError(
+            f"deploy_epic: envs must be a subset of {sorted(_DEPLOYABLE_ENVS)}; "
+            f"got unsupported env(s) {unsupported!r} -- production deploys are "
+            "human-only and are never reachable via deploy_epic"
+        )
+
+    client: OpsClient = ops_client if ops_client is not None else _DefaultOpsClient()
+    envs_status: list[dict] = []
+
+    for env in envs:
+        built = False
+        detail: Optional[str] = None
+        try:
+            client.build_roll(env)
+            built = True
+        except Exception as exc:
+            detail = str(exc)
+
+        smoke_ok = False
+        if built:
+            try:
+                smoke_ok = bool(client.smoke(env))
+                if not smoke_ok:
+                    detail = "smoke check failed"
+            except Exception as exc:
+                smoke_ok = False
+                detail = str(exc)
+
+        envs_status.append(
+            {"env": env, "built": built, "smoke_ok": smoke_ok, "detail": detail}
+        )
+
+        if not built or not smoke_ok:
+            stage = "build" if not built else "smoke"
+            reason = f"deploy: {env} {stage} failed"
+            set_running(conn, epic_id, False, board=board)
+            set_blocked(conn, epic_id, True, board=board, reason=reason)
+            try:
+                with write_txn(conn):
+                    _append_event(
+                        conn, epic_id, "deploy_failed",
+                        {"env": env, "stage": stage, "envs_status": envs_status},
+                    )
+            except Exception:
+                pass
+            return notify_operations(
+                conn, epic_id, board=board, envs_status=envs_status,
+                failure=True, reason=reason, notify_fn=notify_fn,
+            )
+
+    try:
+        with write_txn(conn):
+            _append_event(conn, epic_id, "deployed", {"envs_status": envs_status})
+    except Exception:
+        pass
+    return notify_operations(
+        conn, epic_id, board=board, envs_status=envs_status,
+        failure=False, notify_fn=notify_fn,
+    )
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:

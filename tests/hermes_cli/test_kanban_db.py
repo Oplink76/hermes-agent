@@ -7944,3 +7944,277 @@ def test_integrate_story_to_epic_no_epic_parent_returns_none(kanban_home, tmp_pa
     assert result is None
     assert calls == []
     notify.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# deploy_epic / notify_operations -- test->preprod Ops API deploy, smoke
+# gated, one #operations release notice (Phase 5, T5.1-T5.3).
+#
+# THE HARD BOUNDARY: test + pre-prod ONLY -- never production, never
+# `git push` / any remote-or-origin verb. Every test records the git
+# subcommands actually executed (real subprocess) and asserts none of them
+# is "push" or touches a remote/origin.
+# ---------------------------------------------------------------------------
+
+class _RecordingOpsClient:
+    """Ops client test double -- records call order, lets each env's
+    build/smoke outcome be scripted independently."""
+
+    def __init__(self, *, build_fail: set | None = None, smoke_fail: set | None = None):
+        self.calls: list[tuple[str, str]] = []
+        self.build_fail = build_fail or set()
+        self.smoke_fail = smoke_fail or set()
+
+    def build_roll(self, env: str):
+        self.calls.append(("build_roll", env))
+        if env in self.build_fail:
+            raise RuntimeError(f"build failed for {env}")
+        return {"env": env, "built": True}
+
+    def smoke(self, env: str) -> bool:
+        self.calls.append(("smoke", env))
+        return env not in self.smoke_fail
+
+
+def _seed_epic_merged_event(board: str, epic: str, repo: Path) -> str:
+    """Seed an ``epic_merged`` event ({epic_branch, pre_sha}) so
+    notify_operations' commit-range resolution has something to work with,
+    and advance ``main`` one commit past ``pre_sha`` so the range is
+    non-trivial."""
+    pre_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "main"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    _commit_file(repo, "deploy_work.txt", "deploy work\n", "post-merge commit")
+    with kb.connect(board=board) as conn:
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, epic, "epic_merged",
+                {"epic_branch": kb.epic_branch_for(epic), "pre_sha": pre_sha},
+            )
+    return pre_sha
+
+
+def _make_deploy_epic(tmp_path: Path, board_name: str) -> tuple[str, Path, list[str]]:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board_name, repo)
+    epic, children = _make_epic_with_children(board_name)
+    with kb.connect(board=board_name) as conn:
+        for child in children:
+            _set_task_status(conn, child, "done")
+    _seed_epic_merged_event(board_name, epic, repo)
+    return epic, repo, children
+
+
+def test_deploy_epic_happy_path_deploys_test_then_preprod_and_notifies(kanban_home, tmp_path, monkeypatch):
+    board = "v2-deploy-happy"
+    epic, repo, children = _make_deploy_epic(tmp_path, board)
+
+    calls = _record_git_calls(monkeypatch)
+    ops = _RecordingOpsClient()
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        result = kb.deploy_epic(conn, epic, board=board, ops_client=ops, notify_fn=notify)
+
+    assert ops.calls == [
+        ("build_roll", "test"), ("smoke", "test"),
+        ("build_roll", "preprod"), ("smoke", "preprod"),
+    ]
+    _assert_no_push(calls)
+    assert not any(("remote" in cmd or "origin" in cmd) for cmd in calls)
+
+    with kb.connect(board=board) as conn:
+        row = conn.execute("SELECT blocked FROM tasks WHERE id = ?", (epic,)).fetchone()
+    assert row["blocked"] == 0
+
+    notify.assert_called_once()
+    message = notify.call_args[0][0]
+    assert message["failure"] is False
+    assert message["epic_title"] == "Epic"
+    assert {s["id"] for s in message["stories"]} == set(children)
+    assert message["commit_range"] and ".." in message["commit_range"]
+    assert [e["env"] for e in message["envs_status"]] == ["test", "preprod"]
+    assert all(e["smoke_ok"] for e in message["envs_status"])
+
+    assert result == message
+
+
+def test_deploy_epic_test_smoke_fails_stops_blocks_and_pages(kanban_home, tmp_path, monkeypatch):
+    board = "v2-deploy-test-smoke-fail"
+    epic, repo, children = _make_deploy_epic(tmp_path, board)
+
+    ops = _RecordingOpsClient(smoke_fail={"test"})
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        result = kb.deploy_epic(conn, epic, board=board, ops_client=ops, notify_fn=notify)
+
+    assert ("build_roll", "preprod") not in ops.calls
+    assert ("smoke", "preprod") not in ops.calls
+    assert ops.calls == [("build_roll", "test"), ("smoke", "test")]
+
+    with kb.connect(board=board) as conn:
+        row = conn.execute(
+            "SELECT blocked, running FROM tasks WHERE id = ?", (epic,)
+        ).fetchone()
+    assert row["blocked"] == 1
+    assert row["running"] == 0
+
+    notify.assert_called_once()
+    message = notify.call_args[0][0]
+    assert message["failure"] is True
+    assert message["reason"]
+    assert result == message
+
+
+def test_deploy_epic_preprod_build_fails_blocks_and_pages(kanban_home, tmp_path, monkeypatch):
+    board = "v2-deploy-preprod-build-fail"
+    epic, repo, children = _make_deploy_epic(tmp_path, board)
+
+    ops = _RecordingOpsClient(build_fail={"preprod"})
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        result = kb.deploy_epic(conn, epic, board=board, ops_client=ops, notify_fn=notify)
+
+    assert ops.calls == [
+        ("build_roll", "test"), ("smoke", "test"), ("build_roll", "preprod"),
+    ]
+    assert ("smoke", "preprod") not in ops.calls
+
+    with kb.connect(board=board) as conn:
+        row = conn.execute("SELECT blocked FROM tasks WHERE id = ?", (epic,)).fetchone()
+    assert row["blocked"] == 1
+
+    notify.assert_called_once()
+    message = notify.call_args[0][0]
+    assert message["failure"] is True
+    envs_status = {e["env"]: e for e in message["envs_status"]}
+    assert envs_status["test"]["smoke_ok"] is True
+    assert envs_status["preprod"]["built"] is False
+    assert result == message
+
+
+def test_deploy_epic_message_shape_contains_epic_stories_range_and_status(kanban_home, tmp_path, monkeypatch):
+    board = "v2-deploy-message-shape"
+    epic, repo, children = _make_deploy_epic(tmp_path, board)
+
+    ops = _RecordingOpsClient()
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        kb.deploy_epic(conn, epic, board=board, ops_client=ops, notify_fn=notify)
+
+    message = notify.call_args[0][0]
+    assert message["epic_id"] == epic
+    assert message["epic_title"] == "Epic"
+    story_ids = {s["id"] for s in message["stories"]}
+    story_titles = {s["title"] for s in message["stories"]}
+    assert story_ids == set(children)
+    assert story_titles == {"Story 0", "Story 1"}
+    assert message["commit_range"]
+    assert len(message["envs_status"]) == 2
+    assert message["reason"] is None
+
+
+def test_notify_operations_failure_message_includes_reason(kanban_home, tmp_path, monkeypatch):
+    board = "v2-notify-failure-reason"
+    epic, repo, children = _make_deploy_epic(tmp_path, board)
+
+    notify = unittest.mock.Mock()
+    envs_status = [{"env": "test", "built": True, "smoke_ok": False, "detail": "smoke check failed"}]
+    with kb.connect(board=board) as conn:
+        message = kb.notify_operations(
+            conn, epic, board=board, envs_status=envs_status,
+            failure=True, reason="deploy: test smoke failed", notify_fn=notify,
+        )
+
+    assert message["failure"] is True
+    assert message["reason"] == "deploy: test smoke failed"
+    notify.assert_called_once_with(message)
+
+
+def test_deploy_epic_rejects_production_env_deploys_nothing(kanban_home, tmp_path, monkeypatch):
+    board = "v2-deploy-boundary-prod"
+    epic, repo, children = _make_deploy_epic(tmp_path, board)
+
+    ops = _RecordingOpsClient()
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        with pytest.raises(ValueError):
+            kb.deploy_epic(
+                conn, epic, board=board, envs=("test", "prod"),
+                ops_client=ops, notify_fn=notify,
+            )
+
+    assert ops.calls == []
+    notify.assert_not_called()
+    with kb.connect(board=board) as conn:
+        row = conn.execute("SELECT blocked FROM tasks WHERE id = ?", (epic,)).fetchone()
+    assert row["blocked"] == 0
+
+
+def test_deploy_epic_never_touches_git_push_or_remote(kanban_home, tmp_path, monkeypatch):
+    """Boundary proof (T5.3): record every subprocess call across a full
+    happy-path deploy and assert the deploy path never runs `git push` and
+    never invokes a remote/origin verb -- only local `rev-parse` for the
+    commit range."""
+    board = "v2-deploy-boundary-no-push"
+    epic, repo, children = _make_deploy_epic(tmp_path, board)
+
+    calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def spy_run(cmd, *args, **kwargs):
+        calls.append(list(cmd) if isinstance(cmd, (list, tuple)) else [cmd])
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", spy_run)
+
+    ops = _RecordingOpsClient()
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        kb.deploy_epic(conn, epic, board=board, ops_client=ops, notify_fn=notify)
+
+    assert calls, "expected deploy_epic to run at least one local git subcommand"
+    for cmd in calls:
+        assert "push" not in cmd, f"git push invoked during deploy: {cmd}"
+        assert "remote" not in cmd, f"git remote invoked during deploy: {cmd}"
+        assert "origin" not in cmd, f"origin referenced during deploy: {cmd}"
+
+
+def test_deploy_epic_non_v2_board_returns_none(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "legacy-deploy-board"
+    kb.create_board(board, name="Legacy Board", default_workdir=str(repo))
+    with kb.connect(board=board) as conn:
+        epic = kb.create_task(conn, title="Epic", board=board)
+        kb.create_task(conn, title="Story", board=board, parents=[epic])
+
+    ops = _RecordingOpsClient()
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        result = kb.deploy_epic(conn, epic, board=board, ops_client=ops, notify_fn=notify)
+
+    assert result is None
+    assert ops.calls == []
+    notify.assert_not_called()
+
+
+def test_deploy_epic_default_ops_client_raises_not_implemented(kanban_home, tmp_path, monkeypatch):
+    """No ``ops_client`` injected -> the module stub is used, and it raises
+    rather than silently deploying anything (real adapter deferred to
+    feat/container-ops-api / PR #3)."""
+    board = "v2-deploy-default-client"
+    epic, repo, children = _make_deploy_epic(tmp_path, board)
+
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        result = kb.deploy_epic(conn, epic, board=board, notify_fn=notify)
+
+    # build_roll("test") raises NotImplementedError inside the loop, which
+    # deploy_epic treats like any other build failure: block + page.
+    assert result is not None
+    assert result["failure"] is True
+    with kb.connect(board=board) as conn:
+        row = conn.execute("SELECT blocked FROM tasks WHERE id = ?", (epic,)).fetchone()
+    assert row["blocked"] == 1
+    notify.assert_called_once()
