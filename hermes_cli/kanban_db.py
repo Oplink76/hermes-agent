@@ -7093,8 +7093,9 @@ def integrate_story_to_epic(
     completed story's commits BACK into the epic branch -- so a downstream
     sibling story never sees an upstream story's work, and
     :func:`merge_epic_to_main` has nothing real to carry to main. This
-    closes that gap; it is called on story completion and from the bounded
-    :func:`reconcile` safety net (W3).
+    closes that gap. Today the only caller is the bounded :func:`reconcile`
+    safety net (W3); wiring a fast path in on story completion is a natural
+    future call site but out of scope here.
 
     Returns ``None`` on a non-``handoff_v2`` board, a story with no epic
     parent, or when the repo / epic branch / story branch can't be resolved
