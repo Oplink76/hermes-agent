@@ -6847,6 +6847,161 @@ def epic_ready(
     return bool(verify(epic_branch_for(epic_id)))
 
 
+def _merge_epic_fail_safe(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    reason: str,
+    *,
+    board: Optional[str],
+    notify_fn: Optional[Callable[[str, str, Optional[str]], None]],
+) -> None:
+    """Block the epic + emit an event + notify. Never raises.
+
+    Shared by every failure exit of :func:`merge_epic_to_main` (conflict,
+    post-merge verify failure, unexpected error) so a failed merge always
+    leaves the epic in a visible, blocked state instead of silently retrying
+    forever.
+    """
+    try:
+        set_running(conn, epic_id, False, board=board)
+        set_blocked(conn, epic_id, True, board=board, reason=reason)
+        with write_txn(conn):
+            _append_event(
+                conn, epic_id, "blocked", {"reason": reason, "kind": "epic_merge_failed"},
+            )
+    except Exception:
+        pass
+    if notify_fn is not None:
+        try:
+            notify_fn(epic_id, reason, board)
+        except Exception:
+            pass
+
+
+def merge_epic_to_main(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    *,
+    board: Optional[str] = None,
+    main_branch: str = "main",
+    verify_fn: Optional[Callable[[str], bool]] = None,
+    notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
+) -> Optional[str]:
+    """Hermes-run merge of ``epic_id``'s integration branch into LOCAL main.
+
+    Returns ``None`` on a non-``handoff_v2`` board (nothing to do here --
+    callers fall back to legacy flows); ``"not_ready"`` when :func:`epic_ready`
+    says the epic isn't mergeable yet, or the repo/branch can't be resolved
+    (no git mutation in either case); ``"conflict"`` when the merge itself
+    fails (aborted, main left exactly as it was); ``"verify_failed"`` when the
+    merge succeeds but the post-merge working tree isn't clean or the suite
+    isn't green on main (undone via ``reset --hard`` back to the pre-merge
+    sha); ``"merged"`` on success.
+
+    On both failure outcomes the epic is cleared of ``running``, marked
+    ``blocked``, and ``notify_fn`` (the Slack hook) is invoked -- see
+    :func:`_merge_epic_fail_safe`. Every subprocess call uses the file's
+    defensive idiom (``capture_output=True, text=True, timeout=...,
+    check=False``); no exception escapes this function.
+    """
+    # =========================================================================
+    # LOCAL main only -- never `git push` / touch origin. Production deploys
+    # and `git push origin` are HUMAN-ONLY; this is the hard autonomy
+    # boundary for Hermes. This function must NEVER call `git push`, and must
+    # NEVER import or call web_git.py's push helpers (`_review_push` /
+    # `review_push` / `review_create_pr`). Only local git verbs below:
+    # rev-parse, switch/checkout, merge, merge --abort, reset --hard, status.
+    # =========================================================================
+    meta = product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta):
+        return None
+
+    if not epic_ready(conn, epic_id, board=board, verify_fn=verify_fn):
+        return "not_ready"
+
+    try:
+        board_default = str(meta.get("default_workdir") or "").strip()
+        repo_root = _git_toplevel(Path(board_default).expanduser()) if board_default else None
+        epic_branch = epic_branch_for(epic_id)
+        if repo_root is None or not _git_branch_exists(repo_root, epic_branch):
+            return "not_ready"
+    except Exception:
+        return "not_ready"
+
+    def _run(args: list[str], *, timeout: int = 60):
+        try:
+            return subprocess.run(
+                ["git", "-C", str(repo_root), *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except Exception:
+            return None
+
+    def _fail(reason: str) -> None:
+        _merge_epic_fail_safe(conn, epic_id, reason, board=board, notify_fn=notify_fn)
+
+    pre_sha = ""
+    try:
+        pre_sha_result = _run(["rev-parse", main_branch])
+        pre_sha = (pre_sha_result.stdout or "").strip() if pre_sha_result else ""
+        if pre_sha_result is None or pre_sha_result.returncode != 0 or not pre_sha:
+            _fail(f"could not resolve {main_branch}")
+            return "verify_failed"
+
+        switch_result = _run(["switch", main_branch])
+        if switch_result is None or switch_result.returncode != 0:
+            switch_result = _run(["checkout", main_branch])
+        if switch_result is None or switch_result.returncode != 0:
+            _fail(f"could not switch to {main_branch}")
+            return "verify_failed"
+
+        merge_result = _run(
+            ["merge", "--no-ff", epic_branch, "-m", f"merge epic {epic_id}"],
+            timeout=120,
+        )
+        if merge_result is None or merge_result.returncode != 0:
+            _run(["merge", "--abort"])
+            _fail("merge conflict")
+            return "conflict"
+
+        status_result = _run(["status", "--porcelain"])
+        clean = bool(
+            status_result is not None
+            and status_result.returncode == 0
+            and not (status_result.stdout or "").strip()
+        )
+        verify = verify_fn or _default_epic_verify
+        try:
+            verified = bool(verify(main_branch))
+        except Exception:
+            verified = False
+
+        if not clean or not verified:
+            _run(["reset", "--hard", pre_sha])
+            _fail("post-merge verify failed")
+            return "verify_failed"
+
+        try:
+            with write_txn(conn):
+                _append_event(
+                    conn, epic_id, "epic_merged",
+                    {"epic_branch": epic_branch, "pre_sha": pre_sha},
+                )
+        except Exception:
+            pass
+        return "merged"
+    except Exception:
+        # Never leave a partial merge: best-effort undo, then fail-safe.
+        _run(["merge", "--abort"])
+        if pre_sha:
+            _run(["reset", "--hard", pre_sha])
+        _fail("unexpected error during merge")
+        return "verify_failed"
+
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 

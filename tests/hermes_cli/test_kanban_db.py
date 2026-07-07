@@ -7057,3 +7057,230 @@ def test_epic_ready_non_v2_board_returns_false_verify_not_called(kanban_home):
 
     assert result is False
     verify.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# merge_epic_to_main -- Hermes-run LOCAL merge of an epic into main (T4.3)
+#
+# THE HARD BOUNDARY: this function must never `git push` / touch origin.
+# Every test below records the git subcommands actually executed (real
+# subprocess, real temp git repos) and asserts none of them is "push".
+# ---------------------------------------------------------------------------
+
+def _v2_product_board_with_repo(name: str, repo: Path) -> None:
+    """Like ``_v2_product_board`` but also anchors the board on a real repo
+    via ``default_workdir``, which ``merge_epic_to_main`` resolves its
+    ``repo_root`` from."""
+    kb.create_board(name, name="V2 Board", preset="product", default_workdir=str(repo))
+    meta_path = kb.board_metadata_path(name)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta.setdefault("product_workflow", {})["handoff_v2"] = True
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+
+def _make_epic_branch(repo: Path, epic_branch: str, *, from_branch: str = "main") -> str:
+    """Branch ``epic_branch`` off ``from_branch`` and add a unique commit.
+    Returns the new commit sha. Leaves ``from_branch`` checked out."""
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", epic_branch, from_branch],
+        check=True, capture_output=True, text=True,
+    )
+    sha = _commit_file(repo, "epic_work.txt", "epic work\n", "epic commit")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", from_branch],
+        check=True, capture_output=True, text=True,
+    )
+    return sha
+
+
+def _record_git_calls(monkeypatch) -> list[list[str]]:
+    """Monkeypatch ``subprocess.run`` to record every argv while still
+    executing real git. Returns the list calls are appended to."""
+    calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def spy_run(cmd, *args, **kwargs):
+        calls.append(list(cmd) if isinstance(cmd, (list, tuple)) else [cmd])
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", spy_run)
+    return calls
+
+
+def _assert_no_push(calls: list[list[str]]) -> None:
+    assert calls, "expected merge_epic_to_main to run at least one git subcommand"
+    for cmd in calls:
+        assert "push" not in cmd, f"git push invoked: {cmd}"
+
+
+def test_merge_epic_to_main_happy_path_merges_and_never_pushes(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-merge-happy"
+    _v2_product_board_with_repo(board, repo)
+    epic, children = _make_epic_with_children(board)
+    with kb.connect(board=board) as conn:
+        for child in children:
+            _set_task_status(conn, child, "done")
+
+    epic_branch = kb.epic_branch_for(epic)
+    epic_sha = _make_epic_branch(repo, epic_branch)
+
+    calls = _record_git_calls(monkeypatch)
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        result = kb.merge_epic_to_main(
+            conn, epic, board=board, verify_fn=lambda b: True, notify_fn=notify,
+        )
+
+    assert result == "merged"
+    notify.assert_not_called()
+    _assert_no_push(calls)
+
+    ancestor = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", epic_sha, "main"],
+        capture_output=True, text=True,
+    )
+    assert ancestor.returncode == 0, "main must contain the epic's commit"
+
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True,
+    )
+    assert status.stdout.strip() == "", "working tree must be clean after merge"
+
+
+def test_merge_epic_to_main_conflict_aborts_blocks_and_never_pushes(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-merge-conflict"
+    _v2_product_board_with_repo(board, repo)
+    epic, children = _make_epic_with_children(board)
+    with kb.connect(board=board) as conn:
+        for child in children:
+            _set_task_status(conn, child, "done")
+
+    epic_branch = kb.epic_branch_for(epic)
+    # Branch off main, then have BOTH main and the epic branch modify the
+    # same line differently so the merge conflicts.
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", epic_branch], check=True,
+        capture_output=True, text=True,
+    )
+    _commit_file(repo, "shared.txt", "epic version\n", "epic edits shared")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "main"], check=True, capture_output=True, text=True,
+    )
+    _commit_file(repo, "shared.txt", "main version\n", "main edits shared")
+    pre_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "main"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    calls = _record_git_calls(monkeypatch)
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        result = kb.merge_epic_to_main(
+            conn, epic, board=board, verify_fn=lambda b: True, notify_fn=notify,
+        )
+
+    assert result == "conflict"
+    _assert_no_push(calls)
+    notify.assert_called_once()
+
+    post_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "main"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert post_sha == pre_sha, "a failed merge must never leave main mutated"
+
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True,
+    )
+    assert status.stdout.strip() == "", "merge --abort must leave a clean tree"
+
+    with kb.connect(board=board) as conn:
+        row = conn.execute("SELECT blocked FROM tasks WHERE id = ?", (epic,)).fetchone()
+    assert row["blocked"] == 1
+
+
+def test_merge_epic_to_main_post_merge_verify_fails_resets_and_blocks(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-merge-verify-fail"
+    _v2_product_board_with_repo(board, repo)
+    epic, children = _make_epic_with_children(board)
+    with kb.connect(board=board) as conn:
+        for child in children:
+            _set_task_status(conn, child, "done")
+
+    epic_branch = kb.epic_branch_for(epic)
+    _make_epic_branch(repo, epic_branch)
+    pre_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "main"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    # Branch-aware: True for the epic branch (so epic_ready's own verify
+    # passes) but False for main (so the post-merge check fails).
+    def verify(branch: str) -> bool:
+        return branch != "main"
+
+    calls = _record_git_calls(monkeypatch)
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        result = kb.merge_epic_to_main(
+            conn, epic, board=board, verify_fn=verify, notify_fn=notify,
+        )
+
+    assert result == "verify_failed"
+    _assert_no_push(calls)
+    notify.assert_called_once()
+
+    post_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "main"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert post_sha == pre_sha, "reset --hard must undo the merge"
+
+    with kb.connect(board=board) as conn:
+        row = conn.execute("SELECT blocked FROM tasks WHERE id = ?", (epic,)).fetchone()
+    assert row["blocked"] == 1
+
+
+def test_merge_epic_to_main_not_ready_does_not_touch_git(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-merge-not-ready"
+    _v2_product_board_with_repo(board, repo)
+    epic, children = _make_epic_with_children(board)
+    with kb.connect(board=board) as conn:
+        _set_task_status(conn, children[0], "done")
+        # children[1] stays not-done.
+
+    calls = _record_git_calls(monkeypatch)
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        result = kb.merge_epic_to_main(
+            conn, epic, board=board, verify_fn=lambda b: True, notify_fn=notify,
+        )
+
+    assert result == "not_ready"
+    assert calls == []
+    notify.assert_not_called()
+
+
+def test_merge_epic_to_main_non_v2_board_returns_none(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "legacy-merge-board"
+    kb.create_board(board, name="Legacy Board", default_workdir=str(repo))
+    with kb.connect(board=board) as conn:
+        epic = kb.create_task(conn, title="Epic", board=board)
+        kb.create_task(conn, title="Story", board=board, parents=[epic])
+
+    calls = _record_git_calls(monkeypatch)
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        result = kb.merge_epic_to_main(
+            conn, epic, board=board, verify_fn=lambda b: True, notify_fn=notify,
+        )
+
+    assert result is None
+    assert calls == []
+    notify.assert_not_called()
