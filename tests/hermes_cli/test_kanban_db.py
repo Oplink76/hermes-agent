@@ -3076,6 +3076,59 @@ def test_handoff_non_v2_board_is_noop(kanban_home, monkeypatch):
     assert after == before
 
 
+def test_handoff_noop_then_legacy_complete_task_advances_card(kanban_home, monkeypatch):
+    """Coexistence guard (T2.5): on a non-v2 product board, ``handoff()``
+    no-ops (returns ``False``, mutates nothing, emits no ``handoff`` event)
+    and legacy ``complete_task`` still advances the same card exactly as
+    ``test_product_completion_advances_card_to_next_role`` asserts.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "product-legacy-coexist"
+    kb.create_board(board, name="Product Legacy Coexist", preset="product")
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: checkout",
+            assignee="architect-profile",
+            workflow_template_id="product",
+            current_step_key="architecture",
+        )
+        before = _card_snapshot(conn, tid)
+
+        result = kb.handoff(
+            conn, tid, board=board,
+            metadata={"ai_provenance": {"writer": {"agent": "hermes"}}},
+        )
+
+        after_handoff = _card_snapshot(conn, tid)
+        events_after_handoff = kb.list_events(conn, tid)
+
+        assert result is False
+        assert after_handoff == before
+        assert not any(event.kind == "handoff" for event in events_after_handoff)
+
+        # Legacy completion must still advance the card exactly as before.
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Architecture settled",
+            board=board,
+            product_role_assignees={"developer": "developer-profile"},
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        latest_run = kb.latest_run(conn, tid)
+
+    assert task.status == "ready"
+    assert task.current_step_key == "development"
+    assert task.assignee == "developer-profile"
+    assert latest_run.outcome == "advanced"
+    advanced = [event for event in events if event.kind == "workflow_advanced"]
+    assert advanced
+    assert advanced[-1].payload["from_step"] == "architecture"
+    assert advanced[-1].payload["to_step"] == "development"
+
+
 def test_handoff_provenance_failure_raises_and_leaves_card_untouched(kanban_home, tmp_path, monkeypatch):
     """Provenance gate runs before commit-first: raises, nothing committed or mutated."""
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
