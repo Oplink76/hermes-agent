@@ -3017,15 +3017,13 @@ def test_spawn_one_v2_success_sets_running_flag(kanban_home, tmp_path, monkeypat
     assert row["status"] == "running"
 
 
-def test_spawn_one_v2_failure_does_not_set_running_flag(kanban_home, tmp_path, monkeypatch):
-    """R1 update: claim_task (not _spawn_one_v2) is now the sole setter of
-    the v2 running flag, so it flips to 1 as soon as the card is claimed --
-    before the spawn attempt even runs. A failed spawn then goes through
-    _record_spawn_failure, which flips legacy ``status`` back to 'ready'
-    directly (bypassing the v2 seam) but does not reset ``running``; closing
-    that status/flag gap on the failure path is out of scope here (it
-    belongs to the terminal/reclaim remediation, R3). This test now pins the
-    documented gap rather than asserting the old (pre-R1) behavior."""
+def test_spawn_one_v2_failure_clears_running_flag(kanban_home, tmp_path, monkeypatch):
+    """R3 fix: claim_task sets running=1 at claim time (R1), and a failed
+    spawn now goes through _record_task_failure (via _record_spawn_failure),
+    which clears ``running`` back to 0 alongside the legacy ``status`` revert
+    to 'ready' -- closing the status/flag gap R1's reviewer flagged. This
+    test used to pin the pre-R3 gap (running stuck at 1); it now asserts the
+    fixed behavior."""
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     board = "v2-spawn-failure-no-running"
     _v2_product_board(board)
@@ -3048,13 +3046,14 @@ def test_spawn_one_v2_failure_does_not_set_running_flag(kanban_home, tmp_path, m
         )
         pid = kb._spawn_one_v2(conn, tid, board=board, spawn_fn=boom)
         row = conn.execute(
-            "SELECT running, status FROM tasks WHERE id = ?", (tid,)
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,)
         ).fetchone()
 
     assert pid is None
-    # Set by claim_task at claim time; _record_spawn_failure (R3 scope)
-    # doesn't reset it on the failure path -- see docstring above.
-    assert row["running"] == 1
+    # R3: _record_task_failure now clears running (and blocked) on the
+    # failure path, so flags and status agree again.
+    assert row["running"] == 0
+    assert row["blocked"] == 0
     assert row["status"] != "running"
 
 
@@ -7610,6 +7609,460 @@ def test_block_task_legacy_board_does_not_touch_flags(kanban_home):
         ).fetchone()
         assert row["running"] == 0
         assert row["blocked"] == 0
+
+
+# ---------------------------------------------------------------------------
+# R3: reclaim/terminal paths clear the v2 running flag; done sets phase=done
+#
+# R1 made claim_task set running=1. Every path that ends a worker's run --
+# reclaim (stale claim, crash, timeout, dead-pid reconcile), spawn failure,
+# and terminal completion -- must clear it back to 0, or flags and status
+# disagree. These tests drive the REAL dispatcher/reclaim entry points (not
+# the _apply_v2_flags helper directly) on a v2 board, then prove the same
+# paths are byte-for-byte unchanged on a legacy board.
+# ---------------------------------------------------------------------------
+
+def test_release_stale_claims_v2_board_clears_running_flag(kanban_home, monkeypatch):
+    """A stale-by-TTL v2 claim whose worker PID is dead is reclaimed to
+    ``ready`` with ``running`` cleared -- worker_pid IS NULL implies
+    running=0."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-release-stale-clears-running"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+    meta = kb.read_board_metadata(board)
+
+    with kb.connect(board=board) as conn:
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        host = _kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
+        kb._set_worker_pid(conn, tid, 12345)
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 3600, tid),
+        )
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda *a, **k: None)
+        row = conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert reclaimed == 1
+    assert row["status"] == "ready"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+    assert row["status"] == kb._legacy_status(row, meta)
+
+
+def test_release_stale_claims_legacy_board_flags_stay_zero(kanban_home, monkeypatch):
+    """Legacy board: release_stale_claims behavior (reclaim to ready) is
+    unchanged; running/blocked stay 0 as they always were."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 3600, t),
+        )
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda *a, **k: None)
+        row = conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (t,),
+        ).fetchone()
+
+    assert reclaimed == 1
+    assert row["status"] == "ready"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+
+
+def test_reclaim_task_v2_board_clears_running_flag(kanban_home, monkeypatch):
+    """Operator-driven reclaim_task on a v2 board clears running/blocked
+    alongside worker_pid."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-reclaim-task-clears-running"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+    meta = kb.read_board_metadata(board)
+
+    with kb.connect(board=board) as conn:
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="host:1") is not None
+        pre = conn.execute(
+            "SELECT running FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert pre["running"] == 1
+
+        assert kb.reclaim_task(conn, tid, reason="test") is True
+        row = conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert row["status"] == "ready"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+    assert row["status"] == kb._legacy_status(row, meta)
+
+
+def test_detect_crashed_workers_v2_board_clears_running_flag(kanban_home, monkeypatch):
+    """A v2 card whose worker PID died is reclaimed by detect_crashed_workers
+    with running cleared."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    board = "v2-crashed-clears-running"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+    meta = kb.read_board_metadata(board)
+
+    with kb.connect(board=board) as conn:
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        host = _kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
+        kb._set_worker_pid(conn, tid, 90001)
+        # Past the launch-window grace period so the crash check isn't
+        # skipped as "freshly claimed".
+        conn.execute(
+            "UPDATE tasks SET started_at = ? WHERE id = ?",
+            (int(time.time()) - 3600, tid),
+        )
+
+        crashed = kb.detect_crashed_workers(conn)
+        row = conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert crashed == [tid]
+    assert row["status"] == "ready"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+    assert row["status"] == kb._legacy_status(row, meta)
+
+
+def test_detect_crashed_workers_legacy_board_flags_stay_zero(kanban_home, monkeypatch):
+    """Legacy board: detect_crashed_workers is unchanged; running/blocked
+    stay 0 as they always were (isolated-failure retry path)."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="iso", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? "
+            "WHERE id=?",
+            (80000, f"{host}:w0", tid),
+        )
+        conn.commit()
+
+        crashed = kb.detect_crashed_workers(conn)
+        row = conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert crashed == [tid]
+    assert row["status"] == "ready"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+
+
+def test_detect_stale_running_v2_board_clears_running_flag(kanban_home, monkeypatch):
+    """A v2 card with a stale heartbeat is reclaimed by detect_stale_running
+    with running cleared."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-detect-stale-clears-running"
+    _v2_product_board(board)
+    tid = _seed_v2_card(board, step="development")
+    meta = kb.read_board_metadata(board)
+
+    with kb.connect(board=board) as conn:
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        host = _kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
+        kb._set_worker_pid(conn, tid, os.getpid())
+
+        five_hours_ago = int(time.time()) - (5 * 3600)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?", (five_hours_ago, tid),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (five_hours_ago, tid),
+            )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        stale = kb.detect_stale_running(
+            conn, stale_timeout_seconds=14400, signal_fn=lambda *a, **k: None,
+        )
+        row = conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert tid in stale
+    assert row["status"] == "ready"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+    assert row["status"] == kb._legacy_status(row, meta)
+
+
+def test_enforce_max_runtime_v2_board_clears_running_flag(kanban_home, monkeypatch):
+    """A v2 card past its max_runtime_seconds is timed out with running
+    cleared."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-enforce-max-runtime-clears-running"
+    _v2_product_board(board)
+    meta = kb.read_board_metadata(board)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            workflow_template_id="product",
+            current_step_key="development",
+            max_runtime_seconds=10,
+        )
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        host = kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
+        kb._set_worker_pid(conn, tid, 12345)
+        old_started = int(time.time()) - 20
+        conn.execute(
+            "UPDATE tasks SET started_at = ? WHERE id = ?", (old_started, tid),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ? "
+            "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+            (old_started, tid),
+        )
+
+        timed_out = kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None)
+        row = conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert timed_out == [tid]
+    assert row["status"] == "ready"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+    assert row["status"] == kb._legacy_status(row, meta)
+
+
+def test_reconcile_v2_dead_worker_clears_running_flag(kanban_home, monkeypatch):
+    """reconcile's dead-worker reclaim (step 1) clears running on a v2
+    board's card whose worker PID died."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-reconcile-clears-running"
+    _v2_product_board(board)
+    meta = kb.read_board_metadata(board)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        host = kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
+        kb._set_worker_pid(conn, tid, 99999)
+        pre = conn.execute(
+            "SELECT running FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert pre["running"] == 1
+        stale_started_at = int(time.time()) - 3600
+        conn.execute(
+            "UPDATE tasks SET started_at = ? WHERE id = ?", (stale_started_at, tid),
+        )
+
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        result = kb.reconcile(conn, board=board)
+        row = conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert result.reclaimed == [tid]
+    assert row["status"] == "ready"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+    assert row["status"] == kb._legacy_status(row, meta)
+
+
+def test_dispatch_once_v2_board_spawn_failure_clears_running_flag(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """THE key spawn-failure integration test: drive the REAL dispatch_once
+    -> claim_task -> failing spawn_fn -> _record_task_failure path on a v2
+    board. Closes the R1-flagged gap: claim_task sets running=1 at claim
+    time, and the failed spawn must clear it back to 0 when the card reverts
+    to ready (below the failure-count threshold)."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    board = "v2-dispatch-spawn-failure-clears-running"
+    _v2_product_board(board)
+    meta = kb.read_board_metadata(board)
+
+    def boom(task, workspace, board=None):
+        raise RuntimeError("spawn failed")
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            board=board,
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+
+        result = kb.dispatch_once(conn, spawn_fn=boom, board=board, failure_limit=5)
+
+        row = conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert result.auto_blocked == []
+    assert row["status"] == "ready"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+    assert row["status"] == kb._legacy_status(row, meta)
+
+
+def test_dispatch_spawn_failure_legacy_board_flags_stay_zero(
+    kanban_home, all_assignees_spawnable,
+):
+    """Legacy board: dispatch_once spawn-failure behavior is unchanged;
+    running/blocked stay 0 as they always were."""
+    def boom(task, workspace):
+        raise RuntimeError("spawn failed")
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="boom", assignee="alice")
+        kb.dispatch_once(conn, spawn_fn=boom)
+        row = conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (t,),
+        ).fetchone()
+
+    assert row["status"] == "ready"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+
+
+def test_record_task_failure_v2_board_breaker_trip_sets_blocked_clears_running(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """When the spawn-failure circuit breaker trips (failure_limit reached),
+    the v2 card lands in ``blocked`` with running=0, blocked=1."""
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-breaker-trip-sets-blocked"
+    _v2_product_board(board)
+    meta = kb.read_board_metadata(board)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="host:1") is not None
+
+        tripped = kb._record_task_failure(
+            conn, tid, "boom",
+            outcome="spawn_failed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        )
+        row = conn.execute(
+            "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+
+    assert tripped is True
+    assert row["status"] == "blocked"
+    assert row["running"] == 0
+    assert row["blocked"] == 1
+    assert row["status"] == kb._legacy_status(row, meta)
+
+
+def test_complete_task_v2_terminal_done_sets_phase_and_clears_flags(kanban_home):
+    """Terminal ``done`` on a v2 board must set current_step_key='done' and
+    clear both running and blocked, so status/phase/flags all agree with
+    ``_legacy_status``."""
+    board = "v2-complete-terminal-clears-flags"
+    _v2_product_board(board)
+    meta = kb.read_board_metadata(board)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            workflow_template_id="product",
+            current_step_key="release_measure",
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,),
+        )
+        assert kb.claim_task(conn, tid, claimer="host:1") is not None
+        pre = conn.execute(
+            "SELECT running FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert pre["running"] == 1
+
+        result = kb.complete_task(
+            conn, tid, summary="Released and measured", board=board,
+        )
+        row = conn.execute(
+            "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+
+    assert result is True
+    assert row["status"] == "done"
+    assert row["current_step_key"] == "done"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+    assert row["status"] == kb._legacy_status(row, meta)
+
+
+def test_complete_task_legacy_board_terminal_flags_stay_zero(kanban_home):
+    """Legacy board: complete_task's terminal transition is unchanged;
+    running/blocked stay 0 and current_step_key is untouched (it isn't a v2
+    phase field there)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="Legacy task", assignee="alice",
+            current_step_key="in_progress",
+        )
+        assert kb.claim_task(conn, tid, claimer="host:1") is not None
+        assert kb.complete_task(conn, tid, summary="done", board=None) is True
+        row = conn.execute(
+            "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+
+    assert row["status"] == "done"
+    assert row["running"] == 0
+    assert row["blocked"] == 0
+    # current_step_key is a generic field unrelated to v2 phase on a legacy
+    # board -- complete_task must not repurpose it to 'done'.
+    assert row["current_step_key"] == "in_progress"
 
 
 # ---------------------------------------------------------------------------

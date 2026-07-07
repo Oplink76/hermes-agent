@@ -4844,7 +4844,13 @@ def release_stale_claims(
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
+                "claim_expires = NULL, worker_pid = NULL, "
+                # v2 state-model integrity (R3): worker_pid is cleared here --
+                # the worker is gone -- so the canonical ``running`` flag must
+                # clear with it, and a card re-idled to ``ready`` isn't
+                # ``blocked``. No-op on legacy boards: these columns are
+                # never set true there.
+                "running = 0, blocked = 0 "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
                 (row["id"], row["claim_lock"], now),
@@ -4916,7 +4922,11 @@ def reclaim_task(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL "
+            "claim_expires = NULL, worker_pid = NULL, "
+            # v2 state-model integrity (R3): the worker is gone and the card
+            # lands idle in ``ready`` -- clear both canonical flags. No-op on
+            # legacy boards (columns never set true there).
+            "running = 0, blocked = 0 "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?",
             (task_id, prev_lock),
@@ -5273,7 +5283,9 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       running      = 0,
+                       blocked      = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                 """,
@@ -5290,7 +5302,9 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       running      = 0,
+                       blocked      = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
@@ -5299,6 +5313,19 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        # v2 state-model integrity (R3): terminal ``done`` means phase=done
+        # too -- set current_step_key='done' so a v2 card's phase agrees with
+        # its status (running/blocked above are unconditional no-ops on
+        # legacy since those columns are never true there, but
+        # current_step_key is a general step-tracking field also used by
+        # non-v2 workflow_template boards, so it must stay v2-gated to avoid
+        # corrupting their step semantics).
+        term_meta = product_board_metadata(board)
+        if term_meta is not None and _handoff_v2_enabled(term_meta):
+            conn.execute(
+                "UPDATE tasks SET current_step_key = 'done' WHERE id = ?",
+                (task_id,),
+            )
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -7943,7 +7970,8 @@ def reconcile(
                 """
                 UPDATE tasks
                    SET status = 'ready', claim_lock = NULL,
-                       claim_expires = NULL, worker_pid = NULL
+                       claim_expires = NULL, worker_pid = NULL,
+                       running = 0, blocked = 0
                  WHERE id = ? AND status = 'running' AND claim_lock IS ?
                 """,
                 (task_id, row["claim_lock"]),
@@ -8571,7 +8599,11 @@ def enforce_max_runtime(
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
+                "last_heartbeat_at = NULL, "
+                # v2 state-model integrity (R3): worker_pid clears -- the
+                # worker is gone -- so running/blocked clear too. No-op on
+                # legacy boards.
+                "running = 0, blocked = 0 "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
                 (tid, pid, row["claim_lock"]),
@@ -8697,7 +8729,11 @@ def detect_stale_running(
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
+                "last_heartbeat_at = NULL, "
+                # v2 state-model integrity (R3): worker_pid clears -- the
+                # worker is gone -- so running/blocked clear too. No-op on
+                # legacy boards.
+                "running = 0, blocked = 0 "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ?",
                 (tid, row["claim_lock"]),
@@ -8871,7 +8907,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
+                "claim_expires = NULL, worker_pid = NULL, "
+                # v2 state-model integrity (R3): worker_pid clears -- the
+                # worker is gone -- so running/blocked clear too. No-op on
+                # legacy boards.
+                "running = 0, blocked = 0 "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
                 (row["id"], pid, row["claim_lock"]),
@@ -9148,9 +9188,13 @@ def _record_task_failure(
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
+                # v2 state-model integrity (R3): worker_pid clears here and
+                # the card lands in ``blocked`` -- running=0, blocked=1. No-op
+                # on legacy boards.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
+                    "running = 0, blocked = 1, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('running', 'ready', 'review')",
                     (failures, error[:500], task_id),
@@ -9158,9 +9202,12 @@ def _record_task_failure(
             else:
                 # Timeout/crash path: task is already at ``ready``
                 # with claim cleared; just flip to blocked + update
-                # counter fields.
+                # counter fields. ``running`` was already cleared by the
+                # caller's own reclaim UPDATE (R3); this only needs to set
+                # ``blocked`` for the new ready -> blocked landing. No-op
+                # on legacy boards.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
+                    "UPDATE tasks SET status = 'blocked', blocked = 1, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('ready', 'running')",
                     (failures, error[:500], task_id),
@@ -9196,9 +9243,14 @@ def _record_task_failure(
             # Below threshold.
             if release_claim:
                 # Spawn path: transition running → ready + clear claim.
+                # v2 state-model integrity (R3, the R1-flagged gap): worker_pid
+                # clears here -- the worker never even started -- so running
+                # must clear too; a re-idled ready card isn't blocked. No-op
+                # on legacy boards.
                 conn.execute(
                     "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
+                    "running = 0, blocked = 0, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
                     (failures, error[:500], task_id),
