@@ -121,6 +121,27 @@ except ImportError:
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
 
+# Session listing/detail/search endpoints are FastAPI ``async def`` handlers so
+# running synchronous sqlite3 hydration inline freezes the uvicorn event loop.
+# Keep all SessionDB-heavy work on a small, dedicated worker pool instead of the
+# loop thread (and instead of the shared default executor used by unrelated
+# file/network helpers).
+_SESSION_DB_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=max(2, min(4, (os.cpu_count() or 2))),
+    thread_name_prefix="hermes-session-db",
+)
+atexit.register(
+    lambda: _SESSION_DB_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+)
+
+
+async def _run_session_db_io(fn, /, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _SESSION_DB_EXECUTOR,
+        functools.partial(fn, *args, **kwargs),
+    )
+
 # ---------------------------------------------------------------------------
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
 # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
@@ -2168,6 +2189,24 @@ async def git_branch_switch_route(body: GitBranchSwitchBody):
     return await _git_op(_web_git.branch_switch, _git_path(body.path), body.branch)
 
 
+def _count_active_sessions_for_status() -> int:
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
+        try:
+            sessions = db.list_sessions_rich(limit=50)
+            now = time.time()
+            return sum(
+                1 for s in sessions
+                if s.get("ended_at") is None
+                and (now - s.get("last_active", s.get("started_at", 0))) < 300
+            )
+        finally:
+            db.close()
+    except Exception:
+        return 0
+
+
 @app.get("/api/status")
 async def get_status(profile: Optional[str] = None):
     status_scope = None
@@ -2264,22 +2303,7 @@ async def get_status(profile: Optional[str] = None):
         if gateway_running and gateway_state is None and remote_health_body is not None:
             gateway_state = "running"
 
-        active_sessions = 0
-        try:
-            from hermes_state import SessionDB
-            db = SessionDB()
-            try:
-                sessions = db.list_sessions_rich(limit=50)
-                now = time.time()
-                active_sessions = sum(
-                    1 for s in sessions
-                    if s.get("ended_at") is None
-                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
-                )
-            finally:
-                db.close()
-        except Exception:
-            pass
+        active_sessions = await _run_session_db_io(_count_active_sessions_for_status)
 
         # Busy/drainable readout (NAS lifecycle-safety gate).  active_agents is
         # the in-flight gateway-turn count the gateway now persists at every
@@ -3506,6 +3530,67 @@ async def get_action_status(name: str, lines: int = 200):
     }
 
 
+def _get_sessions_payload(
+    *,
+    limit: int,
+    offset: int,
+    min_messages: int,
+    archived: str,
+    order: str,
+    source: str = None,
+    exclude_sources: str = None,
+    cwd_prefix: str = None,
+    profile: Optional[str] = None,
+) -> Dict[str, Any]:
+    profile_name: Optional[str] = None
+    if profile:
+        profile_name, _ = _cron_profile_home(profile)
+    db = _open_session_db_for_profile(profile)
+    try:
+        min_message_count = max(0, min_messages)
+        archived_only = archived == "only"
+        include_archived = archived == "include"
+        # Optional source scoping: ``source`` includes a single class,
+        # ``exclude_sources`` (comma-separated) drops classes. The desktop
+        # uses these to split recents (exclude=cron) from the cron-jobs
+        # section (source=cron) into two independent lists.
+        exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
+        sessions = db.list_sessions_rich(
+            source=source or None,
+            exclude_sources=exclude_list or None,
+            cwd_prefix=(cwd_prefix or None),
+            limit=limit,
+            offset=offset,
+            min_message_count=min_message_count,
+            include_archived=include_archived,
+            archived_only=archived_only,
+            order_by_last_active=order == "recent",
+        )
+        total = db.session_count(
+            source=source or None,
+            cwd_prefix=(cwd_prefix or None),
+            exclude_sources=exclude_list or None,
+            min_message_count=min_message_count,
+            include_archived=include_archived,
+            archived_only=archived_only,
+            exclude_children=True,
+        )
+        now = time.time()
+        for s in sessions:
+            s["is_active"] = (
+                s.get("ended_at") is None
+                and (now - s.get("last_active", s.get("started_at", 0))) < 300
+            )
+            if profile_name:
+                s["profile"] = profile_name
+                s["is_default_profile"] = profile_name == "default"
+            # SQLite stores the flag as 0/1; expose a real JSON boolean.
+            s["archived"] = bool(s.get("archived"))
+        return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
+    finally:
+        db.close()
+
+
 @app.get("/api/sessions")
 async def get_sessions(
     limit: int = 20,
@@ -3540,54 +3625,19 @@ async def get_sessions(
             status_code=400,
             detail="order must be one of: created, recent",
         )
-    profile_name: Optional[str] = None
-    if profile:
-        profile_name, _ = _cron_profile_home(profile)
     try:
-        db = _open_session_db_for_profile(profile)
-        try:
-            min_message_count = max(0, min_messages)
-            archived_only = archived == "only"
-            include_archived = archived == "include"
-            # Optional source scoping: ``source`` includes a single class,
-            # ``exclude_sources`` (comma-separated) drops classes. The desktop
-            # uses these to split recents (exclude=cron) from the cron-jobs
-            # section (source=cron) into two independent lists.
-            exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
-            sessions = db.list_sessions_rich(
-                source=source or None,
-                exclude_sources=exclude_list or None,
-                cwd_prefix=(cwd_prefix or None),
-                limit=limit,
-                offset=offset,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                order_by_last_active=order == "recent",
-            )
-            total = db.session_count(
-                source=source or None,
-                cwd_prefix=(cwd_prefix or None),
-                exclude_sources=exclude_list or None,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                exclude_children=True,
-            )
-            now = time.time()
-            for s in sessions:
-                s["is_active"] = (
-                    s.get("ended_at") is None
-                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
-                )
-                if profile_name:
-                    s["profile"] = profile_name
-                    s["is_default_profile"] = profile_name == "default"
-                # SQLite stores the flag as 0/1; expose a real JSON boolean.
-                s["archived"] = bool(s.get("archived"))
-            return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
-        finally:
-            db.close()
+        return await _run_session_db_io(
+            _get_sessions_payload,
+            limit=limit,
+            offset=offset,
+            min_messages=min_messages,
+            archived=archived,
+            order=order,
+            source=source,
+            exclude_sources=exclude_sources,
+            cwd_prefix=cwd_prefix,
+            profile=profile,
+        )
     except HTTPException:
         raise
     except Exception:
@@ -3714,6 +3764,151 @@ def get_profiles_sessions(
     }
 
 
+def _search_sessions_payload(q: str, limit: int = 20, profile: Optional[str] = None) -> Dict[str, Any]:
+    db = _open_session_db_for_profile(profile)
+    try:
+        safe_limit = max(1, min(int(limit or 20), 100))
+
+        # Walk parent_session_id to the compression root, memoized so a
+        # chain of compression segments only costs one walk. We deliberately
+        # stop at branch/delegate edges: those sessions may diverge from the
+        # parent and should remain searchable on their own.
+        root_cache: dict = {}
+
+        def compression_root(session_id: str) -> str:
+            if not session_id:
+                return session_id
+            if session_id in root_cache:
+                return root_cache[session_id]
+            chain = []
+            cur = session_id
+            visited = set()
+            root = session_id
+            while cur and cur not in visited:
+                visited.add(cur)
+                chain.append(cur)
+                if cur in root_cache:
+                    root = root_cache[cur]
+                    break
+                try:
+                    s = db.get_session(cur)
+                except Exception:
+                    s = None
+                if not s:
+                    root = cur
+                    break
+                parent = s.get("parent_session_id") if isinstance(s, dict) else None
+                if not parent:
+                    root = cur
+                    break
+                try:
+                    parent_session = db.get_session(parent)
+                except Exception:
+                    parent_session = None
+                if not parent_session:
+                    root = cur
+                    break
+                parent_ended_at = parent_session.get("ended_at")
+                started_at = s.get("started_at")
+                is_compression_edge = (
+                    parent_session.get("end_reason") == "compression"
+                    and parent_ended_at is not None
+                    and started_at is not None
+                    and started_at >= parent_ended_at
+                )
+                if not is_compression_edge:
+                    root = cur
+                    break
+                cur = parent
+            for node in chain:
+                root_cache[node] = root
+            return root
+
+        tip_cache: dict = {}
+
+        def lineage_tip(root_id: str) -> str:
+            if root_id in tip_cache:
+                return tip_cache[root_id]
+            tip = root_id
+            try:
+                resolved = db.get_compression_tip(root_id)
+                if resolved:
+                    tip = resolved
+            except Exception:
+                pass
+            tip_cache[root_id] = tip
+            return tip
+
+        # Both ID matches and content matches share one keyspace, keyed by
+        # compression lineage root, so an id-hit and a content-hit on the
+        # same logical conversation collapse to a single result. The first
+        # hit for a lineage wins; ID matches run first and take priority.
+        seen: dict = {}
+
+        def add_lineage_result(raw_sid: str, payload: dict) -> None:
+            if not raw_sid:
+                return
+            root = compression_root(raw_sid)
+            if root in seen or len(seen) >= safe_limit:
+                return
+            payload = dict(payload)
+            payload["session_id"] = lineage_tip(root)
+            payload["lineage_root"] = root
+            seen[root] = payload
+
+        # Direct ID matches first: users often paste a session id from CLI,
+        # logs, or another Hermes surface. FTS can't find those unless the
+        # id happens to appear in message text. search_sessions_by_id is
+        # SQL-bounded, so this stays cheap even with thousands of sessions.
+        for row in db.search_sessions_by_id(q, limit=safe_limit, include_archived=True):
+            sid = row.get("id")
+            preview = (row.get("preview") or "").strip()
+            snippet = preview or f"Session ID: {sid}"
+            add_lineage_result(
+                sid,
+                {
+                    "snippet": snippet,
+                    "role": None,
+                    "source": row.get("source"),
+                    "model": row.get("model"),
+                    "session_started": row.get("started_at"),
+                },
+            )
+
+        # Auto-add prefix wildcards so partial words match
+        # e.g. "nimb" → "nimb*" matches "nimby"
+        # Preserve quoted phrases and existing wildcards as-is
+        import re
+        terms = []
+        for token in re.findall(r'"[^"]*"|\S+', q.strip()):
+            if token.startswith('"') or token.endswith("*"):
+                terms.append(token)
+            else:
+                terms.append(token + "*")
+        prefix_query = " ".join(terms)
+        # Over-fetch so lineage dedup can still surface `limit` distinct
+        # conversations even when several hits collapse onto one root.
+        fetch_limit = max(safe_limit * 5, 50)
+        matches = db.search_messages(query=prefix_query, limit=fetch_limit)
+
+        for m in matches:
+            if len(seen) >= safe_limit:
+                break
+            add_lineage_result(
+                m["session_id"],
+                {
+                    "snippet": m.get("snippet", ""),
+                    "role": m.get("role"),
+                    "source": m.get("source"),
+                    "model": m.get("model"),
+                    "session_started": m.get("session_started"),
+                },
+            )
+        return {"results": list(seen.values())}
+    finally:
+        db.close()
+
+
 @app.get("/api/sessions/search")
 async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] = None):
     """Search sessions by ID plus full-text message content using FTS5.
@@ -3729,148 +3924,7 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
     if not q or not q.strip():
         return {"results": []}
     try:
-        db = _open_session_db_for_profile(profile)
-        try:
-            safe_limit = max(1, min(int(limit or 20), 100))
-
-            # Walk parent_session_id to the compression root, memoized so a
-            # chain of compression segments only costs one walk. We deliberately
-            # stop at branch/delegate edges: those sessions may diverge from the
-            # parent and should remain searchable on their own.
-            root_cache: dict = {}
-
-            def compression_root(session_id: str) -> str:
-                if not session_id:
-                    return session_id
-                if session_id in root_cache:
-                    return root_cache[session_id]
-                chain = []
-                cur = session_id
-                visited = set()
-                root = session_id
-                while cur and cur not in visited:
-                    visited.add(cur)
-                    chain.append(cur)
-                    if cur in root_cache:
-                        root = root_cache[cur]
-                        break
-                    try:
-                        s = db.get_session(cur)
-                    except Exception:
-                        s = None
-                    if not s:
-                        root = cur
-                        break
-                    parent = s.get("parent_session_id") if isinstance(s, dict) else None
-                    if not parent:
-                        root = cur
-                        break
-                    try:
-                        parent_session = db.get_session(parent)
-                    except Exception:
-                        parent_session = None
-                    if not parent_session:
-                        root = cur
-                        break
-                    parent_ended_at = parent_session.get("ended_at")
-                    started_at = s.get("started_at")
-                    is_compression_edge = (
-                        parent_session.get("end_reason") == "compression"
-                        and parent_ended_at is not None
-                        and started_at is not None
-                        and started_at >= parent_ended_at
-                    )
-                    if not is_compression_edge:
-                        root = cur
-                        break
-                    cur = parent
-                for node in chain:
-                    root_cache[node] = root
-                return root
-
-            tip_cache: dict = {}
-
-            def lineage_tip(root_id: str) -> str:
-                if root_id in tip_cache:
-                    return tip_cache[root_id]
-                tip = root_id
-                try:
-                    resolved = db.get_compression_tip(root_id)
-                    if resolved:
-                        tip = resolved
-                except Exception:
-                    pass
-                tip_cache[root_id] = tip
-                return tip
-
-            # Both ID matches and content matches share one keyspace, keyed by
-            # compression lineage root, so an id-hit and a content-hit on the
-            # same logical conversation collapse to a single result. The first
-            # hit for a lineage wins; ID matches run first and take priority.
-            seen: dict = {}
-
-            def add_lineage_result(raw_sid: str, payload: dict) -> None:
-                if not raw_sid:
-                    return
-                root = compression_root(raw_sid)
-                if root in seen or len(seen) >= safe_limit:
-                    return
-                payload = dict(payload)
-                payload["session_id"] = lineage_tip(root)
-                payload["lineage_root"] = root
-                seen[root] = payload
-
-            # Direct ID matches first: users often paste a session id from CLI,
-            # logs, or another Hermes surface. FTS can't find those unless the
-            # id happens to appear in message text. search_sessions_by_id is
-            # SQL-bounded, so this stays cheap even with thousands of sessions.
-            for row in db.search_sessions_by_id(q, limit=safe_limit, include_archived=True):
-                sid = row.get("id")
-                preview = (row.get("preview") or "").strip()
-                snippet = preview or f"Session ID: {sid}"
-                add_lineage_result(
-                    sid,
-                    {
-                        "snippet": snippet,
-                        "role": None,
-                        "source": row.get("source"),
-                        "model": row.get("model"),
-                        "session_started": row.get("started_at"),
-                    },
-                )
-
-            # Auto-add prefix wildcards so partial words match
-            # e.g. "nimb" → "nimb*" matches "nimby"
-            # Preserve quoted phrases and existing wildcards as-is
-            import re
-            terms = []
-            for token in re.findall(r'"[^"]*"|\S+', q.strip()):
-                if token.startswith('"') or token.endswith("*"):
-                    terms.append(token)
-                else:
-                    terms.append(token + "*")
-            prefix_query = " ".join(terms)
-            # Over-fetch so lineage dedup can still surface `limit` distinct
-            # conversations even when several hits collapse onto one root.
-            fetch_limit = max(safe_limit * 5, 50)
-            matches = db.search_messages(query=prefix_query, limit=fetch_limit)
-
-            for m in matches:
-                if len(seen) >= safe_limit:
-                    break
-                add_lineage_result(
-                    m["session_id"],
-                    {
-                        "snippet": m.get("snippet", ""),
-                        "role": m.get("role"),
-                        "source": m.get("source"),
-                        "model": m.get("model"),
-                        "session_started": m.get("session_started"),
-                    },
-                )
-            return {"results": list(seen.values())}
-        finally:
-            db.close()
+        return await _run_session_db_io(_search_sessions_payload, q, limit, profile)
     except HTTPException:
         raise
     except Exception:
@@ -7896,12 +7950,15 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
             status_code=400,
             detail="ids must contain at most 500 entries",
         )
-    db = _open_session_db_for_profile(body.profile)
-    try:
-        deleted = db.delete_sessions(body.ids)
-        return {"ok": True, "deleted": deleted}
-    finally:
-        db.close()
+    def _delete():
+        db = _open_session_db_for_profile(body.profile)
+        try:
+            deleted = db.delete_sessions(body.ids)
+            return {"ok": True, "deleted": deleted}
+        finally:
+            db.close()
+
+    return await _run_session_db_io(_delete)
 
 
 @app.get("/api/sessions/empty/count")
@@ -7912,11 +7969,14 @@ async def count_empty_sessions_endpoint(profile: Optional[str] = None):
     UI hides the affordance so users aren't presented with a button
     that does nothing. Cheap, single-COUNT query.
     """
-    db = _open_session_db_for_profile(profile)
-    try:
-        return {"count": db.count_empty_sessions()}
-    finally:
-        db.close()
+    def _count():
+        db = _open_session_db_for_profile(profile)
+        try:
+            return {"count": db.count_empty_sessions()}
+        finally:
+            db.close()
+
+    return await _run_session_db_io(_count)
 
 
 @app.delete("/api/sessions/empty")
@@ -7939,12 +7999,15 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
     prune-on-startup pass. Matching that pre-existing trade-off keeps
     the two delete endpoints' DB-vs-disk behaviour consistent.
     """
-    db = _open_session_db_for_profile(profile)
-    try:
-        deleted = db.delete_empty_sessions()
-        return {"ok": True, "deleted": deleted}
-    finally:
-        db.close()
+    def _delete_empty():
+        db = _open_session_db_for_profile(profile)
+        try:
+            deleted = db.delete_empty_sessions()
+            return {"ok": True, "deleted": deleted}
+        finally:
+            db.close()
+
+    return await _run_session_db_io(_delete_empty)
 
 
 @app.get("/api/sessions/stats")
@@ -7954,28 +8017,31 @@ async def get_session_stats(profile: Optional[str] = None):
     Registered before ``/api/sessions/{session_id}`` so the literal ``stats``
     path isn't captured as a session id by the parameterized route.
     """
-    db = _open_session_db_for_profile(profile)
-    try:
-        total = db.session_count(include_archived=True)
-        active_store = db.session_count(include_archived=False)
-        archived = db.session_count(archived_only=True)
-        messages = db.message_count()
-        by_source: Dict[str, int] = {}
+    def _stats():
+        db = _open_session_db_for_profile(profile)
         try:
-            for s in db.list_sessions_rich(limit=10000, include_archived=True):
-                src = str(s.get("source") or "cli")
-                by_source[src] = by_source.get(src, 0) + 1
-        except Exception:
-            pass
-        return {
-            "total": total,
-            "active_store": active_store,
-            "archived": archived,
-            "messages": messages,
-            "by_source": by_source,
-        }
-    finally:
-        db.close()
+            total = db.session_count(include_archived=True)
+            active_store = db.session_count(include_archived=False)
+            archived = db.session_count(archived_only=True)
+            messages = db.message_count()
+            by_source: Dict[str, int] = {}
+            try:
+                for s in db.list_sessions_rich(limit=10000, include_archived=True):
+                    src = str(s.get("source") or "cli")
+                    by_source[src] = by_source.get(src, 0) + 1
+            except Exception:
+                pass
+            return {
+                "total": total,
+                "active_store": active_store,
+                "archived": archived,
+                "messages": messages,
+                "by_source": by_source,
+            }
+        finally:
+            db.close()
+
+    return await _run_session_db_io(_stats)
 
 
 def _open_session_db_for_profile(profile: Optional[str]):
@@ -7995,23 +8061,26 @@ def _open_session_db_for_profile(profile: Optional[str]):
 
 @app.get("/api/sessions/{session_id}")
 async def get_session_detail(session_id: str, profile: Optional[str] = None):
-    db = _open_session_db_for_profile(profile)
-    try:
-        sid = db.resolve_session_id(session_id)
-        session = db.get_session(sid) if sid else None
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-        if profile:
-            session["profile"] = _cron_profile_home(profile)[0]
-        return session
-    finally:
-        db.close()
+    def _detail():
+        db = _open_session_db_for_profile(profile)
+        try:
+            sid = db.resolve_session_id(session_id)
+            session = db.get_session(sid) if sid else None
+            if not session:
+                raise HTTPException(status_code=404, detail="Session not found")
+            if profile:
+                session["profile"] = _cron_profile_home(profile)[0]
+            return session
+        finally:
+            db.close()
+
+    return await _run_session_db_io(_detail)
 
 
 
 @app.get("/api/sessions/{session_id}/latest-descendant")
 async def get_session_latest_descendant(session_id: str):
-    latest, path = _session_latest_descendant(session_id)
+    latest, path = await _run_session_db_io(_session_latest_descendant, session_id)
     if not latest:
         raise HTTPException(status_code=404, detail="Session not found")
     return {
@@ -8023,16 +8092,19 @@ async def get_session_latest_descendant(session_id: str):
 
 @app.get("/api/sessions/{session_id}/messages")
 async def get_session_messages(session_id: str, profile: Optional[str] = None):
-    db = _open_session_db_for_profile(profile)
-    try:
-        sid = db.resolve_session_id(session_id)
-        if not sid:
-            raise HTTPException(status_code=404, detail="Session not found")
-        sid = db.resolve_resume_session_id(sid)
-        messages = db.get_messages(sid)
-        return {"session_id": sid, "messages": messages}
-    finally:
-        db.close()
+    def _messages():
+        db = _open_session_db_for_profile(profile)
+        try:
+            sid = db.resolve_session_id(session_id)
+            if not sid:
+                raise HTTPException(status_code=404, detail="Session not found")
+            sid = db.resolve_resume_session_id(sid)
+            messages = db.get_messages(sid)
+            return {"session_id": sid, "messages": messages}
+        finally:
+            db.close()
+
+    return await _run_session_db_io(_messages)
 
 
 @app.delete("/api/sessions/{session_id}")
@@ -8040,24 +8112,27 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
     # ``profile`` deletes a session belonging to another (local) profile by
     # opening its state.db directly. Remote profiles never reach here — the
     # desktop routes their DELETE to the remote backend. Omit for current/default.
-    db = _open_session_db_for_profile(profile)
-    try:
-        # Resolve exact ids / unique prefixes like every other session endpoint
-        # (detail, messages, rename, export all do). A session that no longer
-        # exists is an idempotent success: DELETE's contract is "ensure it's
-        # gone", and the desktop optimistically removes the row then RESTORES it
-        # on any error — so a 404 on an already-absent row resurrected a ghost
-        # row and surfaced "session not found". /goal + auto-compression churn
-        # leaves transient empty rows (reaped by empty-session hygiene) that
-        # race the sidebar snapshot, which is exactly when this fired. Mirrors
-        # the bulk-delete endpoint, which already treats ghost ids as success.
-        sid = db.resolve_session_id(session_id)
-        if not sid:
-            return {"ok": True, "already_absent": True}
-        db.delete_session(sid)
-        return {"ok": True}
-    finally:
-        db.close()
+    def _delete_one():
+        db = _open_session_db_for_profile(profile)
+        try:
+            # Resolve exact ids / unique prefixes like every other session endpoint
+            # (detail, messages, rename, export all do). A session that no longer
+            # exists is an idempotent success: DELETE's contract is "ensure it's
+            # gone", and the desktop optimistically removes the row then RESTORES it
+            # on any error — so a 404 on an already-absent row resurrected a ghost
+            # row and surfaced "session not found". /goal + auto-compression churn
+            # leaves transient empty rows (reaped by empty-session hygiene) that
+            # race the sidebar snapshot, which is exactly when this fired. Mirrors
+            # the bulk-delete endpoint, which already treats ghost ids as success.
+            sid = db.resolve_session_id(session_id)
+            if not sid:
+                return {"ok": True, "already_absent": True}
+            db.delete_session(sid)
+            return {"ok": True}
+        finally:
+            db.close()
+
+    return await _run_session_db_io(_delete_one)
 
 
 class SessionRename(BaseModel):
@@ -8076,46 +8151,52 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
     restores the session. Either field may be omitted. ``profile`` targets
     another profile's session.
     """
-    db = _open_session_db_for_profile(body.profile)
-    try:
-        sid = db.resolve_session_id(session_id)
-        if not sid:
-            raise HTTPException(status_code=404, detail="Session not found")
-        if body.title is None and body.archived is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Nothing to update; provide 'title' and/or 'archived'.",
-            )
-        if body.title is not None:
-            try:
-                db.set_session_title(sid, body.title or "")
-            except ValueError as e:
-                # Title too long, invalid characters, or already in use.
-                raise HTTPException(status_code=400, detail=str(e))
-        if body.archived is not None:
-            db.set_session_archived(sid, body.archived)
-        result = {"ok": True, "title": db.get_session_title(sid) or ""}
-        if body.archived is not None:
-            result["archived"] = bool(body.archived)
-        return result
-    finally:
-        db.close()
+    def _rename():
+        db = _open_session_db_for_profile(body.profile)
+        try:
+            sid = db.resolve_session_id(session_id)
+            if not sid:
+                raise HTTPException(status_code=404, detail="Session not found")
+            if body.title is None and body.archived is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Nothing to update; provide 'title' and/or 'archived'.",
+                )
+            if body.title is not None:
+                try:
+                    db.set_session_title(sid, body.title or "")
+                except ValueError as e:
+                    # Title too long, invalid characters, or already in use.
+                    raise HTTPException(status_code=400, detail=str(e))
+            if body.archived is not None:
+                db.set_session_archived(sid, body.archived)
+            result = {"ok": True, "title": db.get_session_title(sid) or ""}
+            if body.archived is not None:
+                result["archived"] = bool(body.archived)
+            return result
+        finally:
+            db.close()
+
+    return await _run_session_db_io(_rename)
 
 
 @app.get("/api/sessions/{session_id}/export")
 async def export_session_endpoint(session_id: str, profile: Optional[str] = None):
     """Export a single session (metadata + messages) as JSON."""
-    db = _open_session_db_for_profile(profile)
-    try:
-        sid = db.resolve_session_id(session_id)
-        if not sid:
-            raise HTTPException(status_code=404, detail="Session not found")
-        data = db.export_session(sid)
-        if data is None:
-            raise HTTPException(status_code=404, detail="Session not found")
-        return data
-    finally:
-        db.close()
+    def _export():
+        db = _open_session_db_for_profile(profile)
+        try:
+            sid = db.resolve_session_id(session_id)
+            if not sid:
+                raise HTTPException(status_code=404, detail="Session not found")
+            data = db.export_session(sid)
+            if data is None:
+                raise HTTPException(status_code=404, detail="Session not found")
+            return data
+        finally:
+            db.close()
+
+    return await _run_session_db_io(_export)
 
 
 class SessionPrune(BaseModel):
@@ -8130,17 +8211,21 @@ async def prune_sessions_endpoint(body: SessionPrune):
     if body.older_than_days < 1:
         raise HTTPException(status_code=400, detail="older_than_days must be >= 1")
     profile_home = _cron_profile_home(body.profile)[1] if body.profile else get_hermes_home()
-    db = _open_session_db_for_profile(body.profile)
-    try:
-        sessions_dir = profile_home / "sessions"
-        removed = db.prune_sessions(
-            older_than_days=body.older_than_days,
-            source=(body.source or None),
-            sessions_dir=sessions_dir if sessions_dir.exists() else None,
-        )
-        return {"ok": True, "removed": removed}
-    finally:
-        db.close()
+
+    def _prune():
+        db = _open_session_db_for_profile(body.profile)
+        try:
+            sessions_dir = profile_home / "sessions"
+            removed = db.prune_sessions(
+                older_than_days=body.older_than_days,
+                source=(body.source or None),
+                sessions_dir=sessions_dir if sessions_dir.exists() else None,
+            )
+            return {"ok": True, "removed": removed}
+        finally:
+            db.close()
+
+    return await _run_session_db_io(_prune)
 
 
 # ---------------------------------------------------------------------------
@@ -8486,21 +8571,24 @@ async def list_cron_job_runs(job_id: str, profile: Optional[str] = None, limit: 
     except (TypeError, ValueError):
         limit_n = 20
 
-    db = _open_session_db_for_profile(selected)
-    try:
-        runs = db.list_cron_job_runs(canonical, limit=limit_n, offset=0)
-        now = time.time()
-        for s in runs:
-            s["is_active"] = (
-                s.get("ended_at") is None
-                and (now - s.get("last_active", s.get("started_at", 0))) < 300
-            )
-            s["archived"] = bool(s.get("archived"))
-            if selected:
-                s["profile"] = selected
-        return {"runs": runs, "limit": limit_n}
-    finally:
-        db.close()
+    def _runs():
+        db = _open_session_db_for_profile(selected)
+        try:
+            runs = db.list_cron_job_runs(canonical, limit=limit_n, offset=0)
+            now = time.time()
+            for s in runs:
+                s["is_active"] = (
+                    s.get("ended_at") is None
+                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
+                )
+                s["archived"] = bool(s.get("archived"))
+                if selected:
+                    s["profile"] = selected
+            return {"runs": runs, "limit": limit_n}
+        finally:
+            db.close()
+
+    return await _run_session_db_io(_runs)
 
 
 @app.post("/api/cron/jobs")
@@ -12090,228 +12178,234 @@ async def update_config_raw(body: RawConfigUpdate, profile: Optional[str] = None
 
 @app.get("/api/analytics/usage")
 async def get_usage_analytics(days: int = 30, profile: Optional[str] = None):
-    from agent.insights import InsightsEngine
+    def _usage():
+        from agent.insights import InsightsEngine
 
-    db = _open_session_db_for_profile(profile)
-    try:
-        cutoff = time.time() - (days * 86400)
-        cur = db._conn.execute("""
-            SELECT date(started_at, 'unixepoch') as day,
-                   SUM(input_tokens) as input_tokens,
-                   SUM(output_tokens) as output_tokens,
-                   SUM(cache_read_tokens) as cache_read_tokens,
-                   SUM(reasoning_tokens) as reasoning_tokens,
-                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
-                   COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
-                   COUNT(*) as sessions,
-                   SUM(COALESCE(api_call_count, 0)) as api_calls
-            FROM sessions WHERE started_at > ?
-            GROUP BY day ORDER BY day
-        """, (cutoff,))
-        daily = [dict(r) for r in cur.fetchall()]
+        db = _open_session_db_for_profile(profile)
+        try:
+            cutoff = time.time() - (days * 86400)
+            cur = db._conn.execute("""
+                SELECT date(started_at, 'unixepoch') as day,
+                       SUM(input_tokens) as input_tokens,
+                       SUM(output_tokens) as output_tokens,
+                       SUM(cache_read_tokens) as cache_read_tokens,
+                       SUM(reasoning_tokens) as reasoning_tokens,
+                       COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
+                       COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
+                       COUNT(*) as sessions,
+                       SUM(COALESCE(api_call_count, 0)) as api_calls
+                FROM sessions WHERE started_at > ?
+                GROUP BY day ORDER BY day
+            """, (cutoff,))
+            daily = [dict(r) for r in cur.fetchall()]
 
-        cur2 = db._conn.execute("""
-            SELECT model,
-                   SUM(input_tokens) as input_tokens,
-                   SUM(output_tokens) as output_tokens,
-                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
-                   COUNT(*) as sessions,
-                   SUM(COALESCE(api_call_count, 0)) as api_calls
-            FROM sessions WHERE started_at > ? AND model IS NOT NULL
-            GROUP BY model ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
-        """, (cutoff,))
-        by_model = [dict(r) for r in cur2.fetchall()]
+            cur2 = db._conn.execute("""
+                SELECT model,
+                       SUM(input_tokens) as input_tokens,
+                       SUM(output_tokens) as output_tokens,
+                       COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
+                       COUNT(*) as sessions,
+                       SUM(COALESCE(api_call_count, 0)) as api_calls
+                FROM sessions WHERE started_at > ? AND model IS NOT NULL
+                GROUP BY model ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
+            """, (cutoff,))
+            by_model = [dict(r) for r in cur2.fetchall()]
 
-        cur3 = db._conn.execute("""
-            SELECT SUM(input_tokens) as total_input,
-                   SUM(output_tokens) as total_output,
-                   SUM(cache_read_tokens) as total_cache_read,
-                   SUM(reasoning_tokens) as total_reasoning,
-                   COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost,
-                   COALESCE(SUM(actual_cost_usd), 0) as total_actual_cost,
-                   COUNT(*) as total_sessions,
-                   SUM(COALESCE(api_call_count, 0)) as total_api_calls
-            FROM sessions WHERE started_at > ?
-        """, (cutoff,))
-        totals = dict(cur3.fetchone())
-        insights_report = InsightsEngine(db).generate(days=days)
-        skills = insights_report.get("skills", {
-            "summary": {
-                "total_skill_loads": 0,
-                "total_skill_edits": 0,
-                "total_skill_actions": 0,
-                "distinct_skills_used": 0,
-            },
-            "top_skills": [],
-        })
+            cur3 = db._conn.execute("""
+                SELECT SUM(input_tokens) as total_input,
+                       SUM(output_tokens) as total_output,
+                       SUM(cache_read_tokens) as total_cache_read,
+                       SUM(reasoning_tokens) as total_reasoning,
+                       COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost,
+                       COALESCE(SUM(actual_cost_usd), 0) as total_actual_cost,
+                       COUNT(*) as total_sessions,
+                       SUM(COALESCE(api_call_count, 0)) as total_api_calls
+                FROM sessions WHERE started_at > ?
+            """, (cutoff,))
+            totals = dict(cur3.fetchone())
+            insights_report = InsightsEngine(db).generate(days=days)
+            skills = insights_report.get("skills", {
+                "summary": {
+                    "total_skill_loads": 0,
+                    "total_skill_edits": 0,
+                    "total_skill_actions": 0,
+                    "distinct_skills_used": 0,
+                },
+                "top_skills": [],
+            })
 
-        return {
-            "daily": daily,
-            "by_model": by_model,
-            "totals": totals,
-            "period_days": days,
-            "skills": skills,
-            # Per-tool-name call counts (already computed by InsightsEngine);
-            # the desktop Capabilities page aggregates these per toolset.
-            "tools": insights_report.get("tools", []),
-        }
-    finally:
-        db.close()
+            return {
+                "daily": daily,
+                "by_model": by_model,
+                "totals": totals,
+                "period_days": days,
+                "skills": skills,
+                # Per-tool-name call counts (already computed by InsightsEngine);
+                # the desktop Capabilities page aggregates these per toolset.
+                "tools": insights_report.get("tools", []),
+            }
+        finally:
+            db.close()
+
+    return await _run_session_db_io(_usage)
 
 
 @app.get("/api/analytics/models")
 async def get_models_analytics(days: int = 30, profile: Optional[str] = None):
-    """Rich per-model analytics for the Models dashboard page.
+    def _models():
+        """Rich per-model analytics for the Models dashboard page.
 
-    Returns token/cost/session breakdown per model plus capability metadata
-    from models.dev (context window, vision, tools, reasoning, etc.).
-    """
-    db = _open_session_db_for_profile(profile)
-    try:
-        cutoff = time.time() - (days * 86400)
+        Returns token/cost/session breakdown per model plus capability metadata
+        from models.dev (context window, vision, tools, reasoning, etc.).
+        """
+        db = _open_session_db_for_profile(profile)
+        try:
+            cutoff = time.time() - (days * 86400)
 
-        cur = db._conn.execute("""
-            SELECT model,
-                   billing_provider,
-                   SUM(input_tokens) as input_tokens,
-                   SUM(output_tokens) as output_tokens,
-                   SUM(cache_read_tokens) as cache_read_tokens,
-                   SUM(reasoning_tokens) as reasoning_tokens,
-                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
-                   COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
-                   COUNT(*) as sessions,
-                   SUM(COALESCE(api_call_count, 0)) as api_calls,
-                   SUM(tool_call_count) as tool_calls,
-                   MAX(started_at) as last_used_at,
-                   AVG(input_tokens + output_tokens) as avg_tokens_per_session
-            FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
-            GROUP BY model, billing_provider
-            ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
-        """, (cutoff,))
-        raw_rows = [dict(r) for r in cur.fetchall()]
+            cur = db._conn.execute("""
+                SELECT model,
+                       billing_provider,
+                       SUM(input_tokens) as input_tokens,
+                       SUM(output_tokens) as output_tokens,
+                       SUM(cache_read_tokens) as cache_read_tokens,
+                       SUM(reasoning_tokens) as reasoning_tokens,
+                       COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
+                       COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
+                       COUNT(*) as sessions,
+                       SUM(COALESCE(api_call_count, 0)) as api_calls,
+                       SUM(tool_call_count) as tool_calls,
+                       MAX(started_at) as last_used_at,
+                       AVG(input_tokens + output_tokens) as avg_tokens_per_session
+                FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
+                GROUP BY model, billing_provider
+                ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
+            """, (cutoff,))
+            raw_rows = [dict(r) for r in cur.fetchall()]
 
-        # Session rows can be created before the first billable provider call
-        # finishes. If that early row records only the model name, and a later
-        # row for the same model has real accounting + billing_provider, the
-        # Models page used to show a duplicate "0 tokens / — API calls" card
-        # next to the real provider card. Fold those session-only rows into
-        # the single accounted provider row when the ownership is unambiguous.
-        rows_by_model: Dict[str, List[Dict[str, Any]]] = {}
-        for row in raw_rows:
-            rows_by_model.setdefault(row.get("model") or "", []).append(row)
+            # Session rows can be created before the first billable provider call
+            # finishes. If that early row records only the model name, and a later
+            # row for the same model has real accounting + billing_provider, the
+            # Models page used to show a duplicate "0 tokens / — API calls" card
+            # next to the real provider card. Fold those session-only rows into
+            # the single accounted provider row when the ownership is unambiguous.
+            rows_by_model: Dict[str, List[Dict[str, Any]]] = {}
+            for row in raw_rows:
+                rows_by_model.setdefault(row.get("model") or "", []).append(row)
 
-        rows: List[Dict[str, Any]] = []
-        for model_rows in rows_by_model.values():
-            provider_rows = [r for r in model_rows if r.get("billing_provider")]
-            if len(provider_rows) == 1:
-                target = provider_rows[0]
-                for row in model_rows:
-                    if row is target or row.get("billing_provider"):
-                        continue
-                    has_usage = any(
-                        (row.get(key) or 0) != 0
-                        for key in (
-                            "input_tokens",
-                            "output_tokens",
-                            "cache_read_tokens",
-                            "reasoning_tokens",
-                            "estimated_cost",
-                            "actual_cost",
-                            "api_calls",
-                            "tool_calls",
+            rows: List[Dict[str, Any]] = []
+            for model_rows in rows_by_model.values():
+                provider_rows = [r for r in model_rows if r.get("billing_provider")]
+                if len(provider_rows) == 1:
+                    target = provider_rows[0]
+                    for row in model_rows:
+                        if row is target or row.get("billing_provider"):
+                            continue
+                        has_usage = any(
+                            (row.get(key) or 0) != 0
+                            for key in (
+                                "input_tokens",
+                                "output_tokens",
+                                "cache_read_tokens",
+                                "reasoning_tokens",
+                                "estimated_cost",
+                                "actual_cost",
+                                "api_calls",
+                                "tool_calls",
+                            )
                         )
+                        if has_usage:
+                            continue
+                        target["sessions"] = (target.get("sessions") or 0) + (row.get("sessions") or 0)
+                        target["last_used_at"] = max(target.get("last_used_at") or 0, row.get("last_used_at") or 0)
+                        total_tokens = (target.get("input_tokens") or 0) + (target.get("output_tokens") or 0)
+                        sessions = target.get("sessions") or 0
+                        target["avg_tokens_per_session"] = total_tokens / sessions if sessions else 0
+                    rows.append(target)
+                    rows.extend(
+                        r for r in model_rows
+                        if r is not target
+                        and (r.get("billing_provider") or any(
+                            (r.get(key) or 0) != 0
+                            for key in (
+                                "input_tokens",
+                                "output_tokens",
+                                "cache_read_tokens",
+                                "reasoning_tokens",
+                                "estimated_cost",
+                                "actual_cost",
+                                "api_calls",
+                                "tool_calls",
+                            )
+                        ))
                     )
-                    if has_usage:
-                        continue
-                    target["sessions"] = (target.get("sessions") or 0) + (row.get("sessions") or 0)
-                    target["last_used_at"] = max(target.get("last_used_at") or 0, row.get("last_used_at") or 0)
-                    total_tokens = (target.get("input_tokens") or 0) + (target.get("output_tokens") or 0)
-                    sessions = target.get("sessions") or 0
-                    target["avg_tokens_per_session"] = total_tokens / sessions if sessions else 0
-                rows.append(target)
-                rows.extend(
-                    r for r in model_rows
-                    if r is not target
-                    and (r.get("billing_provider") or any(
-                        (r.get(key) or 0) != 0
-                        for key in (
-                            "input_tokens",
-                            "output_tokens",
-                            "cache_read_tokens",
-                            "reasoning_tokens",
-                            "estimated_cost",
-                            "actual_cost",
-                            "api_calls",
-                            "tool_calls",
-                        )
-                    ))
-                )
-            else:
-                rows.extend(model_rows)
+                else:
+                    rows.extend(model_rows)
 
-        rows.sort(
-            key=lambda r: (r.get("input_tokens") or 0) + (r.get("output_tokens") or 0),
-            reverse=True,
-        )
+            rows.sort(
+                key=lambda r: (r.get("input_tokens") or 0) + (r.get("output_tokens") or 0),
+                reverse=True,
+            )
 
-        models = []
-        for row in rows:
-            provider = row.get("billing_provider") or ""
-            model_name = row["model"]
-            caps = {}
-            try:
-                from agent.models_dev import get_model_capabilities
-                mc = get_model_capabilities(provider=provider, model=model_name)
-                if mc is not None:
-                    caps = {
-                        "supports_tools": mc.supports_tools,
-                        "supports_vision": mc.supports_vision,
-                        "supports_reasoning": mc.supports_reasoning,
-                        "context_window": mc.context_window,
-                        "max_output_tokens": mc.max_output_tokens,
-                        "model_family": mc.model_family,
-                    }
-            except Exception:
-                pass
+            models = []
+            for row in rows:
+                provider = row.get("billing_provider") or ""
+                model_name = row["model"]
+                caps = {}
+                try:
+                    from agent.models_dev import get_model_capabilities
+                    mc = get_model_capabilities(provider=provider, model=model_name)
+                    if mc is not None:
+                        caps = {
+                            "supports_tools": mc.supports_tools,
+                            "supports_vision": mc.supports_vision,
+                            "supports_reasoning": mc.supports_reasoning,
+                            "context_window": mc.context_window,
+                            "max_output_tokens": mc.max_output_tokens,
+                            "model_family": mc.model_family,
+                        }
+                except Exception:
+                    pass
 
-            models.append({
-                "model": model_name,
-                "provider": provider,
-                "input_tokens": row["input_tokens"],
-                "output_tokens": row["output_tokens"],
-                "cache_read_tokens": row["cache_read_tokens"],
-                "reasoning_tokens": row["reasoning_tokens"],
-                "estimated_cost": row["estimated_cost"],
-                "actual_cost": row["actual_cost"],
-                "sessions": row["sessions"],
-                "api_calls": row["api_calls"],
-                "tool_calls": row["tool_calls"],
-                "last_used_at": row["last_used_at"],
-                "avg_tokens_per_session": row["avg_tokens_per_session"],
-                "capabilities": caps,
-            })
+                models.append({
+                    "model": model_name,
+                    "provider": provider,
+                    "input_tokens": row["input_tokens"],
+                    "output_tokens": row["output_tokens"],
+                    "cache_read_tokens": row["cache_read_tokens"],
+                    "reasoning_tokens": row["reasoning_tokens"],
+                    "estimated_cost": row["estimated_cost"],
+                    "actual_cost": row["actual_cost"],
+                    "sessions": row["sessions"],
+                    "api_calls": row["api_calls"],
+                    "tool_calls": row["tool_calls"],
+                    "last_used_at": row["last_used_at"],
+                    "avg_tokens_per_session": row["avg_tokens_per_session"],
+                    "capabilities": caps,
+                })
 
-        totals_cur = db._conn.execute("""
-            SELECT COUNT(DISTINCT model) as distinct_models,
-                   SUM(input_tokens) as total_input,
-                   SUM(output_tokens) as total_output,
-                   SUM(cache_read_tokens) as total_cache_read,
-                   SUM(reasoning_tokens) as total_reasoning,
-                   COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost,
-                   COALESCE(SUM(actual_cost_usd), 0) as total_actual_cost,
-                   COUNT(*) as total_sessions,
-                   SUM(COALESCE(api_call_count, 0)) as total_api_calls
-            FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
-        """, (cutoff,))
-        totals = dict(totals_cur.fetchone())
+            totals_cur = db._conn.execute("""
+                SELECT COUNT(DISTINCT model) as distinct_models,
+                       SUM(input_tokens) as total_input,
+                       SUM(output_tokens) as total_output,
+                       SUM(cache_read_tokens) as total_cache_read,
+                       SUM(reasoning_tokens) as total_reasoning,
+                       COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost,
+                       COALESCE(SUM(actual_cost_usd), 0) as total_actual_cost,
+                       COUNT(*) as total_sessions,
+                       SUM(COALESCE(api_call_count, 0)) as total_api_calls
+                FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
+            """, (cutoff,))
+            totals = dict(totals_cur.fetchone())
 
-        return {
-            "models": models,
-            "totals": totals,
-            "period_days": days,
-        }
-    finally:
-        db.close()
+            return {
+                "models": models,
+                "totals": totals,
+                "period_days": days,
+            }
+        finally:
+            db.close()
+
+    return await _run_session_db_io(_models)
 
 
 # ---------------------------------------------------------------------------

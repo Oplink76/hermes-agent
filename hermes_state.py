@@ -17,6 +17,7 @@ Key design decisions:
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -128,6 +129,12 @@ SCHEMA_VERSION = 17
 # Search queries do not need to be arbitrarily large, and bounding them keeps
 # sanitizer/runtime behavior predictable under adversarial input.
 MAX_FTS5_QUERY_CHARS = 2_048
+# Trigram FTS gives high-quality CJK/substring matching, but it is much larger
+# than the standard FTS5 index. Keep it for small stores, then drop/skip it once
+# the hot DB crosses this many messages; CJK search falls back to LIKE. Operators
+# can override with HERMES_FTS_TRIGRAM_MAX_MESSAGES (0/none/unlimited disables
+# the cap) or force-disable with HERMES_DISABLE_FTS_TRIGRAM=1.
+DEFAULT_FTS_TRIGRAM_MAX_MESSAGES = 50_000
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -166,14 +173,17 @@ _last_init_error_lock = threading.Lock()
 _wal_fallback_warned_paths: set[str] = set()
 _wal_fallback_warned_lock = threading.Lock()
 
-_FTS_TRIGGERS = (
+_BASE_FTS_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
     "messages_fts_update",
+)
+_TRIGRAM_FTS_TRIGGERS = (
     "messages_fts_trigram_insert",
     "messages_fts_trigram_delete",
     "messages_fts_trigram_update",
 )
+_FTS_TRIGGERS = _BASE_FTS_TRIGGERS + _TRIGRAM_FTS_TRIGGERS
 
 
 def _set_last_init_error(msg: Optional[str]) -> None:
@@ -1046,12 +1056,80 @@ class SessionDB:
                 pass
 
     @staticmethod
-    def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
-        placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
+    def _drop_trigram_fts(cursor: sqlite3.Cursor) -> None:
+        """Drop the optional trigram FTS index and its triggers.
+
+        This removes only derived search-index data. Messages remain in the
+        canonical ``messages`` table and the standard ``messages_fts`` index
+        continues to serve normal search; CJK/substring queries fall back to
+        LIKE when ``self._trigram_available`` is false.
+        """
+        for trigger in _TRIGRAM_FTS_TRIGGERS:
+            try:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            except sqlite3.OperationalError:
+                pass
+        try:
+            cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+        except sqlite3.OperationalError:
+            pass
+
+    @staticmethod
+    def _trigram_message_cap() -> Optional[int]:
+        raw = os.environ.get("HERMES_FTS_TRIGRAM_MAX_MESSAGES")
+        if raw is None or raw.strip() == "":
+            return DEFAULT_FTS_TRIGRAM_MAX_MESSAGES
+        val = raw.strip().lower()
+        if val in {"0", "none", "false", "off", "unlimited"}:
+            return None
+        try:
+            return max(0, int(val))
+        except ValueError:
+            logger.warning(
+                "Invalid HERMES_FTS_TRIGRAM_MAX_MESSAGES=%r; using default %d",
+                raw,
+                DEFAULT_FTS_TRIGRAM_MAX_MESSAGES,
+            )
+            return DEFAULT_FTS_TRIGRAM_MAX_MESSAGES
+
+    @classmethod
+    def _trigram_disabled_by_env(cls) -> bool:
+        val = os.environ.get("HERMES_DISABLE_FTS_TRIGRAM", "").strip().lower()
+        return val in {"1", "true", "yes", "on"}
+
+    def _should_enable_trigram_fts(self, cursor: sqlite3.Cursor) -> bool:
+        if self._trigram_disabled_by_env():
+            return False
+        cap = self._trigram_message_cap()
+        if cap is None:
+            return True
+        try:
+            row = cursor.execute("SELECT COUNT(*) FROM messages").fetchone()
+            count = int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
+        except sqlite3.Error:
+            return True
+        if count > cap:
+            logger.warning(
+                "Disabling trigram FTS for %s: %d messages exceeds cap %d; "
+                "CJK search will fall back to LIKE. Set "
+                "HERMES_FTS_TRIGRAM_MAX_MESSAGES=0 to keep trigram unlimited.",
+                self.db_path,
+                count,
+                cap,
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _fts_trigger_count(
+        cursor: sqlite3.Cursor,
+        triggers: Tuple[str, ...] = _FTS_TRIGGERS,
+    ) -> int:
+        placeholders = ",".join("?" for _ in triggers)
         row = cursor.execute(
             f"SELECT COUNT(*) FROM sqlite_master "
             f"WHERE type = 'trigger' AND name IN ({placeholders})",
-            _FTS_TRIGGERS,
+            triggers,
         ).fetchone()
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
 
@@ -1541,13 +1619,18 @@ class SessionDB:
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
             # an earlier no-FTS5 runtime.
-            triggers_need_repair = self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+            trigram_allowed = self._should_enable_trigram_fts(cursor)
+            if not trigram_allowed:
+                self._drop_trigram_fts(cursor)
+                self._trigram_available = False
+            expected_triggers = _FTS_TRIGGERS if trigram_allowed else _BASE_FTS_TRIGGERS
+            triggers_need_repair = self._fts_trigger_count(cursor, expected_triggers) < len(expected_triggers)
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
 
             # Trigram FTS5 for CJK/substring search. This is optional relative
-            # to the main FTS table; if it cannot be created, CJK search falls
-            # back to LIKE.
-            if self._fts_enabled:
+            # to the main FTS table; if it cannot be created, is disabled by
+            # policy, or exceeds the hot-DB cap, CJK search falls back to LIKE.
+            if self._fts_enabled and trigram_allowed:
                 trigram_enabled = self._ensure_fts_schema(
                     cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
                 )
@@ -1557,6 +1640,8 @@ class SessionDB:
                         cursor,
                         include_trigram=trigram_enabled,
                     )
+            elif self._fts_enabled and triggers_need_repair:
+                self._rebuild_fts_indexes(cursor, include_trigram=False)
 
         self._conn.commit()
 

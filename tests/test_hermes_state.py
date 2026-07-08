@@ -3871,6 +3871,30 @@ class TestOptimizeFts:
         # Only the porter index remains -> 1 optimized, no error.
         assert db.optimize_fts() == 1
 
+    def test_trigram_index_is_dropped_when_message_cap_is_exceeded(self, tmp_path, monkeypatch):
+        """Large hot stores shed the derived trigram index while preserving search."""
+        monkeypatch.setenv("HERMES_FTS_TRIGRAM_MAX_MESSAGES", "1")
+        db_path = tmp_path / "capped.db"
+        first = SessionDB(db_path=db_path)
+        try:
+            first.create_session(session_id="s1", source="cli")
+            first.append_message(session_id="s1", role="user", content="大别山项目 needle one")
+            first.append_message(session_id="s1", role="user", content="needle two")
+            assert first._fts_table_exists("messages_fts_trigram") is True
+        finally:
+            first.close()
+
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened._fts_table_exists("messages_fts") is True
+            assert reopened._fts_table_exists("messages_fts_trigram") is False
+            assert reopened._trigram_available is False
+            assert len(reopened.search_messages("needle")) == 2
+            # CJK still works via the LIKE fallback when trigram is capped off.
+            assert len(reopened.search_messages("大别山")) == 1
+        finally:
+            reopened.close()
+
     def test_optimize_idempotent(self, db):
         """Running optimize twice is safe (second pass is a no-op merge)."""
         db.create_session(session_id="s1", source="cli")
