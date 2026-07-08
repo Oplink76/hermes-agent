@@ -29,11 +29,11 @@ def project_workflow_usage() -> str:
         f"""
         Project workflow commands:
         - {PROJECT_CREATE_USAGE}
-          Creates the folder, GitHub repo, Kanban board, and PO interview,
+          Creates the folder, GitHub repo, Kanban board, and Wayfinder discovery,
           then binds the Hermes Project record to the folder/board.
         - {PROJECT_IMPORT_USAGE}
           Runs the existing-project import flow: full markdown understanding,
-          AI synthesis, dry-run importer, and user-story-only Kanban proposal.
+          Wayfinder-guided product discovery, dry-run importer, and user-story-only Kanban proposal.
         """
     ).strip()
 
@@ -57,13 +57,15 @@ def build_project_create_prompt(raw_args: str | None) -> str:
         Goal:
         Create a new Hermes-native product project. This command is expected to
         create the project folder, create the GitHub repository, create the Hermes Kanban board,
-        create the Hermes Project record, and create the initial Product Owner interview card.
+        create the Hermes Project record, and create the initial Wayfinder discovery card.
 
         Hard process rules:
         - Role routing: the slash-command receiver may scaffold/orchestrate the
           workflow, but Product Owner work must run through the `productowner`
           Hermes profile. Do not impersonate Product Owner from the default
-          session. Product Owner interview, Product Brief/MVP Brief capture,
+          session. Product Owner discovery must use the `wayfinder` skill, not
+          `grill-me`, `grill-with-docs`, or ad-hoc grilling. Product discovery,
+          Product Brief/MVP Brief capture,
           story breakdown, story refinement, and story-card creation/review
           should be assigned to or launched as `productowner`; record that actor
           in Kanban traceability where supported.
@@ -76,13 +78,13 @@ def build_project_create_prompt(raw_args: str | None) -> str:
           why. Use the active Hermes profile/user as `created_by` where the
           Kanban CLI supports it.
         - Do not silently create implementation/development work before the
-          Product Owner interview establishes product intent and user stories.
+          Wayfinder discovery establishes product intent and user stories.
         - Product/project Kanban boards must contain product work as valid user
           stories only. Internal setup/ops notes may be comments/log entries,
           not product-story cards.
         - Product Brief, MVP Brief, PO Input Needed, Import Analysis, broad
           dashboard/cockpit/control-plane slices, and "first version" briefs are
-          not user-story cards. Keep them in the PO interview/product brief
+          not user-story cards. Keep them in the Wayfinder discovery/product brief
           trace and ask Product Owner breakdown questions instead of creating
           product-story cards.
 
@@ -93,11 +95,11 @@ def build_project_create_prompt(raw_args: str | None) -> str:
         - decomposed WORK cards on a product board must not default to the
           shared `dir:<project-folder>` checkout. Use scratch/project-bound task
           creation so Hermes auto-promotes to per-card git worktrees, or use an
-          explicit worktree workspace. The single backlog PO interview card may
+          explicit worktree workspace. The single backlog Wayfinder discovery card may
           use `dir:<project-folder>` because it is not concurrent implementation
           work.
         - This workflow does not authorize architecture/coding by itself. After
-          the PO interview and valid user-story readiness, coding starts only
+          Wayfinder discovery and valid user-story readiness, coding starts only
           when Ole explicitly asks to proceed.
         - All coding work must follow Ole's branch -> commit -> review -> merge
           rule: start from updated main, create a dedicated branch, and prefer a
@@ -150,10 +152,10 @@ def build_project_create_prompt(raw_args: str | None) -> str:
              --board <slug> \
              --use
            ```
-        8. Create the initial Product Owner interview card on the project board.
+        8. Create the initial Wayfinder discovery card on the project board.
            Use the project board explicitly, not the default/current board:
            ```bash
-           hermes kanban --board <slug> create "Product Owner interview: <project-name>" \
+           hermes kanban --board <slug> create "Wayfinder discovery: <project-name>" \
              --project <slug> \
              --workspace dir:<project-folder> \
              --assignee productowner \
@@ -166,11 +168,16 @@ def build_project_create_prompt(raw_args: str | None) -> str:
            and lives on the project board.
            Assign it to the `productowner` Hermes profile so the Relay/Hermes
            role worker picks it up. The current/default session should only
-           scaffold the card and record traceability, not conduct the PO
-           interview itself unless Ole explicitly overrides role routing.
-           The card must ask for product intent, target user, problem, outcome,
+           scaffold the card and record traceability, not conduct the Wayfinder
+           discovery itself unless Ole explicitly overrides role routing.
+           The card must instruct the `productowner` worker to load and use the
+           `wayfinder` skill. The Wayfinder destination is a product-discovery
+           route to Product Brief/MVP Brief material plus valid user-story
+           candidates; never substitute `grill-me`, `grill-with-docs`, or an
+           ad-hoc grilling interview for this discovery. The card must ask for
+           product intent, target user, problem, outcome,
            constraints, non-goals, and first story candidates. It must also
-           instruct the future PO interviewer to produce/record Product Brief or
+           instruct the future `productowner` Wayfinder worker to produce/record Product Brief or
            MVP Brief material first, then create user-story cards only after each
            candidate passes the story contract: specific persona, real outcome,
            one When/Then scenario, testable Then, user-visible value,
@@ -179,22 +186,23 @@ def build_project_create_prompt(raw_args: str | None) -> str:
            cockpit/dashboard/control layer, selector plus detail view, end-to-end
            lifecycle, or "first version", do not create a story card; keep it in
            the brief and ask breakdown questions.
-        9. Add a Traceability log comment to the PO interview card summarizing:
+        9. Add a Traceability log comment to the Wayfinder discovery card summarizing:
            actor, folder path, GitHub repo, board slug, project slug/id, commands
            run, and any deviations/overrides.
-        10. Stop after the PO interview is created unless Ole explicitly asks to
-            proceed. Do not start architecture/coding before the interview.
-            Later PO interview output may be only a product brief; that is valid
+        10. Stop after the Wayfinder discovery card is created unless Ole explicitly asks to
+            proceed. Do not start architecture/coding before discovery.
+            Later Wayfinder discovery output may be only a product brief; that is valid
             progress and must not be forced into a broad user-story card.
 
-        Product Owner question rule:
-        When asking Ole/product-holder questions, use `clarify` with 2-4 clickable choices
+        Wayfinder discovery question rule:
+        When asking Ole/product-holder questions, use the `wayfinder` skill's
+        discovery framing and the `clarify` tool with 2-4 clickable choices
         and an `Other` option. Questions must be about product
         intent, user outcomes, scope, personas, or acceptance criteria — not
         generic process trivia.
 
         Final response:
-        Report created artifacts with IDs/paths/URLs, the PO interview task id,
+        Report created artifacts with IDs/paths/URLs, the Wayfinder discovery task id,
         and the Traceability log entries. If anything was blocked, report the
         blocker and the exact safe next step.
         """
@@ -226,7 +234,8 @@ def build_project_import_prompt(raw_args: str | None) -> str:
           dry run.
         - Role routing: the slash-command receiver may orchestrate discovery and
           dry-run mechanics, but Product Owner interpretation must run through
-          the `productowner` Hermes profile. Product Brief/MVP Brief synthesis,
+          the `productowner` Hermes profile using the `wayfinder` skill, not
+          `grill-me`, `grill-with-docs`, or ad-hoc grilling. Product Brief/MVP Brief synthesis,
           PO questions, story breakdown, story refinement, and valid story-card
           proposal/application should be assigned to or launched as
           `productowner`; do not impersonate PO from the default session.
@@ -277,16 +286,21 @@ def build_project_import_prompt(raw_args: str | None) -> str:
            implemented user-facing capabilities, tests, partial/stub/TODO
            signals, missing or uncertain capabilities. Do not perform a code
            quality review and do not turn TODOs/stubs into Kanban cards.
-        6. Draft a Product Brief: name, personas, problem, intended outcome,
+        6. Run product discovery through the `wayfinder` skill. The Wayfinder
+           destination is an apply-safe import decision: Product Brief/MVP Brief,
+           Product Owner questions if still blocked, and only valid user-story
+           candidates for the dry-run importer. Do not use `grill-me`,
+           `grill-with-docs`, or an ad-hoc grilling interview as a substitute.
+        7. Draft a Product Brief: name, personas, problem, intended outcome,
            current state, non-goals, assumptions, evidence. This Product Owner
-           synthesis must be performed by the `productowner` profile or handed
-           off to a `productowner` Kanban/import task when the workflow creates
+           synthesis must be performed by the `productowner` profile using
+           `wayfinder`, or handed off to a `productowner` Kanban/import task when the workflow creates
            durable board state.
-        7. Ask Product Owner questions only if concrete user stories, product
+        8. Ask Product Owner questions only if concrete user stories, product
            outcomes, acceptance criteria, scope, or personas are blocked.
            Questions must use `clarify` with 2-4 clickable choices and an
            `Other` free-text option. Do not ask generic scanner questions.
-        8. Propose only valid user-story cards. Each must start with "User
+        9. Propose only valid user-story cards. Each must start with "User
            story:", use a specific persona, include "As a..., I want..., so
            that...", acceptance criteria, out-of-scope notes, and evidence.
            No Import Analysis cards, Product Brief cards, PO Interview cards,
@@ -305,9 +319,9 @@ def build_project_import_prompt(raw_args: str | None) -> str:
            proving: `not_product_brief`, `single_when_then`,
            `independently_shippable`, `user_visible_value`, and
            `estimated_effort_days <= 2`; set `broad_product_surface` to false.
-        9. Write one temporary synthesis JSON file under /tmp containing only:
+        10. Write one temporary synthesis JSON file under /tmp containing only:
            `product_brief`, `po_questions`, and `user_stories`.
-        10. Run the importer in dry-run mode with --synthesis-file, for example:
+        11. Run the importer in dry-run mode with --synthesis-file, for example:
             python /Users/cloudadvisor/.hermes/scripts/import_product_board.py \
               --repo "<PROJECT_PATH>" \
               --name "<PROJECT_NAME>" \
@@ -319,7 +333,7 @@ def build_project_import_prompt(raw_args: str | None) -> str:
             user-story card uses `--workflow-template-id product --step-key backlog`.
             Dry-run must not execute those commands; live `--apply` requires Ole's
             explicit later approval.
-        11. Report whether apply is safe or blocked. Apply is blocked if Product
+        12. Report whether apply is safe or blocked. Apply is blocked if Product
             Owner questions remain, markdown understanding is incomplete, or no
             valid user-story cards exist.
 

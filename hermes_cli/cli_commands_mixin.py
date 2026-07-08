@@ -1532,13 +1532,13 @@ class CLICommandsMixin:
             label = "Project creation workflow queued"
             visible_steps = (
                 "Expected visible steps: folder/repo/board/project setup, "
-                "then a Product Owner interview card."
+                "then a Wayfinder discovery card."
             )
         elif workflow == "project-import":
             prompt = build_project_import_prompt(raw_args)
             label = "Project import workflow queued"
             visible_steps = (
-                "Expected visible steps: markdown discovery/reads, product brief, "
+                "Expected visible steps: markdown discovery/reads, Wayfinder product discovery, "
                 "synthesis JSON under /tmp, then dry-run importer output."
             )
         else:  # pragma: no cover - defensive

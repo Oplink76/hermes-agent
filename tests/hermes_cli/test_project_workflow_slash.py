@@ -26,7 +26,7 @@ def test_project_create_slash_sets_agent_seed_and_informative_ack(capsys):
     assert "Starting now as the next agent turn" in out
     assert "not a background job" in out
     assert "Expected visible steps" in out
-    assert "Product Owner interview card" in out
+    assert "Wayfinder discovery card" in out
     assert cli._pending_input.empty()
     queued = cli._pending_agent_seed
     assert queued is not None
@@ -38,6 +38,12 @@ def test_project_create_slash_sets_agent_seed_and_informative_ack(capsys):
     assert "Product Owner work must run through the `productowner`" in queued
     assert "Hermes profile" in queued
     assert "Assign it to the `productowner` Hermes profile" in queued
+    assert "Wayfinder discovery" in queued
+    assert "`wayfinder` skill" in queued
+    assert "not" in queued
+    assert "grill-me" in queued
+    assert "grill-with-docs" in queued
+    assert "ad-hoc grilling" in queued
     assert "do not create a story card" in queued
     assert "ask breakdown questions" in queued
     assert "branch -> commit -> review -> merge" in queued
@@ -55,6 +61,7 @@ def test_project_import_slash_sets_agent_seed_and_informative_ack(capsys):
     assert "Starting now as the next agent turn" in out
     assert "not a background job" in out
     assert "markdown discovery/reads" in out
+    assert "Wayfinder product discovery" in out
     assert "synthesis JSON under /tmp" in out
     assert "dry-run importer output" in out
     assert cli._pending_input.empty()
@@ -69,6 +76,11 @@ def test_project_import_slash_sets_agent_seed_and_informative_ack(capsys):
     assert "story_contract" in queued
     assert "Product Owner interpretation must run through" in queued
     assert "`productowner` Hermes profile" in queued
+    assert "using the `wayfinder` skill" in queued
+    assert "grill-me" in queued
+    assert "grill-with-docs" in queued
+    assert "ad-hoc grilling" in queued
+    assert "Wayfinder" in queued
     assert "broad_product_surface" in queued
     assert "branch -> commit -> review -> merge" in queued
     assert "different AI reviewer" in queued
@@ -113,6 +125,7 @@ def test_project_create_seed_requires_product_v2_board_and_backlog_po_card():
     assert "hermes project create <project-name>" in queued
     assert "--board <slug>" in queued
     assert "hermes kanban --board <slug> create" in queued
+    assert '"Wayfinder discovery: <project-name>"' in queued
     assert "--workflow-template-id product" in queued
     assert "--step-key backlog" in queued
     assert 'workflow_template_id == "product"' in queued

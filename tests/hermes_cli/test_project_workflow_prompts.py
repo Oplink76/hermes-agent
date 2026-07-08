@@ -36,8 +36,12 @@ def test_project_create_prompt_enforces_kanban_traceability_and_clickable_po_que
     assert "create the GitHub repository" in prompt
     assert "create the Hermes Kanban board" in prompt
     assert "create the Hermes Project record" in prompt
-    assert "Product Owner interview" in prompt
+    assert "Wayfinder discovery" in prompt
     assert "Product Owner work must run through the `productowner`" in prompt
+    assert "`wayfinder` skill" in prompt
+    assert "grill-me" in prompt
+    assert "grill-with-docs" in prompt
+    assert "ad-hoc grilling" in prompt
     assert "Hermes profile" in prompt
     assert "Do not impersonate Product Owner from the default" in prompt
     assert "session" in prompt
@@ -73,9 +77,13 @@ def test_project_import_prompt_matches_verified_ai_synthesis_flow_and_blocks_app
     assert "Do not run --apply" in prompt
     assert "Product Owner interpretation must run through" in prompt
     assert "`productowner` Hermes profile" in prompt
+    assert "using the `wayfinder` skill" in prompt
+    assert "grill-with-docs" in prompt
+    assert "ad-hoc grilling" in prompt
     assert "do not impersonate PO from the default session" in prompt
     assert "Product Owner" in prompt
-    assert "synthesis must be performed by the `productowner` profile" in prompt
+    assert "synthesis must be performed by the `productowner` profile using" in prompt
+    assert "`wayfinder`" in prompt
     assert "Markdown Understanding Ledger" in prompt
     assert "read and understand all non-excluded markdown files" in prompt
     assert "code current-state-vs-product-goal" in prompt
@@ -111,4 +119,4 @@ def test_project_workflow_usage_lists_both_must_have_commands():
     assert "folder" in usage
     assert "GitHub repo" in usage
     assert "Kanban board" in usage
-    assert "PO interview" in usage
+    assert "Wayfinder discovery" in usage
