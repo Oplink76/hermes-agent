@@ -3816,6 +3816,117 @@ def test_complete_task_v2_no_diff_does_not_complete(kanban_home, tmp_path, monke
     assert not any(event.kind == "workflow_advanced" for event in events)
 
 
+def test_complete_task_v2_clean_test_evidence_advances_without_commit(kanban_home, tmp_path, monkeypatch):
+    """A test-step handoff records evidence and advances even when the
+    worktree is clean: testers verify the existing development commit and
+    usually have no source diff of their own to commit.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-complete-task-clean-test"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    before_head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="tester",
+            workflow_template_id="product",
+            current_step_key="test",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+
+        result = kb.complete_task(
+            conn,
+            tid,
+            summary="Tests passed",
+            board=board,
+            metadata={"ai_provenance": {"tester": {"agent": "hermes", "result": "passed"}}},
+        )
+
+        card = _card_snapshot(conn, tid)
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    after_head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    assert result is True
+    assert card["current_step_key"] == "review"
+    assert card["assignee"] == "reviewer"
+    assert card["running"] == 0
+    assert task.status == "review"
+    assert before_head == after_head
+    handoff_events = [event for event in events if event.kind == "handoff"]
+    assert len(handoff_events) == 1
+    assert handoff_events[0].payload["from_step"] == "test"
+    assert handoff_events[0].payload["to_step"] == "review"
+    assert handoff_events[0].payload["sha"] is None
+
+
+def test_complete_task_v2_clean_review_evidence_advances_without_commit(kanban_home, tmp_path, monkeypatch):
+    """A review-step handoff can be evidence-only: independent review should
+    move the card to Release / Measure without requiring a new code commit.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-complete-task-clean-review"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    before_head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            assignee="reviewer",
+            workflow_template_id="product",
+            current_step_key="review",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+
+        result = kb.complete_task(
+            conn,
+            tid,
+            summary="Independent review passed",
+            board=board,
+            metadata={
+                "ai_provenance": {
+                    "writer": {"agent": "claude-code"},
+                    "reviewer": {"agent": "codex"},
+                }
+            },
+        )
+
+        card = _card_snapshot(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    after_head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    assert result is True
+    assert card["current_step_key"] == "release_measure"
+    assert card["assignee"] is None
+    assert before_head == after_head
+    handoff_events = [event for event in events if event.kind == "handoff"]
+    assert len(handoff_events) == 1
+    assert handoff_events[0].payload["from_step"] == "review"
+    assert handoff_events[0].payload["to_step"] == "release_measure"
+    assert handoff_events[0].payload["sha"] is None
+
+
 def test_complete_task_v2_with_unresolved_preflight_resumes_instead_of_handoff(
     kanban_home, tmp_path, monkeypatch,
 ):

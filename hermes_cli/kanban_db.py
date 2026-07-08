@@ -180,6 +180,8 @@ PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES: dict[str, str] = {
 PRODUCT_HUMAN_BLOCK_KINDS = {None, "needs_input", "capability"}
 PRODUCT_WORKFLOW_PRECHECK_EVENT = "human_input_preflight"
 PRODUCT_PROVENANCE_REQUIRED_STEPS = {"development", "test", "review"}
+_PRODUCT_COMMIT_REQUIRED_STEPS = {"development"}
+PRODUCT_WORKFLOW_COMMIT_REQUIRED_STEPS = _PRODUCT_COMMIT_REQUIRED_STEPS
 PRODUCT_PROVENANCE_BLOCKED_EVENT = "completion_blocked_provenance"
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -5339,10 +5341,10 @@ def complete_task(
                     expected_run_id=expected_run_id,
                 )
                 if not advanced:
-                    # Commit-first gate failed (no committed diff) or
-                    # provenance/board state changed underneath us -- do NOT
-                    # fall through to the terminal-done UPDATE, which would
-                    # wrongly mark an un-committed card done.
+                    # Required source-commit gate failed (for source-producing
+                    # steps), or provenance/board state changed underneath us
+                    # -- do NOT fall through to the terminal-done UPDATE,
+                    # which would wrongly mark an uncommitted card done.
                     return False
                 with write_txn(conn):
                     _end_run(
@@ -7749,7 +7751,7 @@ def handoff(
     metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Atomically advance a handoff_v2 product card, gated on a committed diff.
+    """Atomically advance a handoff_v2 product card.
 
     Self-contained v2 path (T2.2-T2.4): does NOT call or mutate
     ``_complete_product_workflow_step`` / :func:`complete_task` -- those
@@ -7760,19 +7762,20 @@ def handoff(
     auto-advance -- returns ``False``, nothing touched) -> validate AI
     provenance (raises :class:`ProductProvenanceError` on failure, card
     untouched) -> when ``expected_run_id`` is given, a run-ownership
-    precondition check (before the commit, so a reclaimed worker can't
-    create a stale commit) -> commit-first gate via
-    :func:`_commit_worker_diff` (no SHA means no advance) -> one atomic
+    precondition check (before any commit, so a reclaimed worker can't
+    create a stale commit) -> commit any staged source diff; source-producing
+    steps require a commit SHA, while evidence-only test/review handoffs may
+    advance with ``sha=None`` -> one atomic
     transaction: advance the phase, clear ``running``, retag the assignee,
     sync the legacy ``status``, and emit exactly one ``handoff`` event
-    carrying the commit SHA. The advance UPDATE re-checks run ownership
+    carrying the optional commit SHA. The advance UPDATE re-checks run ownership
     via a CAS (``AND current_run_id = ?``) to guard the window between the
     precondition check and the write.
 
     Returns ``False`` (no mutation) when the board isn't handoff_v2, the
-    card doesn't exist, its current step has no advancing transition, the
-    commit-first gate yields no SHA, or (when ``expected_run_id`` is given)
-    the card's run ownership was lost before the commit or before the
+    card doesn't exist, its current step has no advancing transition, a
+    source-producing step has no commit SHA, or (when ``expected_run_id`` is
+    given) the card's run ownership was lost before the commit or before the
     advance.
     """
     meta = product_board_metadata(board)
@@ -7800,7 +7803,7 @@ def handoff(
     _validate_product_ai_provenance(conn, task_id, step, metadata, meta)
 
     sha = _commit_worker_diff(conn, task_id)
-    if sha is None:
+    if sha is None and str(step or "") in _PRODUCT_COMMIT_REQUIRED_STEPS:
         return False
 
     next_step = transition["next_step"]
