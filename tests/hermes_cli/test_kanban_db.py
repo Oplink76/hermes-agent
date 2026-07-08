@@ -9916,3 +9916,94 @@ def test_migrate_cards_to_v2_flags_phase_for_done_idempotent(kanban_home, monkey
     assert second == first
     assert second[tid_already_done]["current_step_key"] == "done"
     assert second[tid_legacy_done]["current_step_key"] == "done"
+
+def test_product_board_defaults_helper_enables_handoff_v2_and_gitignore(kanban_home, tmp_path):
+    repo = tmp_path / "product-repo"
+    _init_git_repo(repo)
+
+    meta = kb.ensure_product_board_defaults(
+        "product-defaults",
+        name="Product Defaults",
+        default_workdir=str(repo),
+    )
+
+    assert meta["preset"] == "product"
+    assert meta["columns"] == kb.PRODUCT_BOARD_COLUMNS
+    assert meta["product_workflow"]["handoff_v2"] is True
+    assert meta["product_workflow"]["assignees"] == kb.PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES
+    assert ".worktrees/" in (repo / ".gitignore").read_text(encoding="utf-8")
+
+
+def test_project_bound_product_task_defaults_to_product_backlog_and_worktree(kanban_home, tmp_path, monkeypatch):
+    from hermes_cli import projects_db as pdb
+
+    repo = tmp_path / "product-repo"
+    _init_git_repo(repo)
+    kb.ensure_product_board_defaults("prod", name="Product", default_workdir=str(repo))
+
+    home = kanban_home
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    with pdb.connect_closing() as pconn:
+        project_id = pdb.create_project(
+            pconn,
+            name="Product Repo",
+            primary_path=str(repo),
+            board_slug="prod",
+        )
+
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(conn, title="User story: isolated work", project_id=project_id, board="prod")
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert task.workflow_template_id == "product"
+    assert task.current_step_key == "backlog"
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == str(repo / ".worktrees" / tid)
+    assert task.branch_name.startswith("product-repo/")
+    assert any(event.kind == "workflow_defaulted" for event in events)
+    assert ".worktrees/" in (repo / ".gitignore").read_text(encoding="utf-8")
+
+
+def test_generic_board_task_without_metadata_stays_plain(kanban_home):
+    kb.create_board("generic", name="Generic")
+
+    with kb.connect(board="generic") as conn:
+        tid = kb.create_task(conn, title="plain", board="generic")
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert task.workflow_template_id is None
+    assert task.current_step_key is None
+    assert task.workspace_kind == "scratch"
+    assert not any(event.kind == "workflow_defaulted" for event in events)
+
+
+def test_project_bound_task_explicit_non_product_metadata_not_overwritten(kanban_home, tmp_path, monkeypatch):
+    from hermes_cli import projects_db as pdb
+
+    repo = tmp_path / "product-repo"
+    _init_git_repo(repo)
+    kb.ensure_product_board_defaults("prod", name="Product", default_workdir=str(repo))
+    monkeypatch.setenv("HERMES_HOME", str(kanban_home))
+    with pdb.connect_closing() as pconn:
+        project_id = pdb.create_project(
+            pconn,
+            name="Product Repo",
+            primary_path=str(repo),
+            board_slug="prod",
+        )
+
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="custom workflow",
+            project_id=project_id,
+            board="prod",
+            workflow_template_id="custom",
+            current_step_key="intake",
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task.workflow_template_id == "custom"
+    assert task.current_step_key == "intake"

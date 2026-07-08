@@ -87,6 +87,15 @@ def build_project_create_prompt(raw_args: str | None) -> str:
           product-story cards.
 
         Engineering operating rules for any later coding/review:
+        - Scope caveat: this workflow fixes CREATION only, not COMPLETION. Do not
+          touch or promise the later commit/handoff/merge/integration back-half
+          unless Ole separately approves that work.
+        - decomposed WORK cards on a product board must not default to the
+          shared `dir:<project-folder>` checkout. Use scratch/project-bound task
+          creation so Hermes auto-promotes to per-card git worktrees, or use an
+          explicit worktree workspace. The single backlog PO interview card may
+          use `dir:<project-folder>` because it is not concurrent implementation
+          work.
         - This workflow does not authorize architecture/coding by itself. After
           the PO interview and valid user-story readiness, coding starts only
           when Ole explicitly asks to proceed.
@@ -120,9 +129,41 @@ def build_project_create_prompt(raw_args: str | None) -> str:
            GitHub auth is missing, block and explain the exact missing auth step;
            do not fake a repo URL.
         6. Create the Hermes Kanban board for the project without switching the
-           user's active/default board unless explicitly requested.
-        7. Create/bind the Hermes Project record to the folder and board.
+           user's active/default board unless explicitly requested. Use the
+           product preset command shape exactly:
+           ```bash
+           hermes kanban boards create <slug> \
+             --name <project-name> \
+             --description "Hermes-native product board" \
+             --default-workdir <project-folder> \
+             --preset product
+           ```
+           Verify the resulting board metadata has `preset == "product"`,
+           `product_workflow.handoff_v2 == true`, and the expected product columns.
+           Also ensure the project repo `.gitignore` contains `.worktrees/` for
+           per-card git worktree isolation.
+        7. Create/bind the Hermes Project record to the folder and board:
+           ```bash
+           hermes project create <project-name> \
+             --slug <slug> \
+             --primary <project-folder> \
+             --board <slug> \
+             --use
+           ```
         8. Create the initial Product Owner interview card on the project board.
+           Use the project board explicitly, not the default/current board:
+           ```bash
+           hermes kanban --board <slug> create "Product Owner interview: <project-name>" \
+             --project <slug> \
+             --workspace dir:<project-folder> \
+             --assignee productowner \
+             --workflow-template-id product \
+             --step-key backlog \
+             --json
+           ```
+           Verify and report that the created PO card has `project_id` set,
+           `workflow_template_id == "product"`, `current_step_key == "backlog"`,
+           and lives on the project board.
            Assign it to the `productowner` Hermes profile so the Relay/Hermes
            role worker picks it up. The current/default session should only
            scaffold the card and record traceability, not conduct the PO
@@ -272,6 +313,12 @@ def build_project_import_prompt(raw_args: str | None) -> str:
               --name "<PROJECT_NAME>" \
               --dry-run \
               --synthesis-file "/tmp/<SYNTHESIS>.json"
+            The importer apply plan must stay V2-only: board creation uses
+            `hermes kanban boards create <slug> --preset product` (which must
+            produce `product_workflow.handoff_v2 == true`), and every live
+            user-story card uses `--workflow-template-id product --step-key backlog`.
+            Dry-run must not execute those commands; live `--apply` requires Ole's
+            explicit later approval.
         11. Report whether apply is safe or blocked. Apply is blocked if Product
             Owner questions remain, markdown understanding is incomplete, or no
             valid user-story cards exist.

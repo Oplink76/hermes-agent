@@ -172,3 +172,33 @@ def test_db_path_under_hermes_home():
     # Resolves under HERMES_HOME (set by the autouse isolation fixture).
     assert pdb.projects_db_path().name == "projects.db"
     assert os.path.basename(str(pdb.projects_db_path().parent))  # non-empty parent
+
+def test_is_kanban_governed_true_when_project_has_board(conn):
+    governed_id = pdb.create_project(conn, name="Governed", folders=["/repo"], board_slug="product-board")
+    plain_id = pdb.create_project(conn, name="Plain", folders=["/other"])
+
+    assert pdb.is_kanban_governed(pdb.get_project(conn, governed_id)) is True
+    assert pdb.is_kanban_governed(pdb.get_project(conn, plain_id)) is False
+    assert pdb.is_kanban_governed(None) is False
+
+
+def test_governance_for_path_resolves_longest_prefix_and_board(conn):
+    pdb.create_project(conn, name="Outer", folders=["/repo"], board_slug="outer-board")
+    inner_id = pdb.create_project(conn, name="Inner", folders=["/repo/app"], board_slug="inner-board")
+
+    governance = pdb.governance_for_path(conn, "/repo/app/src/main.py")
+
+    assert governance is not None
+    assert governance["project_id"] == inner_id
+    assert governance["project_slug"] == "inner"
+    assert governance["primary_path"] == "/repo/app"
+    assert governance["board_slug"] == "inner-board"
+    assert governance["kanban_governed"] is True
+
+
+def test_governance_for_path_skips_archived_by_default(conn):
+    archived_id = pdb.create_project(conn, name="Archived", folders=["/repo/app"], board_slug="archived-board")
+    pdb.archive_project(conn, archived_id)
+
+    assert pdb.governance_for_path(conn, "/repo/app/src") is None
+    assert pdb.governance_for_path(conn, "/repo/app/src", include_archived=True)["project_id"] == archived_id

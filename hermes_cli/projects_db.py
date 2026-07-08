@@ -707,7 +707,57 @@ def project_for_path(
     return get_project(conn, best_pid)
 
 
+def is_kanban_governed(project: Optional[Project]) -> bool:
+    """Return true when a Project is bound to a Kanban board."""
+
+    return bool(project is not None and str(project.board_slug or "").strip())
+
+
+def governance_for_path(
+    conn: sqlite3.Connection,
+    path: str,
+    *,
+    include_archived: bool = False,
+) -> Optional[dict]:
+    """Resolve the project/Kanban governance that owns ``path``.
+
+    Uses the same longest-prefix matching as :func:`project_for_path` and keeps
+    the return shape serialisable for callers outside the Projects module.
+    Product-board metadata is included on a best-effort basis without making
+    Projects depend on Kanban at import time.
+    """
+
+    project = project_for_path(conn, path, include_archived=include_archived)
+    if project is None:
+        return None
+    board_slug = project.board_slug
+    product_board = False
+    handoff_v2 = False
+    if board_slug:
+        try:
+            from hermes_cli import kanban_db as kb
+
+            meta = kb.read_board_metadata(board_slug)
+            product_board = str(meta.get("preset") or "").lower() == "product"
+            wf = meta.get("product_workflow") or meta.get("workflow") or {}
+            handoff_v2 = isinstance(wf, dict) and wf.get("handoff_v2") is True
+        except Exception:
+            product_board = False
+            handoff_v2 = False
+    return {
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "project_name": project.name,
+        "primary_path": project.primary_path,
+        "board_slug": board_slug,
+        "kanban_governed": is_kanban_governed(project),
+        "product_board": product_board,
+        "handoff_v2": handoff_v2,
+    }
+
+
 # Deterministic branch slug: lowercase, separators collapsed, capped.
+
 _BRANCH_SAFE_RE = re.compile(r"[^a-z0-9._-]+")
 
 

@@ -704,6 +704,9 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
+    project_id: Optional[str] = None
+    workflow_template_id: Optional[str] = None
+    current_step_key: Optional[str] = None
 
 
 @router.post("/tasks")
@@ -728,6 +731,10 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
+            board=board,
+            project_id=payload.project_id,
+            workflow_template_id=payload.workflow_template_id,
+            current_step_key=payload.current_step_key,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -955,7 +962,13 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # --- status -------------------------------------------------------
         if payload.status is not None:
             requested_status = payload.status
-            custom_column = _custom_column_by_name(board, requested_status)
+            # Lifecycle verbs must reach their structured handlers with the
+            # card's existing workflow step intact. Product boards also have
+            # visible columns named "done"/"blocked"; treating those as custom
+            # step names before complete_task/block_task corrupts V2 handoff
+            # state (e.g. backlog -> done instead of backlog -> architecture).
+            lifecycle_statuses = {"done", "blocked", "scheduled", "ready", "archived", "running"}
+            custom_column = None if requested_status in lifecycle_statuses else _custom_column_by_name(board, requested_status)
             if custom_column is not None:
                 _set_workflow_direct(
                     conn,
@@ -973,9 +986,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
+                    board=board,
                 )
             elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason, board=board)
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
             elif s == "ready":
@@ -1410,9 +1424,10 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             result=payload.result,
                             summary=payload.summary,
                             metadata=payload.metadata,
+                            board=board,
                         )
                     elif s == "blocked":
-                        ok = kanban_db.block_task(conn, tid)
+                        ok = kanban_db.block_task(conn, tid, board=board)
                     elif s == "ready":
                         cur = kanban_db.get_task(conn, tid)
                         if cur and cur.status in ("blocked", "scheduled"):

@@ -330,6 +330,10 @@ def _sync_board_default_workdir(proj, board_slug: str) -> None:
             return
         if slug != kb.DEFAULT_BOARD and not kb.board_exists(slug):
             return
-        kb.write_board_metadata(slug, default_workdir=proj.primary_path)
+        meta = kb.read_board_metadata(slug)
+        if str(meta.get("preset") or "").lower() == "product":
+            kb.ensure_product_board_defaults(slug, default_workdir=proj.primary_path)
+        else:
+            kb.write_board_metadata(slug, default_workdir=proj.primary_path)
     except Exception:
         pass

@@ -177,6 +177,10 @@ PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES: dict[str, str] = {
     "tester": "tester",
     "reviewer": "reviewer",
 }
+DEFAULT_PRODUCT_WORKFLOW: dict[str, Any] = {
+    "handoff_v2": True,
+    "assignees": PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES,
+}
 PRODUCT_HUMAN_BLOCK_KINDS = {None, "needs_input", "capability"}
 PRODUCT_WORKFLOW_PRECHECK_EVENT = "human_input_preflight"
 PRODUCT_PROVENANCE_REQUIRED_STEPS = {"development", "test", "review"}
@@ -797,6 +801,95 @@ def write_board_metadata(
         encoding="utf-8",
     )
     meta["db_path"] = str(kanban_db_path(slug))
+    return meta
+
+
+def product_workflow_defaults_for_board(board: Optional[str] = None) -> dict:
+    """Canonical metadata defaults for Hermes product boards."""
+
+    slug = _normalize_board_slug(board) if board is not None else None
+    return {
+        "preset": "product",
+        "columns": [dict(column) for column in PRODUCT_BOARD_COLUMNS],
+        "product_workflow": {
+            "handoff_v2": True,
+            "assignees": dict(PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES),
+        },
+        **({"slug": slug} if slug else {}),
+    }
+
+
+def _ensure_worktrees_gitignore(default_workdir: Optional[str]) -> None:
+    """Best-effort .gitignore guard for Hermes per-card worktrees."""
+
+    if not default_workdir:
+        return
+    try:
+        repo = Path(str(default_workdir)).expanduser()
+        if not repo.exists() or not repo.is_dir():
+            return
+        if not (repo / ".git").exists():
+            return
+        gitignore = repo / ".gitignore"
+        text = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+        lines = [line.strip() for line in text.splitlines()]
+        if ".worktrees/" in lines or ".worktrees" in lines:
+            return
+        prefix = "" if not text or text.endswith("\n") else "\n"
+        gitignore.write_text(f"{text}{prefix}.worktrees/\n", encoding="utf-8")
+    except OSError:
+        return
+
+
+def ensure_product_board_defaults(
+    slug: str,
+    *,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    icon: Optional[str] = None,
+    color: Optional[str] = None,
+    default_workdir: Optional[str] = None,
+    switch: bool = False,
+) -> dict:
+    """Create/update a product board with canonical Kanban V2 defaults."""
+
+    normed = _normalize_board_slug(slug)
+    if not normed:
+        raise ValueError("board slug is required")
+
+    defaults = product_workflow_defaults_for_board(normed)
+    meta = write_board_metadata(
+        normed,
+        name=name,
+        description=description,
+        icon=icon,
+        color=color,
+        default_workdir=default_workdir,
+        preset="product",
+        columns=defaults["columns"],
+    )
+    meta.pop("db_path", None)
+    existing_wf = meta.get("product_workflow")
+    wf = dict(existing_wf) if isinstance(existing_wf, dict) else {}
+    wf["handoff_v2"] = True
+    existing_assignees = wf.get("assignees") if isinstance(wf.get("assignees"), dict) else {}
+    assignees = dict(PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES)
+    assignees.update({str(k): str(v) for k, v in existing_assignees.items() if str(v).strip()})
+    wf["assignees"] = assignees
+    meta["product_workflow"] = wf
+    meta["preset"] = "product"
+    meta["columns"] = defaults["columns"]
+    if not meta.get("created_at"):
+        meta["created_at"] = int(time.time())
+
+    path = board_metadata_path(normed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    init_db(board=normed)
+    if switch:
+        set_current_board(normed)
+    _ensure_worktrees_gitignore(default_workdir or meta.get("default_workdir"))
+    meta["db_path"] = str(kanban_db_path(normed))
     return meta
 
 
@@ -3707,6 +3800,40 @@ def create_task(
     if current_step_key is not None:
         current_step_key = str(current_step_key).strip() or None
 
+    workflow_defaulted = False
+    if project_obj is not None and project_obj.board_slug:
+        bound_board = _normalize_board_slug(project_obj.board_slug)
+        effective_board = (
+            _normalize_board_slug(board)
+            if board is not None
+            else _board_slug_for_connection(conn)
+        )
+        bound_meta = read_board_metadata(bound_board) if bound_board else None
+        bound_is_product_v2 = (
+            isinstance(bound_meta, dict)
+            and str(bound_meta.get("preset") or "").lower() == "product"
+            and _handoff_v2_enabled(bound_meta)
+        )
+        if bound_is_product_v2:
+            if bound_board and effective_board != bound_board:
+                raise ValueError(
+                    f"project {project_obj.slug!r} is bound to product board "
+                    f"{bound_board!r}; create project-linked product tasks on "
+                    "that board (for CLI: pass --board before create)"
+                )
+            _ensure_worktrees_gitignore(project_obj.primary_path)
+            if workflow_template_id not in (None, "product"):
+                # Explicit non-product metadata is a caller decision; do not
+                # overwrite it. This preserves custom workflow experiments.
+                pass
+            else:
+                if workflow_template_id is None:
+                    workflow_template_id = "product"
+                    workflow_defaulted = True
+                if current_step_key is None:
+                    current_step_key = "backlog"
+                    workflow_defaulted = True
+
     parents = tuple(p for p in parents if p)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
@@ -3903,6 +4030,17 @@ def create_task(
                         "current_step_key": current_step_key,
                     },
                 )
+                if workflow_defaulted:
+                    _append_event(
+                        conn,
+                        task_id,
+                        "workflow_defaulted",
+                        {
+                            "workflow_template_id": workflow_template_id,
+                            "current_step_key": current_step_key,
+                            "project_id": project_id,
+                        },
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:

@@ -14,6 +14,11 @@ import os
 import pytest
 
 
+def _init_git_repo(path):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / ".git").mkdir()
+
+
 # ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------
@@ -2381,3 +2386,86 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     d = json.loads(out)
     assert d["ok"] is True, d
     assert d["subscribed"] is False, d
+
+def test_create_schema_exposes_workflow_fields():
+    from tools.kanban_tools import KANBAN_CREATE_SCHEMA
+
+    props = KANBAN_CREATE_SCHEMA["parameters"]["properties"]
+    assert "workflow_template_id" in props
+    assert "current_step_key" in props
+
+
+def test_create_passes_workflow_fields(monkeypatch, tmp_path):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    kb._INITIALIZED_PATHS.clear()
+    kb.create_board("prod", preset="product")
+
+    out = kt._handle_create({
+        "title": "User story: tool child",
+        "assignee": "developer",
+        "board": "prod",
+        "workflow_template_id": "product",
+        "current_step_key": "backlog",
+    })
+    data = json.loads(out)
+    assert data["ok"] is True
+
+    with kb.connect(board="prod") as conn:
+        task = kb.get_task(conn, data["task_id"])
+    assert task.workflow_template_id == "product"
+    assert task.current_step_key == "backlog"
+
+
+def test_create_child_from_project_product_parent_defaults_worktree_not_shared_dir(monkeypatch, tmp_path):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from pathlib import Path as _Path
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "productowner")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "prod")
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.ensure_product_board_defaults("prod", name="Product", default_workdir=str(repo))
+    with pdb.connect_closing() as pconn:
+        project_id = pdb.create_project(pconn, name="Repo", primary_path=str(repo), board_slug="prod")
+    with kb.connect(board="prod") as conn:
+        parent = kb.create_task(
+            conn,
+            title="Product Owner interview",
+            assignee="productowner",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            project_id=project_id,
+            board="prod",
+            workflow_template_id="product",
+            current_step_key="backlog",
+            initial_status="running",
+        )
+        kb.claim_task(conn, parent)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", parent)
+
+    out = kt._handle_create({"title": "User story: decomposed work", "assignee": "developer"})
+    data = json.loads(out)
+    assert data["ok"] is True
+
+    with kb.connect(board="prod") as conn:
+        child = kb.get_task(conn, data["task_id"])
+    assert child.project_id == project_id
+    assert child.workflow_template_id == "product"
+    assert child.current_step_key == "backlog"
+    assert child.workspace_kind == "worktree"
+    assert child.workspace_path == str(repo / ".worktrees" / child.id)
+    assert ".worktrees/" in (repo / ".gitignore").read_text(encoding="utf-8")

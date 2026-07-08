@@ -2518,3 +2518,43 @@ def test_dashboard_failed_card_highlight_class_exists():
     assert "hermes-kanban-card--failed" in js
     assert "hermes-kanban-card--failed" in css
     assert "failedIds" in js
+
+def test_dashboard_create_accepts_workflow_fields_at_creation(client):
+    kb.ensure_product_board_defaults("prod", name="Product")
+
+    r = client.post(
+        "/api/plugins/kanban/tasks?board=prod",
+        json={
+            "title": "User story: dashboard create",
+            "workflow_template_id": "product",
+            "current_step_key": "backlog",
+        },
+    )
+
+    assert r.status_code == 200
+    task = r.json()["task"]
+    assert task["workflow_template_id"] == "product"
+    assert task["current_step_key"] == "backlog"
+
+
+def test_dashboard_lifecycle_patch_uses_selected_product_board_context(client):
+    kb.ensure_product_board_defaults("prod", name="Product")
+    with kb.connect(board="prod") as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: finish via dashboard",
+            workflow_template_id="product",
+            current_step_key="backlog",
+            initial_status="running",
+        )
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}?board=prod",
+        json={"status": "done", "summary": "PO backlog complete"},
+    )
+
+    assert r.status_code == 200
+    task = r.json()["task"]
+    assert task["workflow_template_id"] == "product"
+    assert task["current_step_key"] == "architecture"
+    assert task["status"] == "ready"

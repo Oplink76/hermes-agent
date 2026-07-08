@@ -98,3 +98,41 @@ def test_project_workflow_slash_without_args_prints_usage(capsys):
     assert "/project-import" in out
     assert cli._pending_input.empty()
     assert cli._pending_agent_seed is None
+
+def test_project_create_seed_requires_product_v2_board_and_backlog_po_card():
+    cli = DummyCLI()
+
+    cli._handle_project_workflow_command("/project-create Acme Intake --path /tmp/acme", "project-create")
+
+    queued = cli._pending_agent_seed
+    assert queued is not None
+    assert "hermes kanban boards create <slug>" in queued
+    assert "--preset product" in queued
+    assert "product_workflow.handoff_v2 == true" in queued
+    assert "expected product columns" in queued
+    assert "hermes project create <project-name>" in queued
+    assert "--board <slug>" in queued
+    assert "hermes kanban --board <slug> create" in queued
+    assert "--workflow-template-id product" in queued
+    assert "--step-key backlog" in queued
+    assert 'workflow_template_id == "product"' in queued
+    assert 'current_step_key == "backlog"' in queued
+    assert ".worktrees/" in queued
+    assert "decomposed WORK cards" in queued
+    assert "CREATION" in queued
+    assert "not COMPLETION" in queued
+
+
+def test_project_import_seed_stays_dry_run_and_mentions_v2_apply_contract():
+    cli = DummyCLI()
+
+    cli._handle_project_workflow_command("/project-import /tmp/acme --name Acme", "project-import")
+
+    queued = cli._pending_agent_seed
+    assert queued is not None
+    assert "DRY RUN ONLY" in queued
+    assert "Do not run --apply" in queued
+    assert "--preset product" in queued
+    assert "--workflow-template-id product" in queued
+    assert "--step-key backlog" in queued
+    assert "handoff_v2" in queued

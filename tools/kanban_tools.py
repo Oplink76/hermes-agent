@@ -1015,6 +1015,8 @@ def _handle_create(args: dict, **kw) -> str:
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
     project_id = args.get("project") or args.get("project_id")
+    workflow_template_id = args.get("workflow_template_id")
+    current_step_key = args.get("current_step_key") or args.get("step_key")
     _inherit_workspace = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
         workspace_kind = "scratch"
@@ -1052,13 +1054,31 @@ def _handle_create(args: dict, **kw) -> str:
                 _self_tid = os.environ.get("HERMES_KANBAN_TASK")
                 if _self_tid:
                     _self_task = kb.get_task(conn, _self_tid)
-                    if _self_task is not None and _self_task.workspace_kind:
-                        workspace_kind = _self_task.workspace_kind
-                        workspace_path = _self_task.workspace_path
-                        # Keep follow-up children inside the same project so the
-                        # whole subtree shares one repo + branch convention.
-                        if project_id is None and _self_task.project_id:
-                            project_id = _self_task.project_id
+                    if _self_task is not None:
+                        parent_is_product = (
+                            _self_task.workflow_template_id == "product"
+                            or bool(_self_task.current_step_key)
+                        )
+                        # Product-workflow child/work cards must not inherit a
+                        # shared dir workspace from the PO/backlog card. Keep
+                        # the project link, but leave the workspace as scratch
+                        # so kanban_db promotes it to a per-card worktree.
+                        if parent_is_product and _self_task.project_id:
+                            workspace_kind = "scratch"
+                            workspace_path = None
+                            if project_id is None:
+                                project_id = _self_task.project_id
+                            if workflow_template_id is None:
+                                workflow_template_id = "product"
+                            if current_step_key is None:
+                                current_step_key = "backlog"
+                        elif _self_task.workspace_kind:
+                            workspace_kind = _self_task.workspace_kind
+                            workspace_path = _self_task.workspace_path
+                            # Keep follow-up children inside the same project so the
+                            # whole subtree shares one repo + branch convention.
+                            if project_id is None and _self_task.project_id:
+                                project_id = _self_task.project_id
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1084,6 +1104,9 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                board=board,
+                workflow_template_id=workflow_template_id,
+                current_step_key=current_step_key,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1642,6 +1665,21 @@ KANBAN_CREATE_SCHEMA = {
                     "set, the task becomes a git worktree under the project's "
                     "primary repo with a deterministic branch (project slug + "
                     "task id), instead of a random branch."
+                ),
+            },
+            "workflow_template_id": {
+                "type": "string",
+                "description": (
+                    "Optional workflow template id to stamp at creation time. "
+                    "Use 'product' for Kanban V2 product-board cards."
+                ),
+            },
+            "current_step_key": {
+                "type": "string",
+                "description": (
+                    "Optional workflow step key to stamp at creation time. "
+                    "Use 'backlog' for new product user-story/work cards unless "
+                    "a later approved flow intentionally targets another step."
                 ),
             },
             "triage": {
