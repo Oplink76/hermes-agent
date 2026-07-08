@@ -248,6 +248,66 @@ def test_product_task_detail_ai_provenance_includes_read_only_evidence(client):
     assert evidence["by_step"]["review"]["toolchain"] == "codex-cli"
 
 
+def test_approve_unblock_endpoint_validates_snapshot_and_writes_trace(client):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Approve from dashboard",
+            body="Preserve body",
+            assignee="developer",
+            initial_status="blocked",
+        )
+
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{tid}/approve-unblock",
+        json={
+            "confirmed": True,
+            "expected_status": "blocked",
+            "expected_title": "Approve from dashboard",
+            "comment_author": "agentic-os-cockpit/developer",
+            "comment_source": "Agentic OS Cockpit approve/unblock control",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["task"]["status"] == "ready"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        comments = kb.list_comments(conn, tid)
+    assert task is not None
+    assert task.status == "ready"
+    assert task.body == "Preserve body"
+    assert task.assignee == "developer"
+    assert len(comments) == 1
+    assert comments[0].author == "agentic-os-cockpit/developer"
+    assert "Decision: approved_unblock" in comments[0].body
+    assert "Resulting status: ready" in comments[0].body
+
+
+def test_approve_unblock_endpoint_stale_snapshot_returns_409_without_trace(client):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Current title", initial_status="blocked")
+
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{tid}/approve-unblock",
+        json={
+            "confirmed": True,
+            "expected_status": "blocked",
+            "expected_title": "Old title",
+            "comment_author": "agentic-os-cockpit/developer",
+            "comment_source": "Agentic OS Cockpit approve/unblock control",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "refresh" in response.json()["detail"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert kb.list_comments(conn, tid) == []
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------

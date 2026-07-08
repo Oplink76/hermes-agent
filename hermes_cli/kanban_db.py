@@ -6287,6 +6287,102 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def approve_unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_status: Optional[str],
+    expected_title: Optional[str],
+    comment_author: str,
+    comment_source: str = "Agentic OS Cockpit approve/unblock control",
+) -> Optional[Task]:
+    """Atomically approve and unblock one blocked task with an audit comment.
+
+    This is the server-side counterpart to a UI confirmation prompt: the
+    confirmed snapshot is re-read and validated inside the same write
+    transaction that performs canonical unblock bookkeeping and records the
+    traceability comment. A stale snapshot raises ``RuntimeError`` and leaves
+    both status and comments untouched.
+    """
+    if expected_status != "blocked":
+        raise ValueError("expected status snapshot must be blocked")
+    if expected_title is None:
+        raise ValueError("expected title snapshot is required")
+    author = (comment_author or "dashboard").strip() or "dashboard"
+    default_source = "Agentic OS Cockpit approve/unblock control"
+    source = (comment_source or default_source).strip() or default_source
+    board = _board_slug_for_connection(conn)
+    meta = product_board_metadata(board)
+    now = int(time.time())
+
+    with write_txn(conn):
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None or row["status"] == "archived":
+            return None
+        current_status = row["status"] or ""
+        current_title = row["title"] or ""
+        if current_status != "blocked" or current_title != expected_title:
+            raise RuntimeError("card changed; refresh before approving unblock")
+
+        stale_run_id = row["current_run_id"] if "current_run_id" in row.keys() else None
+        if stale_run_id:
+            conn.execute(
+                """
+                UPDATE task_runs
+                   SET status = 'reclaimed', outcome = 'reclaimed',
+                       summary = COALESCE(summary, 'invariant recovery on unblock'),
+                       ended_at = ?,
+                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+                 WHERE id = ? AND ended_at IS NULL
+                """,
+                (now, int(stale_run_id)),
+            )
+
+        undone_parents = conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        new_status = "todo" if undone_parents else "ready"
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ? AND status = 'blocked'",
+            (new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("card changed; refresh before approving unblock")
+        if _handoff_v2_enabled(meta):
+            conn.execute(
+                "UPDATE tasks SET running = 0, blocked = 0 WHERE id = ?",
+                (task_id,),
+            )
+        _append_event(
+            conn,
+            task_id,
+            "unblocked",
+            {"status": new_status} if new_status != "ready" else None,
+        )
+
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+        trace_body = (
+            "Traceability log — approval/unblock confirmed. "
+            f"Actor: {author}. Board: {board}. Task: {task_id}. Title: {current_title}. "
+            "Decision: approved_unblock. "
+            f"Resulting status: {new_status}. "
+            f"Timestamp: {timestamp}. Source: {source}."
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, author, trace_body, now),
+        )
+        _append_event(conn, task_id, "commented", {"author": author, "len": len(trace_body)})
+        refreshed = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return Task.from_row(refreshed) if refreshed else None
+
+
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,

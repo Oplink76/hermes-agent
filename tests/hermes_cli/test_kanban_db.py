@@ -1887,6 +1887,95 @@ def test_unblock_without_parents_goes_to_ready(kanban_home):
         assert kb.get_task(conn, t).status == "ready"
 
 
+def test_approve_unblock_task_checks_snapshot_and_comments_atomically(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Approve blocked card",
+            body="Keep this body",
+            assignee="developer",
+            initial_status="blocked",
+        )
+
+        task = kb.approve_unblock_task(
+            conn,
+            tid,
+            expected_status="blocked",
+            expected_title="Approve blocked card",
+            comment_author="agentic-os-cockpit/developer",
+            comment_source="Agentic OS Cockpit approve/unblock control",
+        )
+
+        assert task is not None
+        assert task.status == "ready"
+        row = conn.execute(
+            "SELECT status, body, assignee, consecutive_failures, last_failure_error "
+            "FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert tuple(row) == ("ready", "Keep this body", "developer", 0, None)
+        comments = kb.list_comments(conn, tid)
+        assert len(comments) == 1
+        assert comments[0].author == "agentic-os-cockpit/developer"
+        assert "Decision: approved_unblock" in comments[0].body
+        assert "Resulting status: ready" in comments[0].body
+        events = [
+            row["kind"]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (tid,)
+            )
+        ]
+        assert events[-2:] == ["unblocked", "commented"]
+
+
+def test_approve_unblock_task_rejects_stale_snapshot_without_comment(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Current title", initial_status="blocked")
+
+        with pytest.raises(RuntimeError, match="refresh"):
+            kb.approve_unblock_task(
+                conn,
+                tid,
+                expected_status="blocked",
+                expected_title="Old title",
+                comment_author="agentic-os-cockpit/developer",
+                comment_source="Agentic OS Cockpit approve/unblock control",
+            )
+
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.list_comments(conn, tid) == []
+        event_kinds = [
+            row["kind"]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (tid,)
+            )
+        ]
+        assert "unblocked" not in event_kinds
+        assert "commented" not in event_kinds
+
+
+def test_approve_unblock_task_uses_todo_when_parent_is_not_done(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="Blocked child", parents=[parent])
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (child,))
+        conn.commit()
+
+        task = kb.approve_unblock_task(
+            conn,
+            child,
+            expected_status="blocked",
+            expected_title="Blocked child",
+            comment_author="agentic-os-cockpit/developer",
+            comment_source="Agentic OS Cockpit approve/unblock control",
+        )
+
+        assert task is not None
+        assert task.status == "todo"
+        comments = kb.list_comments(conn, child)
+        assert "Resulting status: todo" in comments[0].body
+
+
 def test_assign_refuses_while_running(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")

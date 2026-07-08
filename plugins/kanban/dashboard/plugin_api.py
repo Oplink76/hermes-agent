@@ -1260,6 +1260,45 @@ def _set_status_direct(
 
 
 # ---------------------------------------------------------------------------
+# Confirmed approve/unblock
+# ---------------------------------------------------------------------------
+
+class ApproveUnblockBody(BaseModel):
+    confirmed: bool = False
+    expected_status: Optional[str] = None
+    expected_title: Optional[str] = None
+    comment_author: Optional[str] = "dashboard"
+    comment_source: Optional[str] = "Agentic OS Cockpit approve/unblock control"
+
+
+@router.post("/tasks/{task_id}/approve-unblock")
+def approve_unblock_task(task_id: str, payload: ApproveUnblockBody, board: Optional[str] = Query(None)):
+    if payload.confirmed is not True:
+        raise HTTPException(status_code=400, detail="approve/unblock requires explicit confirmation")
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        try:
+            task = kanban_db.approve_unblock_task(
+                conn,
+                task_id,
+                expected_status=payload.expected_status,
+                expected_title=payload.expected_title,
+                comment_author=payload.comment_author or "dashboard",
+                comment_source=payload.comment_source or "Agentic OS Cockpit approve/unblock control",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        return {"ok": True, "task": _task_dict(task)}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Comments
 # ---------------------------------------------------------------------------
 
