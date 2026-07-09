@@ -1031,6 +1031,21 @@ def _product_release_measure_unblocks_dependents(meta: Optional[dict]) -> bool:
     return False
 
 
+def _product_merge_after_green(meta: Optional[dict]) -> bool:
+    """Return True when a Done product story's branch should auto-merge into
+    LOCAL main. OFF by default -- an explicit per-board opt-in
+    (``product_workflow.merge_after_green``) because, unlike the other product
+    flags, this MUTATES git history. Requires an explicit ``True`` (not merely
+    "not False"): the merge-back must never fire on an unset/ambiguous flag.
+    """
+    wf = _product_workflow_dict(meta)
+    if "merge_after_green" in wf:
+        return wf.get("merge_after_green") is True
+    if isinstance(meta, dict) and "merge_after_green" in meta:
+        return meta.get("merge_after_green") is True
+    return False
+
+
 def _dependency_parent_satisfied(row: sqlite3.Row, *, release_measure_unblocks: bool) -> bool:
     status = row["status"]
     if status in ("done", "archived"):
@@ -7736,6 +7751,140 @@ def integrate_story_to_epic(
         return None
 
 
+def _merge_standalone_story_to_main(
+    conn: sqlite3.Connection,
+    story_id: str,
+    *,
+    board: Optional[str] = None,
+    main_branch: str = "main",
+    verify_fn: Optional[Callable[[str], bool]] = None,
+    notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
+) -> Optional[str]:
+    """Merge a Done, epic-LESS product story's branch into LOCAL main.
+
+    The common case for imported / single-story product boards: a finished
+    story with no epic parent, whose work would otherwise strand on its
+    per-card branch (:func:`integrate_story_to_epic` returns ``None`` -- "no
+    epic parent" -- so nothing carries it anywhere, and
+    :func:`merge_epic_to_main` never runs). This closes that gap for the
+    standalone case, mirroring :func:`merge_epic_to_main` exactly.
+
+    Returns ``None`` on a non-``handoff_v2`` board or a story that actually HAS
+    an epic parent (that path is the epic integration + merge); ``"not_ready"``
+    when the story isn't ``done`` or the repo/branch can't be resolved (no git
+    mutation); ``"already_merged"`` when the story branch is already an ancestor
+    of main (idempotent); ``"conflict"`` when the merge fails (aborted, main
+    left exactly as it was); ``"verify_failed"`` when the merge succeeds but the
+    post-merge tree isn't clean or the suite isn't green (undone via
+    ``reset --hard``); ``"merged"`` on success. On both failure outcomes the
+    STORY (not an epic) is cleared of ``running``, blocked, and ``notify_fn``
+    invoked -- see :func:`_integrate_story_fail_safe`.
+    """
+    # =========================================================================
+    # LOCAL main only -- never `git push` / touch origin. Same hard autonomy
+    # boundary as merge_epic_to_main: production deploys and `git push origin`
+    # are HUMAN-ONLY. Only local git verbs below.
+    # =========================================================================
+    meta = product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta):
+        return None
+    # A story WITH an epic goes through integrate_story_to_epic + merge_epic_to_main.
+    if parent_ids(conn, story_id):
+        return None
+    story = get_task(conn, story_id)
+    if story is None or story.status != "done":
+        return "not_ready"
+
+    try:
+        board_default = str(meta.get("default_workdir") or "").strip()
+        repo_root = _git_toplevel(Path(board_default).expanduser()) if board_default else None
+        story_branch = (story.branch_name or "").strip()
+        if (
+            repo_root is None
+            or not story_branch
+            or not _git_branch_exists(repo_root, story_branch)
+        ):
+            return "not_ready"
+    except Exception:
+        return "not_ready"
+
+    def _run(args: list[str], *, timeout: int = 60):
+        try:
+            return subprocess.run(
+                ["git", "-C", str(repo_root), *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except Exception:
+            return None
+
+    def _fail(reason: str) -> None:
+        _integrate_story_fail_safe(conn, story_id, reason, board=board, notify_fn=notify_fn)
+
+    pre_sha = ""
+    try:
+        ancestor_result = _run(["merge-base", "--is-ancestor", story_branch, main_branch])
+        if ancestor_result is not None and ancestor_result.returncode == 0:
+            return "already_merged"
+
+        pre_sha_result = _run(["rev-parse", main_branch])
+        pre_sha = (pre_sha_result.stdout or "").strip() if pre_sha_result else ""
+        if pre_sha_result is None or pre_sha_result.returncode != 0 or not pre_sha:
+            _fail(f"could not resolve {main_branch}")
+            return "verify_failed"
+
+        switch_result = _run(["switch", main_branch])
+        if switch_result is None or switch_result.returncode != 0:
+            switch_result = _run(["checkout", main_branch])
+        if switch_result is None or switch_result.returncode != 0:
+            _fail(f"could not switch to {main_branch}")
+            return "verify_failed"
+
+        merge_result = _run(
+            ["merge", "--no-ff", story_branch, "-m", f"merge story {story_id}"],
+            timeout=120,
+        )
+        if merge_result is None or merge_result.returncode != 0:
+            _run(["merge", "--abort"])
+            _fail("story→main merge conflict")
+            return "conflict"
+
+        status_result = _run(["status", "--porcelain", "--untracked-files=no"])
+        clean = bool(
+            status_result is not None
+            and status_result.returncode == 0
+            and not (status_result.stdout or "").strip()
+        )
+        verify = verify_fn or _default_epic_verify
+        try:
+            verified = bool(verify(main_branch))
+        except Exception:
+            verified = False
+
+        if not clean or not verified:
+            _run(["reset", "--hard", pre_sha])
+            _fail("post-merge verify failed")
+            return "verify_failed"
+
+        try:
+            with write_txn(conn):
+                _append_event(
+                    conn, story_id, "story_merged_to_main",
+                    {"branch": story_branch, "pre_sha": pre_sha},
+                )
+        except Exception:
+            pass
+        return "merged"
+    except Exception:
+        _run(["merge", "--abort"])
+        if pre_sha:
+            _run(["reset", "--hard", pre_sha])
+        _fail("unexpected error during story merge")
+        return "verify_failed"
+
+
 # ---------------------------------------------------------------------------
 # deploy_epic / notify_operations -- Hermes-run test->preprod deploy of a
 # merged epic via an injected Ops API client, smoke-gated, then one
@@ -8408,6 +8557,11 @@ class ReconcileResult:
     """Story task ids merged into their epic's integration branch this pass
     via :func:`integrate_story_to_epic` (at most one per pass -- see the
     added step at the end of :func:`reconcile`'s docstring)."""
+    merged_to_main: list[str] = field(default_factory=list)
+    """Story ids (standalone) or epic ids whose branch was merged into LOCAL
+    main this pass via :func:`_merge_standalone_story_to_main` /
+    :func:`merge_epic_to_main`. Populated ONLY when the board opts into
+    ``product_workflow.merge_after_green`` (default OFF); at most one per pass."""
 
 
 def reconcile(
@@ -8562,12 +8716,32 @@ def reconcile(
     done_rows = conn.execute(
         "SELECT id FROM tasks WHERE status = 'done' ORDER BY completed_at ASC"
     ).fetchall()
+    # Step 4 (merge-back): carry finished work to LOCAL main. OFF unless the
+    # board opts into product_workflow.merge_after_green -- when off, behavior
+    # is byte-for-byte the pre-existing integrate-one-per-pass loop.
+    merge_after_green = _product_merge_after_green(product_board_metadata(board))
     for row in done_rows:
         story_id = row["id"]
         outcome = integrate_story_to_epic(conn, story_id, board=board)
         if outcome == "integrated":
             result.integrated.append(story_id)
+            if merge_after_green:
+                parents = parent_ids(conn, story_id)
+                if parents and epic_ready(conn, parents[0], board=board):
+                    if merge_epic_to_main(conn, parents[0], board=board) == "merged":
+                        result.merged_to_main.append(parents[0])
             break
+        if merge_after_green:
+            if outcome == "already_integrated":
+                parents = parent_ids(conn, story_id)
+                if parents and epic_ready(conn, parents[0], board=board):
+                    if merge_epic_to_main(conn, parents[0], board=board) == "merged":
+                        result.merged_to_main.append(parents[0])
+                        break
+            elif outcome is None:
+                if _merge_standalone_story_to_main(conn, story_id, board=board) == "merged":
+                    result.merged_to_main.append(story_id)
+                    break
 
     return result
 

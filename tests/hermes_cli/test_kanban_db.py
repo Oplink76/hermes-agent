@@ -10145,3 +10145,166 @@ def test_product_board_claim_repairs_legacy_plain_architect_story(kanban_home, t
     assert repaired.workflow_template_id == kb.PRODUCT_WORKFLOW_TEMPLATE_ID
     assert repaired.current_step_key == "architecture"
     assert any(e.kind == "workflow_repaired" for e in events)
+
+
+# ---------------------------------------------------------------------------
+# Merge-back (Phase 5): a Done standalone product story reaches LOCAL main.
+# Mirrors the merge_epic_to_main tests; LOCAL-only, never pushes, policy-gated.
+# ---------------------------------------------------------------------------
+
+def _enable_merge_after_green(board: str) -> None:
+    meta_path = kb.board_metadata_path(board)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta.setdefault("product_workflow", {})["merge_after_green"] = True
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+
+def _make_done_standalone_story(board: str, repo, branch: str = "wt/story-1"):
+    """Create a Done, epic-less product story whose branch (off main, one
+    commit) exists in ``repo``. Returns (story_id, story_branch_sha)."""
+    sha = _make_epic_branch(repo, branch)  # generic: branch off main + 1 commit
+    with kb.connect(board=board) as conn:
+        story = kb.create_task(
+            conn, title="Story: standalone merge-back", board=board,
+            branch_name=branch, workspace_kind="worktree", workspace_path=str(repo),
+        )
+        _set_task_status(conn, story, "done")
+    return story, sha
+
+
+def test_merge_standalone_story_to_main_happy_merges_and_never_pushes(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-standalone-merge-happy"
+    _v2_product_board_with_repo(board, repo)
+    story, sha = _make_done_standalone_story(board, repo)
+
+    calls = _record_git_calls(monkeypatch)
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        result = kb._merge_standalone_story_to_main(
+            conn, story, board=board, verify_fn=lambda b: True, notify_fn=notify,
+        )
+
+    assert result == "merged"
+    notify.assert_not_called()
+    _assert_no_push(calls)
+    ancestor = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, "main"],
+        capture_output=True, text=True,
+    )
+    assert ancestor.returncode == 0, "main must contain the story's commit"
+
+
+def test_merge_standalone_story_with_epic_returns_none(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-standalone-has-epic"
+    _v2_product_board_with_repo(board, repo)
+    with kb.connect(board=board) as conn:
+        epic = kb.create_task(conn, title="Epic", board=board)
+        story = kb.create_task(
+            conn, title="Story", board=board, parents=[epic],
+            branch_name="wt/s", workspace_kind="worktree", workspace_path=str(repo),
+        )
+        _set_task_status(conn, story, "done")
+        result = kb._merge_standalone_story_to_main(conn, story, board=board, verify_fn=lambda b: True)
+    assert result is None  # epic'd stories go through the epic path, not here
+
+
+def test_merge_standalone_story_conflict_aborts_blocks_never_pushes(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-standalone-merge-conflict"
+    _v2_product_board_with_repo(board, repo)
+    story, _ = _make_done_standalone_story(board, repo)
+    # make main touch the SAME file the story branch changed -> conflict
+    _commit_file(repo, "epic_work.txt", "conflicting main content\n", "main change")
+    pre_main = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "main"], capture_output=True, text=True
+    ).stdout.strip()
+
+    calls = _record_git_calls(monkeypatch)
+    notify = unittest.mock.Mock()
+    with kb.connect(board=board) as conn:
+        result = kb._merge_standalone_story_to_main(
+            conn, story, board=board, verify_fn=lambda b: True, notify_fn=notify,
+        )
+        blocked = kb.get_task(conn, story).blocked
+
+    assert result == "conflict"
+    assert blocked, "story must be blocked on conflict"
+    notify.assert_called()
+    _assert_no_push(calls)
+    post_main = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "main"], capture_output=True, text=True
+    ).stdout.strip()
+    assert post_main == pre_main, "main must be untouched after an aborted conflict"
+
+
+def test_merge_standalone_story_verify_failure_resets_and_blocks(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-standalone-merge-verifyfail"
+    _v2_product_board_with_repo(board, repo)
+    story, _ = _make_done_standalone_story(board, repo)
+    pre_main = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "main"], capture_output=True, text=True
+    ).stdout.strip()
+
+    _record_git_calls(monkeypatch)
+    with kb.connect(board=board) as conn:
+        result = kb._merge_standalone_story_to_main(
+            conn, story, board=board, verify_fn=lambda b: False,  # suite red
+        )
+        blocked = kb.get_task(conn, story).blocked
+
+    assert result == "verify_failed"
+    assert blocked
+    post_main = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "main"], capture_output=True, text=True
+    ).stdout.strip()
+    assert post_main == pre_main, "main must be reset to pre-merge sha on verify failure"
+
+
+def test_reconcile_merge_after_green_OFF_does_not_merge(kanban_home, tmp_path, monkeypatch):
+    """CRITICAL safety: with the default (merge_after_green unset), reconcile
+    must NOT merge a done standalone story to main."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-mergeback-off"
+    _v2_product_board_with_repo(board, repo)  # NOTE: merge_after_green NOT set
+    story, sha = _make_done_standalone_story(board, repo)
+    pre_main = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "main"], capture_output=True, text=True
+    ).stdout.strip()
+
+    with kb.connect(board=board) as conn:
+        result = kb.reconcile(conn, board=board, spawn_fn=lambda *a, **k: None)
+
+    assert result.merged_to_main == [], "must not merge when policy is off"
+    post_main = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "main"], capture_output=True, text=True
+    ).stdout.strip()
+    assert post_main == pre_main, "main must be untouched when merge_after_green is off"
+
+
+def test_reconcile_merge_after_green_ON_merges_one_standalone_per_pass(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-mergeback-on"
+    _v2_product_board_with_repo(board, repo)
+    _enable_merge_after_green(board)
+    story, sha = _make_done_standalone_story(board, repo)
+    # inject a green verify so reconcile's merge passes deterministically
+    monkeypatch.setattr(kb, "_default_epic_verify", lambda b: True)
+
+    with kb.connect(board=board) as conn:
+        result = kb.reconcile(conn, board=board, spawn_fn=lambda *a, **k: None)
+
+    assert story in result.merged_to_main
+    ancestor = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, "main"],
+        capture_output=True, text=True,
+    )
+    assert ancestor.returncode == 0, "reconcile must carry the story into main when opted in"
