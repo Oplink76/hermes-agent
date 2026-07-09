@@ -3190,6 +3190,61 @@ def test_spawn_then_handoff_running_flag_round_trip(kanban_home, tmp_path, monke
     assert after_handoff["running"] == 0
 
 
+def test_handoff_releases_worker_claim_so_next_agent_can_spawn(kanban_home, tmp_path, monkeypatch):
+    """Regression: handoff must release the completing worker's claim
+    (claim_lock / claim_expires / worker_pid), not just clear ``running``.
+
+    Otherwise the handed-off card stays ready+claimed, and
+    ``spawn_after_handoff`` (``WHERE claim_lock IS NULL``) skips it -- the
+    event-driven chain stalls at every handoff until a manual reclaim.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    board = "v2-handoff-releases-claim"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+
+    def fake_spawn(task, workspace, board=None):
+        return 4242
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story",
+            board=board,
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        kb._spawn_one_v2(conn, tid, board=board, spawn_fn=fake_spawn)
+        after_spawn = conn.execute(
+            "SELECT claim_lock, worker_pid FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+
+        spawned_workspace = Path(kb.get_task(conn, tid).workspace_path)
+        (spawned_workspace / "src.py").write_text("print('hi')\n", encoding="utf-8")
+        result = kb.handoff(
+            conn, tid, board=board, summary="Implemented checkout",
+            metadata={"ai_provenance": {"writer": {"agent": "hermes"}}},
+        )
+        after_handoff = conn.execute(
+            "SELECT status, claim_lock, claim_expires, worker_pid FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+
+    # spawn claimed the card
+    assert after_spawn["claim_lock"] is not None
+    # handoff advanced AND released the claim -> card is ready + unclaimed,
+    # which is exactly what spawn_after_handoff requires to fire the next agent.
+    assert result is True
+    assert after_handoff["status"] == "ready"
+    assert after_handoff["claim_lock"] is None
+    assert after_handoff["claim_expires"] is None
+    assert after_handoff["worker_pid"] is None
+
+
 # ---------------------------------------------------------------------------
 # R1: claim_task maintains the v2 running flag (state-model integrity)
 #

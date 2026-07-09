@@ -8046,7 +8046,13 @@ def handoff(
 
     with write_txn(conn):
         sql = (
-            "UPDATE tasks SET current_step_key = ?, running = 0, assignee = ?, result = ? "
+            # Release the completing worker's claim as part of the atomic advance:
+            # the card is being handed to a NEW assignee, so the old claim is dead.
+            # Without this, the handed-off card stays ready+claimed, which
+            # spawn_after_handoff (WHERE claim_lock IS NULL) skips -> the next
+            # agent never fires and the event-driven chain stalls every handoff.
+            "UPDATE tasks SET current_step_key = ?, running = 0, assignee = ?, result = ?, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ?"
         ) + ("" if expected_run_id is None else " AND status = 'running' AND current_run_id = ?")
         params = (
