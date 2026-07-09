@@ -10062,3 +10062,86 @@ def test_project_bound_task_explicit_non_product_metadata_not_overwritten(kanban
 
     assert task.workflow_template_id == "custom"
     assert task.current_step_key == "intake"
+
+
+# --- Product-workflow enforcement guards (re-applied from f55580879) ---
+
+def _write_product_board_enf(
+    board: str,
+    default_workdir: Path,
+    *,
+    release_assignee: str | None = None,
+) -> None:
+    kb.create_board(board, name="Product Board", default_workdir=str(default_workdir))
+    meta = kb.read_board_metadata(board)
+    meta.pop("db_path", None)
+    meta["preset"] = "product"
+    meta["columns"] = [
+        {"name": "backlog", "status": "ready"},
+        {"name": "architecture", "status": "ready"},
+        {"name": "development", "status": "ready"},
+        {"name": "test", "status": "ready"},
+        {"name": "review", "status": "review"},
+        {"name": "release_measure", "status": "ready"},
+        {"name": "done", "status": "done"},
+    ]
+    assignees = {
+        "productowner": "productowner",
+        "architect": "architect",
+        "developer": "developer",
+        "tester": "tester",
+        "reviewer": "reviewer",
+    }
+    if release_assignee:
+        assignees["release_measure"] = release_assignee
+    meta["product_workflow"] = {"assignees": assignees}
+    kb.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+
+
+def test_product_board_role_story_creation_gets_workflow_metadata(kanban_home, tmp_path):
+    board = "product-board-enf-create"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_product_board_enf(board, repo)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: Safe paper order evidence",
+            assignee="architect",
+            board=board,
+        )
+        task = kb.get_task(conn, tid)
+    # masquerade fix: a plain architect card on a product board becomes a real
+    # product story anchored to the correct step (architecture), not stuck.
+    assert task.workflow_template_id == kb.PRODUCT_WORKFLOW_TEMPLATE_ID
+    assert task.current_step_key == "architecture"
+    assert task.status == "ready"
+
+
+def test_product_board_claim_repairs_legacy_plain_architect_story(kanban_home, tmp_path):
+    board = "product-board-enf-claim"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_product_board_enf(board, repo)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="User story: Legacy card",
+            assignee="architect",
+            board=board,
+        )
+        # Simulate the Trading Company regression: a plain architect card with
+        # NULL workflow fields slipped onto a product board before this fix.
+        conn.execute(
+            "UPDATE tasks SET workflow_template_id=NULL, current_step_key=NULL, "
+            "workspace_kind='scratch', workspace_path=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        claimed = kb.claim_task(conn, tid, board=board)
+        repaired = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert claimed is not None
+    assert repaired.workflow_template_id == kb.PRODUCT_WORKFLOW_TEMPLATE_ID
+    assert repaired.current_step_key == "architecture"
+    assert any(e.kind == "workflow_repaired" for e in events)

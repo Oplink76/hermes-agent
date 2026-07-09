@@ -188,6 +188,29 @@ _PRODUCT_COMMIT_REQUIRED_STEPS = {"development"}
 PRODUCT_WORKFLOW_COMMIT_REQUIRED_STEPS = _PRODUCT_COMMIT_REQUIRED_STEPS
 PRODUCT_PROVENANCE_BLOCKED_EVENT = "completion_blocked_provenance"
 
+# Product-workflow enforcement (re-applied from f55580879). The step tuple and
+# role<->step maps power create-time inference and legacy-card repair so a plain
+# role card (e.g. assignee=architect with NULL workflow fields) becomes a proper
+# product story instead of a masquerade that stalls after one phase.
+PRODUCT_WORKFLOW_TEMPLATE_ID = "product"
+PRODUCT_WORKFLOW_STEPS = (
+    "backlog",
+    "architecture",
+    "development",
+    "test",
+    "review",
+    "release_measure",
+    "done",
+)
+PRODUCT_WORKFLOW_STEP_SET = frozenset(PRODUCT_WORKFLOW_STEPS)
+PRODUCT_WORKFLOW_ROLE_TO_STEP = {
+    "productowner": "backlog",
+    "architect": "architecture",
+    "developer": "development",
+    "tester": "test",
+    "reviewer": "review",
+}
+
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
@@ -1057,6 +1080,105 @@ def _column_status_for_step(meta: Optional[dict], step_key: Optional[str]) -> st
             status = str(col.get("status") or "").strip()
             return status if status in VALID_STATUSES else "ready"
     return "ready"
+
+
+def _is_product_board_metadata(meta: Optional[dict]) -> bool:
+    """Return True when board metadata opts into the product/Relay workflow."""
+    if not isinstance(meta, dict):
+        return False
+    preset = str(meta.get("preset") or meta.get("workflow") or "").strip().lower()
+    return preset in {"product", "relay"} or isinstance(meta.get("product_workflow"), dict)
+
+
+def _looks_like_product_story(title: str) -> bool:
+    lowered = (title or "").strip().lower()
+    return lowered.startswith(("user story:", "story:", "user story -", "story -"))
+
+
+def _infer_product_step(
+    *, title: str, assignee: Optional[str], explicit_step: Optional[str]
+) -> Optional[str]:
+    """Infer the product workflow step for a card from an explicit step, its
+    role assignee (architect -> architecture, ...), or a story-shaped title."""
+    if explicit_step:
+        return explicit_step
+    role = (assignee or "").strip().lower()
+    if role in PRODUCT_WORKFLOW_ROLE_TO_STEP:
+        return PRODUCT_WORKFLOW_ROLE_TO_STEP[role]
+    if _looks_like_product_story(title):
+        return "backlog"
+    return None
+
+
+def _repair_product_workflow_metadata_if_needed(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+    actor: str = "framework",
+) -> Optional[dict[str, Any]]:
+    """Repair legacy/plain role cards on product boards before they dispatch.
+
+    Regression target: product-board stories mistakenly created as plain
+    ``assignee=architect`` tasks with NULL workflow fields. On a board whose
+    metadata opts into ``preset=product`` / ``product_workflow``, infer the
+    missing product step from the assignee/title and persist an audit event.
+    Returns the repair metadata when a repair happened, ``None`` otherwise.
+    Caller must already hold any desired write transaction. Advancement between
+    steps is NOT done here — that is handoff_v2's job; this only fixes metadata.
+    """
+    board_slug = board if board else get_current_board()
+    meta = read_board_metadata(board_slug)
+    if not _is_product_board_metadata(meta):
+        return None
+    row = conn.execute(
+        "SELECT id, title, assignee, status, workflow_template_id, current_step_key, "
+        "workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    workflow_template = (row["workflow_template_id"] or "").strip() or None
+    current_step = (row["current_step_key"] or "").strip() or None
+    if workflow_template and workflow_template != PRODUCT_WORKFLOW_TEMPLATE_ID:
+        return None
+    if (
+        workflow_template == PRODUCT_WORKFLOW_TEMPLATE_ID
+        and current_step in PRODUCT_WORKFLOW_STEP_SET
+    ):
+        return None
+    inferred = _infer_product_step(
+        title=row["title"] or "",
+        assignee=row["assignee"],
+        explicit_step=current_step if current_step in PRODUCT_WORKFLOW_STEP_SET else None,
+    )
+    if not inferred:
+        return None
+    updates = ["workflow_template_id = ?", "current_step_key = ?"]
+    params: list[Any] = [PRODUCT_WORKFLOW_TEMPLATE_ID, inferred]
+    target_status = _column_status_for_step(meta, inferred)
+    if row["status"] in {"ready", "review"} and target_status != row["status"]:
+        updates.append("status = ?")
+        params.append(target_status)
+    if row["workspace_kind"] == "scratch" and not row["workspace_path"]:
+        board_default = meta.get("default_workdir") if isinstance(meta, dict) else None
+        if board_default:
+            updates.append("workspace_kind = ?")
+            updates.append("workspace_path = ?")
+            params.extend(["dir", str(board_default)])
+    params.append(task_id)
+    conn.execute(
+        f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?",
+        tuple(params),
+    )
+    payload = {
+        "workflow_template_id": PRODUCT_WORKFLOW_TEMPLATE_ID,
+        "current_step_key": inferred,
+        "reason": "product_board_missing_workflow_metadata",
+        "actor": actor,
+    }
+    _append_event(conn, task_id, "workflow_repaired", payload)
+    return payload
 
 
 def _legacy_status(row: Any, meta: Optional[dict] = None) -> str:
@@ -3834,6 +3956,33 @@ def create_task(
                     current_step_key = "backlog"
                     workflow_defaulted = True
 
+    # Product-workflow enforcement (re-applied from f55580879), MASQUERADE FIX:
+    # on a product board, infer the step from assignee/title so a plain role
+    # card (e.g. assignee=architect) becomes a proper product story rather than
+    # a masquerade that stalls after one phase. Conservative: never touches
+    # custom-workflow / non-product cards, and handoff_v2 still owns advancement.
+    _wf_board_meta = read_board_metadata(
+        _normalize_board_slug(board) if board is not None
+        else _board_slug_for_connection(conn)
+    )
+    if workflow_template_id == PRODUCT_WORKFLOW_TEMPLATE_ID and not current_step_key:
+        _inferred_step = _infer_product_step(
+            title=title, assignee=assignee, explicit_step=None
+        )
+        if _inferred_step:
+            current_step_key = _inferred_step
+    elif (
+        workflow_template_id is None
+        and _is_product_board_metadata(_wf_board_meta)
+        and (not current_step_key or current_step_key in PRODUCT_WORKFLOW_STEP_SET)
+    ):
+        _inferred_step = _infer_product_step(
+            title=title, assignee=assignee, explicit_step=current_step_key
+        )
+        if _inferred_step:
+            workflow_template_id = PRODUCT_WORKFLOW_TEMPLATE_ID
+            current_step_key = _inferred_step
+
     parents = tuple(p for p in parents if p)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
@@ -4744,6 +4893,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4753,9 +4903,16 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    board_meta = product_board_metadata(_board_slug_for_connection(conn))
+    _board_slug = _normalize_board_slug(board) if board is not None else _board_slug_for_connection(conn)
+    board_meta = product_board_metadata(_board_slug)
     release_measure_unblocks = _product_release_measure_unblocks_dependents(board_meta)
     with write_txn(conn):
+        # Enforcement preflight: repair a plain/legacy role card missing its
+        # product workflow metadata before it claims, so it dispatches on the
+        # correct step instead of masquerading (re-applied from f55580879).
+        _repair_product_workflow_metadata_if_needed(
+            conn, task_id, board=_board_slug, actor="claim_preflight"
+        )
         # Structural invariant: never transition ready -> running while any
         # parent is not dependency-satisfied. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -5452,6 +5609,14 @@ def complete_task(
     if product_workflow_enabled:
         meta = product_board_metadata(board)
         if meta is not None and _handoff_v2_enabled(meta):
+            # Completion preflight: repair a plain/legacy role card's missing
+            # product metadata before the transition is evaluated, so handoff_v2
+            # advances the correct step (re-applied from f55580879). Repair only
+            # -- advancement stays with handoff() below.
+            with write_txn(conn):
+                _repair_product_workflow_metadata_if_needed(
+                    conn, task_id, board=board, actor="completion_preflight"
+                )
             row = conn.execute(
                 "SELECT current_step_key FROM tasks WHERE id = ?", (task_id,),
             ).fetchone()
