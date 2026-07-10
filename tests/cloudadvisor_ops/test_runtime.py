@@ -42,6 +42,23 @@ class FakeRunner:
         return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
 
 
+class SequenceRunner(FakeRunner):
+    def __init__(self, responses):
+        super().__init__({})
+        self.sequences = {key: list(value) for key, value in responses.items()}
+
+    def run(self, argv: list[str], cwd: Path, timeout: int = 300):
+        key = tuple(argv)
+        self.calls.append(Call(key, Path(cwd)))
+        sequence = self.sequences.get(key)
+        if not sequence:
+            return subprocess.CompletedProcess(
+                argv, 1, "", f"unexpected command: {key}"
+            )
+        returncode, stdout, stderr = sequence.pop(0)
+        return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+
+
 class PlutilRunner:
     def __init__(self, *, fail_name: str | None = None):
         self.fail_name = fail_name
@@ -241,6 +258,11 @@ def test_launchd_controller_operates_only_on_configured_services(tmp_path: Path)
 
     assert controller.loaded_services() == (label,)
     assert controller.running_services() == (label,)
+    responses[("launchctl", "print", f"gui/501/{label}")] = (
+        113,
+        "",
+        "Could not find service",
+    )
     controller.stop((label,))
     controller.start((label,))
 
@@ -253,6 +275,62 @@ def test_launchd_controller_operates_only_on_configured_services(tmp_path: Path)
     ]
     with pytest.raises(RuntimeError, match="unconfigured service"):
         controller.stop(("ai.hermes.not-configured",))
+
+
+def test_launchd_controller_waits_for_bootout_to_finish(tmp_path: Path):
+    install_root, target, _, _ = _runtime_fixture(tmp_path)
+    label = "ai.hermes.gateway-tradingastrid"
+    domain = f"gui/501/{label}"
+    sleeps: list[float] = []
+    runner = SequenceRunner({
+        ("launchctl", "bootout", domain): [(0, "", "")],
+        ("launchctl", "print", domain): [
+            (0, "state = stopping\n\tpid = 4321\n", ""),
+            (113, "", "Could not find service"),
+        ],
+    })
+    controller = LaunchdServiceController(
+        services=[LaunchdService(label=label, plist_path=target.plist_path)],
+        install_root=install_root,
+        uid=501,
+        runner=runner,
+        stop_timeout_seconds=5,
+        poll_interval_seconds=0.01,
+        clock=lambda: 0.0,
+        sleeper=sleeps.append,
+    )
+
+    controller.stop((label,))
+
+    assert sleeps == [0.01]
+    assert [call.argv for call in runner.calls] == [
+        ("launchctl", "bootout", domain),
+        ("launchctl", "print", domain),
+        ("launchctl", "print", domain),
+    ]
+
+
+def test_launchd_controller_does_not_treat_inspection_error_as_unloaded(
+    tmp_path: Path,
+):
+    install_root, target, _, _ = _runtime_fixture(tmp_path)
+    label = "ai.hermes.gateway-tradingastrid"
+    domain = f"gui/501/{label}"
+    runner = SequenceRunner({
+        ("launchctl", "bootout", domain): [(0, "", "")],
+        ("launchctl", "print", domain): [
+            (5, "", "Input/output error"),
+        ],
+    })
+    controller = LaunchdServiceController(
+        services=[LaunchdService(label=label, plist_path=target.plist_path)],
+        install_root=install_root,
+        uid=501,
+        runner=runner,
+    )
+
+    with pytest.raises(RuntimeError, match="could not verify launchd unload"):
+        controller.stop((label,))
 
 
 def test_launchd_controller_reports_loaded_job_without_pid(tmp_path: Path):
@@ -397,6 +475,44 @@ def test_converged_runtime_still_honors_one_shot_failure_injection(tmp_path: Pat
     assert injected.healthy is False
     assert any(check.name == "injected:after_restart" for check in injected.checks)
     assert after_injection.healthy is True
+
+
+def test_rollback_health_suppresses_and_consumes_candidate_injection(tmp_path: Path):
+    install_root, target, _, responses = _runtime_fixture(tmp_path)
+    runner = FakeRunner(responses)
+    controller = LaunchdServiceController(
+        services=[
+            LaunchdService(
+                label="ai.hermes.gateway-tradingastrid",
+                plist_path=target.plist_path,
+            )
+        ],
+        install_root=install_root,
+        uid=501,
+        runner=runner,
+    )
+    checker = RuntimeHealthChecker(
+        controller=controller,
+        gateway_targets=[target],
+        install_root=install_root,
+        uid=501,
+        runner=runner,
+        inject_failure="after_restart",
+    )
+
+    rollback = checker.check(
+        expected_sha="deployed-sha",
+        services=("ai.hermes.gateway-tradingastrid",),
+        apply_injection=False,
+    )
+    later = checker.check(
+        expected_sha="deployed-sha",
+        services=("ai.hermes.gateway-tradingastrid",),
+    )
+
+    assert rollback.healthy is True
+    assert later.healthy is True
+    assert all(check.name != "injected:after_restart" for check in later.checks)
 
 
 def test_runtime_health_checker_can_verify_legacy_service_without_manifest(

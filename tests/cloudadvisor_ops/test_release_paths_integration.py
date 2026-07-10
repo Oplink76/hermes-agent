@@ -235,6 +235,7 @@ class FailCandidateHealth:
         expected_sha: str,
         services: tuple[str, ...],
         identity_required: bool = True,
+        apply_injection: bool = True,
     ) -> HealthReport:
         actual_sha = _git(self.install_root, "rev-parse", "HEAD")
         passed = expected_sha == actual_sha and expected_sha != self.candidate_sha
