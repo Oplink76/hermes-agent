@@ -8368,7 +8368,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 remove_runtime_identity()
             except Exception as _e:
-                logger.debug("runtime identity cleanup error: %s", _e)
+                logger.debug(
+                    "runtime identity cleanup error: %s",
+                    _e,
+                    exc_info=True,
+                )
 
             from gateway.status import remove_pid_file, release_gateway_runtime_lock
             remove_pid_file()
@@ -20504,7 +20508,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         from tools.skills_sync import sync_skills
         sync_skills(quiet=True)
     except Exception:
-        pass
+        logger.debug("Bundled skill sync failed during gateway start", exc_info=True)
 
     # Centralized logging — agent.log (INFO+), errors.log (WARNING+),
     # and gateway.log (INFO+, gateway-component records only).
@@ -20754,7 +20758,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _runtime_identity.executable,
         )
     except Exception as exc:
-        logger.warning("Could not publish gateway runtime identity: %s", exc)
+        logger.warning(
+            "Could not publish gateway runtime identity: %s",
+            exc,
+            exc_info=True,
+        )
 
     try:
         from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
@@ -21019,7 +21027,7 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
 
         remove_runtime_identity()
     except Exception:
-        pass
+        logger.debug("runtime identity cleanup error during exit", exc_info=True)
     try:
         from gateway.status import remove_pid_file, release_gateway_runtime_lock
         remove_pid_file()

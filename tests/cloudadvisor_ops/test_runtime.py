@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import plistlib
 import stat
 import subprocess
@@ -8,7 +9,12 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from ops.cloudadvisor.hermes_ops.runtime import (
+    LaunchdService,
+    LaunchdServiceController,
+    RuntimeHealthChecker,
     RuntimeTarget,
     inventory,
     repoint_runtime_files,
@@ -54,6 +60,8 @@ class PlutilRunner:
 
 
 def _runtime_fixture(tmp_path: Path):
+    if sys.platform == "win32":
+        pytest.skip("runtime identity fixture requires POSIX symlinks")
     install_root = tmp_path / "hermes-agent"
     venv_python = install_root / ".venv" / "bin" / "python"
     venv_python.parent.mkdir(parents=True)
@@ -126,6 +134,7 @@ def test_inventory_is_healthy_only_when_all_runtime_identities_agree(tmp_path: P
     observations = inventory(
         [target],
         install_root=install_root,
+        expected_sha="deployed-sha",
         uid=501,
         runner=runner,
     )
@@ -155,6 +164,7 @@ def test_inventory_reports_every_identity_mismatch(tmp_path: Path):
     observation = inventory(
         [target],
         install_root=install_root,
+        expected_sha="deployed-sha",
         uid=501,
         runner=FakeRunner(responses),
     )[0]
@@ -180,6 +190,7 @@ def test_inventory_is_unhealthy_when_launchd_or_manifest_is_missing(tmp_path: Pa
     observation = inventory(
         [target],
         install_root=install_root,
+        expected_sha="deployed-sha",
         uid=501,
         runner=FakeRunner(responses),
     )[0]
@@ -188,6 +199,143 @@ def test_inventory_is_unhealthy_when_launchd_or_manifest_is_missing(tmp_path: Pa
     assert observation.healthy is False
     assert checks["launchd_owns_process"] is False
     assert checks["runtime_manifest_present"] is False
+
+
+def test_inventory_uses_immutable_deployment_sha_not_checkout_head(tmp_path: Path):
+    install_root, target, _, responses = _runtime_fixture(tmp_path)
+    responses[("git", "rev-parse", "HEAD")] = (0, "unauthorized-sha\n", "")
+
+    observation = inventory(
+        [target],
+        install_root=install_root,
+        expected_sha="deployed-sha",
+        uid=501,
+        runner=FakeRunner(responses),
+    )[0]
+
+    assert observation.healthy is True
+    assert observation.expected_sha == "deployed-sha"
+
+
+def test_launchd_controller_operates_only_on_configured_services(tmp_path: Path):
+    install_root, target, _, responses = _runtime_fixture(tmp_path)
+    label = "ai.hermes.gateway-tradingastrid"
+    responses.update({
+        ("launchctl", "bootout", f"gui/501/{label}"): (0, "", ""),
+        ("plutil", "-lint", str(target.plist_path)): (0, "", ""),
+        (
+            "launchctl",
+            "bootstrap",
+            "gui/501",
+            str(target.plist_path),
+        ): (0, "", ""),
+        ("launchctl", "kickstart", f"gui/501/{label}"): (0, "", ""),
+    })
+    runner = FakeRunner(responses)
+    controller = LaunchdServiceController(
+        services=[LaunchdService(label=label, plist_path=target.plist_path)],
+        install_root=install_root,
+        uid=501,
+        runner=runner,
+    )
+
+    assert controller.loaded_services() == (label,)
+    assert controller.running_services() == (label,)
+    controller.stop((label,))
+    controller.start((label,))
+
+    calls = [call.argv for call in runner.calls]
+    assert ("launchctl", "bootout", f"gui/501/{label}") in calls
+    assert calls[-3:] == [
+        ("plutil", "-lint", str(target.plist_path)),
+        ("launchctl", "bootstrap", "gui/501", str(target.plist_path)),
+        ("launchctl", "kickstart", f"gui/501/{label}"),
+    ]
+    with pytest.raises(RuntimeError, match="unconfigured service"):
+        controller.stop(("ai.hermes.not-configured",))
+
+
+def test_launchd_controller_reports_loaded_job_without_pid(tmp_path: Path):
+    install_root, target, _, responses = _runtime_fixture(tmp_path)
+    label = "ai.hermes.gateway-tradingastrid"
+    responses[("launchctl", "print", f"gui/501/{label}")] = (
+        0,
+        "state = waiting\n",
+        "",
+    )
+    controller = LaunchdServiceController(
+        services=[LaunchdService(label=label, plist_path=target.plist_path)],
+        install_root=install_root,
+        uid=501,
+        runner=FakeRunner(responses),
+    )
+
+    observation = controller.inventory()[0]
+
+    assert observation.loaded is True
+    assert observation.pid is None
+    assert observation.healthy is False
+    assert controller.loaded_services() == (label,)
+    assert controller.running_services() == ()
+
+
+def test_runtime_health_checker_uses_approved_sha_and_one_shot_canary(
+    tmp_path: Path,
+):
+    install_root, target, _, responses = _runtime_fixture(tmp_path)
+    label = "ai.hermes.gateway-tradingastrid"
+    runner = FakeRunner(responses)
+    controller = LaunchdServiceController(
+        services=[LaunchdService(label=label, plist_path=target.plist_path)],
+        install_root=install_root,
+        uid=501,
+        runner=runner,
+    )
+    checker = RuntimeHealthChecker(
+        controller=controller,
+        gateway_targets=[target],
+        install_root=install_root,
+        uid=501,
+        runner=runner,
+        inject_failure="after_restart",
+    )
+
+    first = checker.check(expected_sha="deployed-sha", services=(label,))
+    second = checker.check(expected_sha="deployed-sha", services=(label,))
+
+    assert first.healthy is False
+    assert any(check.name == "injected:after_restart" for check in first.checks)
+    assert second.healthy is True
+    assert all(check.name != "injected:after_restart" for check in second.checks)
+
+
+def test_runtime_health_checker_rejects_service_only_health_without_gateway_target(
+    tmp_path: Path,
+):
+    install_root, target, _, responses = _runtime_fixture(tmp_path)
+    label = "ai.hermes.gateway-tradingastrid"
+    runner = FakeRunner(responses)
+    controller = LaunchdServiceController(
+        services=[LaunchdService(label=label, plist_path=target.plist_path)],
+        install_root=install_root,
+        uid=501,
+        runner=runner,
+    )
+    checker = RuntimeHealthChecker(
+        controller=controller,
+        gateway_targets=[],
+        install_root=install_root,
+        uid=501,
+        runner=runner,
+    )
+
+    report = checker.check(expected_sha="deployed-sha", services=(label,))
+
+    assert report.healthy is False
+    assert any(
+        check.name == "runtime:gateway_targets_configured" and not check.passed
+        for check in report.checks
+    )
 
 
 def _write_service_plist(path: Path, label: str, executable: Path, home: Path) -> None:
@@ -245,7 +393,8 @@ def test_repoint_runtime_files_backs_up_then_moves_wrapper_and_plists_to_dot_ven
     assert result.backup_dir == backup_dir
     assert result.changed_files == (wrapper, gateway_plist, dashboard_plist)
     assert str(new_hermes) in wrapper.read_text(encoding="utf-8")
-    assert stat.S_IMODE(wrapper.stat().st_mode) == 0o755
+    if os.name != "nt":
+        assert stat.S_IMODE(wrapper.stat().st_mode) == 0o755
     for plist_path in (gateway_plist, dashboard_plist):
         with plist_path.open("rb") as handle:
             plist = plistlib.load(handle)

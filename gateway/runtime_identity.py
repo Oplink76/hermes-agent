@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import subprocess
 import sys
-import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from hermes_constants import _get_platform_default_hermes_home
+from utils import atomic_json_write
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -79,6 +83,7 @@ def _active_profile() -> str:
 
         return get_active_profile_name() or "default"
     except Exception:
+        logger.debug("Could not resolve active Hermes profile", exc_info=True)
         return "default"
 
 
@@ -114,28 +119,7 @@ def write_runtime_identity(
 ) -> Path:
     """Atomically write ``identity`` with owner-only permissions."""
     path = runtime_identity_path(hermes_home)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        dir=path.parent,
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(identity.to_dict(), handle, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
-        path.chmod(0o600)
-    except Exception:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        temporary_path.unlink(missing_ok=True)
-        raise
+    atomic_json_write(path, identity.to_dict(), mode=0o600, sort_keys=True)
     return path
 
 

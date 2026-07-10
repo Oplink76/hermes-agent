@@ -1,3 +1,5 @@
+environment: production
+
 sync:
   repo: /Users/cloudadvisor/.hermes/hermes-agent
   worktree: /Users/cloudadvisor/.hermes/worktrees/hermes-upstream-sync
@@ -6,3 +8,34 @@ sync:
   candidate_branch: auto-sync/upstream
   repo_slug: Oplink76/hermes-agent
   lock_path: /Users/cloudadvisor/.hermes/locks/upstream-sync.lock
+  conflict_resolver:
+    codex_executable: /Users/cloudadvisor/.local/bin/codex
+    prompt: Resolve only the current Git merge conflicts. Do not commit, push, or change remotes.
+
+runtime:
+  install_root: /Users/cloudadvisor/.hermes/hermes-agent
+  uid: 501
+  services:
+    - label: ai.hermes.gateway
+      plist: /Users/cloudadvisor/Library/LaunchAgents/ai.hermes.gateway.plist
+    - label: com.cloudadvisor.hermes-dashboard
+      plist: /Users/cloudadvisor/Library/LaunchAgents/com.cloudadvisor.hermes-dashboard.plist
+  gateways:
+    - profile: default
+      hermes_home: /Users/cloudadvisor/.hermes
+      plist: /Users/cloudadvisor/Library/LaunchAgents/ai.hermes.gateway.plist
+
+deploy:
+  origin: origin
+  repo_slug: Oplink76/hermes-agent
+  record_root: /Users/cloudadvisor/.hermes/recovery/deployments
+  lock_path: /Users/cloudadvisor/.hermes/locks/deploy.lock
+  snapshot_root: /Users/cloudadvisor/.hermes/recovery/predeploy
+  hermes_homes:
+    - /Users/cloudadvisor/.hermes
+  # Fail closed until Package 1 has a verified completion receipt.
+  preservation_command: [/usr/bin/false]
+  required_approver: Ole Ørum-Petersen
+  required_check: All required checks pass
+  postinstall_commands:
+    - [.venv/bin/python, scripts/docker_config_migrate.py]

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import fcntl
-import os
+import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -13,6 +13,7 @@ from typing import Protocol
 from hermes_constants import get_hermes_home
 
 from .command import CommandRunner, SubprocessCommandRunner
+from .locking import try_exclusive_file_lock
 
 
 FIXED_CANDIDATE_BRANCH = "auto-sync/upstream"
@@ -92,6 +93,36 @@ class ConflictResolver(Protocol):
     def resolve(self, worktree: Path, runner: CommandRunner) -> bool: ...
 
 
+@dataclass(frozen=True)
+class CodexConflictResolver:
+    """Run Codex with fixed ephemeral, no-user-config workspace isolation."""
+
+    executable: Path
+    prompt: str
+
+    def __post_init__(self) -> None:
+        if self.executable.name not in {"codex", "codex.exe"}:
+            raise ValueError("conflict resolver must use the Codex executable")
+        if not self.prompt.strip():
+            raise ValueError("conflict resolver prompt must not be empty")
+
+    @property
+    def command(self) -> tuple[str, ...]:
+        return (
+            str(self.executable),
+            "exec",
+            "--ignore-user-config",
+            "--sandbox",
+            "workspace-write",
+            "--ephemeral",
+            self.prompt,
+        )
+
+    def resolve(self, worktree: Path, runner: CommandRunner) -> bool:
+        completed = runner.run(list(self.command), cwd=worktree, timeout=1800)
+        return completed.returncode == 0
+
+
 def _run(
     runner: CommandRunner,
     argv: list[str],
@@ -131,21 +162,76 @@ def _result(
     )
 
 
+def _conflict_marker_check(worktree: Path, runner: CommandRunner) -> CheckResult:
+    listed = _run(
+        runner,
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        worktree,
+    )
+    if listed.returncode != 0:
+        detail = (listed.stderr or listed.stdout or "").strip()
+        return CheckResult("conflict_markers", "failed", detail)
+    for relative in (listed.stdout or "").split("\0"):
+        if not relative or Path(relative).name == "package-lock.json":
+            continue
+        path = worktree / relative
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    if line.startswith(("<<<<<<< ", ">>>>>>> ")):
+                        return CheckResult(
+                            "conflict_markers",
+                            "failed",
+                            f"{relative}:{line_number}",
+                        )
+        except OSError as exc:
+            return CheckResult("conflict_markers", "failed", str(exc))
+    return CheckResult("conflict_markers", "passed")
+
+
 def _verify(worktree: Path, runner: CommandRunner) -> list[CheckResult]:
     checks: list[CheckResult] = []
     commands = [
-        ("diff_check", ["git", "diff", "--check"], 300, {0}),
-        ("unmerged_index", ["git", "ls-files", "-u"], 300, {0}),
-        (
-            "conflict_markers",
-            ["rg", "-n", "^(<<<<<<< |>>>>>>> )", "--glob", "!package-lock.json", "."],
-            300,
-            {1},
-        ),
+        ("diff_check", ["git", "diff", "--check"], 300),
+        ("unmerged_index", ["git", "ls-files", "-u"], 300),
+    ]
+    for name, argv, timeout in commands:
+        completed = _run(runner, argv, worktree, timeout=timeout)
+        detail = (completed.stderr or completed.stdout or "").strip()
+        if completed.returncode != 0:
+            checks.append(CheckResult(name=name, status="failed", detail=detail))
+            return checks
+        if name == "unmerged_index" and _output(completed):
+            checks.append(
+                CheckResult(
+                    name=name, status="failed", detail="unmerged index entries remain"
+                )
+            )
+            return checks
+        checks.append(CheckResult(name=name, status="passed"))
+
+    marker_check = _conflict_marker_check(worktree, runner)
+    checks.append(marker_check)
+    if marker_check.status != "passed":
+        return checks
+
+    bash = shutil.which("bash")
+    if bash is None:
+        checks.append(
+            CheckResult(
+                "tests",
+                "failed",
+                "bash is required to run the canonical scripts/run_tests.sh wrapper",
+            )
+        )
+        return checks
+    commands = [
         (
             "compileall",
             [
-                "python",
+                sys.executable,
                 "-m",
                 "compileall",
                 "-q",
@@ -156,11 +242,11 @@ def _verify(worktree: Path, runner: CommandRunner) -> list[CheckResult]:
                 "cron",
             ],
             600,
-            {0},
         ),
         (
             "tests",
             [
+                bash,
                 "scripts/run_tests.sh",
                 "tests/hermes_cli/test_kanban_db.py",
                 "tests/hermes_cli/test_update_autostash.py",
@@ -169,19 +255,13 @@ def _verify(worktree: Path, runner: CommandRunner) -> list[CheckResult]:
                 "-q",
             ],
             1800,
-            {0},
         ),
     ]
-    for name, argv, timeout, accepted_codes in commands:
+    for name, argv, timeout in commands:
         completed = _run(runner, argv, worktree, timeout=timeout)
         detail = (completed.stderr or completed.stdout or "").strip()
-        if completed.returncode not in accepted_codes:
+        if completed.returncode != 0:
             checks.append(CheckResult(name=name, status="failed", detail=detail))
-            return checks
-        if name == "unmerged_index" and _output(completed):
-            checks.append(
-                CheckResult(name=name, status="failed", detail="unmerged index entries remain")
-            )
             return checks
         checks.append(CheckResult(name=name, status="passed"))
     return checks
@@ -213,22 +293,22 @@ def run(
 ) -> SyncResult:
     runner = runner or SubprocessCommandRunner()
     transitions = [SyncState.LOCKED]
-    config.lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-    with config.lock_path.open("a+") as lock_handle:
-        os.chmod(config.lock_path, 0o600)
-        try:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+    with try_exclusive_file_lock(config.lock_path) as acquired:
+        if not acquired:
             return _result(SyncState.LOCKED, transitions)
 
         for remote in (config.origin, config.upstream):
-            fetched = _run(runner, ["git", "fetch", remote, "main"], config.repo, timeout=600)
+            fetched = _run(
+                runner, ["git", "fetch", remote, "main"], config.repo, timeout=600
+            )
             if fetched.returncode != 0:
                 return _result(SyncState.NEEDS_DECISION, transitions)
         transitions.append(SyncState.FETCHED)
 
-        base_result = _run(runner, ["git", "rev-parse", f"{config.origin}/main"], config.repo)
+        base_result = _run(
+            runner, ["git", "rev-parse", f"{config.origin}/main"], config.repo
+        )
         upstream_result = _run(
             runner,
             ["git", "rev-parse", f"{config.upstream}/main"],
@@ -282,7 +362,9 @@ def run(
             ["git", "rev-parse", candidate_ref],
             config.repo,
         )
-        previous_candidate_sha = _output(previous_result) if previous_result.returncode == 0 else ""
+        previous_candidate_sha = (
+            _output(previous_result) if previous_result.returncode == 0 else ""
+        )
 
         branch_result = _run(
             runner,
@@ -352,6 +434,34 @@ def run(
                     upstream_sha=upstream_sha,
                     risk="conflict",
                 )
+            merge_head = _run(
+                runner,
+                ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+                config.worktree,
+            )
+            if merge_head.returncode != 0 or _output(merge_head) != upstream_sha:
+                transitions.append(SyncState.NEEDS_DECISION)
+                return _result(
+                    SyncState.NEEDS_DECISION,
+                    transitions,
+                    base_sha=base_sha,
+                    upstream_sha=upstream_sha,
+                    risk="resolver_did_not_preserve_merge_state",
+                )
+            committed = _run(
+                runner,
+                ["git", "commit", "--no-edit"],
+                config.worktree,
+            )
+            if committed.returncode != 0:
+                transitions.append(SyncState.NEEDS_DECISION)
+                return _result(
+                    SyncState.NEEDS_DECISION,
+                    transitions,
+                    base_sha=base_sha,
+                    upstream_sha=upstream_sha,
+                    risk="resolved_merge_commit_failed",
+                )
             transitions.append(SyncState.AI_RESOLVED)
 
         checks = _verify(config.worktree, runner)
@@ -383,7 +493,9 @@ def run(
                 checks=checks,
             )
         candidate_sha = _output(candidate_result)
-        changed_files = tuple(line for line in _output(changed_result).splitlines() if line)
+        changed_files = tuple(
+            line for line in _output(changed_result).splitlines() if line
+        )
 
         pushed = _push_candidate(config, runner, previous_candidate_sha)
         if pushed.returncode != 0:
@@ -420,9 +532,11 @@ def run(
             github.update_pull_request(pr_number, title=title, body=body)
         transitions.append(SyncState.PR_UPDATED)
         custom_prefixes = ("gateway/", "hermes_cli/kanban", "ops/cloudadvisor/")
-        risk = "fork_customizations_touched" if any(
-            path.startswith(custom_prefixes) for path in changed_files
-        ) else "upstream_only"
+        risk = (
+            "fork_customizations_touched"
+            if any(path.startswith(custom_prefixes) for path in changed_files)
+            else "upstream_only"
+        )
         return _result(
             SyncState.PR_UPDATED,
             transitions,

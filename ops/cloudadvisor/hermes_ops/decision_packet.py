@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from utils import atomic_json_write, atomic_replace
 
 
 @dataclass(frozen=True)
 class DecisionPacket:
+    pr_number: int
+    candidate_sha: str
     upstream_commit_count: int
     fork_custom_areas_touched: tuple[str, ...]
     test_results: tuple[dict[str, str], ...]
@@ -44,12 +48,25 @@ class DecisionPacketArtifacts:
     sha256: str
 
 
-def _atomic_write(path: Path, content: str) -> None:
+def _atomic_text_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(content, encoding="utf-8")
-    temporary.chmod(0o600)
-    os.replace(temporary, path)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(name)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        atomic_replace(temporary, path)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def write_decision_packet(
@@ -59,7 +76,6 @@ def write_decision_packet(
     json_path = prefix.with_suffix(".json")
     markdown_path = prefix.with_suffix(".md")
     payload = packet.to_dict()
-    json_content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     recommendation = packet.recommendation if packet.approve_available else "Wait"
     tests = "\n".join(
         f"- {result['name']}: {result['status']}" for result in packet.test_results
@@ -68,6 +84,8 @@ def write_decision_packet(
         "# Hermes Upstream Sync Decision\n\n"
         f"**Recommendation:** {recommendation}\n\n"
         f"**Approve available:** {'yes' if packet.approve_available else 'no'}\n\n"
+        f"- Pull request: #{packet.pr_number}\n"
+        f"- Candidate SHA: `{packet.candidate_sha}`\n"
         f"- Upstream commits: {packet.upstream_commit_count}\n"
         f"- Fork areas touched: {', '.join(packet.fork_custom_areas_touched) or 'none'}\n"
         f"- Required CI (`All required checks pass`): {packet.ci_status}\n"
@@ -79,11 +97,9 @@ def write_decision_packet(
         "## Risk\n\n"
         f"{packet.risk_explanation}\n"
     )
-    _atomic_write(json_path, json_content)
-    _atomic_write(markdown_path, markdown_content)
-    digest = hashlib.sha256(
-        json_path.read_bytes() + markdown_path.read_bytes()
-    ).hexdigest()
+    atomic_json_write(json_path, payload, mode=0o600, sort_keys=True)
+    _atomic_text_write(markdown_path, markdown_content)
+    digest = hashlib.sha256(json_path.read_bytes()).hexdigest()
     return DecisionPacketArtifacts(
         json_path=json_path,
         markdown_path=markdown_path,

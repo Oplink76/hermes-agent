@@ -67,7 +67,8 @@ def test_identity_is_captured_once_and_written_atomically_with_private_mode(
     assert payload["ppid"] == os.getppid()
     assert payload["profile"] == "tradingastrid"
     assert payload["started_at"] == "2026-07-10T09:30:00+00:00"
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert list(path.parent.glob(".gateway.json.*")) == []
 
 

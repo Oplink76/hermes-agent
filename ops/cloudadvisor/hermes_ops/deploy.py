@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
-import tempfile
+import stat
 import uuid
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
@@ -15,6 +16,11 @@ from typing import Callable, Protocol
 
 from .command import CommandRunner
 from .health import HealthCheck, HealthReport
+from .locking import try_exclusive_file_lock
+from utils import atomic_json_write
+
+
+logger = logging.getLogger(__name__)
 
 
 class PreflightError(RuntimeError):
@@ -32,13 +38,46 @@ class ApprovalRecord:
     merge_sha: str
     approved_at: str
     decision_packet_sha256: str
+    artifact_path: Path
+    artifact_sha256: str
+    decision_packet_path: Path
+
+    @classmethod
+    def load(cls, path: Path) -> "ApprovalRecord":
+        try:
+            artifact_path = Path(path).expanduser().resolve(strict=True)
+        except OSError as exc:
+            raise PreflightError("approval artifact is missing or unreadable") from exc
+        try:
+            if os.name != "nt" and stat.S_IMODE(artifact_path.stat().st_mode) & 0o222:
+                raise PreflightError("approval artifact must be read-only")
+            raw = artifact_path.read_bytes()
+        except OSError as exc:
+            raise PreflightError("approval artifact is missing or unreadable") from exc
+        try:
+            payload = json.loads(raw)
+            packet_path = Path(payload["decision_packet"]).expanduser()
+            if not packet_path.is_absolute():
+                packet_path = artifact_path.parent / packet_path
+            return cls(
+                approver=str(payload["approver"]),
+                pr_number=int(payload["pr_number"]),
+                merge_sha=str(payload["merge_sha"]),
+                approved_at=str(payload["approved_at"]),
+                decision_packet_sha256=str(payload["decision_packet_sha256"]),
+                artifact_path=artifact_path,
+                artifact_sha256=hashlib.sha256(raw).hexdigest(),
+                decision_packet_path=packet_path.resolve(strict=True),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError) as exc:
+            raise PreflightError("approval artifact is incomplete or invalid") from exc
 
 
 @dataclass(frozen=True)
 class DeployRequest:
     sha: str
     pr_number: int
-    approval_record: ApprovalRecord
+    approval_record: Path
     actor: str
 
 
@@ -47,6 +86,7 @@ class DeployConfig:
     install_root: Path
     origin: str
     record_root: Path
+    lock_path: Path | None = None
     required_approver: str = "Ole Ørum-Petersen"
     required_check: str = "All required checks pass"
     postinstall_commands: tuple[tuple[str, ...], ...] = ()
@@ -154,6 +194,7 @@ class SnapshotProvider(Protocol):
 
 
 class ServiceController(Protocol):
+    def loaded_services(self) -> tuple[str, ...]: ...
     def running_services(self) -> tuple[str, ...]: ...
     def inventory(self) -> object: ...
     def stop(self, services: tuple[str, ...]) -> None: ...
@@ -179,25 +220,7 @@ class DeploymentStore:
 
     def write(self, record: DeploymentRecord) -> None:
         path = self.root / f"{record.id}.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        temporary = Path(name)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(record.to_dict(), handle, indent=2, sort_keys=True)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-            path.chmod(0o600)
-        except Exception:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            temporary.unlink(missing_ok=True)
-            raise
+        atomic_json_write(path, record.to_dict(), mode=0o600, sort_keys=True)
 
 
 def _jsonable(value):
@@ -237,10 +260,10 @@ def _run_required(
 
 def _validate_approval(
     request: DeployRequest,
+    approval: ApprovalRecord,
     config: DeployConfig,
     evidence: ReleaseEvidence,
 ) -> None:
-    approval = request.approval_record
     if not request.actor.strip():
         raise PreflightError("deployment actor is missing")
     if approval.approver != config.required_approver:
@@ -262,6 +285,44 @@ def _validate_approval(
         raise PreflightError("approval record timestamp must include a timezone")
     if not re.fullmatch(r"[0-9a-f]{64}", approval.decision_packet_sha256):
         raise PreflightError("approval record decision packet hash is invalid")
+    try:
+        artifact_sha = hashlib.sha256(approval.artifact_path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise PreflightError(
+            "approval artifact is missing during verification"
+        ) from exc
+    if artifact_sha != approval.artifact_sha256:
+        raise PreflightError("approval artifact changed while being verified")
+    try:
+        packet_bytes = approval.decision_packet_path.read_bytes()
+    except OSError as exc:
+        raise PreflightError("decision packet is missing during verification") from exc
+    actual_packet_sha = hashlib.sha256(packet_bytes).hexdigest()
+    if actual_packet_sha != approval.decision_packet_sha256:
+        raise PreflightError("decision packet hash does not match the approval record")
+    try:
+        packet = json.loads(packet_bytes)
+        packet_tests = packet["test_results"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise PreflightError("decision packet is incomplete or invalid") from exc
+    packet_ready = bool(
+        isinstance(packet, dict)
+        and packet.get("pr_number") == request.pr_number
+        and packet.get("candidate_sha") == request.sha
+        and packet.get("approve_available") is True
+        and packet.get("ci_status") == "success"
+        and packet.get("independent_review_status") == "green"
+        and isinstance(packet_tests, list)
+        and packet_tests
+        and all(
+            isinstance(result, dict) and result.get("status") == "passed"
+            for result in packet_tests
+        )
+    )
+    if not packet_ready:
+        raise PreflightError(
+            "decision packet is not approval-ready for this PR and SHA"
+        )
     if not evidence.merged:
         raise PreflightError("pull request is not merged")
     if evidence.required_check != config.required_check:
@@ -293,18 +354,49 @@ def deploy(
     store: RecordStore | None = None,
     fingerprint_fn: Callable[[Path], str] = dependency_fingerprint,
 ) -> DeploymentRecord:
+    lock_path = config.lock_path or (Path(config.record_root) / "deploy.lock")
+    with try_exclusive_file_lock(lock_path) as acquired:
+        if not acquired:
+            raise PreflightError("another deployment is already in progress")
+        return _deploy_locked(
+            request,
+            config=config,
+            runner=runner,
+            github=github,
+            snapshots=snapshots,
+            services=services,
+            health=health,
+            store=store,
+            fingerprint_fn=fingerprint_fn,
+        )
+
+
+def _deploy_locked(
+    request: DeployRequest,
+    *,
+    config: DeployConfig,
+    runner: CommandRunner,
+    github: ReleaseVerifier,
+    snapshots: SnapshotProvider,
+    services: ServiceController,
+    health: HealthChecker,
+    store: RecordStore | None = None,
+    fingerprint_fn: Callable[[Path], str] = dependency_fingerprint,
+) -> DeploymentRecord:
     root = Path(config.install_root).expanduser().resolve(strict=True)
     record_store = store or DeploymentStore(config.record_root)
 
+    approval = ApprovalRecord.load(request.approval_record)
     evidence = github.verify(request.pr_number)
-    _validate_approval(request, config, evidence)
+    _validate_approval(request, approval, config, evidence)
     preflight_checks = [
         HealthCheck(
             "preflight:approval",
             True,
-            f"approver={request.approval_record.approver} "
+            f"approver={approval.approver} "
             f"pr={request.pr_number} actor={request.actor} "
-            f"packet={request.approval_record.decision_packet_sha256}",
+            f"approval_artifact={approval.artifact_sha256} "
+            f"packet={approval.decision_packet_sha256}",
         ),
         HealthCheck(
             "preflight:github",
@@ -408,6 +500,8 @@ def deploy(
         record_store.write(record)
         return record
     except Exception as failure:
+        if not isinstance(failure, _HealthFailure):
+            logger.exception("Exact-SHA deployment failed; starting rollback")
         if isinstance(failure, _HealthFailure):
             candidate_report = failure.report
         rollback = {"trigger": str(failure), "status": "running"}
@@ -419,7 +513,14 @@ def deploy(
         )
         record_store.write(record)
         try:
-            services.stop(prior_services)
+            loaded_during_failure = services.loaded_services()
+            candidate_services_loaded = tuple(
+                service
+                for service in prior_services
+                if service in loaded_during_failure
+            )
+            if candidate_services_loaded:
+                services.stop(candidate_services_loaded)
             _run_required(
                 runner,
                 ["git", "switch", "--detach", previous_sha],
@@ -464,6 +565,7 @@ def deploy(
                 rollback=rollback,
             )
         except Exception as rollback_failure:
+            logger.exception("Exact-SHA deployment rollback failed")
             record = replace(
                 record,
                 status="rollback_failed",

@@ -20,7 +20,8 @@ class HealthReport:
 
     @property
     def healthy(self) -> bool:
-        return all(check.passed for check in self.checks if check.mandatory)
+        mandatory = tuple(check for check in self.checks if check.mandatory)
+        return bool(mandatory) and all(check.passed for check in mandatory)
 
 
 def combine_health_reports(*reports: HealthReport) -> HealthReport:

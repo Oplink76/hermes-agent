@@ -39,3 +39,7 @@ def test_only_mandatory_health_failures_block_deployment():
 
     assert report.healthy is True
     assert combine_health_reports(report, blocking).healthy is False
+
+
+def test_empty_health_report_is_not_healthy():
+    assert HealthReport(checks=()).healthy is False

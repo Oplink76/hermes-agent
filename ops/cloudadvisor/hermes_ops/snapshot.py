@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .command import CommandRunner
+from utils import atomic_json_write
 
 
 @dataclass(frozen=True)
@@ -129,28 +130,6 @@ def _run_required(
     return (completed.stdout or "").strip()
 
 
-def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temporary = Path(name)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        path.chmod(0o600)
-    except Exception:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        temporary.unlink(missing_ok=True)
-        raise
-
-
 def _sqlite_files(hermes_homes: Iterable[Path]) -> tuple[Path, ...]:
     suffixes = {".db", ".sqlite", ".sqlite3"}
     excluded_directories = {
@@ -239,7 +218,7 @@ def create_snapshot(
         databases=tuple(database_records),
         manifest_path=manifest,
     )
-    _write_json_atomic(manifest, record.to_dict())
+    atomic_json_write(manifest, record.to_dict(), mode=0o600, sort_keys=True)
     return record
 
 

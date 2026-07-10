@@ -14,6 +14,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .command import CommandRunner
+from .health import (
+    HealthCheck,
+    HealthReport,
+    combine_health_reports,
+    evaluate_runtime_health,
+)
 
 
 @dataclass(frozen=True)
@@ -50,6 +56,234 @@ class RuntimeObservation:
 class RuntimeRepointResult:
     backup_dir: Path
     changed_files: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class LaunchdService:
+    label: str
+    plist_path: Path
+
+
+@dataclass(frozen=True)
+class ServiceObservation:
+    label: str
+    loaded: bool
+    pid: int | None
+    command: str | None
+    plist_executable: str | None
+    plist_uses_dot_venv: bool
+    process_uses_dot_venv: bool
+
+    @property
+    def healthy(self) -> bool:
+        return bool(
+            self.loaded
+            and self.pid is not None
+            and self.command
+            and self.plist_uses_dot_venv
+            and self.process_uses_dot_venv
+        )
+
+
+def _service_health_check(
+    label: str,
+    observation: ServiceObservation | None,
+) -> HealthCheck:
+    passed = bool(observation and observation.healthy)
+    return HealthCheck(
+        name=f"service:{label}",
+        passed=passed,
+        detail=(
+            "launchd owner, plist, command, and .venv agree"
+            if passed
+            else "service missing or launchd, plist, command, and .venv disagree"
+        ),
+    )
+
+
+class LaunchdServiceController:
+    """Stop/start only the explicitly configured launchd service set."""
+
+    def __init__(
+        self,
+        *,
+        services: Iterable[LaunchdService],
+        install_root: Path,
+        uid: int,
+        runner: CommandRunner,
+    ):
+        self.services = {service.label: service for service in services}
+        self.install_root = Path(install_root).expanduser().resolve(strict=False)
+        self.uid = int(uid)
+        self.runner = runner
+
+    def _domain_target(self, label: str) -> str:
+        return f"gui/{self.uid}/{label}"
+
+    def _required(self, argv: list[str]) -> None:
+        completed = self.runner.run(argv, cwd=self.install_root, timeout=120)
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip()
+            raise RuntimeError(f"command failed ({' '.join(argv)}): {detail}")
+
+    def inventory(self) -> tuple[ServiceObservation, ...]:
+        observations = []
+        dot_venv = self.install_root / ".venv"
+        for service in self.services.values():
+            plist = _load_plist(service.plist_path)
+            arguments = plist.get("ProgramArguments") if plist else None
+            arguments = arguments if isinstance(arguments, list) else []
+            plist_executable = arguments[0] if arguments else None
+            launchd_result = self.runner.run(
+                ["launchctl", "print", self._domain_target(service.label)],
+                cwd=self.install_root,
+                timeout=30,
+            )
+            loaded = launchd_result.returncode == 0
+            launchd_output = (
+                (launchd_result.stdout or "").strip() or None if loaded else None
+            )
+            pid = _launchd_pid(launchd_output)
+            command = None
+            if pid is not None:
+                command = _completed_stdout(
+                    self.runner,
+                    ["ps", "-p", str(pid), "-o", "command="],
+                    cwd=self.install_root,
+                )
+            observations.append(
+                ServiceObservation(
+                    label=service.label,
+                    loaded=loaded,
+                    pid=pid,
+                    command=command,
+                    plist_executable=(
+                        str(plist_executable) if plist_executable is not None else None
+                    ),
+                    plist_uses_dot_venv=_lexically_within(
+                        plist_executable,
+                        dot_venv,
+                    ),
+                    process_uses_dot_venv=bool(command and str(dot_venv) in command),
+                )
+            )
+        return tuple(observations)
+
+    def loaded_services(self) -> tuple[str, ...]:
+        return tuple(
+            observation.label for observation in self.inventory() if observation.loaded
+        )
+
+    def running_services(self) -> tuple[str, ...]:
+        return tuple(
+            observation.label
+            for observation in self.inventory()
+            if observation.pid is not None
+        )
+
+    def stop(self, services: tuple[str, ...]) -> None:
+        for label in services:
+            if label not in self.services:
+                raise RuntimeError(f"refusing to stop unconfigured service: {label}")
+            self._required(["launchctl", "bootout", self._domain_target(label)])
+
+    def start(self, services: tuple[str, ...]) -> None:
+        for label in services:
+            service = self.services.get(label)
+            if service is None:
+                raise RuntimeError(f"refusing to start unconfigured service: {label}")
+            self._required(["plutil", "-lint", str(service.plist_path)])
+            self._required([
+                "launchctl",
+                "bootstrap",
+                f"gui/{self.uid}",
+                str(service.plist_path),
+            ])
+            self._required(["launchctl", "kickstart", self._domain_target(label)])
+
+
+class RuntimeHealthChecker:
+    """Production deploy health matrix for launchd services and gateways."""
+
+    def __init__(
+        self,
+        *,
+        controller: LaunchdServiceController,
+        gateway_targets: Iterable[RuntimeTarget],
+        install_root: Path,
+        uid: int,
+        runner: CommandRunner,
+        inject_failure: str | None = None,
+    ):
+        self.controller = controller
+        self.gateway_targets = tuple(gateway_targets)
+        self.install_root = Path(install_root)
+        self.uid = int(uid)
+        self.runner = runner
+        self.inject_failure = inject_failure
+
+    def check(
+        self,
+        *,
+        expected_sha: str,
+        services: tuple[str, ...],
+    ) -> HealthReport:
+        expected_services = set(services)
+        service_observations = {
+            observation.label: observation
+            for observation in self.controller.inventory()
+        }
+        service_report = HealthReport(
+            checks=tuple(
+                _service_health_check(label, service_observations.get(label))
+                for label in sorted(expected_services)
+            )
+        )
+
+        configuration_report = HealthReport(
+            checks=(
+                HealthCheck(
+                    "runtime:gateway_targets_configured",
+                    bool(self.gateway_targets),
+                    (
+                        "gateway targets configured"
+                        if self.gateway_targets
+                        else "no gateway runtime target configured"
+                    ),
+                ),
+            )
+        )
+        gateway_observations = inventory(
+            self.gateway_targets,
+            install_root=self.install_root,
+            expected_sha=expected_sha,
+            uid=self.uid,
+            runner=self.runner,
+        )
+        runtime_report = evaluate_runtime_health(
+            gateway_observations,
+            expected_profiles=(target.profile for target in self.gateway_targets),
+        )
+        report = combine_health_reports(
+            service_report,
+            configuration_report,
+            runtime_report,
+        )
+        if self.inject_failure == "after_restart":
+            self.inject_failure = None
+            report = combine_health_reports(
+                report,
+                HealthReport(
+                    checks=(
+                        HealthCheck(
+                            "injected:after_restart",
+                            False,
+                            "recovery canary failure injection",
+                        ),
+                    )
+                ),
+            )
+        return report
 
 
 def _completed_stdout(
@@ -138,17 +372,16 @@ def inventory(
     targets: Iterable[RuntimeTarget],
     *,
     install_root: Path,
+    expected_sha: str,
     uid: int,
     runner: CommandRunner,
 ) -> tuple[RuntimeObservation, ...]:
     """Compare launchd, plist, process, Git, and runtime-manifest identity."""
     root = Path(install_root).expanduser().resolve(strict=False)
     expected_python = str((root / ".venv" / "bin" / "python").resolve(strict=False))
-    expected_sha = _completed_stdout(
-        runner,
-        ["git", "rev-parse", "HEAD"],
-        cwd=root,
-    )
+    expected_sha = str(expected_sha).strip()
+    if not expected_sha:
+        raise ValueError("expected_sha must come from an immutable deployment record")
     observations: list[RuntimeObservation] = []
 
     for target in targets:
@@ -280,7 +513,8 @@ def _temporary_file(path: Path, data: bytes, mode: int) -> Path:
     fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(name)
     try:
-        os.fchmod(fd, mode)
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, mode)
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import stat
 import subprocess
 from dataclasses import dataclass
@@ -9,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from ops.cloudadvisor.hermes_ops.deploy import (
-    ApprovalRecord,
     DeployConfig,
     DeployRequest,
     DeploymentRecord,
@@ -20,6 +21,7 @@ from ops.cloudadvisor.hermes_ops.deploy import (
     deploy,
 )
 from ops.cloudadvisor.hermes_ops.health import HealthCheck, HealthReport
+from ops.cloudadvisor.hermes_ops.locking import try_exclusive_file_lock
 
 
 @dataclass(frozen=True)
@@ -80,20 +82,68 @@ class FakeServices:
     def __init__(self, events):
         self.events = events
         self.start_count = 0
+        self.running = (
+            "ai.hermes.gateway",
+            "com.cloudadvisor.hermes-dashboard",
+        )
+
+    def loaded_services(self) -> tuple[str, ...]:
+        self.events.append(("services", "captured"))
+        return self.running
 
     def running_services(self) -> tuple[str, ...]:
-        self.events.append(("services", "captured"))
-        return ("ai.hermes.gateway", "com.cloudadvisor.hermes-dashboard")
+        self.events.append(("services", "captured_running"))
+        return self.running
 
     def inventory(self):
         return {"generation": self.start_count}
 
     def stop(self, services: tuple[str, ...]) -> None:
+        if any(service not in self.running for service in services):
+            raise RuntimeError("service already stopped")
+        self.running = tuple(
+            service for service in self.running if service not in services
+        )
         self.events.append(("services_stopped", services))
 
     def start(self, services: tuple[str, ...]) -> None:
         self.start_count += 1
+        self.running = tuple(dict.fromkeys((*self.running, *services)))
         self.events.append(("services_started", services))
+
+
+class HalfStartedServices(FakeServices):
+    def start(self, services: tuple[str, ...]) -> None:
+        if self.start_count == 0:
+            self.start_count = 1
+            self.running = tuple(dict.fromkeys((*self.running, *services)))
+            self.events.append(("services_half_started", services))
+            raise RuntimeError("kickstart failed after bootstrap")
+        super().start(services)
+
+
+class LoadedInactiveServices(FakeServices):
+    inactive_label = "ai.hermes.gateway-intentionally-inactive"
+
+    def __init__(self, events):
+        super().__init__(events)
+        self.loaded = (*self.running, self.inactive_label)
+
+    def loaded_services(self) -> tuple[str, ...]:
+        return self.loaded
+
+    def running_services(self) -> tuple[str, ...]:
+        return self.running
+
+    def stop(self, services: tuple[str, ...]) -> None:
+        self.loaded = tuple(
+            service for service in self.loaded if service not in services
+        )
+        super().stop(services)
+
+    def start(self, services: tuple[str, ...]) -> None:
+        self.loaded = tuple(dict.fromkeys((*self.loaded, *services)))
+        super().start(services)
 
 
 class FakeHealth:
@@ -116,21 +166,45 @@ class RecordingStore:
         self.records.append(record)
 
 
-def _approval(sha: str = "new-sha") -> ApprovalRecord:
-    return ApprovalRecord(
-        approver="Ole Ørum-Petersen",
-        pr_number=41,
-        merge_sha=sha,
-        approved_at="2026-07-10T10:00:00+00:00",
-        decision_packet_sha256="a" * 64,
+def _approval(
+    tmp_path: Path,
+    sha: str = "new-sha",
+    *,
+    packet_overrides: dict[str, object] | None = None,
+) -> Path:
+    packet = tmp_path / "decision-packet.json"
+    packet_payload = {
+        "pr_number": 41,
+        "candidate_sha": sha,
+        "approve_available": True,
+        "ci_status": "success",
+        "independent_review_status": "green",
+        "test_results": [{"name": "release suite", "status": "passed"}],
+    }
+    packet_payload.update(packet_overrides or {})
+    packet.write_text(json.dumps(packet_payload), encoding="utf-8")
+    packet_sha = hashlib.sha256(packet.read_bytes()).hexdigest()
+    artifact = tmp_path / "approval.json"
+    artifact.write_text(
+        json.dumps({
+            "approver": "Ole Ørum-Petersen",
+            "pr_number": 41,
+            "merge_sha": sha,
+            "approved_at": "2026-07-10T10:00:00+00:00",
+            "decision_packet": str(packet),
+            "decision_packet_sha256": packet_sha,
+        }),
+        encoding="utf-8",
     )
+    artifact.chmod(0o444)
+    return artifact
 
 
-def _request(sha: str = "new-sha") -> DeployRequest:
+def _request(tmp_path: Path, sha: str = "new-sha") -> DeployRequest:
     return DeployRequest(
         sha=sha,
         pr_number=41,
-        approval_record=_approval(sha),
+        approval_record=_approval(tmp_path, sha),
         actor="Oplink76",
     )
 
@@ -246,7 +320,8 @@ def test_deployment_store_atomically_replaces_one_private_json_record(tmp_path: 
 
     path = tmp_path / "records" / "deployment-1.json"
     assert json.loads(path.read_text(encoding="utf-8"))["status"] == "deployed"
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert list(path.parent.glob(".deployment-1.json.*")) == []
 
 
@@ -259,7 +334,7 @@ def test_successful_deploy_is_exact_sha_snapshot_first_and_health_gated(tmp_path
     store = RecordingStore(events)
 
     record = deploy(
-        _request(),
+        _request(tmp_path),
         config=config,
         runner=runner,
         github=FakeGitHub(_evidence()),
@@ -307,7 +382,7 @@ def test_health_failure_rolls_back_source_state_services_and_health_checks(
 
     fingerprints = iter(("old-fingerprint", "new-fingerprint"))
     record = deploy(
-        _request(),
+        _request(tmp_path),
         config=config,
         runner=runner,
         github=FakeGitHub(_evidence()),
@@ -348,7 +423,7 @@ def test_candidate_service_start_counts_as_state_mutation_for_rollback(tmp_path:
     failing = HealthReport(checks=(HealthCheck("candidate-runtime", False),))
 
     record = deploy(
-        _request(),
+        _request(tmp_path),
         config=config,
         runner=FakeRunner(_responses(), events),
         github=FakeGitHub(_evidence()),
@@ -360,6 +435,81 @@ def test_candidate_service_start_counts_as_state_mutation_for_rollback(tmp_path:
 
     assert record.status == "rolled_back_healthy"
     assert snapshots.restored is True
+
+
+def test_pre_restart_failure_does_not_stop_already_unloaded_services_twice(
+    tmp_path: Path,
+):
+    events = []
+    responses = _responses()
+    responses[("env", "UV_PROJECT_ENVIRONMENT=.venv", "uv", "sync", "--locked")] = (
+        1,
+        "",
+        "sync failed",
+    )
+    snapshots = FakeSnapshots(events)
+
+    record = deploy(
+        _request(tmp_path),
+        config=_config(tmp_path),
+        runner=FakeRunner(responses, events),
+        github=FakeGitHub(_evidence()),
+        snapshots=snapshots,
+        services=FakeServices(events),
+        health=FakeHealth([_green("rollback-runtime")], events),
+        store=RecordingStore(events),
+    )
+
+    assert record.status == "rolled_back_healthy"
+    assert sum(event[0] == "services_stopped" for event in events) == 1
+    assert sum(event[0] == "services_started" for event in events) == 1
+    assert snapshots.restored is False
+
+
+def test_half_started_loaded_job_is_unloaded_before_rollback_restart(tmp_path: Path):
+    events = []
+    snapshots = FakeSnapshots(events)
+
+    record = deploy(
+        _request(tmp_path),
+        config=_config(tmp_path),
+        runner=FakeRunner(_responses(), events),
+        github=FakeGitHub(_evidence()),
+        snapshots=snapshots,
+        services=HalfStartedServices(events),
+        health=FakeHealth([_green("rollback-runtime")], events),
+        store=RecordingStore(events),
+    )
+
+    assert record.status == "rolled_back_healthy"
+    assert sum(event[0] == "services_stopped" for event in events) == 2
+    assert sum(event[0] == "services_half_started" for event in events) == 1
+    assert sum(event[0] == "services_started" for event in events) == 1
+    assert snapshots.restored is True
+
+
+def test_loaded_but_inactive_service_is_not_kickstarted_by_deploy(tmp_path: Path):
+    events = []
+    services = LoadedInactiveServices(events)
+
+    record = deploy(
+        _request(tmp_path),
+        config=_config(tmp_path),
+        runner=FakeRunner(_responses(), events),
+        github=FakeGitHub(_evidence()),
+        snapshots=FakeSnapshots(events),
+        services=services,
+        health=FakeHealth([_green("candidate-runtime")], events),
+        store=RecordingStore(events),
+    )
+
+    assert record.status == "deployed"
+    assert services.inactive_label in services.loaded
+    assert all(
+        services.inactive_label not in event[1]
+        for event in events
+        if event[0] in {"services_stopped", "services_started"}
+    )
 
 
 @pytest.mark.parametrize(
@@ -387,7 +537,7 @@ def test_preflight_rejects_dirty_install_or_non_origin_sha(
 
     with pytest.raises(PreflightError, match=message):
         deploy(
-            _request(),
+            _request(tmp_path),
             config=_config(tmp_path),
             runner=FakeRunner(responses, events),
             github=FakeGitHub(_evidence()),
@@ -402,3 +552,116 @@ def test_preflight_rejects_dirty_install_or_non_origin_sha(
         event[0] == "command" and event[1][:3] == ("git", "switch", "--detach")
         for event in events
     )
+
+
+def test_preflight_rejects_tampered_decision_packet(tmp_path: Path):
+    events = []
+    request = _request(tmp_path)
+    approval = json.loads(request.approval_record.read_text(encoding="utf-8"))
+    Path(approval["decision_packet"]).write_text("tampered\n", encoding="utf-8")
+
+    with pytest.raises(PreflightError, match="decision packet hash does not match"):
+        deploy(
+            request,
+            config=_config(tmp_path),
+            runner=FakeRunner(_responses(), events),
+            github=FakeGitHub(_evidence()),
+            snapshots=FakeSnapshots(events),
+            services=FakeServices(events),
+            health=FakeHealth([_green("unused")], events),
+            store=RecordingStore(events),
+        )
+
+    assert not any(event[0] == "snapshot" for event in events)
+
+
+def test_preflight_rejects_packet_without_green_independent_review(tmp_path: Path):
+    request = DeployRequest(
+        sha="new-sha",
+        pr_number=41,
+        approval_record=_approval(
+            tmp_path,
+            packet_overrides={
+                "approve_available": False,
+                "independent_review_status": "pending",
+            },
+        ),
+        actor="Oplink76",
+    )
+
+    with pytest.raises(PreflightError, match="not approval-ready"):
+        deploy(
+            request,
+            config=_config(tmp_path),
+            runner=FakeRunner(_responses()),
+            github=FakeGitHub(_evidence()),
+            snapshots=FakeSnapshots([]),
+            services=FakeServices([]),
+            health=FakeHealth([_green("unused")], []),
+            store=RecordingStore([]),
+        )
+
+
+def test_preflight_reports_missing_approval_artifact_as_a_gate_failure(tmp_path: Path):
+    request = DeployRequest(
+        sha="new-sha",
+        pr_number=41,
+        approval_record=tmp_path / "missing-approval.json",
+        actor="Oplink76",
+    )
+
+    with pytest.raises(PreflightError, match="approval artifact is missing"):
+        deploy(
+            request,
+            config=_config(tmp_path),
+            runner=FakeRunner(_responses()),
+            github=FakeGitHub(_evidence()),
+            snapshots=FakeSnapshots([]),
+            services=FakeServices([]),
+            health=FakeHealth([_green("unused")], []),
+            store=RecordingStore([]),
+        )
+
+
+def test_deploy_refuses_concurrent_invocation_before_preflight(tmp_path: Path):
+    config = _config(tmp_path)
+    lock_path = config.record_root / "deploy.lock"
+
+    with try_exclusive_file_lock(lock_path) as acquired:
+        assert acquired is True
+        with pytest.raises(PreflightError, match="already in progress"):
+            deploy(
+                _request(tmp_path),
+                config=config,
+                runner=FakeRunner(_responses()),
+                github=FakeGitHub(_evidence()),
+                snapshots=FakeSnapshots([]),
+                services=FakeServices([]),
+                health=FakeHealth([_green("unused")], []),
+                store=RecordingStore([]),
+            )
+
+
+def test_preflight_fails_closed_if_packet_disappears_during_verification(
+    tmp_path: Path,
+):
+    request = _request(tmp_path)
+    artifact = json.loads(request.approval_record.read_text(encoding="utf-8"))
+    packet = Path(artifact["decision_packet"])
+
+    class DeletingGitHub:
+        def verify(self, pr_number: int) -> ReleaseEvidence:
+            packet.unlink()
+            return _evidence()
+
+    with pytest.raises(PreflightError, match="decision packet is missing"):
+        deploy(
+            request,
+            config=_config(tmp_path),
+            runner=FakeRunner(_responses()),
+            github=DeletingGitHub(),
+            snapshots=FakeSnapshots([]),
+            services=FakeServices([]),
+            health=FakeHealth([_green("unused")], []),
+            store=RecordingStore([]),
+        )
