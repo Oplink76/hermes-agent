@@ -48,6 +48,12 @@ class TestIgnoreUserConfigEnvGate:
     """
 
     def _write_user_config(self, tmp_path, model_default):
+        # NOTE: the model value is a sentinel that can never appear in a real
+        # config. With HERMES_IGNORE_USER_CONFIG=1, load_cli_config() falls
+        # back to the repo-root ``cli-config.yaml`` (untracked, gitignored) —
+        # on a dev machine that file can legitimately set the same popular
+        # model this test previously used ("anthropic/claude-sonnet-4.6"),
+        # making the != assertion flip locally while passing on CI.
         config_yaml = textwrap.dedent(
             f"""
             model:
