@@ -192,6 +192,9 @@ PRODUCT_POSITIVE_OUTCOMES = {
     "test": "passed",
     "review": "approved",
 }
+PRODUCT_POSITIVE_OUTCOME_STEPS = {
+    verdict: step for step, verdict in PRODUCT_POSITIVE_OUTCOMES.items()
+}
 PRODUCT_PROVENANCE_REQUIRED_STEPS = {"development", "test", "review"}
 _PRODUCT_COMMIT_REQUIRED_STEPS = {"development"}
 PRODUCT_WORKFLOW_COMMIT_REQUIRED_STEPS = _PRODUCT_COMMIT_REQUIRED_STEPS
@@ -6060,6 +6063,7 @@ def complete_task(
     if product_workflow_enabled:
         meta = product_board_metadata(board)
         if meta is not None and _handoff_v2_enabled(meta):
+            validated_positive_phase: Optional[str] = None
             _validate_stored_product_workflow_state(conn, task_id)
             if _latest_unresolved_product_preflight(conn, task_id):
                 resolver_result = _complete_product_workflow_step(
@@ -6085,6 +6089,15 @@ def complete_task(
             )
             if rework_routed is not None:
                 return rework_routed
+            workflow_outcome = (
+                metadata.get("workflow_outcome")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if isinstance(workflow_outcome, dict):
+                validated_positive_phase = PRODUCT_POSITIVE_OUTCOME_STEPS.get(
+                    workflow_outcome.get("verdict")
+                )
             # Completion preflight: repair a plain/legacy role card's missing
             # product metadata before the transition is evaluated, so handoff_v2
             # advances the correct step (re-applied from f55580879). Repair only
@@ -6118,6 +6131,7 @@ def complete_task(
                 advanced = handoff(
                     conn, task_id, board=board, summary=summary, metadata=metadata,
                     expected_run_id=expected_run_id,
+                    expected_phase=validated_positive_phase,
                 )
                 if not advanced:
                     # Required source-commit gate failed (for source-producing
@@ -8911,6 +8925,7 @@ def handoff(
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
+    expected_phase: Optional[str] = None,
 ) -> bool:
     """Atomically advance a handoff_v2 product card.
 
@@ -8961,6 +8976,11 @@ def handoff(
         # Ownership was reclaimed out from under this worker -- refuse
         # before the commit-first gate so we never create a stale commit.
         return False
+    if expected_phase is not None and row["current_step_key"] != expected_phase:
+        # A structured positive verdict was validated for a different phase.
+        # Refuse before the commit-first gate so a same-run set_phase cannot
+        # carry Test evidence through Review (or vice versa).
+        return False
 
     _validate_product_ai_provenance(conn, task_id, step, metadata, meta)
 
@@ -8983,13 +9003,15 @@ def handoff(
             "UPDATE tasks SET current_step_key = ?, running = 0, assignee = ?, result = ?, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ?"
-            ) + ("" if expected_run_id is None else " AND status = 'running' AND current_run_id = ?")
-            params = (
-                (next_step, next_assignee, summary, task_id)
-                if expected_run_id is None
-                else (next_step, next_assignee, summary, task_id, int(expected_run_id))
             )
-            cur = conn.execute(sql, params)
+            params: list[Any] = [next_step, next_assignee, summary, task_id]
+            if expected_run_id is not None:
+                sql += " AND status = 'running' AND current_run_id = ?"
+                params.append(int(expected_run_id))
+            if expected_phase is not None:
+                sql += " AND current_step_key = ?"
+                params.append(expected_phase)
+            cur = conn.execute(sql, tuple(params))
             if cur.rowcount != 1:
                 raise RuntimeError("handoff run ownership changed")
             _sync_legacy_status(conn, task_id, meta)

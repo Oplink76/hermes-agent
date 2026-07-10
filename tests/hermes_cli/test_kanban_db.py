@@ -664,6 +664,61 @@ def test_product_positive_rework_verdict_must_match_phase(
     assert task.status == "running"
 
 
+def test_product_positive_rework_rejects_same_run_phase_change_before_handoff(
+    kanban_home, monkeypatch
+):
+    board = "rework-positive-phase-cas"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: phase-bound verdict",
+            assignee="tester",
+            workflow_template_id="product",
+            current_step_key="test",
+            board=board,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+
+        original_route = kb._route_product_rework_if_requested
+
+        def route_then_change_phase(*args, **kwargs):
+            routed = original_route(*args, **kwargs)
+            assert routed is None
+            assert kb.set_phase(conn, tid, "review", board=board)
+            return routed
+
+        monkeypatch.setattr(
+            kb, "_route_product_rework_if_requested", route_then_change_phase
+        )
+        completed = kb.complete_task(
+            conn,
+            tid,
+            summary="Test verdict must stay bound to Test",
+            metadata={
+                "workflow_outcome": {"verdict": "passed"},
+                "ai_provenance": {
+                    "tester": {"agent": "hermes", "result": "passed"},
+                    "writer": {"agent": "claude-code"},
+                    "reviewer": {"agent": "codex"},
+                },
+            },
+            expected_run_id=claimed.current_run_id,
+            board=board,
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert completed is False
+    assert task is not None
+    assert task.current_step_key == "review"
+    assert task.status == "running"
+    assert task.running is True
+    assert task.current_run_id == claimed.current_run_id
+    assert not any(event.kind == "handoff" for event in events)
+
+
 def test_invalid_product_rework_does_not_commit_workflow_repair(kanban_home):
     board = "rework-invalid-no-repair"
     _v2_product_board(board)
