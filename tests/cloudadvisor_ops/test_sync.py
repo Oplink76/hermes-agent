@@ -223,6 +223,8 @@ def test_command_conflict_resolver_runs_only_configured_command_in_worktree(
 ):
     worktree = tmp_path / "candidate"
     worktree.mkdir()
+    git_common_dir = tmp_path / "repo" / ".git"
+    git_common_dir.mkdir(parents=True)
     resolver = CodexConflictResolver(
         executable=Path("/usr/local/bin/codex"),
         prompt="resolve current merge conflicts",
@@ -233,15 +235,76 @@ def test_command_conflict_resolver_runs_only_configured_command_in_worktree(
         "--ignore-user-config",
         "--sandbox",
         "workspace-write",
+        "--add-dir",
+        str(git_common_dir),
         "--ephemeral",
         "resolve current merge conflicts",
     )
-    runner = FakeRunner({command: (0, "resolved", "")})
+    common_dir_command = (
+        "git",
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    )
+    runner = FakeRunner({
+        common_dir_command: (0, f"{git_common_dir}\n", ""),
+        command: (0, "resolved", ""),
+    })
 
     resolved = resolver.resolve(worktree, runner)
 
     assert resolved is True
-    assert runner.calls == [Call(command, worktree, 1800)]
+    assert runner.calls == [
+        Call(common_dir_command, worktree, 300),
+        Call(command, worktree, 1800),
+    ]
+
+
+def test_conflict_resolver_fails_closed_when_git_common_dir_is_unavailable(
+    tmp_path: Path,
+):
+    worktree = tmp_path / "candidate"
+    worktree.mkdir()
+    resolver = CodexConflictResolver(
+        executable=Path("/usr/local/bin/codex"),
+        prompt="resolve current merge conflicts",
+    )
+    common_dir_command = (
+        "git",
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    )
+    runner = FakeRunner({common_dir_command: (1, "", "not a repository")})
+
+    resolved = resolver.resolve(worktree, runner)
+
+    assert resolved is False
+    assert runner.calls == [Call(common_dir_command, worktree, 300)]
+
+
+def test_conflict_resolver_fails_closed_when_git_common_dir_does_not_exist(
+    tmp_path: Path,
+):
+    worktree = tmp_path / "candidate"
+    worktree.mkdir()
+    missing_common_dir = tmp_path / "missing" / ".git"
+    resolver = CodexConflictResolver(
+        executable=Path("/usr/local/bin/codex"),
+        prompt="resolve current merge conflicts",
+    )
+    common_dir_command = (
+        "git",
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    )
+    runner = FakeRunner({common_dir_command: (0, f"{missing_common_dir}\n", "")})
+
+    resolved = resolver.resolve(worktree, runner)
+
+    assert resolved is False
+    assert runner.calls == [Call(common_dir_command, worktree, 300)]
 
 
 def test_conflict_resolver_rejects_arbitrary_executable():
