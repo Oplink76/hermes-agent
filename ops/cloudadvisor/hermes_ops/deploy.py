@@ -210,6 +210,7 @@ class HealthChecker(Protocol):
         expected_sha: str,
         services: tuple[str, ...],
         identity_required: bool = True,
+        apply_injection: bool = True,
     ) -> HealthReport: ...
 
 
@@ -540,6 +541,7 @@ def _deploy_locked(
             expected_sha=request.sha,
             services=prior_services,
             identity_required=True,
+            apply_injection=True,
         )
         if not candidate_report.healthy:
             raise _HealthFailure(candidate_report)
@@ -591,6 +593,7 @@ def _deploy_locked(
                 expected_sha=previous_sha,
                 services=prior_services,
                 identity_required=previous_identity_required,
+                apply_injection=False,
             )
             final_status = (
                 "rolled_back_healthy" if rollback_report.healthy else "rollback_failed"

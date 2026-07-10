@@ -112,11 +112,19 @@ class LaunchdServiceController:
         install_root: Path,
         uid: int,
         runner: CommandRunner,
+        stop_timeout_seconds: float = 30,
+        poll_interval_seconds: float = 0.25,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
     ):
         self.services = {service.label: service for service in services}
         self.install_root = Path(install_root).expanduser().resolve(strict=False)
         self.uid = int(uid)
         self.runner = runner
+        self.stop_timeout_seconds = max(0.0, float(stop_timeout_seconds))
+        self.poll_interval_seconds = max(0.0, float(poll_interval_seconds))
+        self.clock = clock
+        self.sleeper = sleeper
 
     def _domain_target(self, label: str) -> str:
         return f"gui/{self.uid}/{label}"
@@ -187,6 +195,29 @@ class LaunchdServiceController:
             if label not in self.services:
                 raise RuntimeError(f"refusing to stop unconfigured service: {label}")
             self._required(["launchctl", "bootout", self._domain_target(label)])
+            deadline = self.clock() + self.stop_timeout_seconds
+            while True:
+                completed = self.runner.run(
+                    ["launchctl", "print", self._domain_target(label)],
+                    cwd=self.install_root,
+                    timeout=30,
+                )
+                if completed.returncode != 0:
+                    detail = (completed.stderr or completed.stdout or "").strip()
+                    if (
+                        completed.returncode == 113
+                        or "could not find service" in detail.lower()
+                    ):
+                        break
+                    raise RuntimeError(
+                        f"could not verify launchd unload for {label}: {detail}"
+                    )
+                now = self.clock()
+                if now >= deadline:
+                    raise RuntimeError(
+                        f"timed out waiting for launchd service to unload: {label}"
+                    )
+                self.sleeper(min(self.poll_interval_seconds, deadline - now))
 
     def start(self, services: tuple[str, ...]) -> None:
         for label in services:
@@ -237,6 +268,7 @@ class RuntimeHealthChecker:
         expected_sha: str,
         services: tuple[str, ...],
         identity_required: bool = True,
+        apply_injection: bool = True,
     ) -> HealthReport:
         deadline = self.clock() + self.timeout_seconds
         while True:
@@ -250,8 +282,9 @@ class RuntimeHealthChecker:
                 break
             self.sleeper(min(self.poll_interval_seconds, deadline - now))
 
-        if self.inject_failure == "after_restart":
-            self.inject_failure = None
+        pending_injection = self.inject_failure
+        self.inject_failure = None
+        if apply_injection and pending_injection == "after_restart":
             report = combine_health_reports(
                 report,
                 HealthReport(

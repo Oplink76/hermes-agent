@@ -182,8 +182,11 @@ class FakeHealth:
         expected_sha: str,
         services: tuple[str, ...],
         identity_required: bool = True,
+        apply_injection: bool = True,
     ) -> HealthReport:
-        self.events.append(("health", expected_sha, services, identity_required))
+        self.events.append(
+            ("health", expected_sha, services, identity_required, apply_injection)
+        )
         return self.reports.pop(0)
 
 
@@ -447,6 +450,7 @@ def test_health_failure_rolls_back_source_state_services_and_health_checks(
         "old-sha",
         ("ai.hermes.gateway", "com.cloudadvisor.hermes-dashboard"),
         False,
+        False,
     ) in events
 
 
@@ -475,6 +479,7 @@ def test_modern_rollback_keeps_runtime_identity_mandatory(tmp_path: Path):
         "old-sha",
         ("ai.hermes.gateway", "com.cloudadvisor.hermes-dashboard"),
         True,
+        False,
     ) in events
 
 
@@ -533,6 +538,10 @@ def test_pre_restart_failure_does_not_stop_already_unloaded_services_twice(
     assert sum(event[0] == "services_stopped" for event in events) == 1
     assert sum(event[0] == "services_started" for event in events) == 1
     assert snapshots.restored is False
+    assert any(
+        event[0] == "health" and event[-1] is False
+        for event in events
+    )
 
 
 def test_half_started_loaded_job_is_unloaded_before_rollback_restart(tmp_path: Path):
