@@ -388,6 +388,14 @@ def test_complete_schema_declares_structured_product_fields():
         "create_fix_task",
         "escalate",
     ]
+    assert props["workflow_outcome"]["required"] == ["verdict"]
+    assert props["workflow_outcome"]["additionalProperties"] is False
+    assert props["resolver_action"]["required"] == [
+        "action",
+        "resolution",
+        "fix_task_id",
+    ]
+    assert props["resolver_action"]["additionalProperties"] is False
 
 
 def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):

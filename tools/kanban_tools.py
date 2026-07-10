@@ -1449,6 +1449,35 @@ KANBAN_COMPLETE_SCHEMA = {
                     },
                     "findings": {"type": "array", "items": {"type": "string"}},
                 },
+                "required": ["verdict"],
+                "additionalProperties": False,
+                "allOf": [
+                    {
+                        "if": {
+                            "properties": {
+                                "verdict": {
+                                    "enum": ["changes_requested", "architecture_invalid"]
+                                }
+                            }
+                        },
+                        "then": {"required": ["target_step", "findings"]},
+                    },
+                    {
+                        "if": {
+                            "properties": {
+                                "verdict": {"enum": ["passed", "approved"]}
+                            }
+                        },
+                        "then": {
+                            "not": {
+                                "anyOf": [
+                                    {"required": ["target_step"]},
+                                    {"required": ["findings"]},
+                                ]
+                            }
+                        },
+                    },
+                ],
             },
             "resolver_action": {
                 "type": "object",
@@ -1461,7 +1490,8 @@ KANBAN_COMPLETE_SCHEMA = {
                     "resolution": {"type": "string"},
                     "fix_task_id": {"type": ["string", "null"]},
                 },
-                "required": ["action", "resolution"],
+                "required": ["action", "resolution", "fix_task_id"],
+                "additionalProperties": False,
             },
             "result": {
                 "type": "string",

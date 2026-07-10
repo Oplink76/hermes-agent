@@ -188,6 +188,10 @@ PRODUCT_REWORK_ROUTES = {
     ("review", "changes_requested"): "development",
     ("review", "architecture_invalid"): "architecture",
 }
+PRODUCT_POSITIVE_OUTCOMES = {
+    "test": "passed",
+    "review": "approved",
+}
 PRODUCT_PROVENANCE_REQUIRED_STEPS = {"development", "test", "review"}
 _PRODUCT_COMMIT_REQUIRED_STEPS = {"development"}
 PRODUCT_WORKFLOW_COMMIT_REQUIRED_STEPS = _PRODUCT_COMMIT_REQUIRED_STEPS
@@ -1990,20 +1994,8 @@ def _complete_product_workflow_step(
         candidate_action = (
             metadata.get("resolver_action") if isinstance(metadata, dict) else None
         )
-        if not isinstance(candidate_action, dict):
-            raise ValueError(
-                "resolver_action is required to complete a product preflight"
-            )
-        action = str(candidate_action.get("action") or "").strip()
-        resolution = str(candidate_action.get("resolution") or "").strip()
-        if action not in {"resume", "create_fix_task", "escalate"}:
-            raise ValueError(
-                "resolver_action.action must be resume, create_fix_task, or escalate"
-            )
-        if not resolution:
-            raise ValueError("resolver_action.resolution is required")
+        action, resolution, fix_task_id = _validate_resolver_action(candidate_action)
         if action == "create_fix_task":
-            fix_task_id = str(candidate_action.get("fix_task_id") or "").strip()
             verified, phantom = _verify_created_cards(conn, task_id, [fix_task_id])
             if phantom or verified != [fix_task_id]:
                 raise ValueError("resolver_action.fix_task_id must name a real linked task")
@@ -2050,6 +2042,20 @@ def _complete_product_workflow_step(
                 )
                 if cur.rowcount != 1:
                     return False
+                # A fix task is commonly created as a child of the card that
+                # discovered the blocker. Dependency wait needs the opposite
+                # direction: the original card waits for the fix. Reverse the
+                # direct edge atomically, then validate that no alternate path
+                # would make the new edge cyclic. Any error rolls back the task
+                # CAS and both graph mutations together.
+                conn.execute(
+                    "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
+                    (task_id, fix_task_id),
+                )
+                if _would_cycle(conn, fix_task_id, task_id):
+                    raise ValueError(
+                        f"linking {fix_task_id} -> {task_id} would create a cycle"
+                    )
                 conn.execute(
                     "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                     (fix_task_id, task_id),
@@ -2063,6 +2069,8 @@ def _complete_product_workflow_step(
                     metadata=metadata,
                     expected_run_id=expected_run_id,
                 )
+                if run_id is None:
+                    raise RuntimeError("resolver run ownership changed")
                 _append_event(
                     conn,
                     task_id,
@@ -2095,6 +2103,8 @@ def _complete_product_workflow_step(
                     metadata=metadata,
                     expected_run_id=expected_run_id,
                 )
+                if run_id is None:
+                    raise RuntimeError("resolver run ownership changed")
                 _append_event(
                     conn,
                     task_id,
@@ -2104,6 +2114,18 @@ def _complete_product_workflow_step(
                         "resolution": resolution,
                         "step_key": resume_step,
                         "status": "blocked",
+                    },
+                    run_id=run_id,
+                )
+                _append_event(
+                    conn,
+                    task_id,
+                    "blocked",
+                    {
+                        "reason": str(preflight.get("reason") or "unspecified"),
+                        "kind": "resolver_escalation",
+                        "attempted_resolutions": preflight.get("attempted_resolutions") or [],
+                        "resolution": resolution,
                     },
                     run_id=run_id,
                 )
@@ -2118,6 +2140,8 @@ def _complete_product_workflow_step(
                        worker_pid    = NULL,
                        block_kind    = NULL,
                        block_recurrences = 0,
+                       running       = 0,
+                       blocked       = 0,
                        workflow_template_id = 'product',
                        current_step_key = ?
                  WHERE id = ?
@@ -2139,14 +2163,8 @@ def _complete_product_workflow_step(
                 metadata=metadata,
                 expected_run_id=expected_run_id,
             )
-            if run_id is None and (summary or result or metadata):
-                run_id = _synthesize_ended_run(
-                    conn, task_id,
-                    outcome="preflight_resolved",
-                    summary=summary if summary is not None else result,
-                    metadata=metadata,
-                    step_key=resume_step,
-                )
+            if run_id is None:
+                raise RuntimeError("resolver run ownership changed")
             _append_event(
                 conn,
                 task_id,
@@ -5776,6 +5794,70 @@ class ProductProvenanceError(ValueError):
         super().__init__(reason)
 
 
+def _validate_resolver_action(candidate: Any) -> tuple[str, str, Optional[str]]:
+    if not isinstance(candidate, dict):
+        raise ValueError("resolver_action is required to complete a product preflight")
+    expected_keys = {"action", "resolution", "fix_task_id"}
+    if set(candidate) != expected_keys:
+        raise ValueError(
+            "resolver_action must contain exactly action, resolution, and fix_task_id"
+        )
+    action = candidate.get("action")
+    resolution = candidate.get("resolution")
+    fix_task_id = candidate.get("fix_task_id")
+    if action not in {"resume", "create_fix_task", "escalate"}:
+        raise ValueError(
+            "resolver_action.action must be resume, create_fix_task, or escalate"
+        )
+    if not isinstance(resolution, str) or not resolution.strip():
+        raise ValueError("resolver_action.resolution is required")
+    if action == "create_fix_task":
+        if not isinstance(fix_task_id, str) or not fix_task_id.strip():
+            raise ValueError("resolver_action.fix_task_id is required for create_fix_task")
+        fix_task_id = fix_task_id.strip()
+    elif fix_task_id is not None:
+        raise ValueError("resolver_action.fix_task_id must be null unless creating a fix task")
+    return str(action), resolution.strip(), fix_task_id
+
+
+def _validate_product_workflow_outcome(
+    outcome: Any,
+    current_step: str,
+) -> tuple[str, Optional[str], list[str]]:
+    if not isinstance(outcome, dict):
+        raise ValueError("workflow_outcome must be an object")
+    verdict = outcome.get("verdict")
+    positive = PRODUCT_POSITIVE_OUTCOMES.get(current_step)
+    if verdict in {"passed", "approved"}:
+        if set(outcome) != {"verdict"} or verdict != positive:
+            raise ValueError(
+                f"invalid workflow_outcome for {current_step}: verdict={verdict!r}"
+            )
+        return str(verdict), None, []
+
+    if set(outcome) != {"verdict", "target_step", "findings"}:
+        raise ValueError(
+            "rework workflow_outcome must contain exactly verdict, target_step, and findings"
+        )
+    target_step = outcome.get("target_step")
+    expected_target = PRODUCT_REWORK_ROUTES.get((current_step, verdict))
+    if expected_target is None or target_step != expected_target:
+        raise ValueError(
+            f"invalid workflow_outcome for {current_step}: verdict={verdict!r}, "
+            f"target_step={target_step!r}"
+        )
+    raw_findings = outcome.get("findings")
+    if (
+        not isinstance(raw_findings, list)
+        or not raw_findings
+        or not all(isinstance(item, str) and item.strip() for item in raw_findings)
+    ):
+        raise ValueError(
+            "workflow_outcome findings must be a non-empty list of non-empty strings"
+        )
+    return str(verdict), str(target_step), [item.strip() for item in raw_findings]
+
+
 def _route_product_rework_if_requested(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5784,37 +5866,11 @@ def _route_product_rework_if_requested(
     metadata: Optional[dict],
     summary: Optional[str],
     expected_run_id: Optional[int],
+    product_role_assignees: Optional[dict[str, str]],
 ) -> Optional[bool]:
     outcome = metadata.get("workflow_outcome") if isinstance(metadata, dict) else None
     if outcome is None:
         return None
-    if not isinstance(outcome, dict):
-        raise ValueError("workflow_outcome must be an object")
-    verdict = str(outcome.get("verdict") or "").strip()
-    target_step = str(outcome.get("target_step") or "").strip()
-    if verdict in {"passed", "approved"}:
-        return None
-    row = conn.execute(
-        "SELECT status, current_step_key, rework_count FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if row is None:
-        return False
-    current_step = str(row["current_step_key"] or "")
-    expected_target = PRODUCT_REWORK_ROUTES.get((current_step, verdict))
-    if expected_target is None or target_step != expected_target:
-        raise ValueError(
-            f"invalid workflow_outcome for {current_step}: verdict={verdict!r}, "
-            f"target_step={target_step!r}"
-        )
-    findings = [
-        str(item).strip()
-        for item in (outcome.get("findings") or [])
-        if str(item).strip()
-    ]
-    if not findings:
-        raise ValueError("workflow_outcome findings are required for rework")
-
     meta = product_board_metadata(board) or {}
     policy = meta.get("product_workflow") if isinstance(meta, dict) else {}
     try:
@@ -5822,22 +5878,58 @@ def _route_product_rework_if_requested(
     except (TypeError, ValueError):
         max_cycles = 3
     max_cycles = max(1, max_cycles)
-    next_count = int(row["rework_count"] or 0) + 1
-    limit_reached = next_count > max_cycles
-    if limit_reached:
-        next_status = "blocked"
-        next_assignee = "default"
-    else:
-        next_status = _column_status_for_step(meta, target_step)
-        role = "developer" if target_step == "development" else "architect"
-        next_assignee = _product_role_assignee(meta, role)
-
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT title, assignee, status, current_step_key, "
+            "current_run_id, rework_count FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        observed_step = row["current_step_key"]
+        current_step = str(observed_step or "").strip()
+        if not current_step:
+            current_step = str(
+                _infer_product_step(
+                    title=row["title"] or "",
+                    assignee=row["assignee"],
+                    explicit_step=None,
+                    product_intent=True,
+                )
+                or ""
+            )
+        verdict, target_step, findings = _validate_product_workflow_outcome(
+            outcome, current_step
+        )
+        if verdict in {"passed", "approved"}:
+            return None
+        if expected_run_id is None:
+            raise ValueError("expected_run_id is required for structured rework")
+        if (
+            row["status"] != "running"
+            or row["current_run_id"] != int(expected_run_id)
+        ):
+            return False
+
+        observed_count = int(row["rework_count"] or 0)
+        next_count = observed_count + 1
+        limit_reached = next_count > max_cycles
+        if limit_reached:
+            next_status = "blocked"
+            next_assignee = "default"
+        else:
+            next_status = _column_status_for_step(meta, target_step)
+            role = "developer" if target_step == "development" else "architect"
+            next_assignee = _product_role_assignee(
+                meta, role, product_role_assignees
+            )
         sql = (
             "UPDATE tasks SET rework_count = ?, current_step_key = ?, status = ?, "
             "assignee = ?, running = 0, blocked = ?, claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL WHERE id = ?"
-        ) + ("" if expected_run_id is None else " AND current_run_id = ?")
+            "claim_expires = NULL, worker_pid = NULL, workflow_template_id = 'product' "
+            "WHERE id = ? AND status = ? AND current_step_key IS ? "
+            "AND rework_count = ? AND current_run_id = ?"
+        )
         params: tuple[Any, ...] = (
             next_count,
             target_step,
@@ -5845,9 +5937,11 @@ def _route_product_rework_if_requested(
             next_assignee,
             1 if limit_reached else 0,
             task_id,
+            row["status"],
+            observed_step,
+            observed_count,
+            int(expected_run_id),
         )
-        if expected_run_id is not None:
-            params += (int(expected_run_id),)
         updated = conn.execute(sql, params)
         if updated.rowcount != 1:
             return False
@@ -5876,6 +5970,20 @@ def _route_product_rework_if_requested(
             },
             run_id=run_id,
         )
+        if limit_reached:
+            _append_event(
+                conn,
+                task_id,
+                "blocked",
+                {
+                    "reason": "maximum product rework cycles exceeded",
+                    "kind": "rework_limit",
+                    "findings": findings,
+                    "rework_count": next_count,
+                    "max_rework_cycles": max_cycles,
+                },
+                run_id=run_id,
+            )
     return True
 
 
@@ -5953,6 +6061,30 @@ def complete_task(
         meta = product_board_metadata(board)
         if meta is not None and _handoff_v2_enabled(meta):
             _validate_stored_product_workflow_state(conn, task_id)
+            if _latest_unresolved_product_preflight(conn, task_id):
+                resolver_result = _complete_product_workflow_step(
+                    conn,
+                    task_id,
+                    board=board,
+                    result=result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=expected_run_id,
+                    product_role_assignees=product_role_assignees,
+                )
+                if resolver_result is not None:
+                    return resolver_result
+            rework_routed = _route_product_rework_if_requested(
+                conn,
+                task_id,
+                board=board,
+                metadata=metadata,
+                summary=summary if summary is not None else result,
+                expected_run_id=expected_run_id,
+                product_role_assignees=product_role_assignees,
+            )
+            if rework_routed is not None:
+                return rework_routed
             # Completion preflight: repair a plain/legacy role card's missing
             # product metadata before the transition is evaluated, so handoff_v2
             # advances the correct step (re-applied from f55580879). Repair only
@@ -5965,16 +6097,6 @@ def complete_task(
                 "SELECT current_step_key FROM tasks WHERE id = ?", (task_id,),
             ).fetchone()
             step_key = row["current_step_key"] if row is not None else None
-            rework_routed = _route_product_rework_if_requested(
-                conn,
-                task_id,
-                board=board,
-                metadata=metadata,
-                summary=summary if summary is not None else result,
-                expected_run_id=expected_run_id,
-            )
-            if rework_routed is not None:
-                return rework_routed
             transition = PRODUCT_WORKFLOW_TRANSITIONS.get(str(step_key or ""))
             has_unresolved_preflight = bool(
                 _latest_unresolved_product_preflight(conn, task_id)

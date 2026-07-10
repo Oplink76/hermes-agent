@@ -466,16 +466,27 @@ def test_product_rejection_routes_backward(
             },
             expected_run_id=claimed.current_run_id,
             board=board,
+            product_role_assignees={
+                "developer": "custom-developer",
+                "architect": "custom-architect",
+            },
         )
         task = kb.get_task(conn, tid)
         events = kb.list_events(conn, tid)
     assert task is not None
     assert task.current_step_key == target
     assert task.rework_count == 1
+    assert task.assignee == (
+        "custom-developer" if target == "development" else "custom-architect"
+    )
     assert any(event.kind == "rework_requested" for event in events)
 
 
-def test_product_rejection_requires_findings(kanban_home):
+@pytest.mark.parametrize(
+    "findings",
+    [[], "not-a-list", [""], [1], ["Concrete", ""]],
+)
+def test_product_rework_requires_nonempty_string_findings(kanban_home, findings):
     board = "rework-findings"
     _v2_product_board(board)
     with kb.connect(board=board) as conn:
@@ -497,7 +508,7 @@ def test_product_rejection_requires_findings(kanban_home):
                     "workflow_outcome": {
                         "verdict": "changes_requested",
                         "target_step": "development",
-                        "findings": [],
+                        "findings": findings,
                     }
                 },
                 expected_run_id=claimed.current_run_id,
@@ -505,6 +516,196 @@ def test_product_rejection_requires_findings(kanban_home):
             )
         task = kb.get_task(conn, tid)
     assert task is not None and task.current_step_key == "test"
+
+
+def test_product_rework_requires_expected_run_id(kanban_home):
+    board = "rework-run-required"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: rework",
+            assignee="tester",
+            workflow_template_id="product",
+            current_step_key="test",
+            board=board,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        with pytest.raises(ValueError, match="expected_run_id"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Needs revision",
+                metadata={
+                    "workflow_outcome": {
+                        "verdict": "changes_requested",
+                        "target_step": "development",
+                        "findings": ["Concrete finding"],
+                    }
+                },
+                board=board,
+            )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_step_key == "test"
+    assert task.rework_count == 0
+    assert task.current_run_id == claimed.current_run_id
+
+
+@pytest.mark.parametrize(
+    ("step", "verdict", "next_step", "provenance"),
+    [
+        (
+            "test",
+            "passed",
+            "review",
+            {"tester": {"agent": "hermes", "result": "passed"}},
+        ),
+        (
+            "review",
+            "approved",
+            "release_measure",
+            {
+                "writer": {"agent": "claude-code"},
+                "reviewer": {"agent": "codex"},
+            },
+        ),
+    ],
+)
+def test_product_positive_rework_outcome_uses_forward_handoff(
+    kanban_home, step, verdict, next_step, provenance
+):
+    board = f"rework-positive-{step}"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: accepted",
+            assignee="tester" if step == "test" else "reviewer",
+            workflow_template_id="product",
+            current_step_key=step,
+            board=board,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Accepted",
+            metadata={
+                "workflow_outcome": {"verdict": verdict},
+                "ai_provenance": provenance,
+            },
+            expected_run_id=claimed.current_run_id,
+            board=board,
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert task is not None
+    assert task.current_step_key == next_step
+    # handoff_v2 reads board role policy; the important contract is that a
+    # positive outcome advances normally rather than incrementing rework.
+    assert task.rework_count == 0
+    assert any(event.kind == "handoff" for event in events)
+    assert not any(event.kind == "rework_requested" for event in events)
+
+
+@pytest.mark.parametrize(
+    ("step", "verdict", "provenance"),
+    [
+        (
+            "test",
+            "approved",
+            {"tester": {"agent": "hermes", "result": "passed"}},
+        ),
+        (
+            "review",
+            "passed",
+            {
+                "writer": {"agent": "claude-code"},
+                "reviewer": {"agent": "codex"},
+            },
+        ),
+    ],
+)
+def test_product_positive_rework_verdict_must_match_phase(
+    kanban_home, step, verdict, provenance
+):
+    board = f"rework-positive-invalid-{step}"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: invalid verdict",
+            assignee="tester" if step == "test" else "reviewer",
+            workflow_template_id="product",
+            current_step_key=step,
+            board=board,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        with pytest.raises(ValueError, match="invalid workflow_outcome"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Wrong verdict",
+                metadata={
+                    "workflow_outcome": {"verdict": verdict},
+                    "ai_provenance": provenance,
+                },
+                expected_run_id=claimed.current_run_id,
+                board=board,
+            )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.current_step_key == step
+    assert task.status == "running"
+
+
+def test_invalid_product_rework_does_not_commit_workflow_repair(kanban_home):
+    board = "rework-invalid-no-repair"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: legacy tester card",
+            assignee="tester",
+            workflow_template_id="product",
+            current_step_key="test",
+            board=board,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        conn.execute(
+            "UPDATE tasks SET workflow_template_id=NULL, current_step_key=NULL "
+            "WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        with pytest.raises(ValueError, match="invalid workflow_outcome"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Invalid route",
+                metadata={
+                    "workflow_outcome": {
+                        "verdict": "architecture_invalid",
+                        "target_step": "architecture",
+                        "findings": ["Not valid from Test"],
+                    }
+                },
+                expected_run_id=claimed.current_run_id,
+                board=board,
+            )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert task is not None
+    assert task.workflow_template_id is None
+    assert task.current_step_key is None
+    assert not any(event.kind == "workflow_repaired" for event in events)
 
 
 def test_fourth_product_rejection_routes_to_human_block(kanban_home):
@@ -536,20 +737,33 @@ def test_fourth_product_rejection_routes_to_human_block(kanban_home):
             expected_run_id=claimed.current_run_id,
             board=board,
         )
+        assert kb.recompute_ready(conn) == 0
         task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
     assert task is not None
     assert task.status == "blocked"
     assert task.blocked is True
     assert task.rework_count == 4
+    blocked = [event for event in events if event.kind == "blocked"]
+    assert blocked
+    assert blocked[-1].payload["kind"] == "rework_limit"
+    assert blocked[-1].payload["findings"] == ["Still unsafe"]
 
 
-def _route_task_to_resolver(conn, board: str) -> tuple[str, int]:
+def _route_task_to_resolver(
+    conn, board: str, *, step: str = "development"
+) -> tuple[str, int]:
+    assignee = {
+        "development": "developer",
+        "test": "tester",
+        "review": "reviewer",
+    }[step]
     tid = kb.create_task(
         conn,
         title="Story: resolver",
-        assignee="developer",
+        assignee=assignee,
         workflow_template_id="product",
-        current_step_key="development",
+        current_step_key=step,
         board=board,
     )
     first = kb.claim_task(conn, tid)
@@ -563,9 +777,49 @@ def _route_task_to_resolver(conn, board: str) -> tuple[str, int]:
         expected_run_id=first.current_run_id,
         board=board,
     )
+    if step == "review":
+        # Review is a visible legacy column status, while the resolver must be
+        # claimable as ready work. Model the dispatcher promotion explicitly.
+        conn.execute(
+            "UPDATE tasks SET status='ready' WHERE id=? AND assignee='default'",
+            (tid,),
+        )
+        conn.commit()
     resolver = kb.claim_task(conn, tid)
     assert resolver is not None and resolver.current_run_id is not None
     return tid, resolver.current_run_id
+
+
+@pytest.mark.parametrize("step", ["test", "review"])
+def test_product_preflight_resolver_validation_precedes_rework(
+    kanban_home, step
+):
+    board = f"resolver-before-rework-{step}"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board, step=step)
+        target = "development"
+        with pytest.raises(ValueError, match="resolver_action"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Trying to bypass resolver",
+                metadata={
+                    "workflow_outcome": {
+                        "verdict": "changes_requested",
+                        "target_step": target,
+                        "findings": ["Workflow finding"],
+                    }
+                },
+                expected_run_id=run_id,
+                board=board,
+            )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.current_step_key == step
+    assert task.status == "running"
+    assert task.rework_count == 0
+    assert task.current_run_id == run_id
 
 
 def test_product_preflight_requires_structured_resolver_action(kanban_home):
@@ -587,6 +841,48 @@ def test_product_preflight_requires_structured_resolver_action(kanban_home):
                 expected_run_id=run_id,
                 board=board,
             )
+
+
+@pytest.mark.parametrize(
+    "resolver_action",
+    [
+        {
+            "action": "resume",
+            "resolution": "Use the configured test token source",
+        },
+        {
+            "action": "resume",
+            "resolution": "Use the configured test token source",
+            "fix_task_id": None,
+            "unexpected": True,
+        },
+        {
+            "action": "resume",
+            "resolution": "Use the configured test token source",
+            "fix_task_id": "t_not_null",
+        },
+    ],
+)
+def test_product_preflight_resolver_action_requires_exact_shape(
+    kanban_home, resolver_action
+):
+    board = "resolver-exact-shape"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        with pytest.raises(ValueError, match="resolver_action"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Invalid resolver shape",
+                metadata={"resolver_action": resolver_action},
+                expected_run_id=run_id,
+                board=board,
+            )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == run_id
 
 
 def test_product_preflight_resume_restores_original_step(kanban_home):
@@ -613,6 +909,8 @@ def test_product_preflight_resume_restores_original_step(kanban_home):
     assert task.current_step_key == "development"
     assert task.assignee == "developer"
     assert task.status == "ready"
+    assert task.running is False
+    assert task.blocked is False
 
 
 def test_product_preflight_create_fix_task_waits_on_real_child(kanban_home):
@@ -625,6 +923,7 @@ def test_product_preflight_create_fix_task_waits_on_real_child(kanban_home):
             title="Fix dependency",
             assignee="developer",
             created_by="default",
+            parents=[tid],
             board=board,
         )
         assert kb.complete_task(
@@ -642,7 +941,62 @@ def test_product_preflight_create_fix_task_waits_on_real_child(kanban_home):
             board=board,
         )
         task = kb.get_task(conn, tid)
+        original_parents = kb.parent_ids(conn, tid)
+        fix_parents = kb.parent_ids(conn, fix_id)
     assert task is not None and task.status == "todo"
+    assert original_parents == [fix_id]
+    assert tid not in fix_parents
+
+
+def test_product_preflight_fix_cycle_rolls_back_state_and_graph(kanban_home):
+    board = "resolver-fix-cycle"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        middle_id = kb.create_task(
+            conn,
+            title="Intermediate dependency",
+            assignee="developer",
+            created_by="default",
+            parents=[tid],
+            board=board,
+        )
+        fix_id = kb.create_task(
+            conn,
+            title="Fix dependency",
+            assignee="developer",
+            created_by="default",
+            parents=[tid, middle_id],
+            board=board,
+        )
+        before_task = kb.get_task(conn, tid)
+        before_links = conn.execute(
+            "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
+        ).fetchall()
+
+        with pytest.raises(ValueError, match="cycle"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Created a cyclic fix",
+                metadata={
+                    "resolver_action": {
+                        "action": "create_fix_task",
+                        "resolution": "Dependency needs a dedicated fix",
+                        "fix_task_id": fix_id,
+                    }
+                },
+                expected_run_id=run_id,
+                board=board,
+            )
+        after_task = kb.get_task(conn, tid)
+        after_links = conn.execute(
+            "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
+        ).fetchall()
+    assert after_task is not None and before_task is not None
+    assert after_task.status == before_task.status == "running"
+    assert after_task.current_run_id == before_task.current_run_id == run_id
+    assert [tuple(row) for row in after_links] == [tuple(row) for row in before_links]
 
 
 def test_product_preflight_stale_fix_action_does_not_link_child(kanban_home):
@@ -699,8 +1053,14 @@ def test_product_preflight_escalate_enters_human_block(kanban_home):
             expected_run_id=run_id,
             board=board,
         )
+        assert kb.recompute_ready(conn) == 0
         task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
     assert task is not None and task.status == "blocked" and task.blocked is True
+    blocked = [event for event in events if event.kind == "blocked"]
+    assert blocked
+    assert blocked[-1].payload["kind"] == "resolver_escalation"
+    assert blocked[-1].payload["resolution"] == "Docs and local config are insufficient"
 
 
 def test_story_title_infers_product_without_role_on_product_board(kanban_home):
