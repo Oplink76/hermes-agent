@@ -89,6 +89,7 @@ class DeployConfig:
     lock_path: Path | None = None
     required_approver: str = "Ole Ørum-Petersen"
     required_check: str = "All required checks pass"
+    uv_extras: tuple[str, ...] = ()
     postinstall_commands: tuple[tuple[str, ...], ...] = ()
 
 
@@ -207,6 +208,7 @@ class HealthChecker(Protocol):
         *,
         expected_sha: str,
         services: tuple[str, ...],
+        identity_required: bool = True,
     ) -> HealthReport: ...
 
 
@@ -243,6 +245,13 @@ def dependency_fingerprint(root: Path) -> str:
         if path.is_file():
             digest.update(path.read_bytes())
     return digest.hexdigest()
+
+
+def _uv_sync_command(config: DeployConfig) -> list[str]:
+    command = ["env", "UV_PROJECT_ENVIRONMENT=.venv", "uv", "sync", "--locked"]
+    for extra in config.uv_extras:
+        command.extend(("--extra", extra))
+    return command
 
 
 def _run_required(
@@ -432,6 +441,7 @@ def _deploy_locked(
     )
 
     previous_sha = _run_required(runner, ["git", "rev-parse", "HEAD"], cwd=root)
+    previous_identity_required = (root / "gateway" / "runtime_identity.py").is_file()
     previous_fingerprint = fingerprint_fn(root)
     prior_services = services.running_services()
     runtime_before = services.inventory()
@@ -471,7 +481,7 @@ def _deploy_locked(
         candidate_fingerprint = fingerprint_fn(root)
         _run_required(
             runner,
-            ["env", "UV_PROJECT_ENVIRONMENT=.venv", "uv", "sync", "--locked"],
+            _uv_sync_command(config),
             cwd=root,
         )
         for command in config.postinstall_commands:
@@ -488,6 +498,7 @@ def _deploy_locked(
         candidate_report = health.check(
             expected_sha=request.sha,
             services=prior_services,
+            identity_required=True,
         )
         if not candidate_report.healthy:
             raise _HealthFailure(candidate_report)
@@ -531,19 +542,14 @@ def _deploy_locked(
             if candidate_fingerprint != previous_fingerprint:
                 _run_required(
                     runner,
-                    [
-                        "env",
-                        "UV_PROJECT_ENVIRONMENT=.venv",
-                        "uv",
-                        "sync",
-                        "--locked",
-                    ],
+                    _uv_sync_command(config),
                     cwd=root,
                 )
             services.start(prior_services)
             rollback_report = health.check(
                 expected_sha=previous_sha,
                 services=prior_services,
+                identity_required=previous_identity_required,
             )
             final_status = (
                 "rolled_back_healthy" if rollback_report.healthy else "rollback_failed"

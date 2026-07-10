@@ -24,6 +24,21 @@ from ops.cloudadvisor.hermes_ops.health import HealthCheck, HealthReport
 from ops.cloudadvisor.hermes_ops.locking import try_exclusive_file_lock
 
 
+UV_SYNC_COMMAND = (
+    "env",
+    "UV_PROJECT_ENVIRONMENT=.venv",
+    "uv",
+    "sync",
+    "--locked",
+    "--extra",
+    "all",
+    "--extra",
+    "dev",
+    "--extra",
+    "slack",
+)
+
+
 @dataclass(frozen=True)
 class Call:
     argv: tuple[str, ...]
@@ -151,8 +166,14 @@ class FakeHealth:
         self.reports = list(reports)
         self.events = events
 
-    def check(self, *, expected_sha: str, services: tuple[str, ...]) -> HealthReport:
-        self.events.append(("health", expected_sha, services))
+    def check(
+        self,
+        *,
+        expected_sha: str,
+        services: tuple[str, ...],
+        identity_required: bool = True,
+    ) -> HealthReport:
+        self.events.append(("health", expected_sha, services, identity_required))
         return self.reports.pop(0)
 
 
@@ -218,6 +239,7 @@ def _config(tmp_path: Path) -> DeployConfig:
         install_root=install_root,
         origin="origin",
         record_root=tmp_path / "records",
+        uv_extras=("all", "dev", "slack"),
         postinstall_commands=(
             (".venv/bin/python", "scripts/docker_config_migrate.py"),
         ),
@@ -232,11 +254,7 @@ def _responses():
         ("git", "rev-parse", "HEAD"): (0, "old-sha\n", ""),
         ("git", "switch", "--detach", "new-sha"): (0, "", ""),
         ("git", "switch", "--detach", "old-sha"): (0, "", ""),
-        ("env", "UV_PROJECT_ENVIRONMENT=.venv", "uv", "sync", "--locked"): (
-            0,
-            "",
-            "",
-        ),
+        UV_SYNC_COMMAND: (0, "", ""),
         (".venv/bin/python", "scripts/docker_config_migrate.py"): (0, "", ""),
     }
 
@@ -367,6 +385,7 @@ def test_successful_deploy_is_exact_sha_snapshot_first_and_health_gated(tmp_path
         "services_started",
         ("ai.hermes.gateway", "com.cloudadvisor.hermes-dashboard"),
     ) in events
+    assert ("command", UV_SYNC_COMMAND) in events
 
 
 def test_health_failure_rolls_back_source_state_services_and_health_checks(
@@ -407,6 +426,7 @@ def test_health_failure_rolls_back_source_state_services_and_health_checks(
         "health",
         "old-sha",
         ("ai.hermes.gateway", "com.cloudadvisor.hermes-dashboard"),
+        False,
     ) in events
 
 
@@ -417,6 +437,7 @@ def test_candidate_service_start_counts_as_state_mutation_for_rollback(tmp_path:
         install_root=config.install_root,
         origin=config.origin,
         record_root=config.record_root,
+        uv_extras=config.uv_extras,
         postinstall_commands=(),
     )
     snapshots = FakeSnapshots(events)
@@ -442,7 +463,7 @@ def test_pre_restart_failure_does_not_stop_already_unloaded_services_twice(
 ):
     events = []
     responses = _responses()
-    responses[("env", "UV_PROJECT_ENVIRONMENT=.venv", "uv", "sync", "--locked")] = (
+    responses[UV_SYNC_COMMAND] = (
         1,
         "",
         "sync failed",

@@ -37,5 +37,6 @@ deploy:
   preservation_command: [/usr/bin/false]
   required_approver: Ole Ørum-Petersen
   required_check: All required checks pass
+  uv_extras: [all, dev]
   postinstall_commands:
     - [.venv/bin/python, scripts/docker_config_migrate.py]

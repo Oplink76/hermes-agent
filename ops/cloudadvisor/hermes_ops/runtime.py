@@ -9,9 +9,10 @@ import re
 import shlex
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .command import CommandRunner
 from .health import (
@@ -214,6 +215,10 @@ class RuntimeHealthChecker:
         uid: int,
         runner: CommandRunner,
         inject_failure: str | None = None,
+        timeout_seconds: float = 30,
+        poll_interval_seconds: float = 0.25,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
     ):
         self.controller = controller
         self.gateway_targets = tuple(gateway_targets)
@@ -221,12 +226,51 @@ class RuntimeHealthChecker:
         self.uid = int(uid)
         self.runner = runner
         self.inject_failure = inject_failure
+        self.timeout_seconds = max(0.0, float(timeout_seconds))
+        self.poll_interval_seconds = max(0.0, float(poll_interval_seconds))
+        self.clock = clock
+        self.sleeper = sleeper
 
     def check(
         self,
         *,
         expected_sha: str,
         services: tuple[str, ...],
+        identity_required: bool = True,
+    ) -> HealthReport:
+        deadline = self.clock() + self.timeout_seconds
+        while True:
+            report = self._check_once(
+                expected_sha=expected_sha,
+                services=services,
+                identity_required=identity_required,
+            )
+            if report.healthy or self.clock() >= deadline:
+                break
+            self.sleeper(self.poll_interval_seconds)
+
+        if self.inject_failure == "after_restart":
+            self.inject_failure = None
+            report = combine_health_reports(
+                report,
+                HealthReport(
+                    checks=(
+                        HealthCheck(
+                            "injected:after_restart",
+                            False,
+                            "recovery canary failure injection",
+                        ),
+                    )
+                ),
+            )
+        return report
+
+    def _check_once(
+        self,
+        *,
+        expected_sha: str,
+        services: tuple[str, ...],
+        identity_required: bool,
     ) -> HealthReport:
         expected_services = set(services)
         service_observations = {
@@ -259,31 +303,18 @@ class RuntimeHealthChecker:
             expected_sha=expected_sha,
             uid=self.uid,
             runner=self.runner,
+            identity_required=identity_required,
         )
         runtime_report = evaluate_runtime_health(
             gateway_observations,
             expected_profiles=(target.profile for target in self.gateway_targets),
+            identity_required=identity_required,
         )
-        report = combine_health_reports(
+        return combine_health_reports(
             service_report,
             configuration_report,
             runtime_report,
         )
-        if self.inject_failure == "after_restart":
-            self.inject_failure = None
-            report = combine_health_reports(
-                report,
-                HealthReport(
-                    checks=(
-                        HealthCheck(
-                            "injected:after_restart",
-                            False,
-                            "recovery canary failure injection",
-                        ),
-                    )
-                ),
-            )
-        return report
 
 
 def _completed_stdout(
@@ -375,6 +406,7 @@ def inventory(
     expected_sha: str,
     uid: int,
     runner: CommandRunner,
+    identity_required: bool = True,
 ) -> tuple[RuntimeObservation, ...]:
     """Compare launchd, plist, process, Git, and runtime-manifest identity."""
     root = Path(install_root).expanduser().resolve(strict=False)
@@ -480,6 +512,16 @@ def inventory(
                 actual=_resolved(process_executable),
             ),
         )
+        required_checks = (
+            checks
+            if identity_required
+            else tuple(
+                check
+                for check in checks
+                if check.name != "runtime_manifest_present"
+                and not check.name.startswith("manifest_")
+            )
+        )
         observations.append(
             RuntimeObservation(
                 profile=target.profile,
@@ -491,7 +533,7 @@ def inventory(
                 process_command=process_command,
                 process_executable=process_executable,
                 expected_sha=expected_sha,
-                healthy=all(check.passed for check in checks),
+                healthy=all(check.passed for check in required_checks),
                 checks=checks,
             )
         )

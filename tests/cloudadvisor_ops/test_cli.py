@@ -55,6 +55,7 @@ def _write_operations_config(
             "  hermes_homes:",
             f"    - {tmp_path / 'home'}",
             "  preservation_command: [python, verify-preservation.py]",
+            "  uv_extras: [all, dev, slack]",
             "  postinstall_commands:",
             "    - [python, migrate.py]",
         ])
@@ -98,6 +99,7 @@ def test_load_operations_config_builds_explicit_runtime_and_deploy_scope(
     assert config.gateway_targets[0].profile == "default"
     assert config.snapshot_root == (tmp_path / "snapshots").resolve()
     assert config.hermes_homes == ((tmp_path / "home").resolve(),)
+    assert config.deploy_config.uv_extras == ("all", "dev", "slack")
     assert config.deploy_config.postinstall_commands == (("python", "migrate.py"),)
 
 
