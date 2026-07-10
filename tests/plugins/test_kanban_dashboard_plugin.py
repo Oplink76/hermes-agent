@@ -8,10 +8,13 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from fastapi import FastAPI
@@ -56,7 +59,80 @@ def kanban_home(tmp_path, monkeypatch):
 def client(kanban_home):
     app = FastAPI()
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
-    return TestClient(app)
+    test_client = TestClient(app)
+    original_request = test_client.request
+
+    def snapshot(task_id, board=None):
+        with kb.connect(board=board) as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return {
+                f"expected_{field}": "" if field in {"status", "title"} else None
+                for field in kb.TASK_SNAPSHOT_FIELDS
+            }
+        return {
+            f"expected_{field}": value
+            for field, value in kb.task_snapshot_from_row(row).items()
+        }
+
+    def request_with_snapshot(method, url, **kwargs):
+        parsed = urlparse(str(url))
+        path = parsed.path.removeprefix("/api/plugins/kanban")
+        query = parse_qs(parsed.query)
+        for key, value in (kwargs.get("params") or {}).items():
+            query[key] = [str(value)]
+        board = query.get("board", [None])[0]
+        method = method.upper()
+        body = kwargs.get("json")
+
+        if method != "GET" and path == "/tasks/bulk" and isinstance(body, dict):
+            body = dict(body)
+            body.setdefault(
+                "expected_snapshots",
+                {task_id: snapshot(task_id, board) for task_id in body.get("ids", [])},
+            )
+            kwargs["json"] = body
+        elif method == "POST" and path == "/links":
+            body = dict(body or {})
+            task_id = body.get("expected_task_id") or body.get("child_id")
+            body.setdefault("expected_task_id", task_id)
+            if task_id:
+                for key, value in snapshot(task_id, board).items():
+                    body.setdefault(key, value)
+            kwargs["json"] = body
+        elif method == "DELETE" and path == "/links":
+            body = dict(body or {})
+            task_id = body.get("expected_task_id") or query.get("child_id", [None])[0]
+            body.setdefault("expected_task_id", task_id)
+            if task_id:
+                for key, value in snapshot(task_id, board).items():
+                    body.setdefault(key, value)
+            kwargs["json"] = body
+        elif method == "DELETE" and path.startswith("/attachments/"):
+            attachment_id = int(path.rsplit("/", 1)[-1])
+            with kb.connect(board=board) as conn:
+                attachment = kb.get_attachment(conn, attachment_id)
+            task_id = attachment.task_id if attachment else "t_missing"
+            kwargs["json"] = {**snapshot(task_id, board), **(body or {})}
+        elif method != "GET" and path.startswith("/runs/"):
+            run_id = int(path.split("/")[2])
+            with kb.connect(board=board) as conn:
+                run = kb.get_run(conn, run_id)
+            task_id = run.task_id if run else "t_missing"
+            kwargs["json"] = {**snapshot(task_id, board), **(body or {})}
+        elif method != "GET" and path.startswith("/tasks/"):
+            task_id = path.split("/")[2]
+            if path.endswith("/attachments"):
+                data = dict(kwargs.get("data") or {})
+                data.setdefault("expected_snapshot", json.dumps(snapshot(task_id, board)))
+                kwargs["data"] = data
+            else:
+                kwargs["json"] = {**snapshot(task_id, board), **(body or {})}
+
+        return original_request(method, url, **kwargs)
+
+    test_client.request = request_with_snapshot
+    return test_client
 
 
 # ---------------------------------------------------------------------------
@@ -613,6 +689,7 @@ def test_patch_drag_drop_move_todo_to_ready(client):
         json={"status": "ready"},
     )
     assert r.status_code == 409
+    assert r.json()["current"]["status"] == "todo"
 
     # The 409 detail must name the blocking parent so the dashboard can
     # render an actionable toast instead of a silent no-op (#26744).
@@ -1983,6 +2060,33 @@ def test_home_subscribe_multiple_platforms_independent(client, with_home_channel
     assert set(subs) == {"discord"}
 
 
+def test_home_subscribe_rejects_stale_snapshot_without_subscription(
+    client,
+    with_home_channels,
+):
+    task_id = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Stale subscription target"},
+    ).json()["task"]["id"]
+    expected = _expected_operator_snapshot(task_id)
+    with kb.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET title = 'Current subscription target' WHERE id = ?",
+                (task_id,),
+            )
+
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/telegram",
+        json=expected,
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["current"]["title"] == "Current subscription target"
+    with kb.connect() as conn:
+        assert kb.list_notify_subs(conn, task_id) == []
+
+
 def test_home_channels_empty_when_no_homes_configured(client, monkeypatch):
     """Zero platforms with a home -> empty list (UI hides the section)."""
     # No BOT_TOKEN env vars set → load_gateway_config().platforms is empty.
@@ -2134,6 +2238,7 @@ def test_reclaim_endpoint_409_for_non_running_task(client):
         json={},
     )
     assert r.status_code == 409
+    assert r.json()["current"]["status"] == "ready"
 
 
 def test_reassign_endpoint_switches_profile(client):
@@ -2580,6 +2685,338 @@ def _task_assignee(task_id: str):
         conn.close()
 
 
+def _operator_snapshot(task_id: str) -> dict:
+    conn = kb.connect()
+    try:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        assert row is not None
+        return kb.task_snapshot_from_row(row)
+    finally:
+        conn.close()
+
+
+def _expected_operator_snapshot(task_id: str) -> dict:
+    return {
+        f"expected_{field}": value
+        for field, value in _operator_snapshot(task_id).items()
+    }
+
+
+@pytest.mark.parametrize(
+    ("action", "initial_status", "stale_field", "current_value"),
+    [
+        ("edit", "ready", "status", "review"),
+        ("move", "ready", "title", "Current title"),
+        ("assign", "ready", "title", "Current title"),
+        ("comment", "ready", "title", "Current title"),
+        ("block", "ready", "current_step_key", "architecture"),
+        ("reassign", "ready", "assignee", "tester"),
+        ("approve", "blocked", "current_step_key", "architecture"),
+    ],
+)
+def test_conditional_operator_writes_reject_stale_snapshot_without_mutation(
+    client,
+    action,
+    initial_status,
+    stale_field,
+    current_value,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Snapshot title",
+            assignee="architect",
+            initial_status="blocked",
+            workflow_template_id="product",
+            current_step_key="backlog",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = ? WHERE id = ?",
+                (initial_status, task_id),
+            )
+
+    expected = _expected_operator_snapshot(task_id)
+    with kb.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                f"UPDATE tasks SET {stale_field} = ? WHERE id = ?",
+                (current_value, task_id),
+            )
+        comments_before = len(kb.list_comments(conn, task_id))
+        events_before = len(kb.list_events(conn, task_id))
+    current_before = _operator_snapshot(task_id)
+
+    if action == "edit":
+        response = client.patch(
+            f"/api/plugins/kanban/tasks/{task_id}",
+            json={"title": "Operator edit", **expected},
+        )
+    elif action == "move":
+        response = client.patch(
+            f"/api/plugins/kanban/tasks/{task_id}",
+            json={"status": "review", **expected},
+        )
+    elif action == "assign":
+        response = client.patch(
+            f"/api/plugins/kanban/tasks/{task_id}",
+            json={"assignee": "developer", **expected},
+        )
+    elif action == "comment":
+        response = client.post(
+            f"/api/plugins/kanban/tasks/{task_id}/comments",
+            json={"body": "Operator note", **expected},
+        )
+    elif action == "block":
+        response = client.patch(
+            f"/api/plugins/kanban/tasks/{task_id}",
+            json={
+                "status": "blocked",
+                "block_reason": "Operator block",
+                **expected,
+            },
+        )
+    elif action == "reassign":
+        response = client.post(
+            f"/api/plugins/kanban/tasks/{task_id}/reassign",
+            json={"profile": "developer", **expected},
+        )
+    else:
+        response = client.post(
+            f"/api/plugins/kanban/tasks/{task_id}/approve-unblock",
+            json={"confirmed": True, **expected},
+        )
+
+    assert response.status_code == 409, response.text
+    body = response.json()
+    assert "refresh" in body["detail"]
+    assert body["current"] == current_before
+    assert _operator_snapshot(task_id) == current_before
+    with kb.connect() as conn:
+        assert len(kb.list_comments(conn, task_id)) == comments_before
+        assert len(kb.list_events(conn, task_id)) == events_before
+
+
+def test_conditional_comment_applies_when_snapshot_matches(client):
+    task_id = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Matching comment target", "assignee": "developer"},
+    ).json()["task"]["id"]
+
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/comments",
+        json={"body": "Fresh operator note", **_expected_operator_snapshot(task_id)},
+    )
+
+    assert response.status_code == 200, response.text
+    with kb.connect() as conn:
+        comments = kb.list_comments(conn, task_id)
+    assert [comment.body for comment in comments] == ["Fresh operator note"]
+
+
+def test_existing_task_mutations_require_complete_snapshot(kanban_home):
+    app = FastAPI()
+    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
+    raw_client = TestClient(app)
+    task_id = raw_client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Snapshot required"},
+    ).json()["task"]["id"]
+
+    missing = raw_client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"title": "Bypass attempt"},
+    )
+    partial = raw_client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"title": "Bypass attempt", "expected_status": "ready"},
+    )
+
+    assert missing.status_code == 422
+    assert partial.status_code == 422
+    assert _operator_snapshot(task_id)["title"] == "Snapshot required"
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "delete",
+        "bulk",
+        "reclaim",
+        "terminate",
+        "specify",
+        "decompose",
+        "link",
+        "unlink",
+        "upload_attachment",
+        "delete_attachment",
+    ],
+)
+def test_remaining_operator_writes_reject_stale_snapshot_without_mutation(
+    client,
+    tmp_path,
+    action,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Operator target",
+            assignee="developer",
+            initial_status="blocked",
+            workflow_template_id="product",
+            current_step_key="backlog",
+        )
+        parent_id = kb.create_task(
+            conn,
+            title="Dependency parent",
+            initial_status="blocked",
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        if action == "unlink":
+            kb.link_tasks(conn, parent_id, task_id)
+        attachment_id = None
+        if action == "delete_attachment":
+            stored = tmp_path / "operator-note.txt"
+            stored.write_text("preserve", encoding="utf-8")
+            attachment_id = kb.add_attachment(
+                conn,
+                task_id,
+                filename=stored.name,
+                stored_path=str(stored),
+                size=stored.stat().st_size,
+            )
+        run_id = None
+        if action == "terminate":
+            with kb.write_txn(conn):
+                run = conn.execute(
+                    """
+                    INSERT INTO task_runs
+                        (task_id, profile, status, started_at, ended_at)
+                    VALUES (?, 'developer', 'running', 1234, NULL)
+                    """,
+                    (task_id,),
+                )
+                run_id = int(run.lastrowid)
+                conn.execute(
+                    "UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?",
+                    (run_id, task_id),
+                )
+
+    expected = _expected_operator_snapshot(task_id)
+    with kb.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET title = 'Current operator target' WHERE id = ?",
+                (task_id,),
+            )
+        comments_before = len(kb.list_comments(conn, task_id))
+        events_before = len(kb.list_events(conn, task_id))
+        priority_before = kb.get_task(conn, task_id).priority
+    current_before = _operator_snapshot(task_id)
+
+    if action == "delete":
+        response = client.request(
+            "DELETE",
+            f"/api/plugins/kanban/tasks/{task_id}",
+            json=expected,
+        )
+    elif action == "bulk":
+        response = client.post(
+            "/api/plugins/kanban/tasks/bulk",
+            json={
+                "ids": [task_id],
+                "priority": 9,
+                "expected_snapshots": {task_id: expected},
+            },
+        )
+    elif action == "reclaim":
+        response = client.post(
+            f"/api/plugins/kanban/tasks/{task_id}/reclaim",
+            json=expected,
+        )
+    elif action == "terminate":
+        response = client.post(
+            f"/api/plugins/kanban/runs/{run_id}/terminate",
+            json=expected,
+        )
+    elif action in {"specify", "decompose"}:
+        response = client.post(
+            f"/api/plugins/kanban/tasks/{task_id}/{action}",
+            json=expected,
+        )
+    elif action == "link":
+        response = client.post(
+            "/api/plugins/kanban/links",
+            json={
+                "parent_id": parent_id,
+                "child_id": task_id,
+                "expected_task_id": task_id,
+                **expected,
+            },
+        )
+    elif action == "unlink":
+        response = client.request(
+            "DELETE",
+            f"/api/plugins/kanban/links?parent_id={parent_id}&child_id={task_id}",
+            json={"expected_task_id": task_id, **expected},
+        )
+    elif action == "upload_attachment":
+        response = client.post(
+            f"/api/plugins/kanban/tasks/{task_id}/attachments",
+            data={"expected_snapshot": json.dumps(expected)},
+            files={"file": ("new.txt", b"new attachment", "text/plain")},
+        )
+    else:
+        response = client.request(
+            "DELETE",
+            f"/api/plugins/kanban/attachments/{attachment_id}",
+            json=expected,
+        )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["current"] == current_before
+    assert _operator_snapshot(task_id) == current_before
+    with kb.connect() as conn:
+        assert len(kb.list_comments(conn, task_id)) == comments_before
+        assert len(kb.list_events(conn, task_id)) == events_before
+        assert kb.get_task(conn, task_id).priority == priority_before
+        link = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (parent_id, task_id),
+        ).fetchone()
+        assert bool(link) is (action == "unlink")
+        if attachment_id is not None:
+            assert kb.get_attachment(conn, attachment_id) is not None
+        if run_id is not None:
+            assert kb.get_run(conn, run_id).ended_at is None
+
+
+def test_conditional_bulk_requires_snapshot_for_every_task(client):
+    first = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Bulk first"},
+    ).json()["task"]["id"]
+    second = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Bulk second"},
+    ).json()["task"]["id"]
+
+    response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={
+            "ids": [first, second],
+            "priority": 9,
+            "expected_snapshots": {first: _expected_operator_snapshot(first)},
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    with kb.connect() as conn:
+        assert kb.get_task(conn, first).priority == 0
+        assert kb.get_task(conn, second).priority == 0
+
+
 def test_conditional_manual_block_accepts_todo_and_review_cards(client):
     """Cockpit can manually block non-running product-workflow cards via API.
 
@@ -2735,6 +3172,43 @@ def test_conditional_manual_block_clears_stale_failure_state(client):
     assert row["last_failure_error"] is None
 
 
+def test_conditional_manual_block_preserves_product_preflight_routing(client):
+    kb.ensure_product_board_defaults("prod", name="Product")
+    task_id = client.post(
+        "/api/plugins/kanban/tasks?board=prod",
+        json={
+            "title": "Product block target",
+            "assignee": "developer",
+            "workflow_template_id": "product",
+            "current_step_key": "backlog",
+        },
+    ).json()["task"]["id"]
+    with kb.connect(board="prod") as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        expected = {
+            "expected_status": task.status,
+            "expected_title": task.title,
+            "expected_assignee": task.assignee,
+            "expected_current_step_key": task.current_step_key,
+            "expected_current_run_id": task.current_run_id,
+        }
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}?board=prod",
+        json={"status": "blocked", "block_reason": "operator hold", **expected},
+    )
+
+    assert response.status_code == 200, response.text
+    with kb.connect(board="prod") as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "ready"
+    assert task.running is False
+    assert task.blocked is False
+    assert task.assignee == "default"
+
+
 def test_conditional_reassign_rejects_stale_assignee_snapshot(client):
     task_id = client.post(
         "/api/plugins/kanban/tasks",
@@ -2823,4 +3297,44 @@ def test_conditional_reassign_applies_when_snapshot_matches(client):
     )
 
     assert resp.status_code == 200, resp.text
+    assert _task_assignee(task_id) == "developer"
+
+
+def test_conditional_reassign_holds_write_lock_through_canonical_mutation(
+    client,
+    monkeypatch,
+):
+    task_id = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Race target", "assignee": "architect"},
+    ).json()["task"]["id"]
+    expected = _expected_operator_snapshot(task_id)
+    original_assign = kb.assign_task
+    race = {"blocked": False}
+
+    def assign_with_competing_writer(conn, target_id, profile):
+        competing = kb.connect()
+        try:
+            competing.execute("PRAGMA busy_timeout = 0")
+            with pytest.raises(sqlite3.OperationalError, match="locked|busy"):
+                with kb.write_txn(competing):
+                    competing.execute(
+                        "UPDATE tasks SET title = 'Lost race' WHERE id = ?",
+                        (target_id,),
+                    )
+            race["blocked"] = True
+        finally:
+            competing.close()
+        return original_assign(conn, target_id, profile)
+
+    monkeypatch.setattr(kb, "assign_task", assign_with_competing_writer)
+
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/reassign",
+        json={"profile": "developer", **expected},
+    )
+
+    assert response.status_code == 200, response.text
+    assert race["blocked"] is True
+    assert _operator_snapshot(task_id)["title"] == "Race target"
     assert _task_assignee(task_id) == "developer"

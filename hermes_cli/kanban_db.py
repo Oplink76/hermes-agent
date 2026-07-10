@@ -3979,6 +3979,19 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
+    if conn.in_transaction:
+        savepoint = f"kanban_nested_{secrets.token_hex(8)}"
+        conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            yield conn
+        except Exception:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        return
+
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn
@@ -4005,6 +4018,116 @@ def write_txn(conn: sqlite3.Connection):
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
+
+
+TASK_SNAPSHOT_FIELDS = (
+    "status",
+    "title",
+    "assignee",
+    "current_step_key",
+    "current_run_id",
+)
+
+
+class TaskSnapshotConflict(RuntimeError):
+    """Raised when an operator mutation loses its expected task snapshot."""
+
+    def __init__(self, action: str, current: dict[str, Any]):
+        super().__init__(f"task changed; refresh before {action}")
+        self.current = current
+
+
+def task_snapshot_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "status": row["status"],
+        "title": row["title"],
+        "assignee": _canonical_assignee(row["assignee"]),
+        "current_step_key": row["current_step_key"],
+        "current_run_id": row["current_run_id"],
+    }
+
+
+def assert_task_snapshot(
+    row: sqlite3.Row,
+    expected: dict[str, Any],
+    *,
+    action: str,
+) -> None:
+    current = task_snapshot_from_row(row)
+    for field, value in expected.items():
+        if field not in TASK_SNAPSHOT_FIELDS:
+            continue
+        if field == "assignee":
+            value = _canonical_assignee(value)
+        if current[field] != value:
+            raise TaskSnapshotConflict(action, current)
+
+
+@contextlib.contextmanager
+def conditional_task_write(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected: dict[str, Any],
+    *,
+    action: str,
+):
+    """Hold one write lock across snapshot validation and canonical mutation."""
+    with write_txn(conn):
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is not None:
+            assert_task_snapshot(row, expected, action=action)
+        yield row
+
+
+@contextlib.contextmanager
+def conditional_tasks_write(
+    conn: sqlite3.Connection,
+    expected_by_task_id: dict[str, dict[str, Any]],
+    *,
+    action: str,
+):
+    """Hold one write lock while validating and mutating a task batch."""
+    with write_txn(conn):
+        for task_id, expected in expected_by_task_id.items():
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is not None:
+                assert_task_snapshot(row, expected, action=action)
+        yield
+
+
+_SCOPED_EXPECTED_TASK_SNAPSHOT: ContextVar[
+    Optional[tuple[str, dict[str, Any], str]]
+] = ContextVar("kanban_expected_task_snapshot", default=None)
+
+
+@contextlib.contextmanager
+def scoped_expected_task_snapshot(
+    task_id: str,
+    expected: dict[str, Any],
+    *,
+    action: str,
+):
+    token = _SCOPED_EXPECTED_TASK_SNAPSHOT.set((task_id, expected, action))
+    try:
+        yield
+    finally:
+        _SCOPED_EXPECTED_TASK_SNAPSHOT.reset(token)
+
+
+def _assert_scoped_expected_task_snapshot(
+    row: sqlite3.Row,
+    task_id: str,
+    *,
+    default_action: str,
+) -> None:
+    scoped = _SCOPED_EXPECTED_TASK_SNAPSHOT.get()
+    if scoped is None or scoped[0] != task_id:
+        return
+    _, expected, action = scoped
+    assert_task_snapshot(row, expected, action=action or default_action)
 
 
 # ---------------------------------------------------------------------------
@@ -6680,8 +6803,12 @@ def block_task(
     expected_run_id: Optional[int] = None,
     board: Optional[str] = None,
     human_escalation_assignee: Optional[str] = "default",
+    allow_todo: bool = False,
 ) -> bool:
-    """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+    """Transition a blockable task to ``blocked`` (or route elsewhere).
+
+    ``allow_todo`` extends the operator path to idle ``todo`` cards without
+    changing the worker-facing default.
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
     un-typed block) drives routing instead of every block landing in one
@@ -6757,10 +6884,11 @@ def block_task(
                        worker_pid    = NULL,
                        block_kind    = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'review')
+                   AND (status IN ('running', 'ready', 'review')
+                        OR (? AND status = 'todo'))
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
+                (kind, task_id, int(allow_todo)) if expected_run_id is None
+                else (kind, task_id, int(allow_todo), int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -6821,10 +6949,11 @@ def block_task(
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'review')
+                   AND (status IN ('running', 'ready', 'review')
+                        OR (? AND status = 'todo'))
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                (kind, recurrences, task_id, int(allow_todo)) if expected_run_id is None
+                else (kind, recurrences, task_id, int(allow_todo), int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -6869,9 +6998,10 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready', 'review')
+                       AND (status IN ('running', 'ready', 'review')
+                            OR (? AND status = 'todo'))
                     """,
-                    (kind, recurrences, task_id),
+                    (kind, recurrences, task_id, int(allow_todo)),
                 )
             else:
                 cur = conn.execute(
@@ -6884,10 +7014,17 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready', 'review')
+                       AND (status IN ('running', 'ready', 'review')
+                            OR (? AND status = 'todo'))
                        AND current_run_id = ?
                     """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
+                    (
+                        kind,
+                        recurrences,
+                        task_id,
+                        int(allow_todo),
+                        int(expected_run_id),
+                    ),
                 )
             if cur.rowcount != 1:
                 return False
@@ -7198,11 +7335,16 @@ def specify_triage_task(
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT * FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
             return False
+        _assert_scoped_expected_task_snapshot(
+            existing,
+            task_id,
+            default_action="specifying the task",
+        )
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
@@ -7227,9 +7369,7 @@ def specify_triage_task(
         if cur.rowcount != 1:
             return False
         if changed_fields and author and author.strip():
-            # Inline INSERT (rather than ``add_comment``) because we're
-            # already inside this function's write_txn — nested BEGIN
-            # IMMEDIATE would raise OperationalError. We also skip the
+            # Inline INSERT avoids an unnecessary nested savepoint. We also skip the
             # 'commented' event that ``add_comment`` emits, since the
             # 'specified' event below already records the change.
             conn.execute(
@@ -7250,8 +7390,8 @@ def specify_triage_task(
             "specified",
             {"changed_fields": changed_fields} if changed_fields else None,
         )
-    # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
-    # ready-promotion pass opens its own IMMEDIATE txn. This runs the same
+    # Outside the write_txn above, the ready-promotion pass opens its own
+    # IMMEDIATE txn. This runs the same
     # logic the dispatcher would on its next tick, so a specified task
     # with no open parents flips straight to 'ready' here instead of
     # idling in 'todo' until the next sweep.
@@ -7352,12 +7492,16 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
-            "FROM tasks WHERE id = ?",
+            "SELECT * FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if root_row is None:
             return None
+        _assert_scoped_expected_task_snapshot(
+            root_row,
+            task_id,
+            default_action="decomposing the task",
+        )
         if root_row["status"] != "triage":
             return None
         tenant = root_row["tenant"]

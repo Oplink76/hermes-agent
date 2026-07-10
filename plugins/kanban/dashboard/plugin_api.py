@@ -36,16 +36,18 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import sqlite3
+import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
@@ -689,6 +691,14 @@ def get_task(
 # POST /tasks
 # ---------------------------------------------------------------------------
 
+class _ExpectedTaskSnapshotBody(BaseModel):
+    expected_status: str
+    expected_title: str
+    expected_assignee: Optional[str]
+    expected_current_step_key: Optional[str]
+    expected_current_run_id: Optional[int]
+
+
 class CreateTaskBody(BaseModel):
     title: str
     body: Optional[str] = None
@@ -809,6 +819,7 @@ async def upload_task_attachment(
     file: UploadFile = File(...),
     board: Optional[str] = Query(None),
     uploaded_by: Optional[str] = Form(None),
+    expected_snapshot: str = Form(...),
 ):
     """Store an uploaded file for a task and record its metadata.
 
@@ -819,6 +830,22 @@ async def upload_task_attachment(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        try:
+            expected = _ExpectedTaskSnapshotBody(**json.loads(expected_snapshot))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid expected_snapshot: {exc}",
+            ) from exc
+        try:
+            _preflight_expected_task_snapshot(
+                conn,
+                task_id,
+                expected,
+                action="uploading an attachment",
+            )
+        except _TaskSnapshotConflict as exc:
+            return _snapshot_conflict_response(exc)
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
 
@@ -861,15 +888,25 @@ async def upload_task_attachment(
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"failed to store attachment: {exc}")
 
-        att_id = kanban_db.add_attachment(
-            conn,
-            task_id,
-            filename=candidate,
-            stored_path=str(dest_path.resolve()),
-            content_type=file.content_type,
-            size=total,
-            uploaded_by=(uploaded_by or "dashboard"),
-        )
+        try:
+            with kanban_db.conditional_task_write(
+                conn,
+                task_id,
+                _expected_task_snapshot_values(expected),
+                action="uploading an attachment",
+            ):
+                att_id = kanban_db.add_attachment(
+                    conn,
+                    task_id,
+                    filename=candidate,
+                    stored_path=str(dest_path.resolve()),
+                    content_type=file.content_type,
+                    size=total,
+                    uploaded_by=(uploaded_by or "dashboard"),
+                )
+        except _TaskSnapshotConflict as exc:
+            dest_path.unlink(missing_ok=True)
+            return _snapshot_conflict_response(exc)
         att = kanban_db.get_attachment(conn, att_id)
         return {"attachment": _attachment_dict(att) if att else None}
     except ValueError as e:
@@ -906,11 +943,28 @@ def download_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 
 
 @router.delete("/attachments/{attachment_id}")
-def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
+def remove_attachment(
+    attachment_id: int,
+    payload: _ExpectedTaskSnapshotBody,
+    board: Optional[str] = Query(None),
+):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        att = kanban_db.delete_attachment(conn, attachment_id)
+        existing = kanban_db.get_attachment(conn, attachment_id)
+        if existing is not None:
+            try:
+                with kanban_db.conditional_task_write(
+                    conn,
+                    existing.task_id,
+                    _expected_task_snapshot_values(payload),
+                    action="deleting an attachment",
+                ):
+                    att = kanban_db.delete_attachment(conn, attachment_id)
+            except _TaskSnapshotConflict as exc:
+                return _snapshot_conflict_response(exc)
+        else:
+            att = None
         if att is None:
             raise HTTPException(status_code=404, detail="attachment not found")
         return {"ok": True, "id": attachment_id}
@@ -922,7 +976,7 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 # PATCH /tasks/:id  (status / assignee / priority / title / body)
 # ---------------------------------------------------------------------------
 
-class UpdateTaskBody(BaseModel):
+class UpdateTaskBody(_ExpectedTaskSnapshotBody):
     status: Optional[str] = None
     assignee: Optional[str] = None
     priority: Optional[int] = None
@@ -932,12 +986,8 @@ class UpdateTaskBody(BaseModel):
     block_reason: Optional[str] = None
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
-    # Optional compare-and-swap guards for external Cockpit clients. When
-    # provided, the mutation is applied only if the task is still on the
-    # caller's snapshot. This preserves the dashboard plugin as the single
-    # write surface without forcing clients back to direct SQLite access.
-    expected_status: Optional[str] = None
-    expected_current_run_id: Optional[int] = None
+    # Every existing-card operator write requires this compare-and-swap
+    # snapshot via the base model.
     # Structured handoff fields — forwarded to complete_task when status
     # transitions to 'done'. Dashboard parity with ``hermes kanban
     # complete --summary ... --metadata ...``.
@@ -950,160 +1000,17 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        task = kanban_db.get_task(conn, task_id)
-        if task is None:
+        try:
+            updated = _patch_task(conn, task_id, payload, board=board)
+        except _TaskSnapshotConflict as exc:
+            return _snapshot_conflict_response(exc)
+        except HTTPException as exc:
+            if exc.status_code == 409:
+                return _task_conflict_response(conn, task_id, str(exc.detail))
+            raise
+        if updated is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-
-        # --- assignee ----------------------------------------------------
-        if payload.assignee is not None:
-            try:
-                ok = kanban_db.assign_task(
-                    conn, task_id, payload.assignee or None,
-                )
-            except RuntimeError as e:
-                raise HTTPException(status_code=409, detail=str(e))
-            if not ok:
-                raise HTTPException(status_code=404, detail="task not found")
-
-        # --- status -------------------------------------------------------
-        if payload.status is not None:
-            requested_status = payload.status
-            # Lifecycle verbs must reach their structured handlers with the
-            # card's existing workflow step intact. Product boards also have
-            # visible columns named "done"/"blocked"; treating those as custom
-            # step names before complete_task/block_task corrupts V2 handoff
-            # state (e.g. backlog -> done instead of backlog -> architecture).
-            lifecycle_statuses = {"done", "blocked", "scheduled", "ready", "archived", "running"}
-            custom_column = None if requested_status in lifecycle_statuses else _custom_column_by_name(board, requested_status)
-            if custom_column is not None:
-                _set_workflow_direct(
-                    conn,
-                    task_id,
-                    workflow_template_id="product",
-                    current_step_key=custom_column["name"],
-                )
-                s = custom_column["status"]
-            else:
-                s = requested_status
-            ok = True
-            if s == "done":
-                ok = kanban_db.complete_task(
-                    conn, task_id,
-                    result=payload.result,
-                    summary=payload.summary,
-                    metadata=payload.metadata,
-                    board=board,
-                )
-            elif s == "blocked":
-                if _any_model_fields_set(payload, ("expected_status", "expected_current_run_id")):
-                    ok = _conditional_manual_block_task(
-                        conn,
-                        task_id,
-                        reason=payload.block_reason,
-                        expected_status=payload.expected_status,
-                        expected_current_run_id=payload.expected_current_run_id,
-                    )
-                else:
-                    ok = kanban_db.block_task(
-                        conn,
-                        task_id,
-                        reason=payload.block_reason,
-                        board=board,
-                    )
-            elif s == "scheduled":
-                ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
-            elif s == "ready":
-                # Re-open a blocked/scheduled task, or just an explicit status set.
-                current = kanban_db.get_task(conn, task_id)
-                if current and current.status in ("blocked", "scheduled"):
-                    ok = kanban_db.unblock_task(conn, task_id)
-                else:
-                    # Direct status write for drag-drop (todo -> ready etc).
-                    ok = _set_status_direct(conn, task_id, "ready")
-            elif s == "archived":
-                ok = kanban_db.archive_task(conn, task_id)
-            elif s == "running":
-                raise HTTPException(
-                    status_code=400,
-                    detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
-                )
-            elif s in ("todo", "triage", "scheduled", "review"):
-                ok = _set_status_direct(conn, task_id, s)
-            else:
-                raise HTTPException(status_code=400, detail=f"unknown status: {s}")
-            if not ok:
-                # For ``ready``, name the blocking parent(s) so the dashboard
-                # can render an actionable toast instead of a silent no-op.
-                # See #26744.
-                if s == "ready":
-                    blockers = _parents_blocking_ready(conn, task_id)
-                    if blockers:
-                        names = ", ".join(
-                            f"{p['title']!r} ({p['id']}, status={p['status']})"
-                            for p in blockers
-                        )
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                f"Cannot move to 'ready': blocked by parent(s) "
-                                f"not done — {names}"
-                            ),
-                        )
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"status transition to {s!r} not valid from current state",
-                )
-
-        if (
-            payload.workflow_template_id is not None
-            or payload.current_step_key is not None
-        ):
-            if not _set_workflow_direct(
-                conn,
-                task_id,
-                workflow_template_id=payload.workflow_template_id,
-                current_step_key=payload.current_step_key,
-            ):
-                raise HTTPException(status_code=404, detail="task not found")
-
-        # --- priority -----------------------------------------------------
-        if payload.priority is not None:
-            with kanban_db.write_txn(conn):
-                conn.execute(
-                    "UPDATE tasks SET priority = ? WHERE id = ?",
-                    (int(payload.priority), task_id),
-                )
-                conn.execute(
-                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                    "VALUES (?, 'reprioritized', ?, ?)",
-                    (task_id, json.dumps({"priority": int(payload.priority)}),
-                     int(time.time())),
-                )
-
-        # --- title / body -------------------------------------------------
-        if payload.title is not None or payload.body is not None:
-            with kanban_db.write_txn(conn):
-                sets, vals = [], []
-                if payload.title is not None:
-                    if not payload.title.strip():
-                        raise HTTPException(status_code=400, detail="title cannot be empty")
-                    sets.append("title = ?")
-                    vals.append(payload.title.strip())
-                if payload.body is not None:
-                    sets.append("body = ?")
-                    vals.append(payload.body)
-                vals.append(task_id)
-                conn.execute(
-                    f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals,
-                )
-                conn.execute(
-                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                    "VALUES (?, 'edited', NULL, ?)",
-                    (task_id, int(time.time())),
-                )
-
-        updated = kanban_db.get_task(conn, task_id)
-        return {"task": _task_dict(updated) if updated else None}
+        return {"task": _task_dict(updated)}
     finally:
         conn.close()
 
@@ -1113,11 +1020,24 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 # ---------------------------------------------------------------------------
 
 @router.delete("/tasks/{task_id}")
-def delete_task(task_id: str, board: Optional[str] = Query(None)):
+def delete_task(
+    task_id: str,
+    payload: _ExpectedTaskSnapshotBody,
+    board: Optional[str] = Query(None),
+):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.delete_task(conn, task_id)
+        try:
+            with kanban_db.conditional_task_write(
+                conn,
+                task_id,
+                _expected_task_snapshot_values(payload),
+                action="deleting the task",
+            ):
+                ok = kanban_db.delete_task(conn, task_id)
+        except _TaskSnapshotConflict as exc:
+            return _snapshot_conflict_response(exc)
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         return {"deleted": True, "task_id": task_id}
@@ -1126,16 +1046,56 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
 
 
 
-def _model_field_was_set(model: BaseModel, field_name: str) -> bool:
-    """Pydantic v1/v2 compatible test for whether a JSON field was present."""
-    fields = getattr(model, "model_fields_set", None)
-    if fields is None:
-        fields = getattr(model, "__fields_set__", set())
-    return field_name in fields
+_EXPECTED_TASK_SNAPSHOT_FIELDS = kanban_db.TASK_SNAPSHOT_FIELDS
 
 
-def _any_model_fields_set(model: BaseModel, field_names: tuple[str, ...]) -> bool:
-    return any(_model_field_was_set(model, name) for name in field_names)
+_TaskSnapshotConflict = kanban_db.TaskSnapshotConflict
+
+
+def _expected_task_snapshot_values(model: BaseModel) -> dict[str, Any]:
+    return {
+        field: getattr(model, f"expected_{field}")
+        for field in _EXPECTED_TASK_SNAPSHOT_FIELDS
+    }
+
+
+def _snapshot_conflict_response(exc: _TaskSnapshotConflict) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={"detail": str(exc), "current": exc.current},
+    )
+
+
+def _task_conflict_response(
+    conn: sqlite3.Connection,
+    task_id: str,
+    detail: str,
+) -> JSONResponse:
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    current = kanban_db.task_snapshot_from_row(row) if row is not None else None
+    return JSONResponse(
+        status_code=409,
+        content={"detail": detail, "current": current},
+    )
+
+
+def _preflight_expected_task_snapshot(
+    conn: sqlite3.Connection,
+    task_id: str,
+    payload: BaseModel,
+    *,
+    action: str,
+) -> None:
+    """Reject a stale operator snapshot before invoking a canonical action."""
+    with kanban_db.write_txn(conn):
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        kanban_db.assert_task_snapshot(
+            row,
+            _expected_task_snapshot_values(payload),
+            action=action,
+        )
 
 
 def _canonical_assignee(value: Optional[str]) -> Optional[str]:
@@ -1170,74 +1130,169 @@ def _insert_task_event(
     )
 
 
-def _conditional_manual_block_task(
+def _patch_task(
     conn: sqlite3.Connection,
     task_id: str,
+    payload: UpdateTaskBody,
     *,
-    reason: Optional[str],
-    expected_status: Optional[str],
-    expected_current_run_id: Optional[int],
-) -> bool:
-    """Atomically apply a Cockpit manual block if the task still matches.
-
-    ``kanban_db.block_task`` is worker-oriented and only accepts running/ready
-    tasks. Cockpit also lets humans block not-yet-running todo/review cards.
-    This API helper keeps that manual-control contract while enforcing
-    compare-and-swap guards inside the same SQLite write transaction.
-    """
-    if expected_status not in {"todo", "ready", "review"}:
-        raise HTTPException(
-            status_code=409,
-            detail="manual block requires expected_status todo, ready, or review",
-        )
-
-    with kanban_db.write_txn(conn):
-        row = conn.execute(
-            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            return False
-        if row["status"] != expected_status or row["current_run_id"] != expected_current_run_id:
-            raise HTTPException(status_code=409, detail="task changed; refresh before blocking")
-        if row["claim_lock"] is not None or row["status"] == "running":
-            raise HTTPException(status_code=409, detail="task is running; refresh before blocking")
-        if row["current_run_id"] is not None:
-            run = conn.execute("SELECT ended_at FROM task_runs WHERE id = ?", (row["current_run_id"],)).fetchone()
-            if run is None or run["ended_at"] is None:
-                raise HTTPException(status_code=409, detail="task is running; refresh before blocking")
-
-        cur = conn.execute(
-            """
-            UPDATE tasks
-               SET status        = 'blocked',
-                   claim_lock    = NULL,
-                   claim_expires = NULL,
-                   worker_pid    = NULL,
-                   consecutive_failures = 0,
-                   last_failure_error = NULL,
-                   block_kind    = 'needs_input',
-                   block_recurrences = CASE
-                       WHEN block_kind IS NULL OR block_kind != 'needs_input' THEN 1
-                       ELSE COALESCE(block_recurrences, 0) + 1
-                   END
-             WHERE id = ?
-               AND status = ?
-               AND current_run_id IS ?
-               AND claim_lock IS NULL
-            """,
-            (task_id, expected_status, expected_current_run_id),
-        )
-        if cur.rowcount != 1:
-            raise HTTPException(status_code=409, detail="task changed; refresh before blocking")
-        _insert_task_event(
+    board: Optional[str],
+    snapshot_checked: bool = False,
+) -> Optional[kanban_db.Task]:
+    """Apply the dashboard's conditional card controls in one transaction."""
+    expected = _expected_task_snapshot_values(payload)
+    transaction = (
+        contextlib.nullcontext()
+        if snapshot_checked
+        else kanban_db.conditional_task_write(
             conn,
             task_id,
-            "blocked",
-            {"reason": reason, "kind": "needs_input", "source": "dashboard_api"},
-            run_id=expected_current_run_id,
+            expected,
+            action="updating the task",
         )
-    return True
+    )
+    with transaction:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return None
+
+        if payload.assignee is not None:
+            try:
+                ok = kanban_db.assign_task(conn, task_id, payload.assignee or None)
+            except RuntimeError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=str(exc),
+                ) from exc
+            if not ok:
+                return None
+
+        if payload.status is not None:
+            requested_status = payload.status
+            lifecycle_statuses = {
+                "done", "blocked", "scheduled", "ready", "archived", "running",
+            }
+            custom_column = (
+                None
+                if requested_status in lifecycle_statuses
+                else _custom_column_by_name(board, requested_status)
+            )
+            if custom_column is not None:
+                _set_workflow_direct(
+                    conn,
+                    task_id,
+                    workflow_template_id="product",
+                    current_step_key=custom_column["name"],
+                )
+                status_value = custom_column["status"]
+            else:
+                status_value = requested_status
+
+            ok = True
+            if status_value == "done":
+                ok = kanban_db.complete_task(
+                    conn,
+                    task_id,
+                    result=payload.result,
+                    summary=payload.summary,
+                    metadata=payload.metadata,
+                    board=board,
+                )
+            elif status_value == "blocked":
+                if row["current_run_id"] is not None:
+                    run = conn.execute(
+                        "SELECT ended_at FROM task_runs WHERE id = ?",
+                        (row["current_run_id"],),
+                    ).fetchone()
+                    if run is None or run["ended_at"] is None:
+                        raise _TaskSnapshotConflict(
+                            "blocking",
+                            kanban_db.task_snapshot_from_row(row),
+                        )
+                ok = kanban_db.block_task(
+                    conn,
+                    task_id,
+                    reason=payload.block_reason,
+                    kind="needs_input",
+                    board=board,
+                    allow_todo=True,
+                )
+                if ok:
+                    conn.execute(
+                        "UPDATE tasks SET consecutive_failures = 0, "
+                        "last_failure_error = NULL WHERE id = ?",
+                        (task_id,),
+                    )
+            elif status_value == "scheduled":
+                ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
+            elif status_value == "ready":
+                current = kanban_db.get_task(conn, task_id)
+                if current and current.status in ("blocked", "scheduled"):
+                    ok = kanban_db.unblock_task(conn, task_id)
+                else:
+                    ok = _set_status_direct(conn, task_id, "ready")
+            elif status_value == "archived":
+                ok = kanban_db.archive_task(conn, task_id)
+            elif status_value == "running":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
+                )
+            elif status_value in {"todo", "triage", "review"}:
+                ok = _set_status_direct(conn, task_id, status_value)
+            else:
+                raise HTTPException(status_code=400, detail=f"unknown status: {status_value}")
+            if not ok:
+                if status_value == "ready":
+                    blockers = _parents_blocking_ready(conn, task_id)
+                    if blockers:
+                        names = ", ".join(
+                            f"{parent['title']!r} ({parent['id']}, status={parent['status']})"
+                            for parent in blockers
+                        )
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Cannot move to 'ready': blocked by parent(s) "
+                                f"not done — {names}"
+                            ),
+                        )
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"status transition to {status_value!r} not valid from current state",
+                )
+
+        if payload.workflow_template_id is not None or payload.current_step_key is not None:
+            if not _set_workflow_direct(
+                conn,
+                task_id,
+                workflow_template_id=payload.workflow_template_id,
+                current_step_key=payload.current_step_key,
+            ):
+                return None
+
+        if payload.priority is not None:
+            priority = int(payload.priority)
+            conn.execute("UPDATE tasks SET priority = ? WHERE id = ?", (priority, task_id))
+            _insert_task_event(conn, task_id, "reprioritized", {"priority": priority})
+
+        if payload.title is not None or payload.body is not None:
+            sets: list[str] = []
+            values: list[Any] = []
+            if payload.title is not None:
+                title = payload.title.strip()
+                if not title:
+                    raise HTTPException(status_code=400, detail="title cannot be empty")
+                sets.append("title = ?")
+                values.append(title)
+            if payload.body is not None:
+                sets.append("body = ?")
+                values.append(payload.body)
+            values.append(task_id)
+            conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", values)
+            _insert_task_event(conn, task_id, "edited", None)
+
+        refreshed = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return kanban_db.Task.from_row(refreshed) if refreshed else None
 
 
 def _conditional_reassign_task(
@@ -1247,54 +1302,35 @@ def _conditional_reassign_task(
     *,
     reclaim_first: bool,
     reason: Optional[str],
-    expected_status: Optional[str],
-    expected_current_run_id: Optional[int],
-    expected_assignee: Optional[str],
+    snapshot: BaseModel,
 ) -> bool:
     """Atomically reassign only if the task still matches the caller snapshot."""
-    if reclaim_first:
-        # Reclaim deliberately changes state before reassignment, so snapshot
-        # preconditions would be ambiguous. Keep the existing recovery endpoint
-        # behaviour for reclaim callers.
-        return kanban_db.reassign_task(
-            conn, task_id, profile, reclaim_first=True, reason=reason,
-        )
-
-    new_profile = _canonical_assignee(profile)
-    expected_profile = _canonical_assignee(expected_assignee)
-    with kanban_db.write_txn(conn):
-        row = conn.execute(
-            "SELECT status, current_run_id, claim_lock, assignee FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
+    with kanban_db.conditional_task_write(
+        conn,
+        task_id,
+        _expected_task_snapshot_values(snapshot),
+        action="reassigning",
+    ) as row:
         if row is None:
             return False
-        if expected_status is not None and row["status"] != expected_status:
-            raise HTTPException(status_code=409, detail="task status changed; refresh before reassigning")
-        if row["current_run_id"] != expected_current_run_id:
-            raise HTTPException(status_code=409, detail="task run changed; refresh before reassigning")
-        if _canonical_assignee(row["assignee"]) != expected_profile:
-            raise HTTPException(status_code=409, detail="task assignee changed; refresh before reassigning")
-        if row["claim_lock"] is not None or row["status"] == "running":
-            raise HTTPException(status_code=409, detail="task is running; refresh before reassigning")
-        if row["current_run_id"] is not None:
-            run = conn.execute("SELECT ended_at FROM task_runs WHERE id = ?", (row["current_run_id"],)).fetchone()
+        if not reclaim_first and row["current_run_id"] is not None:
+            run = conn.execute(
+                "SELECT ended_at FROM task_runs WHERE id = ?",
+                (row["current_run_id"],),
+            ).fetchone()
             if run is None or run["ended_at"] is None:
-                raise HTTPException(status_code=409, detail="task is running; refresh before reassigning")
+                raise _TaskSnapshotConflict(
+                    "reassigning",
+                    kanban_db.task_snapshot_from_row(row),
+                )
+        return kanban_db.reassign_task(
+            conn,
+            task_id,
+            profile,
+            reclaim_first=reclaim_first,
+            reason=reason,
+        )
 
-        if _canonical_assignee(row["assignee"]) != new_profile:
-            conn.execute(
-                "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL WHERE id = ?",
-                (new_profile, task_id),
-            )
-        else:
-            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (new_profile, task_id))
-        event_payload: dict[str, Any] = {"assignee": new_profile, "source": "dashboard_api"}
-        if reason:
-            event_payload["reason"] = reason
-        _insert_task_event(conn, task_id, "assigned", event_payload)
-    return True
 
 def _parents_blocking_ready(
     conn: sqlite3.Connection, task_id: str,
@@ -1468,10 +1504,8 @@ def _set_status_direct(
 # Confirmed approve/unblock
 # ---------------------------------------------------------------------------
 
-class ApproveUnblockBody(BaseModel):
+class ApproveUnblockBody(_ExpectedTaskSnapshotBody):
     confirmed: bool = False
-    expected_status: Optional[str] = None
-    expected_title: Optional[str] = None
     comment_author: Optional[str] = "dashboard"
     comment_source: Optional[str] = "Agentic OS Cockpit approve/unblock control"
 
@@ -1484,18 +1518,29 @@ def approve_unblock_task(task_id: str, payload: ApproveUnblockBody, board: Optio
     conn = _conn(board=board)
     try:
         try:
-            task = kanban_db.approve_unblock_task(
+            with kanban_db.conditional_task_write(
                 conn,
                 task_id,
-                expected_status=payload.expected_status,
-                expected_title=payload.expected_title,
-                comment_author=payload.comment_author or "dashboard",
-                comment_source=payload.comment_source or "Agentic OS Cockpit approve/unblock control",
-            )
+                _expected_task_snapshot_values(payload),
+                action="approving unblock",
+            ):
+                task = kanban_db.approve_unblock_task(
+                    conn,
+                    task_id,
+                    expected_status=payload.expected_status,
+                    expected_title=payload.expected_title,
+                    comment_author=payload.comment_author or "dashboard",
+                    comment_source=(
+                        payload.comment_source
+                        or "Agentic OS Cockpit approve/unblock control"
+                    ),
+                )
+        except _TaskSnapshotConflict as exc:
+            return _snapshot_conflict_response(exc)
+        except RuntimeError as exc:
+            return _task_conflict_response(conn, task_id, str(exc))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         return {"ok": True, "task": _task_dict(task)}
@@ -1507,7 +1552,7 @@ def approve_unblock_task(task_id: str, payload: ApproveUnblockBody, board: Optio
 # Comments
 # ---------------------------------------------------------------------------
 
-class CommentBody(BaseModel):
+class CommentBody(_ExpectedTaskSnapshotBody):
     body: str
     author: Optional[str] = "dashboard"
 
@@ -1519,11 +1564,23 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        if kanban_db.get_task(conn, task_id) is None:
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        kanban_db.add_comment(
-            conn, task_id, author=payload.author or "dashboard", body=payload.body,
-        )
+        try:
+            with kanban_db.conditional_task_write(
+                conn,
+                task_id,
+                _expected_task_snapshot_values(payload),
+                action="commenting",
+            ) as row:
+                if row is None:
+                    raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+                kanban_db.add_comment(
+                    conn,
+                    task_id,
+                    author=payload.author or "dashboard",
+                    body=payload.body,
+                )
+        except _TaskSnapshotConflict as exc:
+            return _snapshot_conflict_response(exc)
         return {"ok": True}
     finally:
         conn.close()
@@ -1533,17 +1590,33 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
 # Links
 # ---------------------------------------------------------------------------
 
-class LinkBody(BaseModel):
+class LinkBody(_ExpectedTaskSnapshotBody):
     parent_id: str
     child_id: str
+    expected_task_id: str
+
+
+class DeleteLinkBody(_ExpectedTaskSnapshotBody):
+    expected_task_id: str
 
 
 @router.post("/links")
 def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
+    if payload.expected_task_id not in {payload.parent_id, payload.child_id}:
+        raise HTTPException(status_code=400, detail="expected_task_id must be part of the link")
     conn = _conn(board=board)
     try:
-        kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
+        try:
+            with kanban_db.conditional_task_write(
+                conn,
+                payload.expected_task_id,
+                _expected_task_snapshot_values(payload),
+                action="linking the task",
+            ):
+                kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
+        except _TaskSnapshotConflict as exc:
+            return _snapshot_conflict_response(exc)
         return {"ok": True}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1553,14 +1626,26 @@ def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
 
 @router.delete("/links")
 def delete_link(
+    payload: DeleteLinkBody,
     parent_id: str = Query(...),
     child_id: str = Query(...),
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
+    if payload.expected_task_id not in {parent_id, child_id}:
+        raise HTTPException(status_code=400, detail="expected_task_id must be part of the link")
     conn = _conn(board=board)
     try:
-        ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
+        try:
+            with kanban_db.conditional_task_write(
+                conn,
+                payload.expected_task_id,
+                _expected_task_snapshot_values(payload),
+                action="unlinking the task",
+            ):
+                ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
+        except _TaskSnapshotConflict as exc:
+            return _snapshot_conflict_response(exc)
         return {"ok": bool(ok)}
     finally:
         conn.close()
@@ -1580,22 +1665,46 @@ class BulkTaskBody(BaseModel):
     summary: Optional[str] = None
     metadata: Optional[dict] = None
     reclaim_first: bool = False
+    expected_snapshots: dict[str, _ExpectedTaskSnapshotBody]
 
 
 @router.post("/tasks/bulk")
 def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
     """Apply the same patch to every id in ``payload.ids``.
 
-    This is an *independent* iteration — per-task failures don't abort
-    siblings. Returns per-id outcome so the UI can surface partials.
+    Snapshot validation is all-or-nothing before mutation. Once validated,
+    per-task action failures don't abort siblings; the response reports each
+    outcome so the UI can surface partials.
     """
     ids = [i for i in (payload.ids or []) if i]
     if not ids:
         raise HTTPException(status_code=400, detail="ids is required")
+    if set(payload.expected_snapshots) != set(ids):
+        raise HTTPException(
+            status_code=400,
+            detail="expected_snapshots must contain every bulk task id",
+        )
     results: list[dict] = []
     board = _resolve_board(board)
     conn = _conn(board=board)
+    conditional_txn = None
     try:
+        expected_by_task_id = {
+            tid: _expected_task_snapshot_values(snapshot)
+            for tid, snapshot in payload.expected_snapshots.items()
+            if tid in ids
+        }
+        if expected_by_task_id:
+            candidate = kanban_db.conditional_tasks_write(
+                conn,
+                expected_by_task_id,
+                action="applying the bulk update",
+            )
+            try:
+                candidate.__enter__()
+            except _TaskSnapshotConflict as exc:
+                return _snapshot_conflict_response(exc)
+            conditional_txn = candidate
         for tid in ids:
             entry: dict[str, Any] = {"id": tid, "ok": True}
             try:
@@ -1604,79 +1713,46 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     entry.update(ok=False, error="not found")
                     results.append(entry)
                     continue
-                if payload.archive:
-                    if not kanban_db.archive_task(conn, tid):
-                        entry.update(ok=False, error="archive refused")
-                if payload.status is not None and not payload.archive:
-                    s = payload.status
-                    if s == "done":
-                        ok = kanban_db.complete_task(
-                            conn, tid,
-                            result=payload.result,
-                            summary=payload.summary,
-                            metadata=payload.metadata,
-                            board=board,
-                        )
-                    elif s == "blocked":
-                        ok = kanban_db.block_task(conn, tid, board=board)
-                    elif s == "ready":
-                        cur = kanban_db.get_task(conn, tid)
-                        if cur and cur.status in ("blocked", "scheduled"):
-                            ok = kanban_db.unblock_task(conn, tid)
-                        else:
-                            ok = _set_status_direct(conn, tid, "ready")
-                    elif s == "running":
-                        entry.update(
-                            ok=False,
-                            error=(
-                                "Cannot set status to 'running' directly; "
-                                "use the dispatcher/claim path"
-                            ),
-                        )
-                        results.append(entry)
-                        continue
-                    elif s == "scheduled":
-                        ok = kanban_db.schedule_task(conn, tid)
-                    elif s in {"todo", "triage"}:
-                        ok = _set_status_direct(conn, tid, s)
-                    else:
-                        entry.update(ok=False, error=f"unknown status {s!r}")
-                        results.append(entry)
-                        continue
-                    if not ok:
-                        entry.update(ok=False, error=f"transition to {s!r} refused")
-                if payload.assignee is not None:
-                    try:
-                        if payload.reclaim_first:
-                            ok = kanban_db.reassign_task(
-                                conn, tid, payload.assignee or None,
-                                reclaim_first=True,
-                            )
-                        else:
-                            ok = kanban_db.assign_task(
-                                conn, tid, payload.assignee or None,
-                            )
-                        if not ok:
-                            entry.update(ok=False, error="assign refused")
-                    except RuntimeError as e:
-                        entry.update(ok=False, error=str(e))
-                if payload.priority is not None:
-                    with kanban_db.write_txn(conn):
-                        conn.execute(
-                            "UPDATE tasks SET priority = ? WHERE id = ?",
-                            (int(payload.priority), tid),
-                        )
-                        conn.execute(
-                            "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                            "VALUES (?, 'reprioritized', ?, ?)",
-                            (tid, json.dumps({"priority": int(payload.priority)}),
-                             int(time.time())),
-                        )
+                assignee = payload.assignee
+                if payload.reclaim_first and assignee is not None:
+                    if not kanban_db.reassign_task(
+                        conn,
+                        tid,
+                        assignee or None,
+                        reclaim_first=True,
+                    ):
+                        raise RuntimeError("assign refused")
+                    assignee = None
+                snapshot = payload.expected_snapshots[tid]
+                patch = UpdateTaskBody(
+                    **{
+                        f"expected_{field}": value
+                        for field, value in _expected_task_snapshot_values(snapshot).items()
+                    },
+                    status="archived" if payload.archive else payload.status,
+                    assignee=assignee,
+                    priority=payload.priority,
+                    result=payload.result,
+                    summary=payload.summary,
+                    metadata=payload.metadata,
+                )
+                if _patch_task(
+                    conn,
+                    tid,
+                    patch,
+                    board=board,
+                    snapshot_checked=True,
+                ) is None:
+                    entry.update(ok=False, error="not found")
+            except HTTPException as exc:
+                entry.update(ok=False, error=str(exc.detail))
             except Exception as e:  # defensive — one bad id shouldn't kill the batch
                 entry.update(ok=False, error=str(e))
             results.append(entry)
         return {"results": results}
     finally:
+        if conditional_txn is not None:
+            conditional_txn.__exit__(*sys.exc_info())
         conn.close()
 
 
@@ -1925,7 +2001,7 @@ def inspect_run_endpoint(
         return {"run_id": run_id, "alive": True, "pid": pid, "error": "access denied"}
 
 
-class TerminateRunBody(BaseModel):
+class TerminateRunBody(_ExpectedTaskSnapshotBody):
     reason: Optional[str] = None
 
 
@@ -1959,18 +2035,27 @@ def terminate_run_endpoint(
         if r is None:
             raise HTTPException(status_code=404, detail=f"run {run_id} not found")
         if r.ended_at is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=f"run {run_id} already ended",
+            return _task_conflict_response(
+                conn,
+                r.task_id,
+                f"run {run_id} already ended",
             )
-        ok = kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason)
+        try:
+            with kanban_db.conditional_task_write(
+                conn,
+                r.task_id,
+                _expected_task_snapshot_values(payload),
+                action="terminating the run",
+            ):
+                ok = kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason)
+        except _TaskSnapshotConflict as exc:
+            return _snapshot_conflict_response(exc)
         if not ok:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"cannot terminate run {run_id}: task {r.task_id} is no "
-                    "longer in a reclaimable state"
-                ),
+            return _task_conflict_response(
+                conn,
+                r.task_id,
+                f"cannot terminate run {run_id}: task {r.task_id} is no "
+                "longer in a reclaimable state",
             )
         return {"ok": True, "run_id": run_id, "task_id": r.task_id}
     finally:
@@ -1981,7 +2066,7 @@ def terminate_run_endpoint(
 # Recovery actions — reclaim a running claim, reassign to a new profile
 # ---------------------------------------------------------------------------
 
-class ReclaimBody(BaseModel):
+class ReclaimBody(_ExpectedTaskSnapshotBody):
     reason: Optional[str] = None
 
 
@@ -2001,21 +2086,29 @@ def reclaim_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.reclaim_task(conn, task_id, reason=payload.reason)
+        try:
+            with kanban_db.conditional_task_write(
+                conn,
+                task_id,
+                _expected_task_snapshot_values(payload),
+                action="reclaiming the task",
+            ):
+                ok = kanban_db.reclaim_task(conn, task_id, reason=payload.reason)
+        except _TaskSnapshotConflict as exc:
+            return _snapshot_conflict_response(exc)
         if not ok:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"cannot reclaim {task_id}: not in a claimable state "
-                    "(not running, or unknown id)"
-                ),
+            return _task_conflict_response(
+                conn,
+                task_id,
+                f"cannot reclaim {task_id}: not in a claimable state "
+                "(not running, or unknown id)",
             )
         return {"ok": True, "task_id": task_id}
     finally:
         conn.close()
 
 
-class SpecifyBody(BaseModel):
+class SpecifyBody(_ExpectedTaskSnapshotBody):
     """Optional author override. Nothing else is configurable from the
     dashboard — model + prompt come from ``auxiliary.triage_specifier``
     in config.yaml, same as the CLI."""
@@ -2043,21 +2136,33 @@ def specify_task_endpoint(
     ``async def`` without an explicit ``run_in_executor``.
     """
     board = _resolve_board(board)
-    # Pin the board for the duration of this call so the specifier module
-    # (which calls ``kb.connect()`` with no args) hits the right DB. Use a
-    # context-local override rather than mutating the process-global
-    # HERMES_KANBAN_BOARD env var — this endpoint runs in FastAPI's
-    # threadpool, so two concurrent requests for different boards would
-    # otherwise race on the shared env var and cross-write (issue #38323).
-    with kanban_db.scoped_current_board(board or kanban_db.DEFAULT_BOARD):
-        # Import lazily so a missing auxiliary client at import time
-        # doesn't break plugin load.
-        from hermes_cli import kanban_specify  # noqa: WPS433 (intentional)
-
-        outcome = kanban_specify.specify_task(
+    conn = _conn(board=board)
+    try:
+        try:
+            _preflight_expected_task_snapshot(
+                conn, task_id, payload, action="specifying the task",
+            )
+        except _TaskSnapshotConflict as exc:
+            return _snapshot_conflict_response(exc)
+    finally:
+        conn.close()
+    try:
+        with kanban_db.scoped_expected_task_snapshot(
             task_id,
-            author=(payload.author or None),
-        )
+            _expected_task_snapshot_values(payload),
+            action="specifying the task",
+        ):
+            # Pin the board for the duration of this call so the specifier
+            # module's connection resolves to the selected board.
+            with kanban_db.scoped_current_board(board or kanban_db.DEFAULT_BOARD):
+                from hermes_cli import kanban_specify  # noqa: WPS433 (intentional)
+
+                outcome = kanban_specify.specify_task(
+                    task_id,
+                    author=(payload.author or None),
+                )
+    except _TaskSnapshotConflict as exc:
+        return _snapshot_conflict_response(exc)
 
     return {
         "ok": bool(outcome.ok),
@@ -2067,13 +2172,10 @@ def specify_task_endpoint(
     }
 
 
-class ReassignBody(BaseModel):
+class ReassignBody(_ExpectedTaskSnapshotBody):
     profile: Optional[str] = None  # "" or None = unassign
     reclaim_first: bool = False
     reason: Optional[str] = None
-    expected_status: Optional[str] = None
-    expected_current_run_id: Optional[int] = None
-    expected_assignee: Optional[str] = None
 
 
 @router.post("/tasks/{task_id}/reassign")
@@ -2092,31 +2194,23 @@ def reassign_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        if _any_model_fields_set(payload, ("expected_status", "expected_current_run_id", "expected_assignee")):
+        try:
             ok = _conditional_reassign_task(
                 conn,
                 task_id,
                 payload.profile or None,
                 reclaim_first=bool(payload.reclaim_first),
                 reason=payload.reason,
-                expected_status=payload.expected_status,
-                expected_current_run_id=payload.expected_current_run_id,
-                expected_assignee=payload.expected_assignee,
+                snapshot=payload,
             )
-        else:
-            ok = kanban_db.reassign_task(
-                conn, task_id,
-                payload.profile or None,
-                reclaim_first=bool(payload.reclaim_first),
-                reason=payload.reason,
-            )
+        except _TaskSnapshotConflict as exc:
+            return _snapshot_conflict_response(exc)
         if not ok:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"cannot reassign {task_id}: unknown id, or still "
-                    "running (pass reclaim_first=true to release the claim first)"
-                ),
+            return _task_conflict_response(
+                conn,
+                task_id,
+                f"cannot reassign {task_id}: unknown id, or still "
+                "running (pass reclaim_first=true to release the claim first)",
             )
         return {"ok": True, "task_id": task_id, "assignee": payload.profile or None}
     finally:
@@ -2251,7 +2345,12 @@ def get_home_channels(
 
 
 @router.post("/tasks/{task_id}/home-subscribe/{platform}")
-def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(None)):
+def subscribe_home(
+    task_id: str,
+    platform: str,
+    payload: _ExpectedTaskSnapshotBody,
+    board: Optional[str] = Query(None),
+):
     """Subscribe *task_id* to notifications routed to *platform*'s home channel.
 
     Idempotent — re-subscribing is a no-op at the DB layer. 404 if the
@@ -2269,24 +2368,37 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        task = kanban_db.get_task(conn, task_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        kanban_db.add_notify_sub(
-            conn,
-            task_id=task_id,
-            platform=platform,
-            chat_id=home["chat_id"],
-            thread_id=home["thread_id"] or None,
-            notifier_profile=_active_profile_name(),
-        )
+        try:
+            with kanban_db.conditional_task_write(
+                conn,
+                task_id,
+                _expected_task_snapshot_values(payload),
+                action="subscribing to home notifications",
+            ) as row:
+                if row is None:
+                    raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+                kanban_db.add_notify_sub(
+                    conn,
+                    task_id=task_id,
+                    platform=platform,
+                    chat_id=home["chat_id"],
+                    thread_id=home["thread_id"] or None,
+                    notifier_profile=_active_profile_name(),
+                )
+        except _TaskSnapshotConflict as exc:
+            return _snapshot_conflict_response(exc)
         return {"ok": True, "task_id": task_id, "home_channel": home}
     finally:
         conn.close()
 
 
 @router.delete("/tasks/{task_id}/home-subscribe/{platform}")
-def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(None)):
+def unsubscribe_home(
+    task_id: str,
+    platform: str,
+    payload: _ExpectedTaskSnapshotBody,
+    board: Optional[str] = Query(None),
+):
     """Remove any notify subscription on *task_id* that matches *platform*'s home."""
     homes = _configured_home_channels()
     home = next((h for h in homes if h["platform"] == platform), None)
@@ -2298,13 +2410,24 @@ def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(N
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        kanban_db.remove_notify_sub(
-            conn,
-            task_id=task_id,
-            platform=platform,
-            chat_id=home["chat_id"],
-            thread_id=home["thread_id"] or None,
-        )
+        try:
+            with kanban_db.conditional_task_write(
+                conn,
+                task_id,
+                _expected_task_snapshot_values(payload),
+                action="unsubscribing from home notifications",
+            ) as row:
+                if row is None:
+                    raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+                kanban_db.remove_notify_sub(
+                    conn,
+                    task_id=task_id,
+                    platform=platform,
+                    chat_id=home["chat_id"],
+                    thread_id=home["thread_id"] or None,
+                )
+        except _TaskSnapshotConflict as exc:
+            return _snapshot_conflict_response(exc)
         return {"ok": True, "task_id": task_id, "home_channel": home}
     finally:
         conn.close()
@@ -2647,7 +2770,7 @@ def auto_describe_profile(profile_name: str, payload: DescribeAutoBody):
 # Decompose endpoint (built-in decomposer fan-out)
 # ---------------------------------------------------------------------------
 
-class DecomposeBody(BaseModel):
+class DecomposeBody(_ExpectedTaskSnapshotBody):
     author: Optional[str] = None
 
 
@@ -2669,16 +2792,30 @@ def decompose_task_endpoint(
     can take minutes on reasoning models.
     """
     board = _resolve_board(board)
-    # Context-local board pin (see specify endpoint above): this sync
-    # endpoint runs in FastAPI's threadpool, so mutating the process-global
-    # HERMES_KANBAN_BOARD env var would let concurrent requests for
-    # different boards race and cross-write (issue #38323).
-    with kanban_db.scoped_current_board(board or kanban_db.DEFAULT_BOARD):
-        from hermes_cli import kanban_decompose  # noqa: WPS433 (intentional)
-        outcome = kanban_decompose.decompose_task(
+    conn = _conn(board=board)
+    try:
+        try:
+            _preflight_expected_task_snapshot(
+                conn, task_id, payload, action="decomposing the task",
+            )
+        except _TaskSnapshotConflict as exc:
+            return _snapshot_conflict_response(exc)
+    finally:
+        conn.close()
+    try:
+        with kanban_db.scoped_expected_task_snapshot(
             task_id,
-            author=(payload.author or None),
-        )
+            _expected_task_snapshot_values(payload),
+            action="decomposing the task",
+        ):
+            with kanban_db.scoped_current_board(board or kanban_db.DEFAULT_BOARD):
+                from hermes_cli import kanban_decompose  # noqa: WPS433 (intentional)
+                outcome = kanban_decompose.decompose_task(
+                    task_id,
+                    author=(payload.author or None),
+                )
+    except _TaskSnapshotConflict as exc:
+        return _snapshot_conflict_response(exc)
 
     return {
         "ok": bool(outcome.ok),
