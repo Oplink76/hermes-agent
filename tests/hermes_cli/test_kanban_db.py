@@ -4929,10 +4929,7 @@ def test_complete_task_v2_with_unresolved_preflight_resumes_instead_of_handoff(
     assert head != ""
 
 
-def test_complete_task_v2_terminal_release_measure_completes_to_done(kanban_home):
-    """v2 terminal step (release_measure, no transition) still completes to
-    ``done`` via the existing legacy terminal path -- no handoff advance.
-    """
+def test_complete_task_v2_terminal_release_measure_requires_release_evidence(kanban_home):
     board = "v2-complete-task-terminal"
     _v2_product_board(board)
     with kb.connect(board=board) as conn:
@@ -4943,18 +4940,18 @@ def test_complete_task_v2_terminal_release_measure_completes_to_done(kanban_home
             current_step_key="release_measure",
         )
 
-        result = kb.complete_task(
-            conn,
-            tid,
-            summary="Released and measured",
-            board=board,
-        )
+        with pytest.raises(kb.ReleaseEvidenceError):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Released and measured",
+                board=board,
+            )
 
         task = kb.get_task(conn, tid)
         events = kb.list_events(conn, tid)
 
-    assert result is True
-    assert task.status == "done"
+    assert task.status == "ready"
     assert not any(event.kind == "handoff" for event in events)
 
 
@@ -9345,7 +9342,7 @@ def test_complete_task_v2_terminal_done_sets_phase_and_clears_flags(kanban_home)
             conn,
             title="Story",
             workflow_template_id="product",
-            current_step_key="release_measure",
+            current_step_key="done",
         )
         conn.execute(
             "UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,),
@@ -9370,6 +9367,39 @@ def test_complete_task_v2_terminal_done_sets_phase_and_clears_flags(kanban_home)
     assert row["running"] == 0
     assert row["blocked"] == 0
     assert row["status"] == kb._legacy_status(row, meta)
+
+
+def test_complete_task_release_measure_cannot_bypass_release_orchestration(
+    kanban_home, monkeypatch,
+):
+    board = "v2-release-evidence-gate"
+    kb.ensure_product_board_defaults(board)
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Story: evidence gate",
+            board=board,
+            workflow_template_id="product",
+            current_step_key="release_measure",
+        )
+
+        original_validate = kb._validate_done_evidence
+
+        def validate_in_terminal_transaction(inner_conn, inner_task_id, evidence):
+            assert inner_conn.in_transaction is True
+            return original_validate(inner_conn, inner_task_id, evidence)
+
+        monkeypatch.setattr(
+            kb, "_validate_done_evidence", validate_in_terminal_transaction
+        )
+        with pytest.raises(kb.ReleaseEvidenceError) as exc_info:
+            kb.complete_task(conn, task_id, summary="looks done", board=board)
+
+        assert "integrated_branch" in exc_info.value.missing
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.current_step_key == "release_measure"
 
 
 def test_complete_task_legacy_board_terminal_flags_stay_zero(kanban_home):

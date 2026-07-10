@@ -848,6 +848,7 @@ def product_workflow_defaults_for_board(board: Optional[str] = None) -> dict:
         "columns": [dict(column) for column in PRODUCT_BOARD_COLUMNS],
         "product_workflow": {
             "handoff_v2": True,
+            "deployment_policy": "manual",
             "assignees": dict(PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES),
         },
         **({"slug": slug} if slug else {}),
@@ -907,6 +908,7 @@ def ensure_product_board_defaults(
     existing_wf = meta.get("product_workflow")
     wf = dict(existing_wf) if isinstance(existing_wf, dict) else {}
     wf["handoff_v2"] = True
+    wf.setdefault("deployment_policy", "manual")
     existing_assignees = wf.get("assignees") if isinstance(wf.get("assignees"), dict) else {}
     assignees = dict(PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES)
     assignees.update({str(k): str(v) for k, v in existing_assignees.items() if str(v).strip()})
@@ -5920,6 +5922,18 @@ class ProductProvenanceError(ValueError):
         super().__init__(reason)
 
 
+class ReleaseEvidenceError(ValueError):
+    """Raised when a product task lacks evidence required to reach Done."""
+
+    def __init__(self, task_id: str, missing: list[str]):
+        self.task_id = task_id
+        self.missing = list(dict.fromkeys(missing))
+        super().__init__(
+            f"release blocked for {task_id}; missing evidence: "
+            f"{', '.join(self.missing)}"
+        )
+
+
 def _validate_resolver_action(candidate: Any) -> tuple[str, str, Optional[str]]:
     if not isinstance(candidate, dict):
         raise ValueError("resolver_action is required to complete a product preflight")
@@ -6125,6 +6139,7 @@ def complete_task(
     board: Optional[str] = None,
     product_role_assignees: Optional[dict[str, str]] = None,
     product_workflow_enabled: bool = True,
+    _release_evidence: Optional[dict] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -6281,9 +6296,21 @@ def complete_task(
             return product_transition
 
     with write_txn(conn):
+        terminal_row = conn.execute(
+            "SELECT current_step_key FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        terminal_meta = product_board_metadata(board)
+        if (
+            terminal_row is not None
+            and terminal_row["current_step_key"] == "release_measure"
+            and terminal_meta is not None
+            and _handoff_v2_enabled(terminal_meta)
+        ):
+            _validate_done_evidence(conn, task_id, _release_evidence or {})
+        release_status = ", 'todo'" if _release_evidence is not None else ""
         if expected_run_id is None:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE tasks
                    SET status       = 'done',
                        result       = ?,
@@ -6296,13 +6323,13 @@ def complete_task(
                        running      = 0,
                        blocked      = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked'{release_status})
                 """,
                 (result, now, task_id),
             )
         else:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE tasks
                    SET status       = 'done',
                        result       = ?,
@@ -6315,7 +6342,7 @@ def complete_task(
                        running      = 0,
                        blocked      = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked'{release_status})
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
@@ -6362,6 +6389,8 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if _release_evidence is not None:
+            completed_payload["release_evidence"] = dict(_release_evidence)
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -7743,6 +7772,21 @@ def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
     return result.returncode == 0
 
 
+def _git_ref_sha(repo_root: Path, branch_name: str) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", f"refs/heads/{branch_name}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    value = (result.stdout or "").strip()
+    return value if result.returncode == 0 and value else None
+
+
 def _git_common_dir(path: Path) -> Optional[Path]:
     try:
         result = subprocess.run(
@@ -8004,6 +8048,16 @@ class IntegrationCandidate:
     scratch_worktree: Path
     repo_root: Path
     candidate_ref: str
+
+
+@dataclass(frozen=True)
+class ReleaseResult:
+    released: bool
+    status: str
+    integration_event_id: Optional[int] = None
+    integration_sha: Optional[str] = None
+    deployment_policy_event_id: Optional[int] = None
+    deployment_record_event_id: Optional[int] = None
 
 
 class IntegrationCandidateError(RuntimeError):
@@ -8297,6 +8351,7 @@ def merge_epic_to_main(
     board: Optional[str] = None,
     main_branch: str = "main",
     verify_fn: Optional[Callable[[str], bool]] = None,
+    candidate_verify_fn: Optional[Callable[[Path], bool]] = None,
     notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
 ) -> Optional[str]:
     """Hermes-run merge of ``epic_id``'s integration branch into LOCAL main.
@@ -8328,7 +8383,8 @@ def merge_epic_to_main(
         return None
     _validate_stored_product_workflow_state(conn, epic_id)
 
-    if not epic_ready(conn, epic_id, board=board, verify_fn=verify_fn):
+    readiness_verify = (lambda _branch: True) if candidate_verify_fn else verify_fn
+    if not epic_ready(conn, epic_id, board=board, verify_fn=readiness_verify):
         return "not_ready"
 
     try:
@@ -8344,7 +8400,7 @@ def merge_epic_to_main(
         _merge_epic_fail_safe(conn, epic_id, reason, board=board, notify_fn=notify_fn)
 
     try:
-        candidate_verify_fn = (
+        effective_verify_fn = candidate_verify_fn or (
             (lambda _path: bool(verify_fn(main_branch)))
             if verify_fn is not None
             else None
@@ -8354,7 +8410,7 @@ def merge_epic_to_main(
             main_branch,
             epic_branch,
             f"merge epic {epic_id}",
-            candidate_verify_fn,
+            effective_verify_fn,
         )
         if not _fast_forward_target(candidate):
             _fail(
@@ -8510,6 +8566,18 @@ def integrate_story_to_epic(
             ["merge-base", "--is-ancestor", story_branch, epic_branch], cwd=repo_root,
         )
         if ancestor_result is not None and ancestor_result.returncode == 0:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    story_id,
+                    "story_integrated_to_epic",
+                    {
+                        "source_branch": story_branch,
+                        "target_branch": epic_branch,
+                        "candidate_sha": _git_ref_sha(repo_root, epic_branch),
+                        "already_integrated": True,
+                    },
+                )
             return "already_integrated"
 
         epic_worktree = repo_root / ".worktrees" / f"epic-{epic_id}"
@@ -8535,6 +8603,17 @@ def integrate_story_to_epic(
             _integrate_story_fail_safe(conn, story_id, reason, board=board, notify_fn=notify_fn)
             return "conflict"
 
+        with write_txn(conn):
+            _append_event(
+                conn,
+                story_id,
+                "story_integrated_to_epic",
+                {
+                    "source_branch": story_branch,
+                    "target_branch": epic_branch,
+                    "candidate_sha": _git_ref_sha(repo_root, epic_branch),
+                },
+            )
         return "integrated"
     except Exception:
         return None
@@ -8547,7 +8626,9 @@ def _merge_standalone_story_to_main(
     board: Optional[str] = None,
     main_branch: str = "main",
     verify_fn: Optional[Callable[[str], bool]] = None,
+    candidate_verify_fn: Optional[Callable[[Path], bool]] = None,
     notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
+    allow_release_measure: bool = False,
 ) -> Optional[str]:
     """Merge a Done, epic-LESS product story's branch into LOCAL main.
 
@@ -8582,7 +8663,10 @@ def _merge_standalone_story_to_main(
     if parent_ids(conn, story_id):
         return None
     story = get_task(conn, story_id)
-    if story is None or story.status != "done":
+    if story is None or (
+        story.status != "done"
+        and not (allow_release_measure and story.current_step_key == "release_measure")
+    ):
         return "not_ready"
 
     try:
@@ -8606,8 +8690,21 @@ def _merge_standalone_story_to_main(
             repo_root, ["merge-base", "--is-ancestor", story_branch, main_branch]
         )
         if ancestor_result.returncode == 0:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    story_id,
+                    "story_merged_to_main",
+                    {
+                        "branch": story_branch,
+                        "source_branch": story_branch,
+                        "target_branch": main_branch,
+                        "candidate_sha": _git_ref_sha(repo_root, main_branch),
+                        "already_merged": True,
+                    },
+                )
             return "already_merged"
-        candidate_verify_fn = (
+        effective_verify_fn = candidate_verify_fn or (
             (lambda _path: bool(verify_fn(main_branch)))
             if verify_fn is not None
             else None
@@ -8617,7 +8714,7 @@ def _merge_standalone_story_to_main(
             main_branch,
             story_branch,
             f"merge story {story_id}",
-            candidate_verify_fn,
+            effective_verify_fn,
         )
         if not _fast_forward_target(candidate):
             _fail(
@@ -8654,6 +8751,362 @@ def _merge_standalone_story_to_main(
     except Exception:
         _fail("unexpected error while building story integration candidate")
         return "verify_failed"
+
+
+def _event_by_id(
+    conn: sqlite3.Connection, task_id: str, event_id: Any
+) -> Optional[Event]:
+    if not isinstance(event_id, int):
+        return None
+    return next((event for event in list_events(conn, task_id) if event.id == event_id), None)
+
+
+def _latest_event_of_kind(
+    conn: sqlite3.Connection, task_id: str, kinds: set[str]
+) -> Optional[Event]:
+    events = [event for event in list_events(conn, task_id) if event.kind in kinds]
+    return events[-1] if events else None
+
+
+def _release_run_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    branch: str,
+    source_sha: str,
+) -> dict[str, int]:
+    test_run: Optional[Run] = None
+    review_run: Optional[Run] = None
+    writer_agent: Optional[str] = None
+    reviewer_agent: Optional[str] = None
+    reviewed_writer_agent: Optional[str] = None
+    reviewed_branch: Optional[str] = None
+    reviewed_commit: Optional[str] = None
+
+    for run in list_runs(conn, task_id, include_active=False):
+        metadata = run.metadata if isinstance(run.metadata, dict) else {}
+        run_writer = _writer_agent_from_metadata(metadata)
+        if run_writer:
+            writer_agent = run_writer
+        provenance = _provenance_payload(metadata)
+        workflow = metadata.get("workflow_outcome")
+        if run.step_key == "test":
+            tester = provenance.get("tester")
+            if (
+                isinstance(workflow, dict)
+                and workflow.get("verdict") == "passed"
+                and isinstance(tester, dict)
+                and tester.get("result") == "passed"
+                and _tester_agent_from_metadata(metadata)
+            ):
+                test_run = run
+        if run.step_key == "review":
+            reviewer = provenance.get("reviewer")
+            if (
+                isinstance(workflow, dict)
+                and workflow.get("verdict") == "approved"
+                and isinstance(reviewer, dict)
+                and reviewer.get("verdict") == "approved"
+                and _reviewer_agent_from_metadata(metadata)
+            ):
+                review_run = run
+                reviewer_agent = _reviewer_agent_from_metadata(metadata)
+                reviewed_branch = str(reviewer.get("reviewed_branch") or "").strip()
+                reviewed_commit = str(reviewer.get("reviewed_commit") or "").strip()
+                reviewed_writer_agent = run_writer or writer_agent
+
+    missing: list[str] = []
+    if test_run is None:
+        missing.append("tester_pass")
+    if review_run is None:
+        missing.append("reviewer_approval")
+    if (
+        review_run is not None
+        and reviewed_writer_agent
+        and reviewer_agent
+        and _agent_compare_key(reviewed_writer_agent)
+        == _agent_compare_key(reviewer_agent)
+    ):
+        missing.append("independent_reviewer")
+    if review_run is not None and (
+        reviewed_branch != branch or reviewed_commit != source_sha
+    ):
+        missing.append("reviewed_candidate")
+    if not reviewed_writer_agent:
+        missing.append("writer_evidence")
+    if review_run is not None and not reviewer_agent:
+        missing.append("independent_reviewer")
+    if missing:
+        raise ReleaseEvidenceError(task_id, missing)
+    return {"test_run_id": test_run.id, "review_run_id": review_run.id}
+
+
+def _validate_done_evidence(
+    conn: sqlite3.Connection, task_id: str, evidence: dict
+) -> None:
+    """Validate terminal evidence while ``complete_task`` holds its write txn."""
+    missing: list[str] = []
+    try:
+        run_evidence = _release_run_evidence(
+            conn,
+            task_id,
+            str(evidence.get("source_branch") or ""),
+            str(evidence.get("source_sha") or ""),
+        )
+        if run_evidence.get("test_run_id") != evidence.get("test_run_id"):
+            missing.append("tester_pass")
+        if run_evidence.get("review_run_id") != evidence.get("review_run_id"):
+            missing.append("reviewer_approval")
+    except ReleaseEvidenceError as exc:
+        missing.extend(exc.missing)
+
+    integration = _event_by_id(conn, task_id, evidence.get("integration_event_id"))
+    if (
+        integration is None
+        or integration.kind
+        not in {"story_merged_to_main", "story_integrated_to_epic", "epic_merged"}
+        or not isinstance(integration.payload, dict)
+        or integration.payload.get("candidate_sha") != evidence.get("integration_sha")
+    ):
+        missing.append("integrated_branch")
+
+    policy = _event_by_id(conn, task_id, evidence.get("deployment_policy_event_id"))
+    if policy is None or policy.kind != "deployment_policy_evaluated":
+        missing.append("deployment_policy")
+    policy_payload = policy.payload if policy and isinstance(policy.payload, dict) else {}
+    if policy_payload.get("policy") not in {"manual", "not_required", "required"}:
+        missing.append("deployment_policy")
+    if policy_payload.get("deployment_required") is True:
+        deployment = _event_by_id(
+            conn, task_id, evidence.get("deployment_record_event_id")
+        )
+        deployment_payload = (
+            deployment.payload
+            if deployment and isinstance(deployment.payload, dict)
+            else {}
+        )
+        if deployment is None or deployment.kind != "deployment_recorded":
+            missing.extend(["smoke_evidence", "rollback_evidence", "runtime_evidence"])
+        else:
+            if deployment_payload.get("revision") != evidence.get("integration_sha"):
+                missing.append("deployment_revision")
+            if not deployment_payload.get("environment"):
+                missing.append("deployment_environment")
+            if not deployment_payload.get("smoke_result"):
+                missing.append("smoke_evidence")
+            if not deployment_payload.get("rollback_target"):
+                missing.append("rollback_evidence")
+            if not deployment_payload.get("runtime_evidence"):
+                missing.append("runtime_evidence")
+    if not str(evidence.get("measurement_note") or "").strip():
+        missing.append("measurement_note")
+    board_meta = product_board_metadata(_board_slug_for_connection(conn)) or {}
+    if (
+        _product_workflow_dict(board_meta).get("pull_request_required") is True
+        and not evidence.get("pull_request")
+    ):
+        missing.append("pull_request")
+    if missing:
+        raise ReleaseEvidenceError(task_id, missing)
+
+
+def release_product_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    board: Optional[str],
+    candidate_verify_fn: Optional[Callable[[Path], bool]],
+    release_adapter: Optional[Any],
+    *,
+    measurement_note: Optional[str] = None,
+    completion_metadata: Optional[dict] = None,
+    created_cards: Optional[Iterable[str]] = None,
+    expected_run_id: Optional[int] = None,
+) -> ReleaseResult:
+    """Integrate, evaluate deployment policy, then atomically finish a product task."""
+    task = get_task(conn, task_id)
+    meta = product_board_metadata(board)
+    if (
+        task is None
+        or meta is None
+        or not _handoff_v2_enabled(meta)
+        or task.current_step_key != "release_measure"
+    ):
+        raise ReleaseEvidenceError(task_id, ["release_measure_state"])
+
+    repo_value = str(meta.get("default_workdir") or task.workspace_path or "").strip()
+    repo_root = _git_toplevel(Path(repo_value).expanduser()) if repo_value else None
+    branch = str(task.branch_name or "").strip()
+    source_sha = _git_ref_sha(repo_root, branch) if repo_root and branch else None
+    if repo_root is None or not branch or not source_sha:
+        raise ReleaseEvidenceError(task_id, ["reviewed_candidate"])
+
+    evidence: dict[str, Any] = _release_run_evidence(
+        conn, task_id, branch, source_sha
+    )
+    evidence.update(source_branch=branch, source_sha=source_sha)
+    note = str(measurement_note or "").strip()
+    if not note:
+        raise ReleaseEvidenceError(task_id, ["measurement_note"])
+
+    parents = parent_ids(conn, task_id)
+    children = child_ids(conn, task_id)
+    if children:
+        target_branch = epic_branch_for(task_id)
+        integrated_children = all(
+            (child := get_task(conn, child_id)) is not None
+            and child.status == "done"
+            and any(
+                event.kind == "story_integrated_to_epic"
+                and isinstance(event.payload, dict)
+                and event.payload.get("target_branch") == target_branch
+                and bool(event.payload.get("candidate_sha"))
+                for event in list_events(conn, child_id)
+            )
+            for child_id in children
+        )
+        if not integrated_children:
+            raise ReleaseEvidenceError(task_id, ["integrated_children"])
+        integration_status = merge_epic_to_main(
+            conn,
+            task_id,
+            board=board,
+            candidate_verify_fn=candidate_verify_fn,
+        )
+        integration_kinds = {"epic_merged"}
+    elif parents:
+        integration_status = integrate_story_to_epic(conn, task_id, board=board)
+        integration_kinds = {"story_integrated_to_epic"}
+    else:
+        integration_status = _merge_standalone_story_to_main(
+            conn,
+            task_id,
+            board=board,
+            candidate_verify_fn=candidate_verify_fn,
+            allow_release_measure=True,
+        )
+        integration_kinds = {"story_merged_to_main"}
+
+    if integration_status not in {
+        "merged", "already_merged", "integrated", "already_integrated"
+    }:
+        raise ReleaseEvidenceError(task_id, ["integrated_branch"])
+    integration = _latest_event_of_kind(conn, task_id, integration_kinds)
+    if integration is None or not isinstance(integration.payload, dict):
+        raise ReleaseEvidenceError(task_id, ["integrated_branch"])
+    integration_sha = str(integration.payload.get("candidate_sha") or "").strip()
+    if not integration_sha:
+        raise ReleaseEvidenceError(task_id, ["integrated_branch"])
+    evidence.update(
+        integration_event_id=integration.id,
+        integration_sha=integration_sha,
+        measurement_note=note,
+    )
+
+    workflow = _product_workflow_dict(meta)
+    policy_name = str(workflow.get("deployment_policy") or "manual").strip()
+    if policy_name not in {"manual", "not_required", "required"}:
+        raise ReleaseEvidenceError(task_id, ["deployment_policy"])
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "deployment_policy_evaluated",
+            {
+                "policy": policy_name,
+                "deployment_required": policy_name == "required",
+                "deployment_occurred": False,
+            },
+        )
+    policy_event = _latest_event_of_kind(
+        conn, task_id, {"deployment_policy_evaluated"}
+    )
+    evidence["deployment_policy_event_id"] = policy_event.id if policy_event else None
+    evidence["deployment_record_event_id"] = None
+
+    if policy_name == "required":
+        if release_adapter is None:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "release_adapter_missing",
+                    {"policy": policy_name, "integration_sha": integration_sha},
+                )
+            return ReleaseResult(
+                False,
+                "release_adapter_missing",
+                integration.id,
+                integration_sha,
+                policy_event.id if policy_event else None,
+                None,
+            )
+        deployment = release_adapter.release(task_id, integration_sha)
+        deployment = deployment if isinstance(deployment, dict) else {}
+        deployment_missing: list[str] = []
+        if not deployment.get("environment"):
+            deployment_missing.append("deployment_environment")
+        if deployment.get("revision") != integration_sha:
+            deployment_missing.append("deployment_revision")
+        if not deployment.get("smoke_result"):
+            deployment_missing.append("smoke_evidence")
+        if not deployment.get("rollback_target"):
+            deployment_missing.append("rollback_evidence")
+        if not deployment.get("runtime_evidence"):
+            deployment_missing.append("runtime_evidence")
+        if deployment_missing:
+            raise ReleaseEvidenceError(task_id, deployment_missing)
+        with write_txn(conn):
+            _append_event(conn, task_id, "deployment_recorded", deployment)
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (
+                    json.dumps(
+                        {
+                            "policy": policy_name,
+                            "deployment_required": True,
+                            "deployment_occurred": True,
+                        }
+                    ),
+                    policy_event.id,
+                ),
+            )
+        deployment_event = _latest_event_of_kind(
+            conn, task_id, {"deployment_recorded"}
+        )
+        evidence["deployment_record_event_id"] = (
+            deployment_event.id if deployment_event else None
+        )
+
+    pr_required = workflow.get("pull_request_required") is True
+    pull_request = (
+        completion_metadata.get("pull_request")
+        if isinstance(completion_metadata, dict)
+        else None
+    )
+    if pr_required and not pull_request:
+        raise ReleaseEvidenceError(task_id, ["pull_request"])
+    evidence["pull_request"] = pull_request
+
+    released = complete_task(
+        conn,
+        task_id,
+        result=note,
+        summary=note,
+        metadata=completion_metadata,
+        created_cards=created_cards,
+        expected_run_id=expected_run_id,
+        board=board,
+        _release_evidence=evidence,
+    )
+    if not released:
+        return ReleaseResult(False, "completion_conflict")
+    return ReleaseResult(
+        True,
+        "released",
+        integration.id,
+        integration_sha,
+        policy_event.id if policy_event else None,
+        evidence.get("deployment_record_event_id"),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -737,6 +737,30 @@ def _handle_complete(args: dict, **kw) -> str:
                     )
 
             try:
+                if (
+                    task
+                    and task.workflow_template_id == "product"
+                    and task.current_step_key == "release_measure"
+                    and _product_workflow_enabled()
+                ):
+                    release = kb.release_product_task(
+                        conn,
+                        tid,
+                        board,
+                        None,
+                        None,
+                        measurement_note=summary or result,
+                        completion_metadata=metadata,
+                        created_cards=created_cards,
+                        expected_run_id=_worker_run_id(tid),
+                    )
+                    if not release.released:
+                        return tool_error(
+                            f"kanban_complete release blocked: {release.status}. "
+                            "The task remains in release_measure."
+                        )
+                    run = kb.latest_run(conn, tid)
+                    return _ok(task_id=tid, run_id=run.id if run else None)
                 ok = kb.complete_task(
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
@@ -765,6 +789,12 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"Retry kanban_complete with the same summary/metadata "
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
+                )
+            except kb.ReleaseEvidenceError as release_err:
+                return tool_error(
+                    "kanban_complete blocked by release evidence policy. "
+                    f"Missing: {', '.join(release_err.missing)}. "
+                    "The task remains in release_measure."
                 )
             except kb.ProductProvenanceError as prov_err:
                 missing = getattr(prov_err, "missing", None) or []
