@@ -156,6 +156,90 @@ class TestPluginDiscovery:
             mgr._plugins["kanban-governance"].error or ""
         )
 
+    @pytest.mark.parametrize("source", ["user", "project", "entrypoint"])
+    @pytest.mark.parametrize("allowlisted", [False, True])
+    def test_untrusted_manifest_gate_supplements_plugin_allowlist(
+        self, tmp_path, monkeypatch, source, allowlisted
+    ):
+        hermes_home = tmp_path / "hermes_test"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({
+                "gateway": {"enabled": True},
+                "plugins": {
+                    "enabled": ["gated-plugin"] if allowlisted else [],
+                },
+            })
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        if source == "project":
+            monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "1")
+        manifest = PluginManifest(
+            name="gated-plugin",
+            key="gated-plugin",
+            source=source,
+            config_gate="gateway.enabled",
+        )
+        mgr = PluginManager()
+        loaded = []
+        target_source = source
+
+        def fake_scan(_path, source, skip_names=None):
+            del skip_names
+            return (
+                [manifest]
+                if source == target_source and target_source != "entrypoint"
+                else []
+            )
+
+        monkeypatch.setattr(mgr, "_scan_directory", fake_scan)
+        monkeypatch.setattr(
+            mgr,
+            "_scan_entry_points",
+            lambda: [manifest] if target_source == "entrypoint" else [],
+        )
+        monkeypatch.setattr(mgr, "_load_plugin", loaded.append)
+
+        mgr.discover_and_load()
+
+        assert loaded == ([manifest] if allowlisted else [])
+
+    def test_user_manifest_gate_requires_allowlist_and_literal_gate(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes_test"
+        plugins_dir = hermes_home / "plugins"
+        marker = tmp_path / "loaded"
+        _make_plugin_dir(
+            plugins_dir,
+            "gated-plugin",
+            register_body=f"Path({str(marker)!r}).write_text('loaded')",
+            manifest_extra={"config_gate": "gateway.enabled"},
+            auto_enable=False,
+        )
+        init_path = plugins_dir / "gated-plugin" / "__init__.py"
+        init_path.write_text(
+            "from pathlib import Path\n"
+            f"def register(ctx):\n    Path({str(marker)!r}).write_text('loaded')\n"
+        )
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({"gateway": {"enabled": True}, "plugins": {"enabled": []}})
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr._plugins["gated-plugin"].enabled is False
+        assert not marker.exists()
+
+
+    def test_kanban_governance_config_defaults_off(self):
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["plugins"]["kanban-governance"]["enabled"] is False
+
     def test_plugin_can_register_and_invoke_middleware(self, tmp_path, monkeypatch):
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         _make_plugin_dir(

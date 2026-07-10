@@ -118,6 +118,82 @@ def test_reads_are_always_allowed(governed_workspace):
     ) is None
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git -c diff.external='touch {marker}' diff",
+        "git -c core.pager='touch {marker}' log -1",
+        "git -c pager.log='touch {marker}' log -1",
+        "git -c alias.inspect='!touch {marker}' inspect",
+        "git -c diff.demo.textconv='touch {marker}' diff --textconv",
+        "GIT_EXTERNAL_DIFF='touch {marker}' git diff",
+        "GIT_PAGER='touch {marker}' git log -1",
+        "git diff --ext-diff",
+        "git diff --textconv",
+    ],
+)
+def test_git_execution_hooks_are_not_classified_as_read_only(
+    governed_workspace, command
+):
+    mod = _load_plugin()
+    marker = governed_workspace["outside"] / "git-hook-ran"
+
+    decision = mod._on_pre_tool_call(
+        "terminal",
+        {
+            "command": command.format(marker=marker),
+            "workdir": str(governed_workspace["repo"]),
+        },
+    )
+
+    assert decision is not None
+
+
+def test_git_external_diff_cannot_create_outside_file_through_worker_gate(
+    governed_workspace, monkeypatch
+):
+    """Exercise a real Git repository, not only the command classifier."""
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    marker = governed_workspace["outside"] / "external-diff-ran"
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+    command = f"git -c diff.external='touch {marker}' diff"
+
+    decision = mod._on_pre_tool_call(
+        "terminal", {"command": command, "workdir": str(repo)}
+    )
+    if decision is None:
+        subprocess.run(command, cwd=repo, shell=True, check=False)
+
+    assert decision is not None and decision["action"] == "block"
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git -c diff.external='touch outside' diff",
+        "GIT_EXTERNAL_DIFF='touch outside' git diff",
+        "GIT_PAGER='touch outside' git log -1",
+        "git diff --ext-diff",
+        "git diff --textconv",
+    ],
+)
+def test_worker_git_execution_hooks_fail_closed(
+    governed_workspace, monkeypatch, command
+):
+    mod = _load_plugin()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal",
+        {"command": command, "workdir": str(governed_workspace["repo"])},
+    )
+
+    assert decision is not None and decision["action"] == "block"
+
+
 def test_terminal_redirection_is_a_governed_mutation(governed_workspace):
     mod = _load_plugin()
     repo = governed_workspace["repo"]
@@ -469,6 +545,147 @@ def test_worker_known_terminal_mutation_inside_workspace_is_allowed(
     assert mod._on_pre_tool_call(
         "terminal",
         {"command": command, "workdir": str(governed_workspace["repo"])},
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git add README.md",
+        "git commit -m 'worker checkpoint'",
+    ],
+)
+def test_worker_safe_git_workflow_commands_remain_allowed(
+    governed_workspace, monkeypatch, command
+):
+    mod = _load_plugin()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    assert mod._on_pre_tool_call(
+        "terminal",
+        {"command": command, "workdir": str(governed_workspace["repo"])},
+    ) is None
+
+
+def test_worker_repo_local_test_wrapper_is_allowed(governed_workspace, monkeypatch):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    wrapper = repo / "scripts" / "run_tests.sh"
+    wrapper.parent.mkdir()
+    wrapper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    assert mod._on_pre_tool_call(
+        "terminal",
+        {
+            "command": "scripts/run_tests.sh tests/unit -q",
+            "workdir": str(repo),
+        },
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "wrapper_path",
+    [
+        "bin/run_tests.sh",
+        "../outside/run_tests.sh",
+    ],
+)
+def test_worker_untrusted_test_wrapper_path_is_blocked(
+    governed_workspace, monkeypatch, wrapper_path
+):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    candidate = (repo / wrapper_path).resolve()
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    candidate.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    candidate.chmod(0o755)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal",
+        {"command": wrapper_path, "workdir": str(repo)},
+    )
+
+    assert decision is not None and decision["action"] == "block"
+
+
+def test_worker_repo_test_wrapper_symlink_outside_workspace_is_blocked(
+    governed_workspace, monkeypatch
+):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    outside_wrapper = governed_workspace["outside"] / "run_tests.sh"
+    outside_wrapper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "run_tests.sh").symlink_to(outside_wrapper)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal",
+        {"command": "scripts/run_tests.sh", "workdir": str(repo)},
+    )
+
+    assert decision is not None and decision["action"] == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cp -t {outside} README.md",
+        "cp --target-directory={outside} README.md",
+        "install -t {outside} README.md",
+        "install --target-directory={outside} README.md",
+        "install -d {outside}/first generated/second",
+        "ln --target-directory={outside} README.md",
+        "mv --target-directory={outside} README.md",
+    ],
+)
+def test_worker_target_directory_outside_workspace_is_blocked(
+    governed_workspace, monkeypatch, command
+):
+    mod = _load_plugin()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal",
+        {
+            "command": command.format(outside=governed_workspace["outside"]),
+            "workdir": str(governed_workspace["repo"]),
+        },
+    )
+
+    assert decision is not None and decision["action"] == "block"
+    assert "workspace" in decision["message"].lower()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cp -t {inside} README.md",
+        "install --target-directory={inside} README.md",
+        "install -d {inside}/first {inside}/second",
+        "ln --target-directory={inside} README.md",
+        "mv --target-directory={inside} README.md",
+    ],
+)
+def test_worker_target_directory_inside_workspace_is_allowed(
+    governed_workspace, monkeypatch, command
+):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    inside = repo / "generated"
+    inside.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    assert mod._on_pre_tool_call(
+        "terminal",
+        {
+            "command": command.format(inside=inside),
+            "workdir": str(repo),
+        },
     ) is None
 
 

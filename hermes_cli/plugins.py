@@ -1467,16 +1467,26 @@ class PluginManager:
             # entry-point plugins) is opt-in via plugins.enabled.
             # Accept both the path-derived key and the legacy bare name
             # so existing configs keep working.
-            if manifest.config_gate:
-                is_enabled = _manifest_config_gate_enabled(manifest.config_gate)
-            else:
-                is_enabled = (
-                    enabled is not None
-                    and (lookup_key in enabled or manifest.name in enabled)
-                )
+            allowlisted = (
+                enabled is not None
+                and (lookup_key in enabled or manifest.name in enabled)
+            )
+            gate_enabled = (
+                _manifest_config_gate_enabled(manifest.config_gate)
+                if manifest.config_gate else True
+            )
+            # Only repository-bundled manifests are trusted to replace the
+            # generic allow-list with an exact product-specific config gate.
+            # User/project/entry-point manifests remain explicitly opt-in and
+            # must satisfy their declared gate as an additional condition.
+            is_enabled = (
+                gate_enabled
+                if manifest.source == "bundled" and manifest.config_gate
+                else allowlisted and gate_enabled
+            )
             if not is_enabled:
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
-                if manifest.config_gate:
+                if manifest.config_gate and not gate_enabled:
                     loaded.error = (
                         f"not enabled in config (set "
                         f"{manifest.config_gate}: true to activate)"

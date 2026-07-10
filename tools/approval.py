@@ -1350,14 +1350,8 @@ def _iter_shell_command_word_spans(command: str):
             break
 
 
-def shell_command_argvs(command: str) -> list[list[str]]:
-    """Return quote-aware argv lists for each shell command segment.
-
-    This intentionally reuses the approval detector's non-executing shell
-    scanner so policy plugins do not grow a second, less capable parser.
-    Leading environment assignments and standard command wrappers are removed;
-    quoted operators remain ordinary arguments.
-    """
+def _shell_command_raw_argvs(command: str) -> list[list[str]]:
+    """Return quote-aware argv lists before wrapper/prefix normalization."""
     normalized = _normalize_command_for_detection(str(command or ""))
     commands: list[list[str]] = []
     for command_start in _iter_shell_command_starts(normalized):
@@ -1376,6 +1370,51 @@ def shell_command_argvs(command: str) -> list[list[str]]:
             pos = word_end
         if not argv:
             continue
+        commands.append(argv)
+    return commands
+
+
+def shell_command_prefix_environment(command: str) -> set[str]:
+    """Return environment variable names assigned before shell commands."""
+    names: set[str] = set()
+    for argv in _shell_command_raw_argvs(command):
+        index = 0
+        while index < len(argv):
+            word = argv[index]
+            lower = os.path.basename(word).lower()
+            if _ENV_ASSIGNMENT_RE.fullmatch(word):
+                names.add(word.split("=", 1)[0].upper())
+                index += 1
+                continue
+            if lower in {"sudo", "env"}:
+                index += 1
+                while index < len(argv) and argv[index].startswith("-"):
+                    option = argv[index].split("=", 1)[0].lower()
+                    index += 1
+                    if (
+                        lower == "sudo"
+                        and option in _SUDO_OPTIONS_WITH_ARG
+                        and "=" not in argv[index - 1]
+                    ):
+                        index += 1
+                continue
+            if lower in _COMMAND_WRAPPER_WORDS:
+                index += 1
+                continue
+            break
+    return names
+
+
+def shell_command_argvs(command: str) -> list[list[str]]:
+    """Return quote-aware argv lists for each shell command segment.
+
+    This intentionally reuses the approval detector's non-executing shell
+    scanner so policy plugins do not grow a second, less capable parser.
+    Leading environment assignments and standard command wrappers are removed;
+    quoted operators remain ordinary arguments.
+    """
+    commands: list[list[str]] = []
+    for argv in _shell_command_raw_argvs(command):
 
         index = 0
         while index < len(argv):

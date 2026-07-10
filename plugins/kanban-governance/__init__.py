@@ -9,8 +9,9 @@ import re
 import secrets
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import projects_db as pdb
@@ -19,11 +20,12 @@ from tools.approval import (
     shell_command_argvs,
     shell_command_has_redirection,
     shell_command_output_paths,
+    shell_command_prefix_environment,
 )
 
 
 _FILE_MUTATORS = {"write_file", "patch"}
-_READ_ONLY_COMMANDS = {
+_ALWAYS_READ_ONLY_COMMANDS = {
     "awk",
     "cat",
     "cut",
@@ -67,23 +69,23 @@ _READ_ONLY_GIT = {
     "status",
 }
 _GIT_OPTIONS_WITH_VALUE = {"-c", "-C", "--git-dir", "--work-tree", "--namespace"}
-_KNOWN_MUTATING_COMMANDS = {
-    "chmod",
-    "chown",
-    "cp",
-    "dd",
-    "install",
-    "ln",
-    "mkdir",
-    "mv",
-    "rm",
-    "rmdir",
-    "tee",
-    "touch",
-    "truncate",
-    "unlink",
-}
 _OVERRIDE_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+_GIT_EXECUTION_ENV = {
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
+    "PAGER",
+}
+
+
+@dataclass(frozen=True)
+class _CommandPolicy:
+    read_only: Optional[Callable[[list[str]], bool]] = None
+    targets: Optional[Callable[[list[str]], tuple[list[str], bool]]] = None
+    privileged: Optional[Callable[[list[str]], bool]] = None
 
 
 def _normalize_tool_name(tool_name: str) -> str:
@@ -193,6 +195,102 @@ def _git_remote_is_read_only(args: list[str]) -> bool:
     return args[0] in {"get-url", "show"}
 
 
+def _git_config_key_can_execute(key: str) -> bool:
+    normalized = key.strip().lower()
+    return bool(
+        normalized in {
+            "core.fsmonitor",
+            "core.pager",
+            "diff.external",
+            "interactive.difffilter",
+        }
+        or normalized.startswith(("alias.", "pager."))
+        or re.fullmatch(r"diff\.[^.]+\.(?:command|textconv)", normalized)
+        or re.fullmatch(r"filter\.[^.]+\.(?:clean|process|smudge)", normalized)
+    )
+
+
+def _git_has_execution_config(argv: list[str]) -> bool:
+    index = 1
+    while index < len(argv):
+        word = argv[index]
+        if not word.startswith("-"):
+            return False
+        if word == "-c":
+            if index + 1 >= len(argv):
+                return True
+            assignment = argv[index + 1]
+            key = assignment.split("=", 1)[0]
+            if "=" not in assignment or _git_config_key_can_execute(key):
+                return True
+            index += 2
+            continue
+        if word.startswith("-c") and word != "-c":
+            assignment = word[2:]
+            key = assignment.split("=", 1)[0]
+            if "=" not in assignment or _git_config_key_can_execute(key):
+                return True
+            index += 1
+            continue
+        if word == "--config-env" or word.startswith("--config-env="):
+            return True
+        option = word.split("=", 1)[0]
+        index += 1
+        if option in _GIT_OPTIONS_WITH_VALUE and "=" not in word:
+            index += 1
+    return False
+
+
+def _git_is_read_only(argv: list[str]) -> bool:
+    if _git_has_execution_config(argv):
+        return False
+    subcommand, subargs = _git_subcommand(argv)
+    if subcommand == "branch":
+        return _git_branch_is_read_only(subargs)
+    if subcommand == "tag":
+        return _git_tag_is_read_only(subargs)
+    if subcommand == "remote":
+        return _git_remote_is_read_only(subargs)
+    if subcommand == "diff":
+        return (
+            _diff_is_read_only(subargs)
+            and not any(
+                arg in {"--ext-diff", "--textconv"} for arg in subargs
+            )
+        )
+    return subcommand in _READ_ONLY_GIT
+
+
+def _git_is_privileged(argv: list[str]) -> bool:
+    if _git_has_execution_config(argv):
+        return True
+    known = _READ_ONLY_GIT | {
+        "add", "am", "apply", "branch", "checkout", "cherry-pick", "clean",
+        "commit", "merge", "mv", "rebase", "remote", "reset", "restore",
+        "revert", "rm", "stash", "switch", "tag", "update-ref", "push",
+    }
+    subcommand, subargs = _git_subcommand(argv)
+    if subcommand == "diff" and any(
+        arg in {"--ext-diff", "--textconv"} for arg in subargs
+    ):
+        return True
+    if subcommand in {"push", "reset", "update-ref"}:
+        return True
+    if subcommand in {"switch", "checkout"} and any(
+        arg.split("=", 1)[0]
+        in {"-b", "-B", "-c", "-C", "--create", "--orphan"}
+        for arg in subargs
+    ):
+        return True
+    if subcommand == "branch":
+        return not _git_branch_is_read_only(subargs)
+    if subcommand == "tag":
+        return not _git_tag_is_read_only(subargs)
+    if subcommand == "remote":
+        return not _git_remote_is_read_only(subargs)
+    return subcommand not in known
+
+
 def _find_is_read_only(args: list[str]) -> bool:
     mutating = {
         "-delete", "-exec", "-execdir", "-fls", "-fprint", "-fprintf",
@@ -226,46 +324,22 @@ def _is_read_only_terminal(command: str) -> bool:
     commands = shell_command_argvs(command)
     if not commands:
         return False
+    prefix_environment = shell_command_prefix_environment(command)
+    if prefix_environment & _GIT_EXECUTION_ENV and any(
+        os.path.basename(argv[0]).lower() == "git" for argv in commands
+    ):
+        return False
     for argv in commands:
-        executable = os.path.basename(argv[0]).lower()
-        if executable not in _READ_ONLY_COMMANDS:
+        policy = _command_policy(argv)
+        if policy is None or policy.read_only is None:
             return False
-        if executable == "awk" and not _awk_is_read_only(argv[1:]):
-            return False
-        if executable == "find" and not _find_is_read_only(argv[1:]):
-            return False
-        if executable == "git":
-            subcommand, subargs = _git_subcommand(argv)
-            if subcommand == "branch":
-                if not _git_branch_is_read_only(subargs):
-                    return False
-            elif subcommand == "tag":
-                if not _git_tag_is_read_only(subargs):
-                    return False
-            elif subcommand == "remote":
-                if not _git_remote_is_read_only(subargs):
-                    return False
-            elif subcommand == "diff":
-                if not _diff_is_read_only(subargs):
-                    return False
-            elif subcommand not in _READ_ONLY_GIT:
-                return False
-        elif executable == "diff" and not _diff_is_read_only(argv[1:]):
-            return False
-        elif executable == "sed" and any(
-            arg == "--in-place" or (arg.startswith("-") and "i" in arg[1:])
-            for arg in argv[1:]
-        ):
+        if not policy.read_only(argv):
             return False
     return True
 
 
 def _is_privileged_worker_command(command: str) -> bool:
-    known_git_commands = _READ_ONLY_GIT | {
-        "add", "am", "apply", "branch", "checkout", "cherry-pick", "clean",
-        "commit", "merge", "mv", "rebase", "remote", "reset", "restore",
-        "revert", "rm", "stash", "switch", "tag", "update-ref", "push",
-    }
+    prefix_environment = shell_command_prefix_environment(command)
     for argv in shell_command_argvs(command):
         executable = os.path.basename(argv[0]).lower()
         if (
@@ -291,26 +365,10 @@ def _is_privileged_worker_command(command: str) -> bool:
             for arg in argv[1:]
         ):
             return True
-        if executable != "git":
-            continue
-        if any(arg.lower().startswith("alias.") for arg in argv[1:]):
+        policy = _command_policy(argv)
+        if policy and policy.privileged and policy.privileged(argv):
             return True
-        subcommand, subargs = _git_subcommand(argv)
-        if subcommand in {"push", "reset", "update-ref"}:
-            return True
-        if subcommand in {"switch", "checkout"} and any(
-            arg.split("=", 1)[0]
-            in {"-b", "-B", "-c", "-C", "--create", "--orphan"}
-            for arg in subargs
-        ):
-            return True
-        if subcommand == "branch" and not _git_branch_is_read_only(subargs):
-            return True
-        if subcommand == "tag" and not _git_tag_is_read_only(subargs):
-            return True
-        if subcommand == "remote" and not _git_remote_is_read_only(subargs):
-            return True
-        if subcommand not in known_git_commands:
+        if executable == "git" and prefix_environment & _GIT_EXECUTION_ENV:
             return True
     return False
 
@@ -373,36 +431,185 @@ def _find_output_paths(args: list[str]) -> list[str]:
     return paths
 
 
-def _path_operands(argv: list[str]) -> list[str]:
+def _positional_operands(
+    args: list[str], *, options_with_values: set[str] | None = None
+) -> list[str]:
+    options_with_values = options_with_values or set()
+    operands: list[str] = []
+    index = 0
+    options_done = False
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            options_done = True
+            index += 1
+            continue
+        option = arg.split("=", 1)[0]
+        if not options_done and arg.startswith("-"):
+            index += 1
+            if option in options_with_values and "=" not in arg:
+                index += 1
+            continue
+        operands.append(arg)
+        index += 1
+    return operands
+
+
+def _target_directory(args: list[str]) -> tuple[Optional[str], bool]:
+    targets: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in {"-t", "--target-directory"}:
+            if index + 1 >= len(args):
+                return None, True
+            targets.append(args[index + 1])
+            index += 2
+            continue
+        if arg.startswith("--target-directory="):
+            value = arg.split("=", 1)[1]
+            if not value:
+                return None, True
+            targets.append(value)
+        elif arg.startswith("-t") and len(arg) > 2 and not arg.startswith("-T"):
+            targets.append(arg[2:])
+        index += 1
+    if len(targets) > 1:
+        return None, True
+    return (targets[0] if targets else None), False
+
+
+_INSTALL_OPTIONS_WITH_VALUES = {
+    "-g", "--group", "-m", "--mode", "-o", "--owner",
+    "--strip-program", "--context", "-t", "--target-directory",
+}
+_TARGET_DIRECTORY_OPTIONS = {"-t", "--target-directory"}
+
+
+def _copy_like_targets(argv: list[str]) -> tuple[list[str], bool]:
     executable = os.path.basename(argv[0]).lower()
-    operands = [arg for arg in argv[1:] if arg != "--" and not arg.startswith("-")]
-    if executable in {"cp", "install"}:
-        return operands[-1:] if operands else []
-    if executable in {
-        "chmod", "chown", "ln", "mkdir", "mv", "rm", "rmdir", "tee",
-        "touch", "truncate", "unlink",
-    }:
-        return operands
-    if executable == "dd":
-        return [arg.split("=", 1)[1] for arg in argv[1:] if arg.startswith("of=")]
-    if executable == "diff":
-        return _option_paths(argv[1:], "--output")
-    if executable == "find":
-        return _find_output_paths(argv[1:])
-    if executable == "sed":
-        return _sed_in_place_paths(argv[1:])
-    if executable == "git":
-        targets: list[str] = []
-        for index, arg in enumerate(argv[1:], start=1):
-            if arg in {"-C", "--git-dir", "--work-tree"} and index + 1 < len(argv):
-                targets.append(argv[index + 1])
-            if arg.startswith(("--git-dir=", "--work-tree=")):
-                targets.append(arg.split("=", 1)[1])
-        subcommand, subargs = _git_subcommand(argv)
-        if subcommand == "diff":
-            targets.extend(_option_paths(subargs, "--output"))
-        return targets
-    return []
+    args = argv[1:]
+    target_directory, ambiguous = _target_directory(args)
+    if ambiguous:
+        return [], True
+    options_with_values = (
+        _INSTALL_OPTIONS_WITH_VALUES
+        if executable == "install"
+        else _TARGET_DIRECTORY_OPTIONS
+    )
+    operands = _positional_operands(args, options_with_values=options_with_values)
+    if target_directory is not None:
+        targets = [target_directory]
+        if executable == "mv":
+            targets.extend(operands)
+        return targets, False
+    if executable == "install" and any(
+        arg in {"-d", "--directory"} for arg in args
+    ):
+        return operands, False
+    if executable == "mv":
+        return operands, False
+    return (operands[-1:] if operands else []), False
+
+
+def _all_operand_targets(argv: list[str]) -> tuple[list[str], bool]:
+    return _positional_operands(argv[1:]), False
+
+
+def _git_targets(argv: list[str]) -> tuple[list[str], bool]:
+    targets: list[str] = []
+    for index, arg in enumerate(argv[1:], start=1):
+        if arg in {"-C", "--git-dir", "--work-tree"}:
+            if index + 1 >= len(argv):
+                return [], True
+            targets.append(argv[index + 1])
+        elif arg.startswith(("--git-dir=", "--work-tree=")):
+            targets.append(arg.split("=", 1)[1])
+    subcommand, subargs = _git_subcommand(argv)
+    if subcommand == "diff":
+        targets.extend(_option_paths(subargs, "--output"))
+    return targets, False
+
+
+def _find_targets(argv: list[str]) -> tuple[list[str], bool]:
+    args = argv[1:]
+    ambiguous = any(
+        arg in {"-exec", "-execdir", "-ok", "-okdir"} for arg in args
+    )
+    return _find_output_paths(args), ambiguous
+
+
+def _sed_targets(argv: list[str]) -> tuple[list[str], bool]:
+    return _sed_in_place_paths(argv[1:]), False
+
+
+def _diff_targets(argv: list[str]) -> tuple[list[str], bool]:
+    return _option_paths(argv[1:], "--output"), False
+
+
+def _dd_targets(argv: list[str]) -> tuple[list[str], bool]:
+    return [arg.split("=", 1)[1] for arg in argv[1:] if arg.startswith("of=")], False
+
+
+def _always_read_only(_argv: list[str]) -> bool:
+    return True
+
+
+def _awk_read_only(argv: list[str]) -> bool:
+    return _awk_is_read_only(argv[1:])
+
+
+def _find_read_only(argv: list[str]) -> bool:
+    return _find_is_read_only(argv[1:])
+
+
+def _diff_read_only(argv: list[str]) -> bool:
+    return _diff_is_read_only(argv[1:])
+
+
+def _sed_read_only(argv: list[str]) -> bool:
+    return not any(
+        arg == "--in-place" or (arg.startswith("-") and "i" in arg[1:])
+        for arg in argv[1:]
+    )
+
+
+_COMMAND_POLICIES: dict[str, _CommandPolicy] = {
+    name: _CommandPolicy(read_only=_always_read_only)
+    for name in _ALWAYS_READ_ONLY_COMMANDS
+}
+_COMMAND_POLICIES.update({
+    "awk": _CommandPolicy(read_only=_awk_read_only, targets=lambda _argv: ([], True)),
+    "diff": _CommandPolicy(read_only=_diff_read_only, targets=_diff_targets),
+    "find": _CommandPolicy(read_only=_find_read_only, targets=_find_targets),
+    "git": _CommandPolicy(
+        read_only=_git_is_read_only,
+        targets=_git_targets,
+        privileged=_git_is_privileged,
+    ),
+    "sed": _CommandPolicy(read_only=_sed_read_only, targets=_sed_targets),
+    "cp": _CommandPolicy(targets=_copy_like_targets),
+    "install": _CommandPolicy(targets=_copy_like_targets),
+    "ln": _CommandPolicy(targets=_copy_like_targets),
+    "mv": _CommandPolicy(targets=_copy_like_targets),
+    "dd": _CommandPolicy(targets=_dd_targets),
+})
+for _mutator in {
+    "chmod", "chown", "mkdir", "rm", "rmdir", "tee", "touch",
+    "truncate", "unlink",
+}:
+    _COMMAND_POLICIES[_mutator] = _CommandPolicy(targets=_all_operand_targets)
+
+_TRUSTED_TEST_WRAPPER_POLICY = _CommandPolicy(
+    targets=lambda argv: ([argv[0]], False)
+)
+
+
+def _command_policy(argv: list[str]) -> Optional[_CommandPolicy]:
+    executable = os.path.basename(argv[0]).lower()
+    if executable == "run_tests.sh":
+        return _TRUSTED_TEST_WRAPPER_POLICY
+    return _COMMAND_POLICIES.get(executable)
 
 
 def _terminal_targets(
@@ -413,19 +620,14 @@ def _terminal_targets(
     raw_targets = shell_command_output_paths(command)
     ambiguous = False
     for argv in shell_command_argvs(command):
-        executable = os.path.basename(argv[0]).lower()
-        if executable == "awk":
+        policy = _command_policy(argv)
+        if policy is None:
             ambiguous = True
-        if executable == "find" and any(
-            arg in {"-exec", "-execdir", "-ok", "-okdir"} for arg in argv[1:]
-        ):
-            ambiguous = True
-        if (
-            executable not in _READ_ONLY_COMMANDS
-            and executable not in _KNOWN_MUTATING_COMMANDS
-        ):
-            ambiguous = True
-        raw_targets.extend(_path_operands(argv))
+            continue
+        if policy.targets is not None:
+            policy_targets, policy_ambiguous = policy.targets(argv)
+            raw_targets.extend(policy_targets)
+            ambiguous = ambiguous or policy_ambiguous
 
     targets = [workdir]
     for raw in raw_targets:
@@ -513,6 +715,26 @@ def _new_override(
     }
 
 
+def _trusted_test_wrapper_error(command: str, workspace: Path) -> Optional[str]:
+    expected_lexical = Path(os.path.abspath(workspace / "scripts" / "run_tests.sh"))
+    for argv in shell_command_argvs(command):
+        if os.path.basename(argv[0]).lower() != "run_tests.sh":
+            continue
+        raw = Path(argv[0]).expanduser()
+        candidate_lexical = Path(
+            os.path.abspath(raw if raw.is_absolute() else workspace / raw)
+        )
+        candidate_resolved = candidate_lexical.resolve(strict=False)
+        if candidate_lexical != expected_lexical:
+            return "workers may only invoke the repo-local scripts/run_tests.sh wrapper"
+        if (
+            not _path_is_within(candidate_resolved, workspace)
+            or not candidate_resolved.is_file()
+        ):
+            return "the repo-local test wrapper is missing or resolves outside the workspace"
+    return None
+
+
 def _consume_approved_override(
     tool_name: str,
     args: dict[str, Any],
@@ -572,6 +794,12 @@ def _validate_worker(
         workspace = _resolved_path(task.workspace_path)
     except Exception as exc:
         return _block(f"worker ownership could not be verified: {exc}")
+    if tool_name == "terminal":
+        wrapper_error = _trusted_test_wrapper_error(
+            str(args.get("command") or ""), workspace
+        )
+        if wrapper_error:
+            return _block(wrapper_error)
     if not task.workspace_path or any(
         not _path_is_within(target, workspace) for target in targets
     ):
