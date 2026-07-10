@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -1360,8 +1361,22 @@ def test_dashboard_done_actions_prompt_for_completion_summary():
     assert "withCompletionSummary" in bundle
     assert "Completion summary" in bundle
     assert "result: summary" in bundle
-    assert "body: JSON.stringify(patch)" in bundle
-    assert "body: JSON.stringify(finalPatch)" in bundle
+
+
+def test_dashboard_client_mutation_request_contract():
+    repo_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [
+            "node",
+            str(repo_root / "tests" / "plugins" / "kanban_dashboard_client_contract.js"),
+            str(repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_dashboard_ai_provenance_detail_section_lists_evidence_fields():
