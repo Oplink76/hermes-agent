@@ -24,6 +24,31 @@ from ops.cloudadvisor.hermes_ops.health import HealthCheck, HealthReport
 from ops.cloudadvisor.hermes_ops.locking import try_exclusive_file_lock
 
 
+UV_SYNC_COMMAND = (
+    "env",
+    "UV_PROJECT_ENVIRONMENT=.venv",
+    "uv",
+    "sync",
+    "--locked",
+    "--extra",
+    "all",
+    "--extra",
+    "dev",
+    "--extra",
+    "slack",
+)
+
+PYPROJECT_WITH_EXTRAS = """\
+[project]
+name = "hermes"
+
+[project.optional-dependencies]
+all = []
+dev = []
+slack = []
+"""
+
+
 @dataclass(frozen=True)
 class Call:
     argv: tuple[str, ...]
@@ -151,8 +176,14 @@ class FakeHealth:
         self.reports = list(reports)
         self.events = events
 
-    def check(self, *, expected_sha: str, services: tuple[str, ...]) -> HealthReport:
-        self.events.append(("health", expected_sha, services))
+    def check(
+        self,
+        *,
+        expected_sha: str,
+        services: tuple[str, ...],
+        identity_required: bool = True,
+    ) -> HealthReport:
+        self.events.append(("health", expected_sha, services, identity_required))
         return self.reports.pop(0)
 
 
@@ -218,6 +249,7 @@ def _config(tmp_path: Path) -> DeployConfig:
         install_root=install_root,
         origin="origin",
         record_root=tmp_path / "records",
+        uv_extras=("all", "dev", "slack"),
         postinstall_commands=(
             (".venv/bin/python", "scripts/docker_config_migrate.py"),
         ),
@@ -230,13 +262,19 @@ def _responses():
         ("git", "fetch", "origin", "main"): (0, "", ""),
         ("git", "rev-parse", "origin/main"): (0, "new-sha\n", ""),
         ("git", "rev-parse", "HEAD"): (0, "old-sha\n", ""),
-        ("git", "switch", "--detach", "new-sha"): (0, "", ""),
-        ("git", "switch", "--detach", "old-sha"): (0, "", ""),
-        ("env", "UV_PROJECT_ENVIRONMENT=.venv", "uv", "sync", "--locked"): (
+        ("git", "show", "old-sha:pyproject.toml"): (
             0,
-            "",
+            PYPROJECT_WITH_EXTRAS,
             "",
         ),
+        ("git", "show", "new-sha:pyproject.toml"): (
+            0,
+            PYPROJECT_WITH_EXTRAS,
+            "",
+        ),
+        ("git", "switch", "--detach", "new-sha"): (0, "", ""),
+        ("git", "switch", "--detach", "old-sha"): (0, "", ""),
+        UV_SYNC_COMMAND: (0, "", ""),
         (".venv/bin/python", "scripts/docker_config_migrate.py"): (0, "", ""),
     }
 
@@ -367,6 +405,7 @@ def test_successful_deploy_is_exact_sha_snapshot_first_and_health_gated(tmp_path
         "services_started",
         ("ai.hermes.gateway", "com.cloudadvisor.hermes-dashboard"),
     ) in events
+    assert ("command", UV_SYNC_COMMAND) in events
 
 
 def test_health_failure_rolls_back_source_state_services_and_health_checks(
@@ -407,6 +446,35 @@ def test_health_failure_rolls_back_source_state_services_and_health_checks(
         "health",
         "old-sha",
         ("ai.hermes.gateway", "com.cloudadvisor.hermes-dashboard"),
+        False,
+    ) in events
+
+
+def test_modern_rollback_keeps_runtime_identity_mandatory(tmp_path: Path):
+    events: list[tuple] = []
+    config = _config(tmp_path)
+    identity_module = config.install_root / "gateway" / "runtime_identity.py"
+    identity_module.parent.mkdir()
+    identity_module.write_text("# modern runtime identity\n", encoding="utf-8")
+    failing = HealthReport(checks=(HealthCheck("candidate-runtime", False),))
+
+    record = deploy(
+        _request(tmp_path),
+        config=config,
+        runner=FakeRunner(_responses(), events),
+        github=FakeGitHub(_evidence()),
+        snapshots=FakeSnapshots(events),
+        services=FakeServices(events),
+        health=FakeHealth([failing, _green("rollback-runtime")], events),
+        store=RecordingStore(events),
+    )
+
+    assert record.status == "rolled_back_healthy"
+    assert (
+        "health",
+        "old-sha",
+        ("ai.hermes.gateway", "com.cloudadvisor.hermes-dashboard"),
+        True,
     ) in events
 
 
@@ -417,6 +485,7 @@ def test_candidate_service_start_counts_as_state_mutation_for_rollback(tmp_path:
         install_root=config.install_root,
         origin=config.origin,
         record_root=config.record_root,
+        uv_extras=config.uv_extras,
         postinstall_commands=(),
     )
     snapshots = FakeSnapshots(events)
@@ -442,7 +511,7 @@ def test_pre_restart_failure_does_not_stop_already_unloaded_services_twice(
 ):
     events = []
     responses = _responses()
-    responses[("env", "UV_PROJECT_ENVIRONMENT=.venv", "uv", "sync", "--locked")] = (
+    responses[UV_SYNC_COMMAND] = (
         1,
         "",
         "sync failed",
@@ -552,6 +621,71 @@ def test_preflight_rejects_dirty_install_or_non_origin_sha(
         event[0] == "command" and event[1][:3] == ("git", "switch", "--detach")
         for event in events
     )
+
+
+def test_preflight_rejects_empty_or_revision_incompatible_uv_extras(
+    tmp_path: Path,
+):
+    empty_root = tmp_path / "empty"
+    mismatch_root = tmp_path / "mismatch"
+    candidate_root = tmp_path / "candidate-mismatch"
+    empty_root.mkdir()
+    mismatch_root.mkdir()
+    candidate_root.mkdir()
+    empty_base = _config(empty_root)
+    empty_config = DeployConfig(
+        install_root=empty_base.install_root,
+        origin=empty_base.origin,
+        record_root=empty_base.record_root,
+    )
+
+    for index, (config, responses, message) in enumerate((
+        (
+            empty_config,
+            _responses(),
+            "deploy.uv_extras must contain at least one extra",
+        ),
+        (
+            _config(mismatch_root),
+            {
+                **_responses(),
+                ("git", "show", "old-sha:pyproject.toml"): (
+                    0,
+                    PYPROJECT_WITH_EXTRAS.replace("slack = []\n", ""),
+                    "",
+                ),
+            },
+            "old-sha.*slack",
+        ),
+        (
+            _config(candidate_root),
+            {
+                **_responses(),
+                ("git", "show", "new-sha:pyproject.toml"): (
+                    0,
+                    PYPROJECT_WITH_EXTRAS.replace("slack = []\n", ""),
+                    "",
+                ),
+            },
+            "new-sha.*slack",
+        ),
+    )):
+        events: list[tuple] = []
+        request_root = tmp_path / f"request-{index}"
+        request_root.mkdir()
+        with pytest.raises(PreflightError, match=message):
+            deploy(
+                _request(request_root),
+                config=config,
+                runner=FakeRunner(responses, events),
+                github=FakeGitHub(_evidence()),
+                snapshots=FakeSnapshots(events),
+                services=FakeServices(events),
+                health=FakeHealth([_green("unused")], events),
+                store=RecordingStore(events),
+            )
+        assert not any(event[0] == "snapshot" for event in events)
+        assert not any(event[0] == "services_stopped" for event in events)
 
 
 def test_preflight_rejects_tampered_decision_packet(tmp_path: Path):

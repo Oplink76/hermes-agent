@@ -142,6 +142,12 @@ def load_operations_config(path: Path) -> OperationsConfig:
         _command(value, field=f"deploy.postinstall_commands[{index}]")
         for index, value in enumerate(postinstall_value)
     )
+    uv_extras_value = deploy.get("uv_extras")
+    if not isinstance(uv_extras_value, list) or not uv_extras_value or any(
+        not isinstance(value, str) or not value.strip() for value in uv_extras_value
+    ):
+        raise ValueError("deploy.uv_extras must contain non-empty strings")
+    uv_extras = tuple(value.strip() for value in uv_extras_value)
     required_fields = ("origin", "repo_slug", "record_root", "snapshot_root")
     missing = [field for field in required_fields if not deploy.get(field)]
     if missing:
@@ -158,6 +164,7 @@ def load_operations_config(path: Path) -> OperationsConfig:
         ),
         required_approver=str(deploy.get("required_approver", "Ole Ørum-Petersen")),
         required_check=str(deploy.get("required_check", "All required checks pass")),
+        uv_extras=uv_extras,
         postinstall_commands=postinstall_commands,
     )
     return OperationsConfig(

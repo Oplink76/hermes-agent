@@ -36,7 +36,11 @@ def _seed_remotes(tmp_path: Path) -> tuple[Path, Path, Path]:
     _git(seed, "config", "user.name", "Hermes Integration Test")
     _git(seed, "config", "user.email", "hermes-test@example.invalid")
     (seed / "base.txt").write_text("fork base\n", encoding="utf-8")
-    _git(seed, "add", "base.txt")
+    (seed / "pyproject.toml").write_text(
+        '[project]\nname = "fixture"\n\n[project.optional-dependencies]\ndev = []\n',
+        encoding="utf-8",
+    )
+    _git(seed, "add", "base.txt", "pyproject.toml")
     _git(seed, "commit", "-m", "base")
 
     origin = tmp_path / "origin.git"
@@ -225,7 +229,13 @@ class FailCandidateHealth:
         self.install_root = install_root
         self.candidate_sha = candidate_sha
 
-    def check(self, *, expected_sha: str, services: tuple[str, ...]) -> HealthReport:
+    def check(
+        self,
+        *,
+        expected_sha: str,
+        services: tuple[str, ...],
+        identity_required: bool = True,
+    ) -> HealthReport:
         actual_sha = _git(self.install_root, "rev-parse", "HEAD")
         passed = expected_sha == actual_sha and expected_sha != self.candidate_sha
         return HealthReport(
@@ -304,12 +314,13 @@ def test_deploy_real_git_and_sqlite_path_restores_previous_state_on_failure(
             approval_record=approval,
             actor="integration-test",
         ),
-        config=DeployConfig(
-            install_root=install_root,
-            origin="origin",
-            record_root=tmp_path / "records",
-            postinstall_commands=(("python", "migrate.py"),),
-        ),
+            config=DeployConfig(
+                install_root=install_root,
+                origin="origin",
+                record_root=tmp_path / "records",
+                uv_extras=("dev",),
+                postinstall_commands=(("python", "migrate.py"),),
+            ),
         runner=runner,
         github=ReleaseVerifier(candidate_sha),
         snapshots=snapshots,

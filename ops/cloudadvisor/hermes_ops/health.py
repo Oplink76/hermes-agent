@@ -34,6 +34,7 @@ def evaluate_runtime_health(
     observations: Iterable[object],
     *,
     expected_profiles: Iterable[str],
+    identity_required: bool = True,
 ) -> HealthReport:
     by_profile = {
         str(getattr(observation, "profile")): observation
@@ -49,7 +50,11 @@ def evaluate_runtime_health(
                     observation is not None and getattr(observation, "healthy", False)
                 ),
                 detail=(
-                    "runtime identity agrees"
+                    (
+                        "runtime identity agrees"
+                        if identity_required
+                        else "legacy runtime process and service ownership agree"
+                    )
                     if observation is not None
                     and getattr(observation, "healthy", False)
                     else "runtime missing or identity mismatch"
