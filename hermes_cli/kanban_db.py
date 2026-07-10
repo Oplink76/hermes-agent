@@ -4655,6 +4655,7 @@ def _end_run(
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
     status: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> Optional[int]:
     """Close the currently-active run for ``task_id`` and clear the pointer.
 
@@ -4671,8 +4672,20 @@ def _end_run(
     ).fetchone()
     if not row or not row["current_run_id"]:
         return None
-    run_id = int(row["current_run_id"])
-    conn.execute(
+    run_id = (
+        int(expected_run_id)
+        if expected_run_id is not None
+        else int(row["current_run_id"])
+    )
+    if int(row["current_run_id"]) != run_id:
+        return None
+    active = conn.execute(
+        "SELECT id FROM task_runs WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+        (run_id, task_id),
+    ).fetchone()
+    if active is None:
+        return None
+    closed = conn.execute(
         """
         UPDATE task_runs
            SET status        = ?,
@@ -4685,6 +4698,7 @@ def _end_run(
                claim_expires = NULL,
                worker_pid    = NULL
          WHERE id = ?
+           AND task_id = ?
            AND ended_at IS NULL
         """,
         (
@@ -4695,11 +4709,15 @@ def _end_run(
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
             now,
             run_id,
+            task_id,
         ),
     )
-    conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+    cleared = conn.execute(
+        "UPDATE tasks SET current_run_id = NULL WHERE id = ? AND current_run_id = ?",
+        (task_id, run_id),
     )
+    if closed.rowcount != 1 or cleared.rowcount != 1:
+        return None
     return run_id
 
 
@@ -5664,14 +5682,6 @@ def complete_task(
                     # -- do NOT fall through to the terminal-done UPDATE,
                     # which would wrongly mark an uncommitted card done.
                     return False
-                with write_txn(conn):
-                    _end_run(
-                        conn, task_id,
-                        outcome="advanced",
-                        status="completed",
-                        summary=summary if summary is not None else result,
-                        metadata=metadata,
-                    )
                 return True
             # Terminal / non-advancing v2 step (e.g. release_measure, or no
             # transition at all): fall through to the existing legacy path
@@ -8515,8 +8525,9 @@ def handoff(
     next_role = transition.get("assignee_role")
     next_assignee = _product_role_assignee(meta, next_role)
 
-    with write_txn(conn):
-        sql = (
+    try:
+        with write_txn(conn):
+            sql = (
             # Release the completing worker's claim as part of the atomic advance:
             # the card is being handed to a NEW assignee, so the old claim is dead.
             # Without this, the handed-off card stays ready+claimed, which
@@ -8525,28 +8536,44 @@ def handoff(
             "UPDATE tasks SET current_step_key = ?, running = 0, assignee = ?, result = ?, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ?"
-        ) + ("" if expected_run_id is None else " AND status = 'running' AND current_run_id = ?")
-        params = (
-            (next_step, next_assignee, summary, task_id)
-            if expected_run_id is None
-            else (next_step, next_assignee, summary, task_id, int(expected_run_id))
-        )
-        cur = conn.execute(sql, params)
-        if cur.rowcount != 1:
+            ) + ("" if expected_run_id is None else " AND status = 'running' AND current_run_id = ?")
+            params = (
+                (next_step, next_assignee, summary, task_id)
+                if expected_run_id is None
+                else (next_step, next_assignee, summary, task_id, int(expected_run_id))
+            )
+            cur = conn.execute(sql, params)
+            if cur.rowcount != 1:
+                raise RuntimeError("handoff run ownership changed")
+            _sync_legacy_status(conn, task_id, meta)
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="advanced",
+                status="completed",
+                summary=summary,
+                metadata=metadata,
+                expected_run_id=expected_run_id,
+            )
+            if expected_run_id is not None and run_id is None:
+                raise RuntimeError("handoff run ownership changed")
+            _append_event(
+                conn,
+                task_id,
+                "handoff",
+                {
+                    "from_step": step,
+                    "to_step": next_step,
+                    "sha": sha,
+                    "assignee": next_assignee,
+                    "summary": summary,
+                },
+                run_id=run_id,
+            )
+    except RuntimeError as exc:
+        if str(exc) == "handoff run ownership changed":
             return False
-        _sync_legacy_status(conn, task_id, meta)
-        _append_event(
-            conn,
-            task_id,
-            "handoff",
-            {
-                "from_step": step,
-                "to_step": next_step,
-                "sha": sha,
-                "assignee": next_assignee,
-                "summary": summary,
-            },
-        )
+        raise
     return True
 
 

@@ -4292,7 +4292,6 @@ def test_complete_task_v2_stale_reclaimed_worker_cannot_advance(kanban_home, tmp
     assert result is False
     assert card["current_step_key"] == "development"
     assert not any(event.kind == "handoff" for event in events)
-
     after_head = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
         check=True, capture_output=True, text=True,
@@ -4304,6 +4303,37 @@ def test_complete_task_v2_stale_reclaimed_worker_cannot_advance(kanban_home, tmp
     ).stdout
     assert status.strip() != ""  # still dirty -- never staged/committed
 
+
+def test_end_run_expected_id_cannot_close_new_owner(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="owned run", assignee="developer")
+        first = kb.claim_task(conn, tid, claimer="old")
+        assert first is not None and first.current_run_id is not None
+        old_run_id = first.current_run_id
+        assert kb.reclaim_task(conn, tid, reason="new owner") is True
+        second = kb.claim_task(conn, tid, claimer="new")
+        assert second is not None and second.current_run_id is not None
+        new_run_id = second.current_run_id
+
+        with kb.write_txn(conn):
+            ended = kb._end_run(
+                conn,
+                tid,
+                outcome="advanced",
+                expected_run_id=old_run_id,
+            )
+        task = kb.get_task(conn, tid)
+        old_run = conn.execute(
+            "SELECT ended_at, outcome FROM task_runs WHERE id=?", (old_run_id,)
+        ).fetchone()
+        new_run = conn.execute(
+            "SELECT ended_at, outcome FROM task_runs WHERE id=?", (new_run_id,)
+        ).fetchone()
+
+    assert ended is None
+    assert task is not None and task.current_run_id == new_run_id
+    assert old_run["ended_at"] is not None and old_run["outcome"] == "reclaimed"
+    assert new_run["ended_at"] is None and new_run["outcome"] is None
 
 def test_complete_task_v2_owning_worker_still_advances_with_expected_run_id(
     kanban_home, tmp_path, monkeypatch,
