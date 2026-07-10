@@ -38,6 +38,16 @@ UV_SYNC_COMMAND = (
     "slack",
 )
 
+PYPROJECT_WITH_EXTRAS = """\
+[project]
+name = "hermes"
+
+[project.optional-dependencies]
+all = []
+dev = []
+slack = []
+"""
+
 
 @dataclass(frozen=True)
 class Call:
@@ -252,6 +262,16 @@ def _responses():
         ("git", "fetch", "origin", "main"): (0, "", ""),
         ("git", "rev-parse", "origin/main"): (0, "new-sha\n", ""),
         ("git", "rev-parse", "HEAD"): (0, "old-sha\n", ""),
+        ("git", "show", "old-sha:pyproject.toml"): (
+            0,
+            PYPROJECT_WITH_EXTRAS,
+            "",
+        ),
+        ("git", "show", "new-sha:pyproject.toml"): (
+            0,
+            PYPROJECT_WITH_EXTRAS,
+            "",
+        ),
         ("git", "switch", "--detach", "new-sha"): (0, "", ""),
         ("git", "switch", "--detach", "old-sha"): (0, "", ""),
         UV_SYNC_COMMAND: (0, "", ""),
@@ -430,6 +450,34 @@ def test_health_failure_rolls_back_source_state_services_and_health_checks(
     ) in events
 
 
+def test_modern_rollback_keeps_runtime_identity_mandatory(tmp_path: Path):
+    events: list[tuple] = []
+    config = _config(tmp_path)
+    identity_module = config.install_root / "gateway" / "runtime_identity.py"
+    identity_module.parent.mkdir()
+    identity_module.write_text("# modern runtime identity\n", encoding="utf-8")
+    failing = HealthReport(checks=(HealthCheck("candidate-runtime", False),))
+
+    record = deploy(
+        _request(tmp_path),
+        config=config,
+        runner=FakeRunner(_responses(), events),
+        github=FakeGitHub(_evidence()),
+        snapshots=FakeSnapshots(events),
+        services=FakeServices(events),
+        health=FakeHealth([failing, _green("rollback-runtime")], events),
+        store=RecordingStore(events),
+    )
+
+    assert record.status == "rolled_back_healthy"
+    assert (
+        "health",
+        "old-sha",
+        ("ai.hermes.gateway", "com.cloudadvisor.hermes-dashboard"),
+        True,
+    ) in events
+
+
 def test_candidate_service_start_counts_as_state_mutation_for_rollback(tmp_path: Path):
     events = []
     config = _config(tmp_path)
@@ -573,6 +621,71 @@ def test_preflight_rejects_dirty_install_or_non_origin_sha(
         event[0] == "command" and event[1][:3] == ("git", "switch", "--detach")
         for event in events
     )
+
+
+def test_preflight_rejects_empty_or_revision_incompatible_uv_extras(
+    tmp_path: Path,
+):
+    empty_root = tmp_path / "empty"
+    mismatch_root = tmp_path / "mismatch"
+    candidate_root = tmp_path / "candidate-mismatch"
+    empty_root.mkdir()
+    mismatch_root.mkdir()
+    candidate_root.mkdir()
+    empty_base = _config(empty_root)
+    empty_config = DeployConfig(
+        install_root=empty_base.install_root,
+        origin=empty_base.origin,
+        record_root=empty_base.record_root,
+    )
+
+    for index, (config, responses, message) in enumerate((
+        (
+            empty_config,
+            _responses(),
+            "deploy.uv_extras must contain at least one extra",
+        ),
+        (
+            _config(mismatch_root),
+            {
+                **_responses(),
+                ("git", "show", "old-sha:pyproject.toml"): (
+                    0,
+                    PYPROJECT_WITH_EXTRAS.replace("slack = []\n", ""),
+                    "",
+                ),
+            },
+            "old-sha.*slack",
+        ),
+        (
+            _config(candidate_root),
+            {
+                **_responses(),
+                ("git", "show", "new-sha:pyproject.toml"): (
+                    0,
+                    PYPROJECT_WITH_EXTRAS.replace("slack = []\n", ""),
+                    "",
+                ),
+            },
+            "new-sha.*slack",
+        ),
+    )):
+        events: list[tuple] = []
+        request_root = tmp_path / f"request-{index}"
+        request_root.mkdir()
+        with pytest.raises(PreflightError, match=message):
+            deploy(
+                _request(request_root),
+                config=config,
+                runner=FakeRunner(responses, events),
+                github=FakeGitHub(_evidence()),
+                snapshots=FakeSnapshots(events),
+                services=FakeServices(events),
+                health=FakeHealth([_green("unused")], events),
+                store=RecordingStore(events),
+            )
+        assert not any(event[0] == "snapshot" for event in events)
+        assert not any(event[0] == "services_stopped" for event in events)
 
 
 def test_preflight_rejects_tampered_decision_packet(tmp_path: Path):

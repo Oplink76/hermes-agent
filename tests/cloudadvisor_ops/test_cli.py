@@ -113,6 +113,16 @@ def test_load_operations_config_requires_gateway_identity_scope(tmp_path: Path):
         load_operations_config(config_file)
 
 
+def test_load_operations_config_requires_nonempty_uv_extras(tmp_path: Path):
+    config_file = _write_operations_config(tmp_path)
+    payload = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    payload["deploy"].pop("uv_extras")
+    config_file.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="deploy.uv_extras must contain"):
+        load_operations_config(config_file)
+
+
 def test_github_query_rejects_duplicate_open_sync_pull_requests(tmp_path: Path):
     response = subprocess.CompletedProcess(
         [],

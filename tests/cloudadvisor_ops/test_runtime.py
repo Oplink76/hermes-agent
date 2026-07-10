@@ -352,6 +352,53 @@ def test_runtime_health_checker_waits_for_manifest_convergence(tmp_path: Path):
     assert sleeps == [0.01]
 
 
+def test_converged_runtime_still_honors_one_shot_failure_injection(tmp_path: Path):
+    install_root, target, manifest_path, responses = _runtime_fixture(tmp_path)
+    manifest = manifest_path.read_text(encoding="utf-8")
+    manifest_path.unlink()
+
+    def publish_manifest(delay: float) -> None:
+        manifest_path.write_text(manifest, encoding="utf-8")
+
+    runner = FakeRunner(responses)
+    controller = LaunchdServiceController(
+        services=[
+            LaunchdService(
+                label="ai.hermes.gateway-tradingastrid",
+                plist_path=target.plist_path,
+            )
+        ],
+        install_root=install_root,
+        uid=501,
+        runner=runner,
+    )
+    checker = RuntimeHealthChecker(
+        controller=controller,
+        gateway_targets=[target],
+        install_root=install_root,
+        uid=501,
+        runner=runner,
+        inject_failure="after_restart",
+        timeout_seconds=5,
+        poll_interval_seconds=0.01,
+        clock=lambda: 0.0,
+        sleeper=publish_manifest,
+    )
+
+    injected = checker.check(
+        expected_sha="deployed-sha",
+        services=("ai.hermes.gateway-tradingastrid",),
+    )
+    after_injection = checker.check(
+        expected_sha="deployed-sha",
+        services=("ai.hermes.gateway-tradingastrid",),
+    )
+
+    assert injected.healthy is False
+    assert any(check.name == "injected:after_restart" for check in injected.checks)
+    assert after_injection.healthy is True
+
+
 def test_runtime_health_checker_can_verify_legacy_service_without_manifest(
     tmp_path: Path,
 ):
@@ -390,6 +437,44 @@ def test_runtime_health_checker_can_verify_legacy_service_without_manifest(
         and check.detail == "legacy runtime process and service ownership agree"
         for check in report.checks
     )
+
+
+def test_runtime_health_checker_caps_sleep_at_timeout_boundary(tmp_path: Path):
+    install_root, target, manifest_path, responses = _runtime_fixture(tmp_path)
+    manifest_path.unlink()
+    times = iter((0.0, 0.9, 1.0))
+    sleeps: list[float] = []
+    runner = FakeRunner(responses)
+    controller = LaunchdServiceController(
+        services=[
+            LaunchdService(
+                label="ai.hermes.gateway-tradingastrid",
+                plist_path=target.plist_path,
+            )
+        ],
+        install_root=install_root,
+        uid=501,
+        runner=runner,
+    )
+    checker = RuntimeHealthChecker(
+        controller=controller,
+        gateway_targets=[target],
+        install_root=install_root,
+        uid=501,
+        runner=runner,
+        timeout_seconds=1,
+        poll_interval_seconds=0.25,
+        clock=lambda: next(times),
+        sleeper=sleeps.append,
+    )
+
+    report = checker.check(
+        expected_sha="deployed-sha",
+        services=("ai.hermes.gateway-tradingastrid",),
+    )
+
+    assert report.healthy is False
+    assert sleeps == pytest.approx([0.1])
 
 
 def test_runtime_health_checker_rejects_service_only_health_without_gateway_target(

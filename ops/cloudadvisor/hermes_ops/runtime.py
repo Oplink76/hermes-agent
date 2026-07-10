@@ -245,9 +245,10 @@ class RuntimeHealthChecker:
                 services=services,
                 identity_required=identity_required,
             )
-            if report.healthy or self.clock() >= deadline:
+            now = self.clock()
+            if report.healthy or now >= deadline:
                 break
-            self.sleeper(self.poll_interval_seconds)
+            self.sleeper(min(self.poll_interval_seconds, deadline - now))
 
         if self.inject_failure == "after_restart":
             self.inject_failure = None

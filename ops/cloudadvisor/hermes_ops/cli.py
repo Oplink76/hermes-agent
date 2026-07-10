@@ -142,11 +142,11 @@ def load_operations_config(path: Path) -> OperationsConfig:
         _command(value, field=f"deploy.postinstall_commands[{index}]")
         for index, value in enumerate(postinstall_value)
     )
-    uv_extras_value = deploy.get("uv_extras", [])
-    if not isinstance(uv_extras_value, list) or any(
+    uv_extras_value = deploy.get("uv_extras")
+    if not isinstance(uv_extras_value, list) or not uv_extras_value or any(
         not isinstance(value, str) or not value.strip() for value in uv_extras_value
     ):
-        raise ValueError("deploy.uv_extras must be a list of non-empty strings")
+        raise ValueError("deploy.uv_extras must contain non-empty strings")
     uv_extras = tuple(value.strip() for value in uv_extras_value)
     required_fields = ("origin", "repo_slug", "record_root", "snapshot_root")
     missing = [field for field in required_fields if not deploy.get(field)]

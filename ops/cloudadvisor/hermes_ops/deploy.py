@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import stat
+import tomllib
 import uuid
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
@@ -254,6 +255,40 @@ def _uv_sync_command(config: DeployConfig) -> list[str]:
     return command
 
 
+def _validate_uv_extras_for_revisions(
+    config: DeployConfig,
+    *,
+    runner: CommandRunner,
+    root: Path,
+    revisions: tuple[str, ...],
+) -> None:
+    if not config.uv_extras:
+        raise PreflightError("deploy.uv_extras must contain at least one extra")
+    for revision in dict.fromkeys(revisions):
+        raw = _run_required(
+            runner,
+            ["git", "show", f"{revision}:pyproject.toml"],
+            cwd=root,
+        )
+        try:
+            payload = tomllib.loads(raw)
+            available = payload["project"]["optional-dependencies"]
+        except (KeyError, TypeError, tomllib.TOMLDecodeError) as exc:
+            raise PreflightError(
+                f"could not read optional dependencies at {revision}"
+            ) from exc
+        if not isinstance(available, dict):
+            raise PreflightError(
+                f"could not read optional dependencies at {revision}"
+            )
+        missing = sorted(set(config.uv_extras) - set(available))
+        if missing:
+            raise PreflightError(
+                f"configured uv extras are unavailable at {revision}: "
+                + ", ".join(missing)
+            )
+
+
 def _run_required(
     runner: CommandRunner,
     argv: list[str],
@@ -441,6 +476,12 @@ def _deploy_locked(
     )
 
     previous_sha = _run_required(runner, ["git", "rev-parse", "HEAD"], cwd=root)
+    _validate_uv_extras_for_revisions(
+        config,
+        runner=runner,
+        root=root,
+        revisions=(previous_sha, request.sha),
+    )
     previous_identity_required = (root / "gateway" / "runtime_identity.py").is_file()
     previous_fingerprint = fingerprint_fn(root)
     prior_services = services.running_services()
