@@ -1,4 +1,4 @@
-"""Read-only reconciliation of installed Hermes gateway runtimes."""
+"""Inventory and guarded file reconciliation for installed Hermes runtimes."""
 
 from __future__ import annotations
 
