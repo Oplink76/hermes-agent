@@ -5934,6 +5934,27 @@ class ReleaseEvidenceError(ValueError):
         )
 
 
+_RELEASE_SUCCESS_WORDS = frozenset(
+    {"green", "healthy", "ok", "pass", "passed", "success", "succeeded"}
+)
+
+
+def _release_evidence_succeeded(value: Any) -> bool:
+    """Return true only for an explicit positive release-evidence result."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in _RELEASE_SUCCESS_WORDS
+    if not isinstance(value, dict):
+        return False
+    results = [
+        _release_evidence_succeeded(value[key])
+        for key in ("success", "passed", "healthy", "status", "result", "health")
+        if key in value
+    ]
+    return bool(results) and all(results)
+
+
 def _validate_resolver_action(candidate: Any) -> tuple[str, str, Optional[str]]:
     if not isinstance(candidate, dict):
         raise ValueError("resolver_action is required to complete a product preflight")
@@ -8050,6 +8071,9 @@ class IntegrationCandidate:
     candidate_ref: str
 
 
+_RECONCILE_INTEGRATION_VERIFY_UNSET = object()
+
+
 @dataclass(frozen=True)
 class ReleaseResult:
     released: bool
@@ -8486,6 +8510,7 @@ def integrate_story_to_epic(
     *,
     board: Optional[str] = None,
     notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
+    candidate_verify_fn: Any = _RECONCILE_INTEGRATION_VERIFY_UNSET,
 ) -> Optional[str]:
     """Merge a Done story's branch into its epic's integration branch, LOCALLY.
 
@@ -8565,7 +8590,11 @@ def integrate_story_to_epic(
         ancestor_result = _run(
             ["merge-base", "--is-ancestor", story_branch, epic_branch], cwd=repo_root,
         )
-        if ancestor_result is not None and ancestor_result.returncode == 0:
+        already_integrated = ancestor_result is not None and ancestor_result.returncode == 0
+        if (
+            already_integrated
+            and candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
+        ):
             with write_txn(conn):
                 _append_event(
                     conn,
@@ -8579,6 +8608,55 @@ def integrate_story_to_epic(
                     },
                 )
             return "already_integrated"
+
+        if candidate_verify_fn is not _RECONCILE_INTEGRATION_VERIFY_UNSET:
+            try:
+                candidate = _build_verified_merge_candidate(
+                    repo_root,
+                    epic_branch,
+                    story_branch,
+                    f"integrate story {story_id}",
+                    candidate_verify_fn,
+                )
+                if not _fast_forward_target(candidate):
+                    reason = (
+                        "epic target moved or became dirty; candidate retained at "
+                        f"{candidate.candidate_ref}"
+                    )
+                    with write_txn(conn):
+                        _append_event(
+                            conn,
+                            story_id,
+                            "story_integration_failed",
+                            {"reason": reason, "release_candidate": True},
+                        )
+                    return "verify_failed"
+            except IntegrationCandidateError as exc:
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        story_id,
+                        "story_integration_failed",
+                        {"reason": str(exc), "release_candidate": True},
+                    )
+                return "conflict" if "merge conflict" in str(exc) else "verify_failed"
+
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    story_id,
+                    "story_integrated_to_epic",
+                    {
+                        "source_branch": story_branch,
+                        "target_branch": epic_branch,
+                        "pre_sha": candidate.pre_sha,
+                        "candidate_sha": candidate.candidate_sha,
+                        "target": str(candidate.target_worktree or epic_branch),
+                        "test_command": "bash scripts/run_tests.sh",
+                        "already_integrated": already_integrated,
+                    },
+                )
+            return "already_integrated" if already_integrated else "integrated"
 
         epic_worktree = repo_root / ".worktrees" / f"epic-{epic_id}"
         _ensure_git_worktree(repo_root, epic_worktree, epic_branch)
@@ -8891,11 +8969,13 @@ def _validate_done_evidence(
                 missing.append("deployment_revision")
             if not deployment_payload.get("environment"):
                 missing.append("deployment_environment")
-            if not deployment_payload.get("smoke_result"):
+            if not _release_evidence_succeeded(deployment_payload.get("smoke_result")):
                 missing.append("smoke_evidence")
             if not deployment_payload.get("rollback_target"):
                 missing.append("rollback_evidence")
-            if not deployment_payload.get("runtime_evidence"):
+            if not _release_evidence_succeeded(
+                deployment_payload.get("runtime_evidence")
+            ):
                 missing.append("runtime_evidence")
     if not str(evidence.get("measurement_note") or "").strip():
         missing.append("measurement_note")
@@ -8973,7 +9053,12 @@ def release_product_task(
         )
         integration_kinds = {"epic_merged"}
     elif parents:
-        integration_status = integrate_story_to_epic(conn, task_id, board=board)
+        integration_status = integrate_story_to_epic(
+            conn,
+            task_id,
+            board=board,
+            candidate_verify_fn=candidate_verify_fn,
+        )
         integration_kinds = {"story_integrated_to_epic"}
     else:
         integration_status = _merge_standalone_story_to_main(
@@ -9046,11 +9131,11 @@ def release_product_task(
             deployment_missing.append("deployment_environment")
         if deployment.get("revision") != integration_sha:
             deployment_missing.append("deployment_revision")
-        if not deployment.get("smoke_result"):
+        if not _release_evidence_succeeded(deployment.get("smoke_result")):
             deployment_missing.append("smoke_evidence")
         if not deployment.get("rollback_target"):
             deployment_missing.append("rollback_evidence")
-        if not deployment.get("runtime_evidence"):
+        if not _release_evidence_succeeded(deployment.get("runtime_evidence")):
             deployment_missing.append("runtime_evidence")
         if deployment_missing:
             raise ReleaseEvidenceError(task_id, deployment_missing)

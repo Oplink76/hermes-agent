@@ -2680,6 +2680,69 @@ def test_dashboard_lifecycle_patch_uses_selected_product_board_context(client):
     assert task["status"] == "ready"
 
 
+def test_dashboard_rejects_invalid_product_workflow_patch_without_mutation(client):
+    kb.ensure_product_board_defaults("prod-invalid-patch", name="Product")
+    with kb.connect(board="prod-invalid-patch") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="User story: preserve valid state",
+            workflow_template_id="product",
+            current_step_key="backlog",
+            board="prod-invalid-patch",
+        )
+        before = kb.task_snapshot_from_row(
+            conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        )
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}?board=prod-invalid-patch",
+        json={
+            "workflow_template_id": "product",
+            "current_step_key": "typo-development",
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["current"] == before
+    with kb.connect(board="prod-invalid-patch") as conn:
+        after = kb.task_snapshot_from_row(
+            conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        )
+    assert after == before
+
+
+def test_dashboard_custom_column_cannot_create_arbitrary_product_step(client):
+    board = "prod-invalid-custom-column"
+    kb.ensure_product_board_defaults(board, name="Product")
+    metadata = kb.read_board_metadata(board)
+    metadata["columns"].insert(-1, {"name": "qa_hold", "status": "review"})
+    kb.board_metadata_path(board).write_text(json.dumps(metadata), encoding="utf-8")
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="User story: valid backlog",
+            workflow_template_id="product",
+            current_step_key="backlog",
+            board=board,
+        )
+        before = kb.task_snapshot_from_row(
+            conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        )
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}?board={board}",
+        json={"status": "qa_hold"},
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["current"] == before
+    with kb.connect(board=board) as conn:
+        after = kb.task_snapshot_from_row(
+            conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        )
+    assert after == before
+
+
 def _task_status(task_id: str) -> str:
     conn = kb.connect()
     try:

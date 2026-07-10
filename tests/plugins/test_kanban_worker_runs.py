@@ -78,6 +78,15 @@ def _insert_run(conn, task_id, *, worker_pid=None, ended_at=None):
     return cur.lastrowid
 
 
+def _expected_snapshot(task_id: str) -> dict:
+    with kb.connect() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return {
+        f"expected_{field}": value
+        for field, value in kb.task_snapshot_from_row(row).items()
+    }
+
+
 # ---------------------------------------------------------------------------
 # GET /workers/active
 # ---------------------------------------------------------------------------
@@ -327,6 +336,10 @@ def _setup_running_task_with_run(conn, *, title, assignee, worker_pid):
         "VALUES (?, 'running', ?, ?, ?, ?)",
         (task_id, lock, future, worker_pid, int(time.time())),
     )
+    conn.execute(
+        "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+        (cur.lastrowid, task_id),
+    )
     conn.commit()
     return task_id, cur.lastrowid
 
@@ -339,6 +352,11 @@ def test_terminate_run_404_unknown_id(client):
     )
     assert r.status_code == 404
     assert "777777" in r.json()["detail"]
+
+
+def test_terminate_run_404_unknown_id_without_body(client):
+    response = client.post("/api/plugins/kanban/runs/777778/terminate")
+    assert response.status_code == 404
 
 
 def test_terminate_run_409_already_ended(client):
@@ -354,7 +372,7 @@ def test_terminate_run_409_already_ended(client):
 
     r = client.post(
         f"/api/plugins/kanban/runs/{run_id}/terminate",
-        json={"reason": "too late"},
+        json={"reason": "too late", **_expected_snapshot(task_id)},
     )
     assert r.status_code == 409
     assert "already ended" in r.json()["detail"]
@@ -381,7 +399,7 @@ def test_terminate_run_ok(client, monkeypatch):
 
     r = client.post(
         f"/api/plugins/kanban/runs/{run_id}/terminate",
-        json={"reason": "operator abort"},
+        json={"reason": "operator abort", **_expected_snapshot(task_id)},
     )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -423,7 +441,7 @@ def test_terminate_run_409_task_not_reclaimable(client, monkeypatch):
 
     r = client.post(
         f"/api/plugins/kanban/runs/{run_id}/terminate",
-        json={"reason": "stale"},
+        json={"reason": "stale", **_expected_snapshot(task_id)},
     )
     assert r.status_code == 409
     assert "reclaimable" in r.json()["detail"]
@@ -438,3 +456,15 @@ def test_terminate_run_accepts_empty_body(client):
     # 404 because run doesn't exist — what we're asserting here is that
     # the endpoint doesn't 422 on a missing 'reason' field.
     assert r.status_code == 404
+
+
+def test_terminate_existing_run_without_snapshot_is_422(client):
+    with kb.connect() as conn:
+        task_id, run_id = _setup_running_task_with_run(
+            conn, title="snapshot-required", assignee="ivy", worker_pid=55555,
+        )
+    response = client.post(
+        f"/api/plugins/kanban/runs/{run_id}/terminate",
+        json={"reason": "missing snapshot"},
+    )
+    assert response.status_code == 422

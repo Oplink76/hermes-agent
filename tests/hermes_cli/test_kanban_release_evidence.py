@@ -315,6 +315,47 @@ class _SuccessfulReleaseAdapter:
         }
 
 
+class _EvidenceReleaseAdapter:
+    def __init__(self, *, smoke_result, runtime_evidence):
+        self.smoke_result = smoke_result
+        self.runtime_evidence = runtime_evidence
+
+    def release(self, task_id: str, revision: str) -> dict:
+        return {
+            "environment": "preprod",
+            "revision": revision,
+            "smoke_result": self.smoke_result,
+            "rollback_target": "previous",
+            "runtime_evidence": self.runtime_evidence,
+        }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, "passed", "green", {"status": "passed"}, {"health": "green"}],
+)
+def test_release_evidence_success_predicate_accepts_explicit_positive_shapes(value):
+    assert kb._release_evidence_succeeded(value) is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        False,
+        None,
+        "failed",
+        "red",
+        {"status": "failed"},
+        {"health": "red"},
+        {"healthy": False},
+        {"success": True, "health": "red"},
+        {"evidence": "present but indeterminate"},
+    ],
+)
+def test_release_evidence_success_predicate_rejects_failed_or_indeterminate_shapes(value):
+    assert kb._release_evidence_succeeded(value) is False
+
+
 def test_required_deployment_records_runtime_evidence_before_done(
     release_home, tmp_path,
 ):
@@ -342,6 +383,45 @@ def test_required_deployment_records_runtime_evidence_before_done(
         )
         assert deployment.payload["rollback_target"] == "preprod-previous"
         assert deployment.payload["runtime_evidence"] == {"health": "green"}
+
+
+def test_terminal_done_validation_rechecks_positive_deployment_results(
+    release_home, tmp_path,
+):
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = "release-terminal-revalidation"
+    _release_board(board, repo, policy="required")
+    with kb.connect(board=board) as conn:
+        task_id = _release_task(conn, board, repo, branch)
+        _seed_structured_evidence(conn, task_id, branch, source_sha)
+        result = kb.release_product_task(
+            conn,
+            task_id,
+            board,
+            lambda _path: True,
+            _SuccessfulReleaseAdapter(),
+            measurement_note="runtime measured",
+        )
+        completed = next(
+            event for event in kb.list_events(conn, task_id) if event.kind == "completed"
+        )
+        evidence = completed.payload["release_evidence"]
+        deployment_id = evidence["deployment_record_event_id"]
+        deployment = next(
+            event for event in kb.list_events(conn, task_id) if event.id == deployment_id
+        )
+        failed_payload = dict(deployment.payload, smoke_result="failed")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (json.dumps(failed_payload), deployment_id),
+            )
+
+        with pytest.raises(kb.ReleaseEvidenceError) as exc_info:
+            kb._validate_done_evidence(conn, task_id, evidence)
+
+        assert result.released is True
+        assert "smoke_evidence" in exc_info.value.missing
 
 
 def test_required_pull_request_is_referenced_by_terminal_evidence(
@@ -398,6 +478,46 @@ def test_required_deployment_rejects_missing_smoke_or_rollback_evidence(
         assert task is not None and task.current_step_key == "release_measure"
 
 
+@pytest.mark.parametrize(
+    ("smoke_result", "runtime_evidence", "missing"),
+    [
+        ("failed", {"health": "green"}, "smoke_evidence"),
+        ({"status": "failed"}, {"health": "green"}, "smoke_evidence"),
+        (True, {"health": "red"}, "runtime_evidence"),
+        (True, {"healthy": False}, "runtime_evidence"),
+    ],
+)
+def test_required_deployment_rejects_explicitly_failed_evidence(
+    release_home, tmp_path, smoke_result, runtime_evidence, missing,
+):
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = f"release-failed-{missing}-{type(smoke_result).__name__}"
+    _release_board(board, repo, policy="required")
+    with kb.connect(board=board) as conn:
+        task_id = _release_task(conn, board, repo, branch)
+        _seed_structured_evidence(conn, task_id, branch, source_sha)
+        adapter = _EvidenceReleaseAdapter(
+            smoke_result=smoke_result,
+            runtime_evidence=runtime_evidence,
+        )
+
+        with pytest.raises(kb.ReleaseEvidenceError) as exc_info:
+            kb.release_product_task(
+                conn,
+                task_id,
+                board,
+                lambda _path: True,
+                adapter,
+                measurement_note="deployment failed",
+            )
+
+        assert missing in exc_info.value.missing
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.current_step_key == "release_measure"
+
+
 def test_epic_child_integrates_before_child_done(release_home, tmp_path, monkeypatch):
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = "release-epic-child"
@@ -430,6 +550,85 @@ def test_epic_child_integrates_before_child_done(release_home, tmp_path, monkeyp
 
         assert result.released is True
         assert kb.get_task(conn, story).status == "done"
+
+
+def test_epic_child_failed_candidate_verification_preserves_epic_and_release_state(
+    release_home, tmp_path,
+):
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = "release-epic-child-verify-fails"
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        epic = kb.create_task(conn, title="Epic", board=board)
+        epic_branch = kb.epic_branch_for(epic)
+        _git(repo, "branch", epic_branch, "main")
+        story = _release_task(conn, board, repo, branch, parents=[epic])
+        _seed_structured_evidence(conn, story, branch, source_sha)
+        epic_before = _git(repo, "rev-parse", epic_branch)
+        status_before = kb.get_task(conn, story).status
+        observed_combined_tree: list[bool] = []
+
+        def reject_combined(candidate: Path) -> bool:
+            observed_combined_tree.append((candidate / "story.txt").is_file())
+            return False
+
+        with pytest.raises(kb.ReleaseEvidenceError) as exc_info:
+            kb.release_product_task(
+                conn,
+                story,
+                board,
+                reject_combined,
+                None,
+                measurement_note="child integration rejected",
+            )
+
+        assert "integrated_branch" in exc_info.value.missing
+        assert observed_combined_tree == [True]
+        assert _git(repo, "rev-parse", epic_branch) == epic_before
+        task = kb.get_task(conn, story)
+        assert task is not None
+        assert task.status == status_before
+        assert task.current_step_key == "release_measure"
+        assert not any(
+            event.kind == "story_integrated_to_epic"
+            for event in kb.list_events(conn, story)
+        )
+
+
+def test_epic_child_verified_candidate_fast_forwards_before_done(
+    release_home, tmp_path,
+):
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = "release-epic-child-verified"
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        epic = kb.create_task(conn, title="Epic", board=board)
+        epic_branch = kb.epic_branch_for(epic)
+        _git(repo, "branch", epic_branch, "main")
+        story = _release_task(conn, board, repo, branch, parents=[epic])
+        _seed_structured_evidence(conn, story, branch, source_sha)
+        observed: list[str] = []
+
+        def accept_combined(candidate: Path) -> bool:
+            observed.append((candidate / "story.txt").read_text(encoding="utf-8"))
+            return True
+
+        result = kb.release_product_task(
+            conn,
+            story,
+            board,
+            accept_combined,
+            None,
+            measurement_note="child integration verified",
+        )
+
+        assert result.released is True
+        assert observed == ["released\n"]
+        assert _git(repo, "merge-base", "--is-ancestor", source_sha, epic_branch) == ""
+        task = kb.get_task(conn, story)
+        assert task is not None
+        assert task.status == "done"
+        assert task.current_step_key == "done"
 
 
 def test_epic_release_requires_every_child_done_and_integrated(

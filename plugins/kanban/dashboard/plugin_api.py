@@ -699,6 +699,16 @@ class _ExpectedTaskSnapshotBody(BaseModel):
     expected_current_run_id: Optional[int]
 
 
+class _DeferredExpectedTaskSnapshotBody(BaseModel):
+    """Parse an optional snapshot so unknown resources can return 404 first."""
+
+    expected_status: Optional[str] = None
+    expected_title: Optional[str] = None
+    expected_assignee: Optional[str] = None
+    expected_current_step_key: Optional[str] = None
+    expected_current_run_id: Optional[int] = None
+
+
 class CreateTaskBody(BaseModel):
     title: str
     body: Optional[str] = None
@@ -819,7 +829,7 @@ async def upload_task_attachment(
     file: UploadFile = File(...),
     board: Optional[str] = Query(None),
     uploaded_by: Optional[str] = Form(None),
-    expected_snapshot: str = Form(...),
+    expected_snapshot: Optional[str] = Form(None),
 ):
     """Store an uploaded file for a task and record its metadata.
 
@@ -830,6 +840,13 @@ async def upload_task_attachment(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        if expected_snapshot is None:
+            raise HTTPException(
+                status_code=422,
+                detail="expected_snapshot is required for an existing task",
+            )
         try:
             expected = _ExpectedTaskSnapshotBody(**json.loads(expected_snapshot))
         except (TypeError, ValueError) as exc:
@@ -846,9 +863,6 @@ async def upload_task_attachment(
             )
         except _TaskSnapshotConflict as exc:
             return _snapshot_conflict_response(exc)
-        if kanban_db.get_task(conn, task_id) is None:
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-
         safe_name = _safe_attachment_name(file.filename or "")
 
         # Stream to disk with a hard size cap so a huge upload can't fill
@@ -945,26 +959,26 @@ def download_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 @router.delete("/attachments/{attachment_id}")
 def remove_attachment(
     attachment_id: int,
-    payload: _ExpectedTaskSnapshotBody,
+    payload: Optional[_DeferredExpectedTaskSnapshotBody] = None,
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
         existing = kanban_db.get_attachment(conn, attachment_id)
-        if existing is not None:
-            try:
-                with kanban_db.conditional_task_write(
-                    conn,
-                    existing.task_id,
-                    _expected_task_snapshot_values(payload),
-                    action="deleting an attachment",
-                ):
-                    att = kanban_db.delete_attachment(conn, attachment_id)
-            except _TaskSnapshotConflict as exc:
-                return _snapshot_conflict_response(exc)
-        else:
-            att = None
+        if existing is None:
+            raise HTTPException(status_code=404, detail="attachment not found")
+        expected = _require_expected_task_snapshot(payload)
+        try:
+            with kanban_db.conditional_task_write(
+                conn,
+                existing.task_id,
+                expected,
+                action="deleting an attachment",
+            ):
+                att = kanban_db.delete_attachment(conn, attachment_id)
+        except _TaskSnapshotConflict as exc:
+            return _snapshot_conflict_response(exc)
         if att is None:
             raise HTTPException(status_code=404, detail="attachment not found")
         return {"ok": True, "id": attachment_id}
@@ -1004,6 +1018,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             updated = _patch_task(conn, task_id, payload, board=board)
         except _TaskSnapshotConflict as exc:
             return _snapshot_conflict_response(exc)
+        except kanban_db.ProductWorkflowStateError as exc:
+            return _task_error_response(conn, task_id, str(exc))
         except HTTPException as exc:
             if exc.status_code == 409:
                 return _task_conflict_response(conn, task_id, str(exc.detail))
@@ -1059,6 +1075,18 @@ def _expected_task_snapshot_values(model: BaseModel) -> dict[str, Any]:
     }
 
 
+def _require_expected_task_snapshot(
+    model: Optional[_DeferredExpectedTaskSnapshotBody],
+) -> dict[str, Any]:
+    required = {f"expected_{field}" for field in _EXPECTED_TASK_SNAPSHOT_FIELDS}
+    if model is None or not required.issubset(model.model_fields_set):
+        raise HTTPException(
+            status_code=422,
+            detail="complete expected task snapshot is required",
+        )
+    return _expected_task_snapshot_values(model)
+
+
 def _snapshot_conflict_response(exc: _TaskSnapshotConflict) -> JSONResponse:
     return JSONResponse(
         status_code=409,
@@ -1075,6 +1103,19 @@ def _task_conflict_response(
     current = kanban_db.task_snapshot_from_row(row) if row is not None else None
     return JSONResponse(
         status_code=409,
+        content={"detail": detail, "current": current},
+    )
+
+
+def _task_error_response(
+    conn: sqlite3.Connection,
+    task_id: str,
+    detail: str,
+) -> JSONResponse:
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    current = kanban_db.task_snapshot_from_row(row) if row is not None else None
+    return JSONResponse(
+        status_code=400,
         content={"detail": detail, "current": current},
     )
 
@@ -1154,6 +1195,30 @@ def _patch_task(
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None:
             return None
+
+        requested_template = (
+            payload.workflow_template_id
+            if payload.workflow_template_id is not None
+            else row["workflow_template_id"]
+        )
+        requested_step = (
+            payload.current_step_key
+            if payload.current_step_key is not None
+            else row["current_step_key"]
+        )
+        kanban_db._validate_product_workflow_state(
+            requested_template,
+            requested_step,
+        )
+        if payload.status is not None and payload.status not in {
+            "done", "blocked", "scheduled", "ready", "archived", "running",
+        }:
+            requested_column = _custom_column_by_name(board, payload.status)
+            if requested_column is not None:
+                kanban_db._validate_product_workflow_state(
+                    "product",
+                    requested_column["name"],
+                )
 
         if payload.assignee is not None:
             try:
@@ -1373,6 +1438,16 @@ def _set_workflow_direct(
         else None
     )
     with kanban_db.write_txn(conn):
+        current = conn.execute(
+            "SELECT workflow_template_id, current_step_key FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if current is None:
+            return False
+        kanban_db._validate_product_workflow_state(
+            workflow_value or current["workflow_template_id"],
+            step_value or current["current_step_key"],
+        )
         cur = conn.execute(
             "UPDATE tasks SET workflow_template_id = COALESCE(?, workflow_template_id), "
             "current_step_key = COALESCE(?, current_step_key) WHERE id = ?",
@@ -2001,14 +2076,14 @@ def inspect_run_endpoint(
         return {"run_id": run_id, "alive": True, "pid": pid, "error": "access denied"}
 
 
-class TerminateRunBody(_ExpectedTaskSnapshotBody):
+class TerminateRunBody(_DeferredExpectedTaskSnapshotBody):
     reason: Optional[str] = None
 
 
 @router.post("/runs/{run_id}/terminate")
 def terminate_run_endpoint(
     run_id: int,
-    payload: TerminateRunBody,
+    payload: Optional[TerminateRunBody] = None,
     board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
 ):
     """Terminate the worker process backing an in-flight run.
@@ -2034,6 +2109,7 @@ def terminate_run_endpoint(
         r = kanban_db.get_run(conn, run_id)
         if r is None:
             raise HTTPException(status_code=404, detail=f"run {run_id} not found")
+        expected = _require_expected_task_snapshot(payload)
         if r.ended_at is not None:
             return _task_conflict_response(
                 conn,
@@ -2044,10 +2120,14 @@ def terminate_run_endpoint(
             with kanban_db.conditional_task_write(
                 conn,
                 r.task_id,
-                _expected_task_snapshot_values(payload),
+                expected,
                 action="terminating the run",
             ):
-                ok = kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason)
+                ok = kanban_db.reclaim_task(
+                    conn,
+                    r.task_id,
+                    reason=payload.reason if payload is not None else None,
+                )
         except _TaskSnapshotConflict as exc:
             return _snapshot_conflict_response(exc)
         if not ok:
