@@ -14,12 +14,12 @@
     "moduleResolution": "Bundler",
     "resolveJsonModule": true,
     "isolatedModules": true,
+    "noEmit": true,
     "jsx": "react-jsx",
     "paths": {
       "@/*": ["./src/*"],
       "@hermes/shared": ["../shared/src/index.ts"]
     }
   },
-  "include": ["src", "../shared/src"],
-  "references": [{ "path": "./tsconfig.electron.json" }]
+  "include": ["src", "../shared/src"]
 }

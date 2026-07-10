@@ -62,6 +62,7 @@ except ModuleNotFoundError:
     pass
 
 import os
+import re
 import sys
 
 
@@ -6493,6 +6494,27 @@ def _resolve_stash_selector(
     return None
 
 
+def _preserve_stash_commit(
+    git_cmd: list[str], cwd: Path, stash_ref: str
+) -> bool:
+    """Name a restored stash commit before its mutable stash selector is dropped."""
+    safe_sha = re.sub(r"[^0-9a-f]", "", stash_ref.lower())
+    if len(safe_sha) < 7:
+        return False
+    result = subprocess.run(
+        [
+            *git_cmd,
+            "update-ref",
+            f"refs/hermes/autostash/{safe_sha}",
+            stash_ref,
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
 def _print_stash_cleanup_guidance(
     stash_ref: str, stash_selector: Optional[str] = None
 ) -> None:
@@ -6581,6 +6603,16 @@ def _restore_stashed_changes(
         # restore had conflicts.  Let cmd_update continue with pip install,
         # skill sync, and gateway restart.
         return False
+
+    safe_sha = re.sub(r"[^0-9a-f]", "", stash_ref.lower())
+    recovery_ref = f"refs/hermes/autostash/{safe_sha}"
+    if not _preserve_stash_commit(git_cmd, cwd, stash_ref):
+        print(
+            "⚠ Local changes were restored, but Hermes couldn't create a durable recovery ref."
+        )
+        print("  The stash was left in place; it was not dropped.")
+        print(f"  Retry with: git update-ref {recovery_ref} {stash_ref}")
+        return True
 
     stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
     if stash_selector is None:

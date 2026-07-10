@@ -104,8 +104,10 @@ def test_restore_stashed_changes_prompts_before_applying(monkeypatch, tmp_path, 
             return SimpleNamespace(stdout="applied\n", stderr="", returncode=0)
         if cmd[1:3] == ["diff", "--name-only"]:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd[1] == "update-ref":
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
         if cmd[1:3] == ["stash", "list"]:
-            return SimpleNamespace(stdout="stash@{1} abc123\n", stderr="", returncode=0)
+            return SimpleNamespace(stdout="stash@{1} abc1234\n", stderr="", returncode=0)
         if cmd[1:3] == ["stash", "drop"]:
             return SimpleNamespace(stdout="dropped\n", stderr="", returncode=0)
         raise AssertionError(f"unexpected command: {cmd}")
@@ -113,13 +115,16 @@ def test_restore_stashed_changes_prompts_before_applying(monkeypatch, tmp_path, 
     monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
     monkeypatch.setattr("builtins.input", lambda: "")
 
-    restored = hermes_main._restore_stashed_changes(["git"], tmp_path, "abc123", prompt_user=True)
+    restored = hermes_main._restore_stashed_changes(["git"], tmp_path, "abc1234", prompt_user=True)
 
     assert restored is True
-    assert calls[0][0] == ["git", "stash", "apply", "abc123"]
+    assert calls[0][0] == ["git", "stash", "apply", "abc1234"]
     assert calls[1][0] == ["git", "diff", "--name-only", "--diff-filter=U"]
-    assert calls[2][0] == ["git", "stash", "list", "--format=%gd %H"]
-    assert calls[3][0] == ["git", "stash", "drop", "stash@{1}"]
+    assert calls[2][0] == [
+        "git", "update-ref", "refs/hermes/autostash/abc1234", "abc1234",
+    ]
+    assert calls[3][0] == ["git", "stash", "list", "--format=%gd %H"]
+    assert calls[4][0] == ["git", "stash", "drop", "stash@{1}"]
     out = capsys.readouterr().out
     assert "Restore local changes now? [Y/n]" in out
     assert "restored on top of the updated codebase" in out
@@ -156,21 +161,26 @@ def test_restore_stashed_changes_applies_without_prompt_when_disabled(monkeypatc
             return SimpleNamespace(stdout="applied\n", stderr="", returncode=0)
         if cmd[1:3] == ["diff", "--name-only"]:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd[1] == "update-ref":
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
         if cmd[1:3] == ["stash", "list"]:
-            return SimpleNamespace(stdout="stash@{0} abc123\n", stderr="", returncode=0)
+            return SimpleNamespace(stdout="stash@{0} abc1234\n", stderr="", returncode=0)
         if cmd[1:3] == ["stash", "drop"]:
             return SimpleNamespace(stdout="dropped\n", stderr="", returncode=0)
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
 
-    restored = hermes_main._restore_stashed_changes(["git"], tmp_path, "abc123", prompt_user=False)
+    restored = hermes_main._restore_stashed_changes(["git"], tmp_path, "abc1234", prompt_user=False)
 
     assert restored is True
-    assert calls[0][0] == ["git", "stash", "apply", "abc123"]
+    assert calls[0][0] == ["git", "stash", "apply", "abc1234"]
     assert calls[1][0] == ["git", "diff", "--name-only", "--diff-filter=U"]
-    assert calls[2][0] == ["git", "stash", "list", "--format=%gd %H"]
-    assert calls[3][0] == ["git", "stash", "drop", "stash@{0}"]
+    assert calls[2][0] == [
+        "git", "update-ref", "refs/hermes/autostash/abc1234", "abc1234",
+    ]
+    assert calls[3][0] == ["git", "stash", "list", "--format=%gd %H"]
+    assert calls[4][0] == ["git", "stash", "drop", "stash@{0}"]
     assert "Restore local changes now?" not in capsys.readouterr().out
 
 
@@ -194,24 +204,29 @@ def test_restore_stashed_changes_keeps_going_when_stash_entry_cannot_be_resolved
             return SimpleNamespace(stdout="applied\n", stderr="", returncode=0)
         if cmd[1:3] == ["diff", "--name-only"]:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd[1] == "update-ref":
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
         if cmd[1:3] == ["stash", "list"]:
             return SimpleNamespace(stdout="stash@{0} def456\n", stderr="", returncode=0)
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
 
-    restored = hermes_main._restore_stashed_changes(["git"], tmp_path, "abc123", prompt_user=False)
+    restored = hermes_main._restore_stashed_changes(["git"], tmp_path, "abc1234", prompt_user=False)
 
     assert restored is True
-    assert calls[0] == (["git", "stash", "apply", "abc123"], {"cwd": tmp_path, "capture_output": True, "text": True})
+    assert calls[0] == (["git", "stash", "apply", "abc1234"], {"cwd": tmp_path, "capture_output": True, "text": True})
     assert calls[1] == (["git", "diff", "--name-only", "--diff-filter=U"], {"cwd": tmp_path, "capture_output": True, "text": True})
-    assert calls[2] == (["git", "stash", "list", "--format=%gd %H"], {"cwd": tmp_path, "capture_output": True, "text": True, "check": True})
+    assert calls[2][0] == [
+        "git", "update-ref", "refs/hermes/autostash/abc1234", "abc1234",
+    ]
+    assert calls[3] == (["git", "stash", "list", "--format=%gd %H"], {"cwd": tmp_path, "capture_output": True, "text": True, "check": True})
     out = capsys.readouterr().out
     assert "couldn't find the stash entry to drop" in out
     assert "stash was left in place" in out
     assert "Check `git status` first" in out
     assert "git stash list --format='%gd %H %s'" in out
-    assert "Look for commit abc123" in out
+    assert "Look for commit abc1234" in out
 
 
 
@@ -224,24 +239,55 @@ def test_restore_stashed_changes_keeps_going_when_drop_fails(monkeypatch, tmp_pa
             return SimpleNamespace(stdout="applied\n", stderr="", returncode=0)
         if cmd[1:3] == ["diff", "--name-only"]:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd[1] == "update-ref":
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
         if cmd[1:3] == ["stash", "list"]:
-            return SimpleNamespace(stdout="stash@{0} abc123\n", stderr="", returncode=0)
+            return SimpleNamespace(stdout="stash@{0} abc1234\n", stderr="", returncode=0)
         if cmd[1:3] == ["stash", "drop"]:
             return SimpleNamespace(stdout="", stderr="drop failed\n", returncode=1)
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
 
-    restored = hermes_main._restore_stashed_changes(["git"], tmp_path, "abc123", prompt_user=False)
+    restored = hermes_main._restore_stashed_changes(["git"], tmp_path, "abc1234", prompt_user=False)
 
     assert restored is True
-    assert calls[3][0] == ["git", "stash", "drop", "stash@{0}"]
+    assert calls[4][0] == ["git", "stash", "drop", "stash@{0}"]
     out = capsys.readouterr().out
     assert "couldn't drop the saved stash entry" in out
     assert "drop failed" in out
     assert "Check `git status` first" in out
     assert "git stash list --format='%gd %H %s'" in out
     assert "git stash drop stash@{0}" in out
+
+
+def test_restore_keeps_stash_when_durable_ref_cannot_be_created(
+    monkeypatch, tmp_path, capsys
+):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if cmd[1:3] == ["stash", "apply"]:
+            return SimpleNamespace(stdout="applied\n", stderr="", returncode=0)
+        if cmd[1:3] == ["diff", "--name-only"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd[1] == "update-ref":
+            return SimpleNamespace(stdout="", stderr="ref write failed\n", returncode=1)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    restored = hermes_main._restore_stashed_changes(
+        ["git"], tmp_path, "abcdef1", prompt_user=False
+    )
+
+    assert restored is True
+    assert [call[0][1] for call in calls] == ["stash", "diff", "update-ref"]
+    out = capsys.readouterr().out
+    assert "durable recovery ref" in out
+    assert "git update-ref refs/hermes/autostash/abcdef1 abcdef1" in out
+    assert "stash was left in place" in out
 
 
 def test_restore_stashed_changes_always_resets_on_conflict(monkeypatch, tmp_path, capsys):
