@@ -1023,6 +1023,76 @@ class TestResolvePreToolBlock:
         msg = resolve_pre_tool_block("terminal", {})
         assert msg is not None and "gate failed" in msg  # fail-closed
 
+    def test_one_shot_approval_metadata_is_consumed_before_allowing(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        record = {"operation_hash": "abc123"}
+        consumed = {}
+
+        def _consume(tool_name, args, override, *, actor):
+            consumed.update(
+                tool_name=tool_name,
+                args=args,
+                override=override,
+                actor=actor,
+            )
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{
+                "action": "approve",
+                "message": "exact operation only",
+                "rule_key": "kanban-governance:abc123",
+                "one_shot_override": record,
+                "_consume_approved_override": _consume,
+            }],
+        )
+
+        seen = {}
+
+        def _approve(tool_name, reason, **kwargs):
+            seen.update(tool_name=tool_name, reason=reason, **kwargs)
+            return {
+                "approved": True,
+                "message": None,
+                "actor": "human:test",
+            }
+
+        monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
+
+        args = {"path": "/repo/file.txt", "content": "exact"}
+        assert resolve_pre_tool_block("write_file", args) is None
+        assert seen["one_shot_override"] == record
+        assert consumed == {
+            "tool_name": "write_file",
+            "args": args,
+            "override": record,
+            "actor": "human:test",
+        }
+
+    def test_one_shot_consumption_failure_blocks(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        def _consume(*args, **kwargs):
+            raise ValueError("already consumed")
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{
+                "action": "approve",
+                "one_shot_override": {"operation_hash": "abc123"},
+                "_consume_approved_override": _consume,
+            }],
+        )
+        monkeypatch.setattr(
+            "tools.approval.request_tool_approval",
+            lambda *args, **kwargs: {"approved": True, "actor": "human:test"},
+        )
+
+        message = resolve_pre_tool_block("write_file", {"path": "/repo/file.txt"})
+        assert message is not None
+        assert "one-shot override" in message
+
 
 class TestGetPreVerifyContinueMessage:
     """`pre_verify` directive aggregation — mirrors the pre_tool_call block path."""

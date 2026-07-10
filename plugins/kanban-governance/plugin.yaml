@@ -1,0 +1,6 @@
+name: kanban-governance
+version: "0.1.0"
+description: "Enforce Kanban project ownership at filesystem side-effect boundaries."
+author: "CloudAdvisor ApS"
+hooks:
+  - pre_tool_call

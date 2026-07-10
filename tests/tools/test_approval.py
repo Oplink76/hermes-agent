@@ -23,6 +23,48 @@ from tools.approval import (
 )
 
 
+def test_shell_command_argvs_is_quote_aware_and_unwraps_command_prefixes():
+    from tools.approval import shell_command_argvs
+
+    assert shell_command_argvs(
+        'echo "git push origin main"; FOO=bar env git status && touch "two words.txt"'
+    ) == [
+        ["echo", "git push origin main"],
+        ["git", "status"],
+        ["touch", "two words.txt"],
+    ]
+
+
+def test_shell_command_has_redirection_ignores_quoted_operators():
+    from tools.approval import shell_command_has_redirection
+
+    assert shell_command_has_redirection("echo changed > generated.txt") is True
+    assert shell_command_has_redirection("echo changed 2>> errors.txt") is True
+    assert shell_command_has_redirection("echo 'literal > text'") is False
+
+
+def test_one_shot_tool_approval_disables_reusable_approval(monkeypatch):
+    captured = {}
+
+    def _gate(**kwargs):
+        captured.update(kwargs)
+        return {"approved": True, "message": None, "actor": "human:approval"}
+
+    monkeypatch.setattr(approval_module, "_run_approval_gate", _gate)
+    record = {"operation_hash": "abc123"}
+
+    result = approval_module.request_tool_approval(
+        "write_file",
+        "exact operation only",
+        rule_key="kanban-governance:abc123",
+        one_shot_override=record,
+    )
+
+    assert captured["one_shot"] is True
+    assert result["one_shot_override"] == record
+    assert result["actor"] == "human:approval"
+
+
 class TestApprovalModeParsing:
     def test_unquoted_yaml_off_boolean_false_maps_to_off(self):
         with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": False}}):

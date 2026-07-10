@@ -2082,6 +2082,8 @@ class _PreToolCallDirective:
     action: Optional[str] = None
     message: Optional[str] = None
     rule_key: Optional[str] = None
+    one_shot_override: Optional[Dict[str, Any]] = None
+    override_consumer: Optional[Callable] = None
 
 
 def set_thread_tool_whitelist(
@@ -2168,7 +2170,24 @@ def _get_pre_tool_call_directive_details(
         rule_key = rule_key.strip() if isinstance(rule_key, str) else None
         if not rule_key:
             rule_key = None
-        return _PreToolCallDirective(action=action, message=message, rule_key=rule_key)
+        one_shot_override = (
+            result.get("one_shot_override") if action == "approve" else None
+        )
+        if not isinstance(one_shot_override, dict):
+            one_shot_override = None
+        override_consumer = (
+            result.get("_consume_approved_override")
+            if one_shot_override is not None else None
+        )
+        if not callable(override_consumer):
+            override_consumer = None
+        return _PreToolCallDirective(
+            action=action,
+            message=message,
+            rule_key=rule_key,
+            one_shot_override=one_shot_override,
+            override_consumer=override_consumer,
+        )
 
     return _PreToolCallDirective()
 
@@ -2257,10 +2276,13 @@ def resolve_pre_tool_block(
     if details.action == "approve":
         try:
             from tools.approval import request_tool_approval
+            approval_kwargs: Dict[str, Any] = {
+                "rule_key": details.rule_key or tool_name,
+            }
+            if details.one_shot_override is not None:
+                approval_kwargs["one_shot_override"] = details.one_shot_override
             result = request_tool_approval(
-                tool_name,
-                details.message or "",
-                rule_key=details.rule_key or tool_name,
+                tool_name, details.message or "", **approval_kwargs
             )
         except Exception:
             # Fail-closed: if the gate itself errors, block rather than
@@ -2271,6 +2293,18 @@ def resolve_pre_tool_block(
                 result.get("message")
                 or f"BLOCKED: plugin approval required for {tool_name}"
             )
+        if details.one_shot_override is not None:
+            if details.override_consumer is None:
+                return "BLOCKED: governed one-shot override has no audit consumer"
+            try:
+                details.override_consumer(
+                    tool_name,
+                    args if isinstance(args, dict) else {},
+                    details.one_shot_override,
+                    actor=str(result.get("actor") or "human:approval"),
+                )
+            except Exception:
+                return "BLOCKED: governed one-shot override could not be consumed"
     return None
 
 
