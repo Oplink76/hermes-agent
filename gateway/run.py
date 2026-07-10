@@ -8363,6 +8363,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _phase_elapsed(),
             )
 
+            try:
+                from gateway.runtime_identity import remove_runtime_identity
+
+                remove_runtime_identity()
+            except Exception as _e:
+                logger.debug("runtime identity cleanup error: %s", _e)
+
             from gateway.status import remove_pid_file, release_gateway_runtime_lock
             remove_pid_file()
             release_gateway_runtime_lock()
@@ -20728,6 +20735,26 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         return False
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
+    try:
+        from gateway.runtime_identity import (
+            capture_runtime_identity,
+            remove_runtime_identity,
+            write_runtime_identity,
+        )
+
+        _runtime_identity = capture_runtime_identity()
+        write_runtime_identity(_runtime_identity)
+        atexit.register(remove_runtime_identity)
+        logger.info(
+            "Runtime identity: profile=%s pid=%d sha=%s python=%s executable=%s",
+            _runtime_identity.profile,
+            _runtime_identity.pid,
+            _runtime_identity.source_sha[:12],
+            _runtime_identity.python_version,
+            _runtime_identity.executable,
+        )
+    except Exception as exc:
+        logger.warning("Could not publish gateway runtime identity: %s", exc)
 
     try:
         from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
@@ -20987,6 +21014,12 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
     # could still take up to its timeout on a wedged disk, and these locks must
     # never be stranded. os._exit skips atexit, and the early SystemExit exit
     # paths never run _stop_impl, so release here (idempotent).
+    try:
+        from gateway.runtime_identity import remove_runtime_identity
+
+        remove_runtime_identity()
+    except Exception:
+        pass
     try:
         from gateway.status import remove_pid_file, release_gateway_runtime_lock
         remove_pid_file()
