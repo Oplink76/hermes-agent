@@ -374,6 +374,69 @@ def _seed_v2_card(board: str, *, step: str = "development") -> str:
     return tid
 
 
+@pytest.mark.parametrize("step", sorted(kb.PRODUCT_WORKFLOW_STEP_SET))
+def test_create_task_accepts_each_product_step(kanban_home, step):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: valid state",
+            workflow_template_id="product",
+            current_step_key=step,
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.current_step_key == step
+
+
+def test_create_task_infers_missing_product_step_from_explicit_intent(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Implementation work",
+            assignee="developer",
+            workflow_template_id="product",
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.current_step_key == "development"
+
+
+def test_create_task_allows_custom_workflow_step(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Custom flow",
+            workflow_template_id="custom",
+            current_step_key="bespoke-review",
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.current_step_key == "bespoke-review"
+
+
+def test_create_task_keeps_legacy_step_without_product_template(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Legacy flow", current_step_key="in_progress")
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.workflow_template_id is None
+    assert task.current_step_key == "in_progress"
+
+
+def test_create_task_rejects_unknown_project(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="unknown project"):
+            kb.create_task(conn, title="Lost governance", project_id="missing-project")
+
+
+def test_story_title_infers_product_without_role_on_product_board(kanban_home):
+    board = "story-intent"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(conn, title="Story: explicit user intent", board=board)
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.workflow_template_id == "product"
+    assert task.current_step_key == "backlog"
+
+
 def test_set_phase_v2_board_updates_step_and_syncs_status(kanban_home, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     board = "v2-phase"
@@ -9960,7 +10023,7 @@ def test_migrate_cards_to_v2_flags_reconciles_mixed_board(kanban_home, monkeypat
         for status in statuses:
             step_key = "development" if status in ("running", "blocked") else status
             tid = kb.create_task(
-                conn, title=f"card-{status}", workflow_template_id="product",
+                conn, title=f"card-{status}", workflow_template_id="custom",
                 current_step_key=step_key,
             )
             conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
@@ -10487,13 +10550,22 @@ def test_reconcile_merge_after_green_OFF_does_not_merge(kanban_home, tmp_path, m
 def test_reconcile_merge_after_green_ON_merges_one_standalone_per_pass(kanban_home, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
+    (repo / "scripts").mkdir()
+    test_script = repo / "scripts" / "run_tests.sh"
+    test_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    test_script.chmod(0o755)
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "scripts/run_tests.sh"],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "add test gate"],
+        check=True, capture_output=True, text=True,
+    )
     board = "v2-reconcile-mergeback-on"
     _v2_product_board_with_repo(board, repo)
     _enable_merge_after_green(board)
     story, sha = _make_done_standalone_story(board, repo)
-    # inject a green verify so reconcile's merge passes deterministically
-    monkeypatch.setattr(kb, "_default_epic_verify", lambda b: True)
-
     with kb.connect(board=board) as conn:
         result = kb.reconcile(conn, board=board, spawn_fn=lambda *a, **k: None)
 

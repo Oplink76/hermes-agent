@@ -1110,19 +1110,102 @@ def _looks_like_product_story(title: str) -> bool:
     return lowered.startswith(("user story:", "story:", "user story -", "story -"))
 
 
+class ProductWorkflowStateError(ValueError):
+    def __init__(self, task_id: str, step_key: Optional[str], reason: str):
+        self.task_id = task_id
+        self.step_key = step_key
+        self.reason = reason
+        super().__init__(
+            f"invalid product workflow step for {task_id}: {step_key!r} ({reason})"
+        )
+
+
+def _validate_product_workflow_state(
+    template_id: Optional[str],
+    step_key: Optional[str],
+    *,
+    allow_terminal: bool = True,
+) -> None:
+    template = str(template_id or "").strip() or None
+    step = str(step_key or "").strip() or None
+    if template == PRODUCT_WORKFLOW_TEMPLATE_ID:
+        allowed = PRODUCT_WORKFLOW_STEP_SET
+        if not allow_terminal:
+            allowed = allowed - {"done"}
+        if step not in allowed:
+            raise ProductWorkflowStateError(
+                "<unsaved>",
+                step,
+                f"valid steps: {', '.join(sorted(allowed))}",
+            )
+
+
+def _validate_stored_product_workflow_state(
+    conn: sqlite3.Connection, task_id: str
+) -> None:
+    row = conn.execute(
+        "SELECT workflow_template_id, current_step_key FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+    try:
+        _validate_product_workflow_state(
+            row["workflow_template_id"], row["current_step_key"]
+        )
+    except ProductWorkflowStateError as exc:
+        error = ProductWorkflowStateError(task_id, row["current_step_key"], exc.reason)
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_invalid_workflow",
+                {
+                    "workflow_template_id": row["workflow_template_id"],
+                    "current_step_key": row["current_step_key"],
+                    "reason": exc.reason,
+                },
+            )
+        raise error from exc
+
+
 def _infer_product_step(
-    *, title: str, assignee: Optional[str], explicit_step: Optional[str]
+    *,
+    title: str,
+    assignee: Optional[str],
+    explicit_step: Optional[str],
+    product_intent: bool = False,
 ) -> Optional[str]:
     """Infer the product workflow step for a card from an explicit step, its
     role assignee (architect -> architecture, ...), or a story-shaped title."""
     if explicit_step:
         return explicit_step
     role = (assignee or "").strip().lower()
-    if role in PRODUCT_WORKFLOW_ROLE_TO_STEP:
+    if product_intent and role in PRODUCT_WORKFLOW_ROLE_TO_STEP:
         return PRODUCT_WORKFLOW_ROLE_TO_STEP[role]
     if _looks_like_product_story(title):
         return "backlog"
     return None
+
+
+def _project_is_bound_to_product_board(
+    project_id: Optional[str], board_slug: str
+) -> bool:
+    if not project_id:
+        return False
+    try:
+        from hermes_cli import projects_db as _pdb
+
+        with _pdb.connect_closing() as project_conn:
+            project = _pdb.get_project(project_conn, project_id)
+        return bool(
+            project is not None
+            and project.board_slug
+            and _normalize_board_slug(project.board_slug)
+            == _normalize_board_slug(board_slug)
+        )
+    except Exception:
+        return False
 
 
 def _repair_product_workflow_metadata_if_needed(
@@ -1147,7 +1230,7 @@ def _repair_product_workflow_metadata_if_needed(
     if not _is_product_board_metadata(meta):
         return None
     row = conn.execute(
-        "SELECT id, title, assignee, status, workflow_template_id, current_step_key, "
+        "SELECT id, title, assignee, status, project_id, workflow_template_id, current_step_key, "
         "workspace_kind, workspace_path FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
@@ -1166,6 +1249,11 @@ def _repair_product_workflow_metadata_if_needed(
         title=row["title"] or "",
         assignee=row["assignee"],
         explicit_step=current_step if current_step in PRODUCT_WORKFLOW_STEP_SET else None,
+        product_intent=bool(
+            workflow_template == PRODUCT_WORKFLOW_TEMPLATE_ID
+            or _project_is_bound_to_product_board(row["project_id"], board_slug)
+            or _looks_like_product_story(row["title"] or "")
+        ),
     )
     if not inferred:
         return None
@@ -1175,12 +1263,6 @@ def _repair_product_workflow_metadata_if_needed(
     if row["status"] in {"ready", "review"} and target_status != row["status"]:
         updates.append("status = ?")
         params.append(target_status)
-    if row["workspace_kind"] == "scratch" and not row["workspace_path"]:
-        board_default = meta.get("default_workdir") if isinstance(meta, dict) else None
-        if board_default:
-            updates.append("workspace_kind = ?")
-            updates.append("workspace_path = ?")
-            params.extend(["dir", str(board_default)])
     params.append(task_id)
     conn.execute(
         f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?",
@@ -1404,6 +1486,7 @@ def set_phase(
     meta = product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return False
+    _validate_product_workflow_state(PRODUCT_WORKFLOW_TEMPLATE_ID, phase)
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET current_step_key = ? WHERE id = ?",
@@ -3913,10 +3996,7 @@ def create_task(
         except Exception:
             project_obj = None
         if project_obj is None:
-            # A project id/slug that doesn't resolve must not crash task
-            # creation or persist a dangling reference — drop the link and
-            # create the task as an ordinary (scratch) task.
-            project_id = None
+            raise ValueError(f"unknown project: {project_id}")
         else:
             # Canonicalise (a slug may have been passed) and anchor the
             # worktree under the project's primary repo.
@@ -3982,21 +4062,29 @@ def create_task(
     )
     if workflow_template_id == PRODUCT_WORKFLOW_TEMPLATE_ID and not current_step_key:
         _inferred_step = _infer_product_step(
-            title=title, assignee=assignee, explicit_step=None
+            title=title,
+            assignee=assignee,
+            explicit_step=None,
+            product_intent=True,
         )
         if _inferred_step:
             current_step_key = _inferred_step
     elif (
         workflow_template_id is None
         and _is_product_board_metadata(_wf_board_meta)
-        and (not current_step_key or current_step_key in PRODUCT_WORKFLOW_STEP_SET)
+        and current_step_key is None
     ):
         _inferred_step = _infer_product_step(
-            title=title, assignee=assignee, explicit_step=current_step_key
+            title=title,
+            assignee=assignee,
+            explicit_step=None,
+            product_intent=_looks_like_product_story(title),
         )
         if _inferred_step:
             workflow_template_id = PRODUCT_WORKFLOW_TEMPLATE_ID
             current_step_key = _inferred_step
+
+    _validate_product_workflow_state(workflow_template_id, current_step_key)
 
     parents = tuple(p for p in parents if p)
 
@@ -5642,6 +5730,7 @@ def complete_task(
     if product_workflow_enabled:
         meta = product_board_metadata(board)
         if meta is not None and _handoff_v2_enabled(meta):
+            _validate_stored_product_workflow_state(conn, task_id)
             # Completion preflight: repair a plain/legacy role card's missing
             # product metadata before the transition is evaluated, so handoff_v2
             # advances the correct step (re-applied from f55580879). Repair only
@@ -7725,6 +7814,7 @@ def merge_epic_to_main(
     meta = product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return None
+    _validate_stored_product_workflow_state(conn, epic_id)
 
     if not epic_ready(conn, epic_id, board=board, verify_fn=verify_fn):
         return "not_ready"
@@ -7867,6 +7957,7 @@ def integrate_story_to_epic(
     meta = product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return None
+    _validate_stored_product_workflow_state(conn, story_id)
 
     parents = parent_ids(conn, story_id)
     if not parents:
@@ -7974,6 +8065,7 @@ def _merge_standalone_story_to_main(
     meta = product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return None
+    _validate_stored_product_workflow_state(conn, story_id)
     # A story WITH an epic goes through integrate_story_to_epic + merge_epic_to_main.
     if parent_ids(conn, story_id):
         return None
@@ -8503,6 +8595,7 @@ def handoff(
     ).fetchone()
     if row is None:
         return False
+    _validate_stored_product_workflow_state(conn, task_id)
     step = row["current_step_key"]
     transition = PRODUCT_WORKFLOW_TRANSITIONS.get(str(step or ""))
     if not transition or not transition.get("next_step"):
