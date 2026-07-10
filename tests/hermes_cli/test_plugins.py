@@ -120,16 +120,31 @@ class TestPluginDiscovery:
         mgr.discover_and_load()
 
         assert mgr._plugins["kanban-governance"].enabled is True
+        assert (
+            mgr._plugins["kanban-governance"].manifest.config_gate
+            == "plugins.kanban-governance.enabled"
+        )
 
-    def test_kanban_governance_nested_false_stays_disabled(
-        self, tmp_path, monkeypatch
+    @pytest.mark.parametrize(
+        "plugins_config",
+        [
+            {"enabled": ["kanban-governance"]},
+            {
+                "enabled": ["kanban-governance"],
+                "kanban-governance": {"enabled": False},
+            },
+            {"kanban-governance": {"enabled": False}},
+            {"kanban-governance": {"enabled": 1}},
+            {"kanban-governance": {"enabled": "true"}},
+        ],
+    )
+    def test_kanban_governance_requires_literal_nested_true(
+        self, tmp_path, monkeypatch, plugins_config
     ):
         hermes_home = tmp_path / "hermes_test"
         hermes_home.mkdir(parents=True, exist_ok=True)
         (hermes_home / "config.yaml").write_text(
-            yaml.safe_dump({
-                "plugins": {"kanban-governance": {"enabled": False}}
-            })
+            yaml.safe_dump({"plugins": plugins_config})
         )
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
@@ -137,6 +152,9 @@ class TestPluginDiscovery:
         mgr.discover_and_load()
 
         assert mgr._plugins["kanban-governance"].enabled is False
+        assert "plugins.kanban-governance.enabled: true" in (
+            mgr._plugins["kanban-governance"].error or ""
+        )
 
     def test_plugin_can_register_and_invoke_middleware(self, tmp_path, monkeypatch):
         plugins_dir = tmp_path / "hermes_test" / "plugins"
@@ -935,6 +953,64 @@ class TestPreToolCallDirective:
         )
         assert get_pre_tool_call_directive("terminal", {}) == (
             "block", "block second")
+
+    @pytest.mark.parametrize("one_shot_first", [False, True])
+    def test_one_shot_approval_dominates_ordinary_approval_regardless_of_order(
+        self, monkeypatch, one_shot_first
+    ):
+        from hermes_cli.plugins import _get_pre_tool_call_directive_details
+
+        record = {"operation_hash": "exact"}
+
+        def consume(*args, **kwargs):
+            return None
+
+        ordinary = {
+            "action": "approve",
+            "message": "ordinary approval",
+            "rule_key": "ordinary",
+        }
+        one_shot = {
+            "action": "approve",
+            "message": "exact approval",
+            "rule_key": "kanban-governance:exact",
+            "one_shot_override": record,
+            "_consume_approved_override": consume,
+        }
+        results = [one_shot, ordinary] if one_shot_first else [ordinary, one_shot]
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: results,
+        )
+
+        details = _get_pre_tool_call_directive_details("write_file", {"path": "x"})
+
+        assert details.message == "exact approval"
+        assert details.rule_key == "kanban-governance:exact"
+        assert details.one_shot_override is record
+        assert details.override_consumer is consume
+
+    def test_block_dominates_one_shot_and_ordinary_approvals(self, monkeypatch):
+        from hermes_cli.plugins import _get_pre_tool_call_directive_details
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "approve", "message": "ordinary"},
+                {
+                    "action": "approve",
+                    "message": "exact",
+                    "one_shot_override": {"operation_hash": "exact"},
+                    "_consume_approved_override": lambda *args, **kwargs: None,
+                },
+                {"action": "block", "message": "denied"},
+            ],
+        )
+
+        details = _get_pre_tool_call_directive_details("write_file", {"path": "x"})
+
+        assert details.action == "block"
+        assert details.message == "denied"
 
     def test_shim_ignores_approve(self, monkeypatch):
         """Back-compat shim only reports block, never approve."""

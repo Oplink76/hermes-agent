@@ -297,6 +297,27 @@ class TestPatchSensitivePathExtraction:
        same traversal rejection as the other V4A headers).
     """
 
+    def test_extract_v4a_patch_paths_includes_every_operation_endpoint(self):
+        from tools.file_tools import extract_v4a_patch_paths
+
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: update.py\n"
+            "@@\n-old\n+new\n"
+            "*** Add File: add.py\n+new\n"
+            "*** Delete File: delete.py\n"
+            "*** Move File: old.py -> new.py\n"
+            "*** End Patch\n"
+        )
+
+        assert extract_v4a_patch_paths(patch_text) == [
+            "update.py",
+            "add.py",
+            "delete.py",
+            "old.py",
+            "new.py",
+        ]
+
     @patch("tools.file_tools._get_file_ops")
     def test_patch_move_to_sensitive_dst_blocked(self, mock_get):
         from tools.file_tools import patch_tool

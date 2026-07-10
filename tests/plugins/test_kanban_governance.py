@@ -196,11 +196,15 @@ def test_relative_path_resolution_failure_blocks(governed_workspace, monkeypatch
 
 @pytest.mark.parametrize("command", [
     "find . -delete",
+    "find . -fprint generated.txt",
+    "diff --output=generated.diff README.md README.md",
+    "git diff --output=generated.diff",
     "git tag new-tag",
     "git tag -d old-tag",
     "git remote add backup https://example.invalid/repo.git",
     "git remote remove backup",
     "awk 'BEGIN { print \"changed\" > \"generated.txt\" }'",
+    "awk 'BEGIN { cmd=\"touch generated.txt\"; print \"changed\" | cmd }'",
 ])
 def test_mutating_command_variants_are_governed(governed_workspace, command):
     mod = _load_plugin()
@@ -270,6 +274,97 @@ def test_worker_ambiguous_file_mutation_fails_closed(governed_workspace, monkeyp
     assert "target" in decision["message"].lower()
 
 
+def test_human_v4a_patch_uses_embedded_governed_target(governed_workspace):
+    mod = _load_plugin()
+    target = governed_workspace["repo"] / "README.md"
+    decision = mod._on_pre_tool_call(
+        "patch",
+        {
+            "mode": "patch",
+            "patch": (
+                "*** Begin Patch\n"
+                f"*** Update File: {target}\n"
+                "@@\n"
+                "-governed\n"
+                "+changed\n"
+                "*** End Patch"
+            ),
+        },
+        task_id="outside-session",
+    )
+    assert decision["action"] == "approve"
+
+
+def test_worker_v4a_patch_inside_card_workspace_is_allowed(
+    governed_workspace, monkeypatch
+):
+    mod = _load_plugin()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+    repo = governed_workspace["repo"]
+    decision = mod._on_pre_tool_call(
+        "patch",
+        {
+            "mode": "patch",
+            "patch": (
+                "*** Begin Patch\n"
+                f"*** Update File: {repo / 'README.md'}\n"
+                "@@\n"
+                "-governed\n"
+                "+changed\n"
+                f"*** Add File: {repo / 'new.txt'}\n"
+                "+new\n"
+                "*** End Patch"
+            ),
+        },
+    )
+    assert decision is None
+
+
+@pytest.mark.parametrize("operation", ["Update", "Add", "Delete"])
+def test_worker_v4a_file_target_outside_workspace_is_blocked(
+    governed_workspace, monkeypatch, operation
+):
+    mod = _load_plugin()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+    target = governed_workspace["outside"] / "escape.txt"
+    decision = mod._on_pre_tool_call(
+        "patch",
+        {
+            "mode": "patch",
+            "patch": (
+                "*** Begin Patch\n"
+                f"*** {operation} File: {target}\n"
+                "+changed\n"
+                "*** End Patch"
+            ),
+        },
+    )
+    assert decision["action"] == "block"
+    assert "workspace" in decision["message"].lower()
+
+
+def test_worker_v4a_move_destination_outside_workspace_is_blocked(
+    governed_workspace, monkeypatch
+):
+    mod = _load_plugin()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+    source = governed_workspace["repo"] / "README.md"
+    target = governed_workspace["outside"] / "escape.txt"
+    decision = mod._on_pre_tool_call(
+        "patch",
+        {
+            "mode": "patch",
+            "patch": (
+                "*** Begin Patch\n"
+                f"*** Move File: {source} -> {target}\n"
+                "*** End Patch"
+            ),
+        },
+    )
+    assert decision["action"] == "block"
+    assert "workspace" in decision["message"].lower()
+
+
 def test_worker_wrong_branch_is_blocked(governed_workspace, monkeypatch):
     mod = _load_plugin()
     monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
@@ -298,6 +393,8 @@ def test_worker_wrong_branch_is_blocked(governed_workspace, monkeypatch):
     "git checkout --orphan=surprise",
     "git -c alias.ship=push ship origin HEAD",
     "sh -c 'git push origin HEAD'",
+    "busybox sh -c 'git push origin HEAD'",
+    "make deploy",
 ])
 def test_worker_privileged_git_and_deploy_actions_are_blocked(
     governed_workspace, monkeypatch, command
@@ -314,6 +411,11 @@ def test_worker_privileged_git_and_deploy_actions_are_blocked(
     "touch {target}",
     "echo changed > {target}",
     "git --git-dir={target}/.git add file.txt",
+    "sed -i 's/a/b/' {target}",
+    "dd if=/dev/null of={target}",
+    "diff --output={target} README.md README.md",
+    "git diff --output={target}",
+    "find . -fprint {target}",
 ])
 def test_worker_terminal_write_target_outside_workspace_is_blocked(
     governed_workspace, monkeypatch, command
@@ -330,6 +432,44 @@ def test_worker_terminal_write_target_outside_workspace_is_blocked(
     )
     assert decision["action"] == "block"
     assert "workspace" in decision["message"].lower()
+
+
+@pytest.mark.parametrize("command", [
+    "python -c \"open('/tmp/escape', 'w').write('x')\"",
+    "perl -e 'open my $fh, q(>), q(/tmp/escape)'",
+    "node -e \"require('fs').writeFileSync('/tmp/escape', 'x')\"",
+    "unknown-mutator --target /tmp/escape",
+])
+def test_worker_opaque_terminal_mutator_fails_closed(
+    governed_workspace, monkeypatch, command
+):
+    mod = _load_plugin()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+    decision = mod._on_pre_tool_call(
+        "terminal",
+        {"command": command, "workdir": str(governed_workspace["repo"])},
+    )
+    assert decision["action"] == "block"
+    assert "target" in decision["message"].lower()
+
+
+@pytest.mark.parametrize("command", [
+    "touch generated.txt",
+    "sed -i 's/governed/changed/' README.md",
+    "dd if=/dev/null of=generated.txt",
+    "diff --output=generated.diff README.md README.md",
+    "git diff --output=generated.diff",
+    "find . -fprint generated.txt",
+])
+def test_worker_known_terminal_mutation_inside_workspace_is_allowed(
+    governed_workspace, monkeypatch, command
+):
+    mod = _load_plugin()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+    assert mod._on_pre_tool_call(
+        "terminal",
+        {"command": command, "workdir": str(governed_workspace["repo"])},
+    ) is None
 
 
 def test_worker_find_exec_target_fails_closed(governed_workspace, monkeypatch):

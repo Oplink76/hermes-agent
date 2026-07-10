@@ -67,6 +67,22 @@ _READ_ONLY_GIT = {
     "status",
 }
 _GIT_OPTIONS_WITH_VALUE = {"-c", "-C", "--git-dir", "--work-tree", "--namespace"}
+_KNOWN_MUTATING_COMMANDS = {
+    "chmod",
+    "chown",
+    "cp",
+    "dd",
+    "install",
+    "ln",
+    "mkdir",
+    "mv",
+    "rm",
+    "rmdir",
+    "tee",
+    "touch",
+    "truncate",
+    "unlink",
+}
 _OVERRIDE_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 
 
@@ -191,7 +207,14 @@ def _awk_is_read_only(args: list[str]) -> bool:
         program
         and ">" not in program
         and "system(" not in program.replace(" ", "").lower()
-        and not re.search(r"\|\s*[\"']", program)
+        and "|" not in program
+    )
+
+
+def _diff_is_read_only(args: list[str]) -> bool:
+    return not any(
+        arg == "--output" or arg.startswith("--output=")
+        for arg in args
     )
 
 
@@ -222,8 +245,13 @@ def _is_read_only_terminal(command: str) -> bool:
             elif subcommand == "remote":
                 if not _git_remote_is_read_only(subargs):
                     return False
+            elif subcommand == "diff":
+                if not _diff_is_read_only(subargs):
+                    return False
             elif subcommand not in _READ_ONLY_GIT:
                 return False
+        elif executable == "diff" and not _diff_is_read_only(argv[1:]):
+            return False
         elif executable == "sed" and any(
             arg == "--in-place" or (arg.startswith("-") and "i" in arg[1:])
             for arg in argv[1:]
@@ -240,6 +268,13 @@ def _is_privileged_worker_command(command: str) -> bool:
     }
     for argv in shell_command_argvs(command):
         executable = os.path.basename(argv[0]).lower()
+        if (
+            executable == "busybox"
+            and len(argv) > 2
+            and argv[1].lower() in {"ash", "bash", "sh"}
+            and any(arg.startswith("-") and "c" in arg[1:] for arg in argv[2:])
+        ):
+            return True
         if executable in {"bash", "dash", "ksh", "sh", "zsh"} and any(
             arg.startswith("-") and "c" in arg[1:] for arg in argv[1:]
         ):
@@ -247,6 +282,11 @@ def _is_privileged_worker_command(command: str) -> bool:
         if "deploy" in executable:
             return True
         if executable in {"npm", "pnpm", "yarn", "bun"} and any(
+            "deploy" in arg.lower() or "publish" in arg.lower()
+            for arg in argv[1:]
+        ):
+            return True
+        if executable in {"make", "just"} and any(
             "deploy" in arg.lower() or "publish" in arg.lower()
             for arg in argv[1:]
         ):
@@ -293,6 +333,46 @@ def _terminal_workdir(args: dict[str, Any], task_context: str) -> Path:
     return _task_path(raw, task_context)
 
 
+def _option_paths(args: list[str], option_name: str) -> list[str]:
+    paths: list[str] = []
+    for index, arg in enumerate(args):
+        if arg == option_name and index + 1 < len(args):
+            paths.append(args[index + 1])
+        elif arg.startswith(f"{option_name}="):
+            paths.append(arg.split("=", 1)[1])
+    return paths
+
+
+def _sed_in_place_paths(args: list[str]) -> list[str]:
+    paths: list[str] = []
+    script_seen = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        option = arg.split("=", 1)[0]
+        if option in {"-e", "--expression", "-f", "--file"}:
+            script_seen = True
+            index += 2 if "=" not in arg else 1
+            continue
+        if arg.startswith("-"):
+            index += 1
+            continue
+        if not script_seen:
+            script_seen = True
+        else:
+            paths.append(arg)
+        index += 1
+    return paths
+
+
+def _find_output_paths(args: list[str]) -> list[str]:
+    paths: list[str] = []
+    for index, arg in enumerate(args):
+        if arg in {"-fls", "-fprint", "-fprintf"} and index + 1 < len(args):
+            paths.append(args[index + 1])
+    return paths
+
+
 def _path_operands(argv: list[str]) -> list[str]:
     executable = os.path.basename(argv[0]).lower()
     operands = [arg for arg in argv[1:] if arg != "--" and not arg.startswith("-")]
@@ -303,6 +383,14 @@ def _path_operands(argv: list[str]) -> list[str]:
         "touch", "truncate", "unlink",
     }:
         return operands
+    if executable == "dd":
+        return [arg.split("=", 1)[1] for arg in argv[1:] if arg.startswith("of=")]
+    if executable == "diff":
+        return _option_paths(argv[1:], "--output")
+    if executable == "find":
+        return _find_output_paths(argv[1:])
+    if executable == "sed":
+        return _sed_in_place_paths(argv[1:])
     if executable == "git":
         targets: list[str] = []
         for index, arg in enumerate(argv[1:], start=1):
@@ -310,6 +398,9 @@ def _path_operands(argv: list[str]) -> list[str]:
                 targets.append(argv[index + 1])
             if arg.startswith(("--git-dir=", "--work-tree=")):
                 targets.append(arg.split("=", 1)[1])
+        subcommand, subargs = _git_subcommand(argv)
+        if subcommand == "diff":
+            targets.extend(_option_paths(subargs, "--output"))
         return targets
     return []
 
@@ -327,6 +418,11 @@ def _terminal_targets(
             ambiguous = True
         if executable == "find" and any(
             arg in {"-exec", "-execdir", "-ok", "-okdir"} for arg in argv[1:]
+        ):
+            ambiguous = True
+        if (
+            executable not in _READ_ONLY_COMMANDS
+            and executable not in _KNOWN_MUTATING_COMMANDS
         ):
             ambiguous = True
         raw_targets.extend(_path_operands(argv))
@@ -349,7 +445,17 @@ def _effective_targets(
 ) -> tuple[list[Path], bool]:
     if tool_name == "terminal":
         return _terminal_targets(args, task_context)
-    return [_task_path(args.get("path"), task_context)], False
+    if tool_name == "patch" and args.get("mode", "replace") == "patch":
+        from tools.file_tools import extract_v4a_patch_paths
+
+        raw_paths = extract_v4a_patch_paths(str(args.get("patch") or ""))
+        if not raw_paths:
+            return [_task_path(".", task_context)], True
+        return [_task_path(path, task_context) for path in raw_paths], False
+    raw_path = str(args.get("path") or "").strip()
+    if not raw_path:
+        return [_task_path(".", task_context)], True
+    return [_task_path(raw_path, task_context)], False
 
 
 def _governance(path: Path) -> Optional[dict]:
@@ -504,10 +610,6 @@ def _on_pre_tool_call(
         return None
 
     worker_task_id = str(os.getenv("HERMES_KANBAN_TASK") or "").strip()
-    if worker_task_id and normalized in _FILE_MUTATORS and not str(
-        call_args.get("path") or ""
-    ).strip():
-        return _block("worker mutation target is ambiguous")
     task_context = str(task_id or session_id or "default")
     try:
         targets, ambiguous_targets = _effective_targets(

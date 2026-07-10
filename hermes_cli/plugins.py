@@ -242,9 +242,7 @@ def _get_enabled_plugins() -> Optional[set]:
     """Read the enabled-plugins allow-list from config.yaml.
 
     Plugins are opt-in by default — only plugins whose name appears in
-    this set are loaded. ``kanban-governance`` additionally accepts its
-    approved nested compatibility key,
-    ``plugins.kanban-governance.enabled: true``. Returns:
+    this set are loaded. Returns:
 
     * ``None`` — the key is missing or malformed. Callers should treat
       this as "nothing enabled yet" (the opt-in default); the first
@@ -260,22 +258,29 @@ def _get_enabled_plugins() -> Optional[set]:
         plugins_cfg = config.get("plugins")
         if not isinstance(plugins_cfg, dict):
             return None
-        nested_governance = plugins_cfg.get("kanban-governance")
-        governance_enabled = (
-            isinstance(nested_governance, dict)
-            and nested_governance.get("enabled") is True
-        )
-        enabled = plugins_cfg.get("enabled")
-        if "enabled" in plugins_cfg and not isinstance(enabled, list):
-            return {"kanban-governance"} if governance_enabled else None
-        result = set(enabled) if isinstance(enabled, list) else set()
-        if governance_enabled:
-            result.add("kanban-governance")
-        if "enabled" not in plugins_cfg and not governance_enabled:
+        if "enabled" not in plugins_cfg:
             return None
-        return result
+        enabled = plugins_cfg.get("enabled")
+        if not isinstance(enabled, list):
+            return None
+        return set(enabled)
     except Exception:
         return None
+
+
+def _manifest_config_gate_enabled(dot_path: str) -> bool:
+    """Return True only when a manifest's nested config gate is literal true."""
+    try:
+        from hermes_cli.config import load_config
+
+        value: Any = load_config()
+        for key in dot_path.split("."):
+            if not key or not isinstance(value, dict) or key not in value:
+                return False
+            value = value[key]
+        return value is True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +325,9 @@ class PluginManifest:
     # category plugin at ``plugins/image_gen/openai/`` the key is
     # ``image_gen/openai``. When empty, falls back to ``name``.
     key: str = ""
+    # Optional dot-path whose literal boolean value exclusively controls
+    # activation instead of the generic ``plugins.enabled`` allow-list.
+    config_gate: str = ""
 
 
 @dataclass
@@ -1459,16 +1467,26 @@ class PluginManager:
             # entry-point plugins) is opt-in via plugins.enabled.
             # Accept both the path-derived key and the legacy bare name
             # so existing configs keep working.
-            is_enabled = (
-                enabled is not None
-                and (lookup_key in enabled or manifest.name in enabled)
-            )
+            if manifest.config_gate:
+                is_enabled = _manifest_config_gate_enabled(manifest.config_gate)
+            else:
+                is_enabled = (
+                    enabled is not None
+                    and (lookup_key in enabled or manifest.name in enabled)
+                )
             if not is_enabled:
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
-                loaded.error = (
-                    "not enabled in config (run `hermes plugins enable {}` to activate)"
-                    .format(lookup_key)
-                )
+                if manifest.config_gate:
+                    loaded.error = (
+                        f"not enabled in config (set "
+                        f"{manifest.config_gate}: true to activate)"
+                    )
+                else:
+                    loaded.error = (
+                        "not enabled in config "
+                        "(run `hermes plugins enable {}` to activate)"
+                        .format(lookup_key)
+                    )
                 self._plugins[lookup_key] = loaded
                 logger.debug(
                     "Skipping '%s' (not in plugins.enabled)", lookup_key
@@ -1652,6 +1670,11 @@ class PluginManager:
                 path=str(plugin_dir),
                 kind=kind,
                 key=key,
+                config_gate=(
+                    data.get("config_gate", "").strip()
+                    if isinstance(data.get("config_gate"), str)
+                    else ""
+                ),
             )
         except Exception as exc:
             logger.warning(
@@ -2165,6 +2188,7 @@ def _get_pre_tool_call_directive_details(
         middleware_trace=list(middleware_trace or []),
     )
 
+    first_one_shot_approval: Optional[_PreToolCallDirective] = None
     first_approval: Optional[_PreToolCallDirective] = None
     for result in hook_results:
         if not isinstance(result, dict):
@@ -2202,10 +2226,12 @@ def _get_pre_tool_call_directive_details(
         )
         if action == "block":
             return directive
-        if first_approval is None:
+        if one_shot_override is not None and first_one_shot_approval is None:
+            first_one_shot_approval = directive
+        elif one_shot_override is None and first_approval is None:
             first_approval = directive
 
-    return first_approval or _PreToolCallDirective()
+    return first_one_shot_approval or first_approval or _PreToolCallDirective()
 
 
 def get_pre_tool_call_directive(
