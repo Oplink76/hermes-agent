@@ -15,7 +15,11 @@ from typing import Any, Optional
 from hermes_cli import kanban_db as kb
 from hermes_cli import projects_db as pdb
 from hermes_constants import get_hermes_home
-from tools.approval import shell_command_argvs, shell_command_has_redirection
+from tools.approval import (
+    shell_command_argvs,
+    shell_command_has_redirection,
+    shell_command_output_paths,
+)
 
 
 _FILE_MUTATORS = {"write_file", "patch"}
@@ -56,13 +60,11 @@ _READ_ONLY_GIT = {
     "ls-files",
     "ls-tree",
     "merge-base",
-    "remote",
     "rev-list",
     "rev-parse",
     "show",
     "show-ref",
     "status",
-    "tag",
 }
 _GIT_OPTIONS_WITH_VALUE = {"-c", "-C", "--git-dir", "--work-tree", "--namespace"}
 _OVERRIDE_ID_RE = re.compile(r"^[a-f0-9]{32}$")
@@ -137,6 +139,62 @@ def _git_branch_is_read_only(args: list[str]) -> bool:
     return True
 
 
+def _git_tag_is_read_only(args: list[str]) -> bool:
+    if not args:
+        return True
+    read_flags = {
+        "--column", "--contains", "--format", "--ignore-case", "--list",
+        "--merged", "--no-contains", "--no-merged", "--points-at", "--sort",
+        "-l", "-n",
+    }
+    flags_with_value = {
+        "--contains", "--format", "--merged", "--no-contains", "--no-merged",
+        "--points-at", "--sort",
+    }
+    index = 0
+    listing = False
+    while index < len(args):
+        word = args[index]
+        option = word.split("=", 1)[0]
+        if not word.startswith("-"):
+            if listing:
+                index += 1
+                continue
+            return False
+        if option not in read_flags:
+            return False
+        if option in {"-l", "--list"}:
+            listing = True
+        index += 1
+        if option in flags_with_value and "=" not in word:
+            index += 1
+    return True
+
+
+def _git_remote_is_read_only(args: list[str]) -> bool:
+    if not args or all(arg in {"-v", "--verbose"} for arg in args):
+        return True
+    return args[0] in {"get-url", "show"}
+
+
+def _find_is_read_only(args: list[str]) -> bool:
+    mutating = {
+        "-delete", "-exec", "-execdir", "-fls", "-fprint", "-fprintf",
+        "-ok", "-okdir",
+    }
+    return not any(arg in mutating for arg in args)
+
+
+def _awk_is_read_only(args: list[str]) -> bool:
+    program = next((arg for arg in args if not arg.startswith("-")), "")
+    return bool(
+        program
+        and ">" not in program
+        and "system(" not in program.replace(" ", "").lower()
+        and not re.search(r"\|\s*[\"']", program)
+    )
+
+
 def _is_read_only_terminal(command: str) -> bool:
     if not str(command or "").strip():
         return True
@@ -149,10 +207,20 @@ def _is_read_only_terminal(command: str) -> bool:
         executable = os.path.basename(argv[0]).lower()
         if executable not in _READ_ONLY_COMMANDS:
             return False
+        if executable == "awk" and not _awk_is_read_only(argv[1:]):
+            return False
+        if executable == "find" and not _find_is_read_only(argv[1:]):
+            return False
         if executable == "git":
             subcommand, subargs = _git_subcommand(argv)
             if subcommand == "branch":
                 if not _git_branch_is_read_only(subargs):
+                    return False
+            elif subcommand == "tag":
+                if not _git_tag_is_read_only(subargs):
+                    return False
+            elif subcommand == "remote":
+                if not _git_remote_is_read_only(subargs):
                     return False
             elif subcommand not in _READ_ONLY_GIT:
                 return False
@@ -165,8 +233,17 @@ def _is_read_only_terminal(command: str) -> bool:
 
 
 def _is_privileged_worker_command(command: str) -> bool:
+    known_git_commands = _READ_ONLY_GIT | {
+        "add", "am", "apply", "branch", "checkout", "cherry-pick", "clean",
+        "commit", "merge", "mv", "rebase", "remote", "reset", "restore",
+        "revert", "rm", "stash", "switch", "tag", "update-ref", "push",
+    }
     for argv in shell_command_argvs(command):
         executable = os.path.basename(argv[0]).lower()
+        if executable in {"bash", "dash", "ksh", "sh", "zsh"} and any(
+            arg.startswith("-") and "c" in arg[1:] for arg in argv[1:]
+        ):
+            return True
         if "deploy" in executable:
             return True
         if executable in {"npm", "pnpm", "yarn", "bun"} and any(
@@ -176,23 +253,103 @@ def _is_privileged_worker_command(command: str) -> bool:
             return True
         if executable != "git":
             continue
+        if any(arg.lower().startswith("alias.") for arg in argv[1:]):
+            return True
         subcommand, subargs = _git_subcommand(argv)
         if subcommand in {"push", "reset", "update-ref"}:
             return True
         if subcommand in {"switch", "checkout"} and any(
-            arg in {"-b", "-B", "-c", "-C", "--create", "--orphan"}
+            arg.split("=", 1)[0]
+            in {"-b", "-B", "-c", "-C", "--create", "--orphan"}
             for arg in subargs
         ):
             return True
         if subcommand == "branch" and not _git_branch_is_read_only(subargs):
             return True
+        if subcommand == "tag" and not _git_tag_is_read_only(subargs):
+            return True
+        if subcommand == "remote" and not _git_remote_is_read_only(subargs):
+            return True
+        if subcommand not in known_git_commands:
+            return True
     return False
 
 
-def _effective_target(tool_name: str, args: dict[str, Any]) -> Path:
+def _task_path(value: Any, task_context: str) -> Path:
+    raw = str(value or "").strip()
+    from tools.file_tools import _resolve_path_for_task
+
+    return Path(str(_resolve_path_for_task(raw or ".", task_context))).resolve(
+        strict=False
+    )
+
+
+def _terminal_workdir(args: dict[str, Any], task_context: str) -> Path:
+    raw = str(args.get("workdir") or "").strip()
+    if not raw:
+        return _task_path(".", task_context)
+    if Path(raw).expanduser().is_absolute():
+        return _resolved_path(raw)
+    return _task_path(raw, task_context)
+
+
+def _path_operands(argv: list[str]) -> list[str]:
+    executable = os.path.basename(argv[0]).lower()
+    operands = [arg for arg in argv[1:] if arg != "--" and not arg.startswith("-")]
+    if executable in {"cp", "install"}:
+        return operands[-1:] if operands else []
+    if executable in {
+        "chmod", "chown", "ln", "mkdir", "mv", "rm", "rmdir", "tee",
+        "touch", "truncate", "unlink",
+    }:
+        return operands
+    if executable == "git":
+        targets: list[str] = []
+        for index, arg in enumerate(argv[1:], start=1):
+            if arg in {"-C", "--git-dir", "--work-tree"} and index + 1 < len(argv):
+                targets.append(argv[index + 1])
+            if arg.startswith(("--git-dir=", "--work-tree=")):
+                targets.append(arg.split("=", 1)[1])
+        return targets
+    return []
+
+
+def _terminal_targets(
+    args: dict[str, Any], task_context: str
+) -> tuple[list[Path], bool]:
+    command = str(args.get("command") or "")
+    workdir = _terminal_workdir(args, task_context)
+    raw_targets = shell_command_output_paths(command)
+    ambiguous = False
+    for argv in shell_command_argvs(command):
+        executable = os.path.basename(argv[0]).lower()
+        if executable == "awk":
+            ambiguous = True
+        if executable == "find" and any(
+            arg in {"-exec", "-execdir", "-ok", "-okdir"} for arg in argv[1:]
+        ):
+            ambiguous = True
+        raw_targets.extend(_path_operands(argv))
+
+    targets = [workdir]
+    for raw in raw_targets:
+        if not raw or raw == "-":
+            continue
+        if any(char in raw for char in ("$", "`", "*", "?", "[", "]")):
+            ambiguous = True
+            continue
+        targets.append(_resolved_path(raw, base=workdir))
+    return list(dict.fromkeys(targets)), ambiguous
+
+
+def _effective_targets(
+    tool_name: str,
+    args: dict[str, Any],
+    task_context: str,
+) -> tuple[list[Path], bool]:
     if tool_name == "terminal":
-        return _resolved_path(args.get("cwd"), base=Path.cwd())
-    return _resolved_path(args.get("path"), base=Path.cwd())
+        return _terminal_targets(args, task_context)
+    return [_task_path(args.get("path"), task_context)], False
 
 
 def _governance(path: Path) -> Optional[dict]:
@@ -291,24 +448,32 @@ def _consume_approved_override(
 
 def _validate_worker(
     task_id: str,
-    target: Path,
-    governance: Optional[dict],
+    targets: list[Path],
+    governances: list[Optional[dict]],
     *,
     tool_name: str,
     args: dict[str, Any],
+    ambiguous_targets: bool,
 ) -> Optional[dict[str, str]]:
     if tool_name == "terminal" and _is_privileged_worker_command(
         str(args.get("command") or "")
     ):
         return _block("workers may not push, create branches, force-update refs, reset, or deploy")
+    if ambiguous_targets:
+        return _block("worker mutation targets could not be verified")
     try:
         task = _load_worker_task(task_id)
         workspace = _resolved_path(task.workspace_path)
     except Exception as exc:
         return _block(f"worker ownership could not be verified: {exc}")
-    if not task.workspace_path or not _path_is_within(target, workspace):
+    if not task.workspace_path or any(
+        not _path_is_within(target, workspace) for target in targets
+    ):
         return _block("worker mutation is outside the card workspace")
-    if not task.project_id or not governance or governance.get("project_id") != task.project_id:
+    if not task.project_id or any(
+        not governance or governance.get("project_id") != task.project_id
+        for governance in governances
+    ):
         return _block("worker mutation does not match the card project")
     if not task.branch_name:
         return _block("worker task has no assigned branch")
@@ -330,7 +495,6 @@ def _on_pre_tool_call(
     session_id: str = "",
     **_: Any,
 ) -> Optional[dict[str, Any]]:
-    del task_id, session_id
     normalized = _normalize_tool_name(tool_name)
     call_args = args if isinstance(args, dict) else {}
     if normalized == "terminal":
@@ -344,22 +508,37 @@ def _on_pre_tool_call(
         call_args.get("path") or ""
     ).strip():
         return _block("worker mutation target is ambiguous")
-    target = _effective_target(normalized, call_args)
+    task_context = str(task_id or session_id or "default")
     try:
-        governance = _governance(target)
+        targets, ambiguous_targets = _effective_targets(
+            normalized, call_args, task_context
+        )
+    except Exception as exc:
+        return _block(f"mutation target could not be resolved: {exc}")
+    try:
+        governances = [_governance(target) for target in targets]
     except Exception as exc:
         return _block(f"project ownership could not be resolved: {exc}")
 
     if worker_task_id:
         return _validate_worker(
             worker_task_id,
-            target,
-            governance,
+            targets,
+            governances,
             tool_name=normalized,
             args=call_args,
+            ambiguous_targets=ambiguous_targets,
         )
 
-    if not governance or not governance.get("kanban_governed"):
+    governance = next(
+        (
+            item
+            for item in governances
+            if item and item.get("kanban_governed")
+        ),
+        None,
+    )
+    if governance is None:
         return None
 
     override = _new_override(normalized, call_args, governance)

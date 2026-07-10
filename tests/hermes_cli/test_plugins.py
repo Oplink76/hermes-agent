@@ -104,6 +104,40 @@ class TestPluginDiscovery:
         assert "hello_plugin" in mgr._plugins
         assert mgr._plugins["hello_plugin"].enabled
 
+    def test_kanban_governance_exact_nested_opt_in_enables_plugin(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes_test"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({
+                "plugins": {"kanban-governance": {"enabled": True}}
+            })
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr._plugins["kanban-governance"].enabled is True
+
+    def test_kanban_governance_nested_false_stays_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes_test"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({
+                "plugins": {"kanban-governance": {"enabled": False}}
+            })
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr._plugins["kanban-governance"].enabled is False
+
     def test_plugin_can_register_and_invoke_middleware(self, tmp_path, monkeypatch):
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         _make_plugin_dir(
@@ -890,7 +924,7 @@ class TestPreToolCallDirective:
         )
         assert get_pre_tool_call_directive("terminal", {}) == (None, None)
 
-    def test_first_directive_wins_across_actions(self, monkeypatch):
+    def test_block_is_deny_dominant_over_earlier_approval(self, monkeypatch):
         from hermes_cli.plugins import get_pre_tool_call_directive
         monkeypatch.setattr(
             "hermes_cli.plugins.invoke_hook",
@@ -900,7 +934,7 @@ class TestPreToolCallDirective:
             ],
         )
         assert get_pre_tool_call_directive("terminal", {}) == (
-            "approve", "gate first")
+            "block", "block second")
 
     def test_shim_ignores_approve(self, monkeypatch):
         """Back-compat shim only reports block, never approve."""

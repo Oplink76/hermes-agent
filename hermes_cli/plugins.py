@@ -242,7 +242,9 @@ def _get_enabled_plugins() -> Optional[set]:
     """Read the enabled-plugins allow-list from config.yaml.
 
     Plugins are opt-in by default — only plugins whose name appears in
-    this set are loaded. Returns:
+    this set are loaded. ``kanban-governance`` additionally accepts its
+    approved nested compatibility key,
+    ``plugins.kanban-governance.enabled: true``. Returns:
 
     * ``None`` — the key is missing or malformed. Callers should treat
       this as "nothing enabled yet" (the opt-in default); the first
@@ -258,12 +260,20 @@ def _get_enabled_plugins() -> Optional[set]:
         plugins_cfg = config.get("plugins")
         if not isinstance(plugins_cfg, dict):
             return None
-        if "enabled" not in plugins_cfg:
-            return None
+        nested_governance = plugins_cfg.get("kanban-governance")
+        governance_enabled = (
+            isinstance(nested_governance, dict)
+            and nested_governance.get("enabled") is True
+        )
         enabled = plugins_cfg.get("enabled")
-        if not isinstance(enabled, list):
+        if "enabled" in plugins_cfg and not isinstance(enabled, list):
+            return {"kanban-governance"} if governance_enabled else None
+        result = set(enabled) if isinstance(enabled, list) else set()
+        if governance_enabled:
+            result.add("kanban-governance")
+        if "enabled" not in plugins_cfg and not governance_enabled:
             return None
-        return set(enabled)
+        return result
     except Exception:
         return None
 
@@ -2131,8 +2141,9 @@ def _get_pre_tool_call_directive_details(
     - ``rule_key`` is optional and only honored for ``approve`` directives. It
       lets plugins choose the allowlist grain for `[a]lways` approvals.
 
-    The first valid directive wins. Invalid or irrelevant hook return values
-    are silently ignored so existing observer-only hooks are unaffected.
+    Blocks are deny-dominant across every valid hook result. When no block is
+    present, the first valid approval wins. Invalid or irrelevant hook return
+    values are silently ignored so existing observer-only hooks are unaffected.
     """
     allowed = getattr(_thread_tool_whitelist, "allowed", None)
     if allowed is not None and tool_name not in allowed:
@@ -2154,6 +2165,7 @@ def _get_pre_tool_call_directive_details(
         middleware_trace=list(middleware_trace or []),
     )
 
+    first_approval: Optional[_PreToolCallDirective] = None
     for result in hook_results:
         if not isinstance(result, dict):
             continue
@@ -2181,15 +2193,19 @@ def _get_pre_tool_call_directive_details(
         )
         if not callable(override_consumer):
             override_consumer = None
-        return _PreToolCallDirective(
+        directive = _PreToolCallDirective(
             action=action,
             message=message,
             rule_key=rule_key,
             one_shot_override=one_shot_override,
             override_consumer=override_consumer,
         )
+        if action == "block":
+            return directive
+        if first_approval is None:
+            first_approval = directive
 
-    return _PreToolCallDirective()
+    return first_approval or _PreToolCallDirective()
 
 
 def get_pre_tool_call_directive(

@@ -43,6 +43,15 @@ def test_shell_command_has_redirection_ignores_quoted_operators():
     assert shell_command_has_redirection("echo 'literal > text'") is False
 
 
+def test_shell_command_output_paths_are_quote_aware():
+    from tools.approval import shell_command_output_paths
+
+    assert shell_command_output_paths(
+        "echo changed > '/tmp/two words.txt'; printf x 2>>/tmp/errors.txt"
+    ) == ["/tmp/two words.txt", "/tmp/errors.txt"]
+    assert shell_command_output_paths("echo 'literal > /tmp/not-a-target'") == []
+
+
 def test_one_shot_tool_approval_disables_reusable_approval(monkeypatch):
     captured = {}
 

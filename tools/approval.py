@@ -1438,6 +1438,52 @@ def shell_command_has_redirection(command: str) -> bool:
     return False
 
 
+def shell_command_output_paths(command: str) -> list[str]:
+    """Return literal targets of unquoted shell output redirections.
+
+    The scan shares the approval detector's normalization and word reader, so
+    quoted ``>`` characters remain data while ``>``, ``>>``, ``>|`` and file
+    descriptor-prefixed variants expose their following filesystem word.
+    Descriptor duplication (for example ``2>&1``) is not a filesystem target.
+    """
+    normalized = _normalize_command_for_detection(str(command or ""))
+    targets: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(normalized):
+        char = normalized[index]
+        if quote:
+            if char == "\\" and quote == '"' and index + 1 < len(normalized):
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(normalized):
+            index += 2
+            continue
+        if char != ">":
+            index += 1
+            continue
+
+        index += 1
+        if index < len(normalized) and normalized[index] in ">|":
+            index += 1
+        word_start, word_end, word = _read_shell_word(normalized, index)
+        if word_start == word_end:
+            continue
+        target = _deobfuscate_shell_word_for_detection(word)
+        if target and not target.startswith(("&", "(")):
+            targets.append(target)
+        index = word_end
+    return targets
+
+
 def _command_detection_variants(command: str):
     normalized = _normalize_command_for_detection(command)
     seen = {normalized}
