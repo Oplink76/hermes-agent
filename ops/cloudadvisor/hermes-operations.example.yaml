@@ -1,0 +1,8 @@
+sync:
+  repo: /Users/cloudadvisor/.hermes/hermes-agent
+  worktree: /Users/cloudadvisor/.hermes/worktrees/hermes-upstream-sync
+  origin: origin
+  upstream: upstream
+  candidate_branch: auto-sync/upstream
+  repo_slug: Oplink76/hermes-agent
+  lock_path: /Users/cloudadvisor/.hermes/locks/upstream-sync.lock
