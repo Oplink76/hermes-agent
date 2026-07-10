@@ -11,7 +11,10 @@ from gateway.restart import (
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
 )
 
-STARTUP_TEST_TIMEOUT = 5
+# The full 24-worker repository run can delay gateway import/startup work for
+# more than five seconds on macOS. Keep a bounded deadlock guard without
+# treating scheduler contention as the restart-race failure under test.
+STARTUP_TEST_TIMEOUT = 15
 
 
 class StartupRaceAdapter(BasePlatformAdapter):
