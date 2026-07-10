@@ -225,7 +225,13 @@ class FailCandidateHealth:
         self.install_root = install_root
         self.candidate_sha = candidate_sha
 
-    def check(self, *, expected_sha: str, services: tuple[str, ...]) -> HealthReport:
+    def check(
+        self,
+        *,
+        expected_sha: str,
+        services: tuple[str, ...],
+        identity_required: bool = True,
+    ) -> HealthReport:
         actual_sha = _git(self.install_root, "rev-parse", "HEAD")
         passed = expected_sha == actual_sha and expected_sha != self.candidate_sha
         return HealthReport(
