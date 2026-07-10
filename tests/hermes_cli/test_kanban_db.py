@@ -9004,6 +9004,149 @@ def _assert_no_push(calls: list[list[str]]) -> None:
         assert "push" not in cmd, f"git push invoked: {cmd}"
 
 
+def _git_output(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_build_merge_candidate_keeps_checked_out_target_unchanged(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    source_sha = _make_epic_branch(repo, "wt/source")
+    pre_sha = _git_output(repo, "rev-parse", "main")
+
+    candidate = kb._build_verified_merge_candidate(
+        repo,
+        "main",
+        "wt/source",
+        "test candidate",
+        lambda path: (path / "epic_work.txt").read_text() == "epic work\n",
+    )
+
+    assert candidate.pre_sha == pre_sha
+    assert candidate.target_worktree == repo.resolve()
+    assert candidate.candidate_sha != pre_sha
+    assert subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", source_sha, "main"]
+    ).returncode == 1
+    assert kb._fast_forward_target(candidate) is True
+    assert subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", source_sha, "main"]
+    ).returncode == 0
+
+
+def test_build_merge_candidate_rejects_dirty_checked_out_target(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _make_epic_branch(repo, "wt/source")
+    pre_sha = _git_output(repo, "rev-parse", "main")
+    (repo / "tracked.txt").write_text("dirty", encoding="utf-8")
+
+    with pytest.raises(kb.IntegrationCandidateError, match="target worktree is dirty"):
+        kb._build_verified_merge_candidate(
+            repo, "main", "wt/source", "test candidate", lambda _path: True
+        )
+
+    assert _git_output(repo, "rev-parse", "main") == pre_sha
+    assert (repo / "tracked.txt").read_text(encoding="utf-8") == "dirty"
+
+
+def test_build_merge_candidate_updates_unchecked_target_ref(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    source_sha = _make_epic_branch(repo, "wt/source")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", "operator"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate = kb._build_verified_merge_candidate(
+        repo, "main", "wt/source", "test candidate", lambda _path: True
+    )
+    assert candidate.target_worktree is None
+    assert kb._fast_forward_target(candidate) is True
+    assert _git_output(repo, "branch", "--show-current") == "operator"
+    assert subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", source_sha, "main"]
+    ).returncode == 0
+
+
+def test_build_merge_candidate_conflict_preserves_target(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", "wt/source"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _commit_file(repo, "shared.txt", "source\n", "source")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _commit_file(repo, "shared.txt", "main\n", "main")
+    pre_sha = _git_output(repo, "rev-parse", "main")
+    with pytest.raises(kb.IntegrationCandidateError, match="merge conflict"):
+        kb._build_verified_merge_candidate(
+            repo, "main", "wt/source", "test candidate", lambda _path: True
+        )
+    assert _git_output(repo, "rev-parse", "main") == pre_sha
+
+
+def test_build_merge_candidate_verification_failure_preserves_target(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _make_epic_branch(repo, "wt/source")
+    pre_sha = _git_output(repo, "rev-parse", "main")
+    with pytest.raises(kb.IntegrationCandidateError, match="verification failed"):
+        kb._build_verified_merge_candidate(
+            repo, "main", "wt/source", "test candidate", lambda _path: False
+        )
+    assert _git_output(repo, "rev-parse", "main") == pre_sha
+
+
+def test_fast_forward_rejects_target_that_moved_after_candidate(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _make_epic_branch(repo, "wt/source")
+    candidate = kb._build_verified_merge_candidate(
+        repo, "main", "wt/source", "test candidate", lambda _path: True
+    )
+    _commit_file(repo, "operator.txt", "new\n", "operator moved main")
+    moved_sha = _git_output(repo, "rev-parse", "main")
+    assert kb._fast_forward_target(candidate) is False
+    assert _git_output(repo, "rev-parse", "main") == moved_sha
+
+
+def test_build_merge_candidate_preserves_dirty_scratch_on_cleanup_failure(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _make_epic_branch(repo, "wt/source")
+    pre_sha = _git_output(repo, "rev-parse", "main")
+    scratch: Path | None = None
+
+    def dirty_verify(path: Path) -> bool:
+        nonlocal scratch
+        scratch = path
+        (path / "verification-output.txt").write_text("keep", encoding="utf-8")
+        return True
+
+    with pytest.raises(kb.IntegrationCandidateError, match="scratch worktree is dirty"):
+        kb._build_verified_merge_candidate(
+            repo, "main", "wt/source", "test candidate", dirty_verify
+        )
+    assert _git_output(repo, "rev-parse", "main") == pre_sha
+    assert scratch is not None and (scratch / "verification-output.txt").exists()
+
+
 def test_merge_epic_to_main_happy_path_merges_and_never_pushes(kanban_home, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
@@ -9040,12 +9183,10 @@ def test_merge_epic_to_main_happy_path_merges_and_never_pushes(kanban_home, tmp_
     assert status.stdout.strip() == "", "working tree must be clean after merge"
 
 
-def test_merge_epic_to_main_untracked_sibling_worktree_still_merges(kanban_home, tmp_path, monkeypatch):
-    """Dogfood repro: a story worktree lives at ``<repo>/.worktrees/<story_id>``
-    and is NOT gitignored, so it shows up as ``?? .worktrees/`` in
-    ``git status --porcelain`` on main. That untracked entry must NOT trip
-    the post-merge cleanliness check -- only tracked/conflicted state should.
-    """
+def test_merge_epic_to_main_refuses_unignored_sibling_worktree(
+    kanban_home, tmp_path, monkeypatch
+):
+    """All target dirt, including an unignored worktree, fails closed."""
     repo = tmp_path / "repo"
     _init_git_repo(repo)
     board = "v2-merge-untracked-worktree"
@@ -9084,16 +9225,16 @@ def test_merge_epic_to_main_untracked_sibling_worktree_still_merges(kanban_home,
             conn, epic, board=board, verify_fn=lambda b: True, notify_fn=notify,
         )
 
-    assert result == "merged"
-    notify.assert_not_called()
+    assert result == "verify_failed"
+    notify.assert_called_once()
     _assert_no_push(calls)
-    assert not any("reset" in cmd for cmd in calls), "clean-but-untracked main must not trigger a reset"
+    assert not any("reset" in cmd for cmd in calls)
 
     ancestor = subprocess.run(
         ["git", "-C", str(repo), "merge-base", "--is-ancestor", epic_sha, "main"],
         capture_output=True, text=True,
     )
-    assert ancestor.returncode == 0, "main must contain the epic's commit"
+    assert ancestor.returncode == 1, "dirty main must not contain the epic's commit"
 
 
 def test_merge_epic_to_main_conflict_aborts_blocks_and_never_pushes(kanban_home, tmp_path, monkeypatch):

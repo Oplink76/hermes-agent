@@ -7384,6 +7384,194 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
+@dataclass(frozen=True)
+class IntegrationCandidate:
+    pre_sha: str
+    candidate_sha: str
+    target_branch: str
+    target_worktree: Optional[Path]
+    scratch_worktree: Path
+    repo_root: Path
+    candidate_ref: str
+
+
+class IntegrationCandidateError(RuntimeError):
+    def __init__(self, message: str, *, scratch_worktree: Optional[Path] = None):
+        super().__init__(message)
+        self.scratch_worktree = scratch_worktree
+
+
+def _integration_git(
+    cwd: Path, args: list[str], *, timeout: int = 120
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except Exception as exc:
+        raise IntegrationCandidateError(f"git command failed: {args[0]}") from exc
+
+
+def _checked_out_branch_worktree(repo_root: Path, branch: str) -> Optional[Path]:
+    listed = _integration_git(repo_root, ["worktree", "list", "--porcelain"])
+    if listed.returncode != 0:
+        raise IntegrationCandidateError("could not list repository worktrees")
+    wanted = f"refs/heads/{branch}"
+    for block in (listed.stdout or "").strip().split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in block.splitlines():
+            key, _, value = line.partition(" ")
+            fields[key] = value
+        if fields.get("branch") == wanted and fields.get("worktree"):
+            return Path(fields["worktree"]).resolve()
+    return None
+
+
+def _worktree_is_clean(path: Path) -> bool:
+    status = _integration_git(path, ["status", "--porcelain", "--untracked-files=all"])
+    return status.returncode == 0 and not (status.stdout or "").strip()
+
+
+def _remove_clean_integration_worktree(repo_root: Path, scratch: Path) -> None:
+    if not _worktree_is_clean(scratch):
+        raise IntegrationCandidateError(
+            f"scratch worktree is dirty; preserved at {scratch}",
+            scratch_worktree=scratch,
+        )
+    removed = _integration_git(repo_root, ["worktree", "remove", str(scratch)])
+    if removed.returncode != 0:
+        raise IntegrationCandidateError(
+            f"could not remove scratch worktree; preserved at {scratch}",
+            scratch_worktree=scratch,
+        )
+
+
+def _build_verified_merge_candidate(
+    repo_root: Path,
+    target_branch: str,
+    source_branch: str,
+    message: str,
+    candidate_verify_fn: Optional[Callable[[Path], bool]] = None,
+) -> IntegrationCandidate:
+    repo_root = repo_root.resolve()
+    target_worktree = _checked_out_branch_worktree(repo_root, target_branch)
+    if target_worktree is not None and not _worktree_is_clean(target_worktree):
+        raise IntegrationCandidateError(f"target worktree is dirty: {target_worktree}")
+
+    pre_result = _integration_git(repo_root, ["rev-parse", f"refs/heads/{target_branch}"])
+    pre_sha = (pre_result.stdout or "").strip()
+    if pre_result.returncode != 0 or not pre_sha:
+        raise IntegrationCandidateError(f"could not resolve {target_branch}")
+
+    nonce = secrets.token_hex(6)
+    scratch = repo_root / ".worktrees" / f"integration-{nonce}"
+    scratch.parent.mkdir(parents=True, exist_ok=True)
+    added = _integration_git(
+        repo_root, ["worktree", "add", "--detach", str(scratch), pre_sha]
+    )
+    if added.returncode != 0:
+        raise IntegrationCandidateError("could not create integration worktree")
+
+    merged = _integration_git(
+        scratch,
+        ["merge", "--no-ff", source_branch, "-m", message],
+        timeout=900,
+    )
+    if merged.returncode != 0:
+        _integration_git(scratch, ["merge", "--abort"])
+        _remove_clean_integration_worktree(repo_root, scratch)
+        raise IntegrationCandidateError("merge conflict")
+
+    candidate_result = _integration_git(scratch, ["rev-parse", "HEAD"])
+    candidate_sha = (candidate_result.stdout or "").strip()
+    if candidate_result.returncode != 0 or not candidate_sha:
+        raise IntegrationCandidateError(
+            "could not resolve integration candidate", scratch_worktree=scratch
+        )
+
+    if candidate_verify_fn is None:
+        script = scratch / "scripts" / "run_tests.sh"
+        if not script.is_file():
+            verified = False
+        else:
+            try:
+                result = subprocess.run(
+                    ["bash", "scripts/run_tests.sh"],
+                    cwd=scratch,
+                    capture_output=True,
+                    text=True,
+                    timeout=1800,
+                    check=False,
+                )
+                verified = result.returncode == 0
+            except Exception:
+                verified = False
+    else:
+        try:
+            verified = bool(candidate_verify_fn(scratch))
+        except Exception:
+            verified = False
+    if not verified:
+        _remove_clean_integration_worktree(repo_root, scratch)
+        raise IntegrationCandidateError("candidate verification failed")
+
+    if not _worktree_is_clean(scratch):
+        raise IntegrationCandidateError(
+            f"scratch worktree is dirty; preserved at {scratch}",
+            scratch_worktree=scratch,
+        )
+
+    candidate_ref = f"refs/hermes/integration-candidates/{nonce}"
+    retained = _integration_git(repo_root, ["update-ref", candidate_ref, candidate_sha])
+    if retained.returncode != 0:
+        raise IntegrationCandidateError(
+            "could not retain integration candidate", scratch_worktree=scratch
+        )
+    _remove_clean_integration_worktree(repo_root, scratch)
+    return IntegrationCandidate(
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+        target_branch=target_branch,
+        target_worktree=target_worktree,
+        scratch_worktree=scratch,
+        repo_root=repo_root,
+        candidate_ref=candidate_ref,
+    )
+
+
+def _fast_forward_target(candidate: IntegrationCandidate) -> bool:
+    target_ref = f"refs/heads/{candidate.target_branch}"
+    current = _integration_git(candidate.repo_root, ["rev-parse", target_ref])
+    if current.returncode != 0 or (current.stdout or "").strip() != candidate.pre_sha:
+        return False
+
+    if candidate.target_worktree is not None:
+        if not _worktree_is_clean(candidate.target_worktree):
+            return False
+        branch = _integration_git(candidate.target_worktree, ["branch", "--show-current"])
+        if branch.returncode != 0 or (branch.stdout or "").strip() != candidate.target_branch:
+            return False
+        applied = _integration_git(
+            candidate.target_worktree, ["merge", "--ff-only", candidate.candidate_sha]
+        )
+    else:
+        applied = _integration_git(
+            candidate.repo_root,
+            ["update-ref", target_ref, candidate.candidate_sha, candidate.pre_sha],
+        )
+    if applied.returncode != 0:
+        return False
+    _integration_git(
+        candidate.repo_root,
+        ["update-ref", "-d", candidate.candidate_ref, candidate.candidate_sha],
+    )
+    return True
+
+
 def _default_epic_verify(epic_branch: str) -> bool:
     """Run the project's test suite against ``epic_branch`` and report green.
 
@@ -7507,9 +7695,8 @@ def merge_epic_to_main(
     says the epic isn't mergeable yet, or the repo/branch can't be resolved
     (no git mutation in either case); ``"conflict"`` when the merge itself
     fails (aborted, main left exactly as it was); ``"verify_failed"`` when the
-    merge succeeds but the post-merge working tree isn't clean or the suite
-    isn't green on main (undone via ``reset --hard`` back to the pre-merge
-    sha); ``"merged"`` on success.
+    candidate merge succeeds but its isolated verification fails;
+    ``"merged"`` only after an atomic fast-forward of the unchanged target.
 
     On both failure outcomes the epic is cleared of ``running``, marked
     ``blocked``, and ``notify_fn`` (the Slack hook) is invoked -- see
@@ -7523,7 +7710,7 @@ def merge_epic_to_main(
     # boundary for Hermes. This function must NEVER call `git push`, and must
     # NEVER import or call web_git.py's push helpers (`_review_push` /
     # `review_push` / `review_create_pr`). Only local git verbs below:
-    # rev-parse, switch/checkout, merge, merge --abort, reset --hard, status.
+    # rev-parse, worktree, merge, merge --abort, status, and update-ref.
     # =========================================================================
     meta = product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
@@ -7541,77 +7728,56 @@ def merge_epic_to_main(
     except Exception:
         return "not_ready"
 
-    def _run(args: list[str], *, timeout: int = 60):
-        try:
-            return subprocess.run(
-                ["git", "-C", str(repo_root), *args],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-        except Exception:
-            return None
-
     def _fail(reason: str) -> None:
         _merge_epic_fail_safe(conn, epic_id, reason, board=board, notify_fn=notify_fn)
 
-    pre_sha = ""
     try:
-        pre_sha_result = _run(["rev-parse", main_branch])
-        pre_sha = (pre_sha_result.stdout or "").strip() if pre_sha_result else ""
-        if pre_sha_result is None or pre_sha_result.returncode != 0 or not pre_sha:
-            _fail(f"could not resolve {main_branch}")
-            return "verify_failed"
-
-        switch_result = _run(["switch", main_branch])
-        if switch_result is None or switch_result.returncode != 0:
-            switch_result = _run(["checkout", main_branch])
-        if switch_result is None or switch_result.returncode != 0:
-            _fail(f"could not switch to {main_branch}")
-            return "verify_failed"
-
-        merge_result = _run(
-            ["merge", "--no-ff", epic_branch, "-m", f"merge epic {epic_id}"],
-            timeout=120,
+        candidate_verify_fn = (
+            (lambda _path: bool(verify_fn(main_branch)))
+            if verify_fn is not None
+            else None
         )
-        if merge_result is None or merge_result.returncode != 0:
-            _run(["merge", "--abort"])
-            _fail("merge conflict")
-            return "conflict"
-
-        status_result = _run(["status", "--porcelain", "--untracked-files=no"])
-        clean = bool(
-            status_result is not None
-            and status_result.returncode == 0
-            and not (status_result.stdout or "").strip()
+        candidate = _build_verified_merge_candidate(
+            repo_root,
+            main_branch,
+            epic_branch,
+            f"merge epic {epic_id}",
+            candidate_verify_fn,
         )
-        verify = verify_fn or _default_epic_verify
-        try:
-            verified = bool(verify(main_branch))
-        except Exception:
-            verified = False
-
-        if not clean or not verified:
-            _run(["reset", "--hard", pre_sha])
-            _fail("post-merge verify failed")
+        if not _fast_forward_target(candidate):
+            _fail(
+                "target moved or became dirty; candidate retained at "
+                f"{candidate.candidate_ref}"
+            )
             return "verify_failed"
 
         try:
             with write_txn(conn):
                 _append_event(
-                    conn, epic_id, "epic_merged",
-                    {"epic_branch": epic_branch, "pre_sha": pre_sha},
+                    conn,
+                    epic_id,
+                    "epic_merged",
+                    {
+                        "epic_branch": epic_branch,
+                        "source_branch": epic_branch,
+                        "target_branch": main_branch,
+                        "pre_sha": candidate.pre_sha,
+                        "candidate_sha": candidate.candidate_sha,
+                        "target": str(candidate.target_worktree or main_branch),
+                        "test_command": "bash scripts/run_tests.sh",
+                    },
                 )
         except Exception:
             pass
         return "merged"
+    except IntegrationCandidateError as exc:
+        reason = str(exc)
+        _fail(reason)
+        if "merge conflict" in reason:
+            return "conflict"
+        return "verify_failed"
     except Exception:
-        # Never leave a partial merge: best-effort undo, then fail-safe.
-        _run(["merge", "--abort"])
-        if pre_sha:
-            _run(["reset", "--hard", pre_sha])
-        _fail("unexpected error during merge")
+        _fail("unexpected error while building integration candidate")
         return "verify_failed"
 
 
@@ -7735,6 +7901,12 @@ def integrate_story_to_epic(
 
         epic_worktree = repo_root / ".worktrees" / f"epic-{epic_id}"
         _ensure_git_worktree(repo_root, epic_worktree, epic_branch)
+        if not _worktree_is_clean(epic_worktree):
+            reason = f"epic integration worktree is dirty; preserved at {epic_worktree}"
+            _integrate_story_fail_safe(
+                conn, story_id, reason, board=board, notify_fn=notify_fn
+            )
+            return "verify_failed"
 
         merge_result = _run(
             ["merge", "--no-ff", story_branch, "-m", f"integrate story {story_id}"],
@@ -7742,7 +7914,11 @@ def integrate_story_to_epic(
         )
         if merge_result is None or merge_result.returncode != 0:
             _run(["merge", "--abort"], cwd=epic_worktree)
-            reason = "story→epic merge conflict"
+            reason = (
+                "story→epic merge conflict"
+                if _worktree_is_clean(epic_worktree)
+                else f"story→epic merge conflict; preserved dirty worktree at {epic_worktree}"
+            )
             _integrate_story_fail_safe(conn, story_id, reason, board=board, notify_fn=notify_fn)
             return "conflict"
 
@@ -7775,8 +7951,8 @@ def _merge_standalone_story_to_main(
     mutation); ``"already_merged"`` when the story branch is already an ancestor
     of main (idempotent); ``"conflict"`` when the merge fails (aborted, main
     left exactly as it was); ``"verify_failed"`` when the merge succeeds but the
-    post-merge tree isn't clean or the suite isn't green (undone via
-    ``reset --hard``); ``"merged"`` on success. On both failure outcomes the
+    isolated candidate is dirty or the suite isn't green (the target remains
+    unchanged); ``"merged"`` on success. On both failure outcomes the
     STORY (not an epic) is cleared of ``running``, blocked, and ``notify_fn``
     invoked -- see :func:`_integrate_story_fail_safe`.
     """
@@ -7808,80 +7984,61 @@ def _merge_standalone_story_to_main(
     except Exception:
         return "not_ready"
 
-    def _run(args: list[str], *, timeout: int = 60):
-        try:
-            return subprocess.run(
-                ["git", "-C", str(repo_root), *args],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-        except Exception:
-            return None
-
     def _fail(reason: str) -> None:
         _integrate_story_fail_safe(conn, story_id, reason, board=board, notify_fn=notify_fn)
 
-    pre_sha = ""
     try:
-        ancestor_result = _run(["merge-base", "--is-ancestor", story_branch, main_branch])
-        if ancestor_result is not None and ancestor_result.returncode == 0:
+        ancestor_result = _integration_git(
+            repo_root, ["merge-base", "--is-ancestor", story_branch, main_branch]
+        )
+        if ancestor_result.returncode == 0:
             return "already_merged"
-
-        pre_sha_result = _run(["rev-parse", main_branch])
-        pre_sha = (pre_sha_result.stdout or "").strip() if pre_sha_result else ""
-        if pre_sha_result is None or pre_sha_result.returncode != 0 or not pre_sha:
-            _fail(f"could not resolve {main_branch}")
-            return "verify_failed"
-
-        switch_result = _run(["switch", main_branch])
-        if switch_result is None or switch_result.returncode != 0:
-            switch_result = _run(["checkout", main_branch])
-        if switch_result is None or switch_result.returncode != 0:
-            _fail(f"could not switch to {main_branch}")
-            return "verify_failed"
-
-        merge_result = _run(
-            ["merge", "--no-ff", story_branch, "-m", f"merge story {story_id}"],
-            timeout=120,
+        candidate_verify_fn = (
+            (lambda _path: bool(verify_fn(main_branch)))
+            if verify_fn is not None
+            else None
         )
-        if merge_result is None or merge_result.returncode != 0:
-            _run(["merge", "--abort"])
-            _fail("story→main merge conflict")
-            return "conflict"
-
-        status_result = _run(["status", "--porcelain", "--untracked-files=no"])
-        clean = bool(
-            status_result is not None
-            and status_result.returncode == 0
-            and not (status_result.stdout or "").strip()
+        candidate = _build_verified_merge_candidate(
+            repo_root,
+            main_branch,
+            story_branch,
+            f"merge story {story_id}",
+            candidate_verify_fn,
         )
-        verify = verify_fn or _default_epic_verify
-        try:
-            verified = bool(verify(main_branch))
-        except Exception:
-            verified = False
-
-        if not clean or not verified:
-            _run(["reset", "--hard", pre_sha])
-            _fail("post-merge verify failed")
+        if not _fast_forward_target(candidate):
+            _fail(
+                "target moved or became dirty; candidate retained at "
+                f"{candidate.candidate_ref}"
+            )
             return "verify_failed"
 
         try:
             with write_txn(conn):
                 _append_event(
-                    conn, story_id, "story_merged_to_main",
-                    {"branch": story_branch, "pre_sha": pre_sha},
+                    conn,
+                    story_id,
+                    "story_merged_to_main",
+                    {
+                        "branch": story_branch,
+                        "source_branch": story_branch,
+                        "target_branch": main_branch,
+                        "pre_sha": candidate.pre_sha,
+                        "candidate_sha": candidate.candidate_sha,
+                        "target": str(candidate.target_worktree or main_branch),
+                        "test_command": "bash scripts/run_tests.sh",
+                    },
                 )
         except Exception:
             pass
         return "merged"
+    except IntegrationCandidateError as exc:
+        reason = str(exc)
+        _fail(reason)
+        if "merge conflict" in reason:
+            return "conflict"
+        return "verify_failed"
     except Exception:
-        _run(["merge", "--abort"])
-        if pre_sha:
-            _run(["reset", "--hard", pre_sha])
-        _fail("unexpected error during story merge")
+        _fail("unexpected error while building story integration candidate")
         return "verify_failed"
 
 

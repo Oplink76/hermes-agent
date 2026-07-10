@@ -130,6 +130,14 @@ def test_dirty_target_is_preserved_and_not_integrated(
     _product_board(board, repo)
     monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
 
+    calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def spy_run(command, *args, **kwargs):
+        calls.append(list(command))
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", spy_run)
     with kb.connect(board=board) as conn:
         story_id = kb.create_task(
             conn,
@@ -158,6 +166,7 @@ def test_dirty_target_is_preserved_and_not_integrated(
         check=False,
     )
     assert ancestor.returncode == 1
+    assert not any("reset" in command for command in calls)
 
 
 def test_old_completion_cannot_close_next_claim(
