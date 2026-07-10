@@ -119,7 +119,27 @@ class CodexConflictResolver:
         )
 
     def resolve(self, worktree: Path, runner: CommandRunner) -> bool:
-        completed = runner.run(list(self.command), cwd=worktree, timeout=1800)
+        git_common_dir = runner.run(
+            [
+                "git",
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ],
+            cwd=worktree,
+        )
+        common_dir = _output(git_common_dir)
+        common_dir_path = Path(common_dir)
+        if (
+            git_common_dir.returncode != 0
+            or not common_dir
+            or not common_dir_path.is_absolute()
+            or not common_dir_path.is_dir()
+        ):
+            return False
+        command = list(self.command)
+        command[5:5] = ["--add-dir", str(common_dir_path)]
+        completed = runner.run(command, cwd=worktree, timeout=1800)
         return completed.returncode == 0
 
 
