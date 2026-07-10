@@ -853,7 +853,22 @@ def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]
     can do so without mutating ``HERMES_HOME`` in-process.  Defaults to
     the active profile's ``gateway_state.json``.
     """
-    return _read_json_file(path or _get_runtime_status_path())
+    status_path = path or _get_runtime_status_path()
+    payload = _read_json_file(status_path)
+    if payload is None:
+        return None
+    try:
+        from gateway.runtime_identity import read_runtime_identity
+
+        identity = read_runtime_identity(
+            path=status_path.parent / "runtime" / "gateway.json"
+        )
+    except Exception:
+        identity = None
+    if identity is not None:
+        payload = dict(payload)
+        payload["runtime_identity"] = identity.to_dict()
+    return payload
 
 
 def parse_active_agents(raw: Any) -> int:

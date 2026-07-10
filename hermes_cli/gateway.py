@@ -5236,6 +5236,18 @@ def _runtime_health_lines() -> list[str]:
     active_agents = state.get("active_agents")
     restart_requested = state.get("restart_requested")
     platforms = state.get("platforms", {}) or {}
+    runtime_identity = state.get("runtime_identity")
+
+    if isinstance(runtime_identity, dict):
+        source_sha = str(runtime_identity.get("source_sha") or "unknown")[:12]
+        lines.append(
+            "Runtime: "
+            f"profile={runtime_identity.get('profile') or 'unknown'} "
+            f"pid={runtime_identity.get('pid') or 'unknown'} "
+            f"sha={source_sha} "
+            f"python={runtime_identity.get('python_version') or 'unknown'} "
+            f"executable={runtime_identity.get('executable') or 'unknown'}"
+        )
 
     for platform, pdata in platforms.items():
         if pdata.get("state") == "fatal":

@@ -48,6 +48,12 @@ class TestIgnoreUserConfigEnvGate:
     """
 
     def _write_user_config(self, tmp_path, model_default):
+        # NOTE: the model value is a sentinel that can never appear in a real
+        # config. With HERMES_IGNORE_USER_CONFIG=1, load_cli_config() falls
+        # back to the repo-root ``cli-config.yaml`` (untracked, gitignored) —
+        # on a dev machine that file can legitimately set the same popular
+        # model this test previously used ("anthropic/claude-sonnet-4.6"),
+        # making the != assertion flip locally while passing on CI.
         config_yaml = textwrap.dedent(
             f"""
             model:
@@ -66,7 +72,7 @@ class TestIgnoreUserConfigEnvGate:
         return cli.load_cli_config
 
     def test_user_config_loaded_when_flag_unset(self, tmp_path, monkeypatch):
-        user_model = "user-config/sentinel-model-do-not-leak"
+        user_model = "test-vendor/ignore-user-config-sentinel"
         self._write_user_config(tmp_path, user_model)
         load_cli_config = self._reload_cli(monkeypatch, tmp_path)
 
@@ -82,7 +88,7 @@ class TestIgnoreUserConfigEnvGate:
         The built-in default ``model.default`` is empty string (no user override),
         and the user's ``agent.system_prompt`` is not seen.
         """
-        user_model = "user-config/sentinel-model-do-not-leak"
+        user_model = "test-vendor/ignore-user-config-sentinel"
         self._write_user_config(tmp_path, user_model)
         monkeypatch.setenv("HERMES_IGNORE_USER_CONFIG", "1")
 
@@ -99,7 +105,7 @@ class TestIgnoreUserConfigEnvGate:
 
     def test_flag_ignored_when_set_to_other_value(self, tmp_path, monkeypatch):
         """Only the literal value "1" activates the bypass, matching the yolo pattern."""
-        user_model = "user-config/sentinel-model-do-not-leak"
+        user_model = "test-vendor/ignore-user-config-sentinel"
         self._write_user_config(tmp_path, user_model)
         monkeypatch.setenv("HERMES_IGNORE_USER_CONFIG", "true")  # not "1"
 

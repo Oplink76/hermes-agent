@@ -388,6 +388,52 @@ def _check_gateway_service_linger(issues: list[str]) -> None:
         check_warn("Could not verify systemd linger", f"({linger_detail})")
 
 
+def _check_gateway_runtime_identity(issues: list[str]) -> None:
+    """Show the source and interpreter identity of the live gateway."""
+    try:
+        from gateway.status import get_running_pid, read_runtime_status
+
+        live_pid = get_running_pid(cleanup_stale=False)
+    except Exception:
+        return
+    if live_pid is None:
+        return
+
+    _section("Gateway Runtime Identity")
+    try:
+        state = read_runtime_status() or {}
+    except Exception:
+        state = {}
+    identity = state.get("runtime_identity")
+    if not isinstance(identity, dict):
+        check_warn(
+            "Live gateway has no runtime identity",
+            "(restart it after installing this recovery change)",
+        )
+        issues.append("Restart the gateway so it publishes runtime identity")
+        return
+
+    try:
+        identity_pid = int(identity.get("pid"))
+    except (TypeError, ValueError):
+        identity_pid = None
+    if identity_pid != live_pid:
+        check_warn(
+            "Runtime identity PID does not match the live gateway",
+            f"(manifest={identity_pid!r}, live={live_pid})",
+        )
+        issues.append("Reconcile the gateway service and its runtime identity")
+        return
+
+    check_ok(f"Runtime identity matches live PID {live_pid}")
+    source_sha = str(identity.get("source_sha") or "unknown")[:12]
+    check_info(
+        f"profile={identity.get('profile') or 'unknown'} "
+        f"sha={source_sha} python={identity.get('python_version') or 'unknown'}"
+    )
+    check_info(f"executable={identity.get('executable') or 'unknown'}")
+
+
 _APIKEY_PROVIDERS_CACHE: list | None = None
 
 
@@ -1344,6 +1390,7 @@ def run_doctor(args):
         except Exception:
             pass
 
+    _check_gateway_runtime_identity(issues)
     _check_gateway_service_linger(issues)
     _check_s6_supervision(issues)
 
