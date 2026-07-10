@@ -614,6 +614,19 @@ def _handle_complete(args: dict, **kw) -> str:
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
+    for field in ("workflow_outcome", "resolver_action"):
+        value = args.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            return tool_error(f"{field} must be an object/dict")
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            return tool_error(
+                f"metadata must be an object/dict, got {type(metadata).__name__}"
+            )
+        metadata[field] = value
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
     if result:
@@ -1418,6 +1431,37 @@ KANBAN_COMPLETE_SCHEMA = {
                     "must differ from writer. Include branch/worktree/commit "
                     "when available."
                 ),
+            },
+            "workflow_outcome": {
+                "type": "object",
+                "description": (
+                    "Structured product test/review outcome. Rejections require "
+                    "verdict, target_step, and non-empty findings."
+                ),
+                "properties": {
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["passed", "approved", "changes_requested", "architecture_invalid"],
+                    },
+                    "target_step": {
+                        "type": "string",
+                        "enum": ["architecture", "development"],
+                    },
+                    "findings": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+            "resolver_action": {
+                "type": "object",
+                "description": "Required when resolving a product human-input preflight.",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["resume", "create_fix_task", "escalate"],
+                    },
+                    "resolution": {"type": "string"},
+                    "fix_task_id": {"type": ["string", "null"]},
+                },
+                "required": ["action", "resolution"],
             },
             "result": {
                 "type": "string",

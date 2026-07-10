@@ -342,6 +342,54 @@ def test_complete_metadata_round_trips_through_show(worker_env):
     assert shown["runs"][-1]["metadata"] == handoff
 
 
+def test_complete_structured_workflow_fields_merge_into_metadata(worker_env):
+    from tools import kanban_tools as kt
+
+    workflow_outcome = {
+        "verdict": "changes_requested",
+        "target_step": "development",
+        "findings": ["Fix cleanup"],
+    }
+    resolver_action = {
+        "action": "resume",
+        "resolution": "Use the configured fixture",
+        "fix_task_id": None,
+    }
+    out = kt._handle_complete(
+        {
+            "summary": "structured fields",
+            "metadata": {"existing": True},
+            "workflow_outcome": workflow_outcome,
+            "resolver_action": resolver_action,
+        }
+    )
+    assert json.loads(out)["ok"] is True
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, worker_env)
+    assert run.metadata["existing"] is True
+    assert run.metadata["workflow_outcome"] == workflow_outcome
+    assert run.metadata["resolver_action"] == resolver_action
+
+
+def test_complete_schema_declares_structured_product_fields():
+    from tools import kanban_tools as kt
+
+    props = kt.KANBAN_COMPLETE_SCHEMA["parameters"]["properties"]
+    assert set(props["workflow_outcome"]["properties"]["verdict"]["enum"]) == {
+        "passed",
+        "approved",
+        "changes_requested",
+        "architecture_invalid",
+    }
+    assert props["resolver_action"]["properties"]["action"]["enum"] == [
+        "resume",
+        "create_fix_task",
+        "escalate",
+    ]
+
+
 def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
     from tools import kanban_tools as kt
 
@@ -1606,7 +1654,8 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     profile discovery) when the standalone kanban-worker / kanban-orchestrator
     skills were removed and folded into this always-injected guidance, so the
     ceiling is sized to fit that content with a little headroom. It was bumped
-    again to fit the commit-first handoff contract note (step 5): on
+    again to fit the commit-first handoff contract and the structured
+    rework/resolver action vocabulary (step 5): on
     product/handoff boards `kanban_complete` commits the worker's diff for
     them, so the guidance must say so explicitly.
     """
@@ -1618,7 +1667,7 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 5_800, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 6_300, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 

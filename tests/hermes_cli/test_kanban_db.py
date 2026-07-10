@@ -220,12 +220,13 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_events_run" in indexes
 
 
-def test_fresh_db_has_running_and_blocked_columns(kanban_home):
-    """New handoff_v2 state-model flags exist on brand-new DBs (T1.1)."""
+def test_fresh_db_has_running_blocked_and_rework_columns(kanban_home):
+    """New state-model and bounded-rework columns exist on fresh DBs."""
     with kb.connect() as conn:
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     assert "running" in cols
     assert "blocked" in cols
+    assert "rework_count" in cols
 
 
 def test_legacy_db_gains_running_and_blocked_columns_without_data_loss(tmp_path):
@@ -268,7 +269,7 @@ def test_legacy_db_gains_running_and_blocked_columns_without_data_loss(tmp_path)
     with kb.connect(db_path) as migrated:
         cols = {row["name"] for row in migrated.execute("PRAGMA table_info(tasks)")}
         row = migrated.execute(
-            "SELECT title, status, created_at, running, blocked FROM tasks "
+            "SELECT title, status, created_at, running, blocked, rework_count FROM tasks "
             "WHERE id = 'legacy'"
         ).fetchone()
 
@@ -281,6 +282,7 @@ def test_legacy_db_gains_running_and_blocked_columns_without_data_loss(tmp_path)
     # New columns default to 0 on the pre-existing row.
     assert row["running"] == 0
     assert row["blocked"] == 0
+    assert row["rework_count"] == 0
 
     # Idempotent: connecting again does not error or duplicate columns.
     with kb.connect(db_path) as migrated_again:
@@ -289,6 +291,7 @@ def test_legacy_db_gains_running_and_blocked_columns_without_data_loss(tmp_path)
         ]
     assert cols_again.count("running") == 1
     assert cols_again.count("blocked") == 1
+    assert cols_again.count("rework_count") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +427,280 @@ def test_create_task_rejects_unknown_project(kanban_home):
     with kb.connect() as conn:
         with pytest.raises(ValueError, match="unknown project"):
             kb.create_task(conn, title="Lost governance", project_id="missing-project")
+
+
+@pytest.mark.parametrize(
+    ("step", "verdict", "target"),
+    [
+        ("test", "changes_requested", "development"),
+        ("review", "changes_requested", "development"),
+        ("review", "architecture_invalid", "architecture"),
+    ],
+)
+def test_product_rejection_routes_backward(
+    kanban_home, step, verdict, target
+):
+    board = f"rework-{step}-{target}"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: rework",
+            assignee="tester" if step == "test" else "reviewer",
+            workflow_template_id="product",
+            current_step_key=step,
+            board=board,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Needs revision",
+            metadata={
+                "workflow_outcome": {
+                    "verdict": verdict,
+                    "target_step": target,
+                    "findings": ["Concrete finding"],
+                }
+            },
+            expected_run_id=claimed.current_run_id,
+            board=board,
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert task is not None
+    assert task.current_step_key == target
+    assert task.rework_count == 1
+    assert any(event.kind == "rework_requested" for event in events)
+
+
+def test_product_rejection_requires_findings(kanban_home):
+    board = "rework-findings"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: rework",
+            assignee="tester",
+            workflow_template_id="product",
+            current_step_key="test",
+            board=board,
+        )
+        claimed = kb.claim_task(conn, tid)
+        with pytest.raises(ValueError, match="findings"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Needs revision",
+                metadata={
+                    "workflow_outcome": {
+                        "verdict": "changes_requested",
+                        "target_step": "development",
+                        "findings": [],
+                    }
+                },
+                expected_run_id=claimed.current_run_id,
+                board=board,
+            )
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.current_step_key == "test"
+
+
+def test_fourth_product_rejection_routes_to_human_block(kanban_home):
+    board = "rework-limit"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: bounded rework",
+            assignee="reviewer",
+            workflow_template_id="product",
+            current_step_key="review",
+            board=board,
+        )
+        conn.execute("UPDATE tasks SET rework_count=3 WHERE id=?", (tid,))
+        conn.commit()
+        claimed = kb.claim_task(conn, tid)
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Fourth rejection",
+            metadata={
+                "workflow_outcome": {
+                    "verdict": "changes_requested",
+                    "target_step": "development",
+                    "findings": ["Still unsafe"],
+                }
+            },
+            expected_run_id=claimed.current_run_id,
+            board=board,
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.blocked is True
+    assert task.rework_count == 4
+
+
+def _route_task_to_resolver(conn, board: str) -> tuple[str, int]:
+    tid = kb.create_task(
+        conn,
+        title="Story: resolver",
+        assignee="developer",
+        workflow_template_id="product",
+        current_step_key="development",
+        board=board,
+    )
+    first = kb.claim_task(conn, tid)
+    assert first is not None and first.current_run_id is not None
+    assert kb.block_task(
+        conn,
+        tid,
+        reason="Need a decision",
+        kind="needs_input",
+        attempted_resolutions=["read docs"],
+        expected_run_id=first.current_run_id,
+        board=board,
+    )
+    resolver = kb.claim_task(conn, tid)
+    assert resolver is not None and resolver.current_run_id is not None
+    return tid, resolver.current_run_id
+
+
+def test_product_preflight_requires_structured_resolver_action(kanban_home):
+    board = "resolver-required"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        context = kb.build_worker_context(conn, tid)
+        assert "## Required resolver action" in context
+        assert "Original blocker:" in context
+        assert "Attempted resolutions:" in context
+        assert "Board policy:" in context
+        assert "resume, create_fix_task, or escalate" in context
+        with pytest.raises(ValueError, match="resolver_action"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="I think it is fine",
+                expected_run_id=run_id,
+                board=board,
+            )
+
+
+def test_product_preflight_resume_restores_original_step(kanban_home):
+    board = "resolver-resume"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Resolved",
+            metadata={
+                "resolver_action": {
+                    "action": "resume",
+                    "resolution": "Use the configured test token source",
+                    "fix_task_id": None,
+                }
+            },
+            expected_run_id=run_id,
+            board=board,
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.current_step_key == "development"
+    assert task.assignee == "developer"
+    assert task.status == "ready"
+
+
+def test_product_preflight_create_fix_task_waits_on_real_child(kanban_home):
+    board = "resolver-fix"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        fix_id = kb.create_task(
+            conn,
+            title="Fix dependency",
+            assignee="developer",
+            created_by="default",
+            board=board,
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Created a concrete fix",
+            metadata={
+                "resolver_action": {
+                    "action": "create_fix_task",
+                    "resolution": "Dependency needs a dedicated fix",
+                    "fix_task_id": fix_id,
+                }
+            },
+            expected_run_id=run_id,
+            board=board,
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.status == "todo"
+
+
+def test_product_preflight_stale_fix_action_does_not_link_child(kanban_home):
+    board = "resolver-fix-stale"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        fix_id = kb.create_task(
+            conn,
+            title="Fix dependency",
+            assignee="developer",
+            created_by="default",
+            board=board,
+        )
+        assert not kb.complete_task(
+            conn,
+            tid,
+            summary="Stale resolver action",
+            metadata={
+                "resolver_action": {
+                    "action": "create_fix_task",
+                    "resolution": "Dependency needs a dedicated fix",
+                    "fix_task_id": fix_id,
+                }
+            },
+            expected_run_id=run_id + 1,
+            board=board,
+        )
+        link = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+            (fix_id, tid),
+        ).fetchone()
+        task = kb.get_task(conn, tid)
+    assert link is None
+    assert task is not None and task.status == "running"
+
+
+def test_product_preflight_escalate_enters_human_block(kanban_home):
+    board = "resolver-escalate"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Cannot resolve safely",
+            metadata={
+                "resolver_action": {
+                    "action": "escalate",
+                    "resolution": "Docs and local config are insufficient",
+                    "fix_task_id": None,
+                }
+            },
+            expected_run_id=run_id,
+            board=board,
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.status == "blocked" and task.blocked is True
 
 
 def test_story_title_infers_product_without_role_on_product_board(kanban_home):
@@ -4195,6 +4472,8 @@ def test_complete_task_v2_with_unresolved_preflight_resumes_instead_of_handoff(
         blocked_card = _card_snapshot(conn, tid)
         assert blocked_card["assignee"] == "default"
         assert blocked_card["current_step_key"] == "development"
+        resolver_run = kb.claim_task(conn, tid)
+        assert resolver_run is not None and resolver_run.current_run_id is not None
 
         # A stray uncommitted diff is present in the worktree -- if the
         # buggy v2 branch fired here, it would wrongly commit it and
@@ -4205,6 +4484,14 @@ def test_complete_task_v2_with_unresolved_preflight_resumes_instead_of_handoff(
             conn,
             tid,
             summary="Found internal test token path",
+            metadata={
+                "resolver_action": {
+                    "action": "resume",
+                    "resolution": "Found internal test token path",
+                    "fix_task_id": None,
+                }
+            },
+            expected_run_id=resolver_run.current_run_id,
             board=board,
         )
 
@@ -5512,10 +5799,20 @@ def test_product_preflight_resolution_returns_card_to_original_assignee(kanban_h
             board="prod",
             human_escalation_assignee="default",
         )
+        resolver_run = kb.claim_task(conn, tid)
+        assert resolver_run is not None and resolver_run.current_run_id is not None
         assert kb.complete_task(
             conn,
             tid,
             summary="Found internal test token path",
+            metadata={
+                "resolver_action": {
+                    "action": "resume",
+                    "resolution": "Found internal test token path",
+                    "fix_task_id": None,
+                }
+            },
+            expected_run_id=resolver_run.current_run_id,
             board="prod",
         )
         task = kb.get_task(conn, tid)
