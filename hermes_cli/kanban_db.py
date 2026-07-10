@@ -3981,7 +3981,7 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
-    if conn.in_transaction:
+    if getattr(conn, "in_transaction", False):
         savepoint = f"kanban_nested_{secrets.token_hex(8)}"
         conn.execute(f"SAVEPOINT {savepoint}")
         try:
