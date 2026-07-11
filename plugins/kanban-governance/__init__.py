@@ -983,7 +983,13 @@ def _on_pre_tool_call(
         None,
     )
     if governance is None:
-        return None
+        if normalized != "execute_code":
+            return None
+        # Opaque code can address any absolute path regardless of the
+        # session cwd, so cwd-based project resolution cannot prove that a
+        # governed project is untouched. Require an exact one-shot approval
+        # globally whenever this governance hook is enabled.
+        governance = {"project_id": "global:execute-code"}
 
     override = _new_override(normalized, call_args, governance)
     return {

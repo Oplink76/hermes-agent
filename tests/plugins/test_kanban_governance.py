@@ -883,6 +883,32 @@ def test_human_execute_code_uses_exact_one_shot_approval(governed_workspace):
     assert override["operation_hash"] == mod._operation_hash("execute_code", args)
 
 
+def test_human_execute_code_outside_governed_cwd_still_requires_one_shot(
+    governed_workspace,
+):
+    from tools.terminal_tool import clear_task_env_overrides, register_task_env_overrides
+
+    mod = _load_plugin()
+    session_task_id = "governance-execute-code-outside"
+    target = governed_workspace["repo"] / "must-not-run.txt"
+    args = {"code": f"from pathlib import Path; Path({str(target)!r}).write_text('x')"}
+    register_task_env_overrides(
+        session_task_id, {"cwd": str(governed_workspace["outside"])}
+    )
+    try:
+        decision = mod._on_pre_tool_call(
+            "execute_code", args, task_id=session_task_id
+        )
+    finally:
+        clear_task_env_overrides(session_task_id)
+
+    assert decision is not None and decision["action"] == "approve"
+    assert decision["one_shot_override"]["operation_hash"] == mod._operation_hash(
+        "execute_code", args
+    )
+    assert not target.exists()
+
+
 def test_valid_worker_write_in_its_workspace_and_branch_is_allowed(
     governed_workspace, monkeypatch
 ):
