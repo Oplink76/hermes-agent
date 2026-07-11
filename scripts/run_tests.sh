@@ -41,8 +41,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV=""
 for candidate in \
   "$REPO_ROOT/.venv" \
-  "$HOME/.hermes/hermes-agent/.venv" \
   "$REPO_ROOT/venv" \
+  "$HOME/.hermes/hermes-agent/.venv" \
   "$HOME/.hermes/hermes-agent/venv"; do
   if [ -f "$candidate/bin/activate" ]; then
     VENV="$candidate"

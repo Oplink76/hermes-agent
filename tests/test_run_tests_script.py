@@ -42,3 +42,30 @@ def test_linked_worktree_prefers_authoritative_home_dotvenv(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "AUTHORITATIVE_DOTVENV" in result.stdout
     assert "LEGACY_VENV" not in result.stdout
+
+
+def test_checkout_legacy_venv_precedes_installed_home_dotvenv(tmp_path):
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    source = Path(__file__).resolve().parents[1] / "scripts" / "run_tests.sh"
+    shutil.copy2(source, scripts / "run_tests.sh")
+    _fake_venv(repo / "venv", "CHECKOUT_LEGACY_VENV")
+
+    home = tmp_path / "home"
+    install = home / ".hermes" / "hermes-agent"
+    _fake_venv(install / ".venv", "INSTALLED_DOTVENV")
+
+    env = {"HOME": str(home), "PATH": os.environ["PATH"]}
+    result = subprocess.run(
+        ["bash", str(scripts / "run_tests.sh")],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "CHECKOUT_LEGACY_VENV" in result.stdout
+    assert "INSTALLED_DOTVENV" not in result.stdout

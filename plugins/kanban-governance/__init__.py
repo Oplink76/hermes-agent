@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -78,6 +79,16 @@ _GIT_EXECUTION_ENV = {
     "GIT_EXTERNAL_DIFF",
     "GIT_PAGER",
     "PAGER",
+}
+_COMMAND_EXECUTION_ENV = _GIT_EXECUTION_ENV | {
+    "BASH_ENV",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "ENV",
+    "GIT_EXEC_PATH",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "PATH",
 }
 
 
@@ -241,8 +252,40 @@ def _git_has_execution_config(argv: list[str]) -> bool:
     return False
 
 
+def _git_has_execution_option(argv: list[str]) -> bool:
+    index = 1
+    while index < len(argv):
+        word = argv[index]
+        option = word.split("=", 1)[0]
+        if not word.startswith("-"):
+            break
+        if option in {"-p", "--paginate", "--exec-path"}:
+            return True
+        index += 1
+        if option in _GIT_OPTIONS_WITH_VALUE and "=" not in word:
+            index += 1
+
+    subcommand, subargs = _git_subcommand(argv)
+    for arg in subargs:
+        option = arg.split("=", 1)[0]
+        if option in {
+            "--ext-diff",
+            "--filters",
+            "--show-signature",
+            "--textconv",
+        }:
+            return True
+        if subcommand == "grep" and (
+            option == "--open-files-in-pager"
+            or arg == "-O"
+            or (arg.startswith("-O") and len(arg) > 2)
+        ):
+            return True
+    return False
+
+
 def _git_is_read_only(argv: list[str]) -> bool:
-    if _git_has_execution_config(argv):
+    if _git_has_execution_config(argv) or _git_has_execution_option(argv):
         return False
     subcommand, subargs = _git_subcommand(argv)
     if subcommand == "branch":
@@ -262,7 +305,7 @@ def _git_is_read_only(argv: list[str]) -> bool:
 
 
 def _git_is_privileged(argv: list[str]) -> bool:
-    if _git_has_execution_config(argv):
+    if _git_has_execution_config(argv) or _git_has_execution_option(argv):
         return True
     known = _READ_ONLY_GIT | {
         "add", "am", "apply", "branch", "checkout", "cherry-pick", "clean",
@@ -270,6 +313,10 @@ def _git_is_privileged(argv: list[str]) -> bool:
         "revert", "rm", "stash", "switch", "tag", "update-ref", "push",
     }
     subcommand, subargs = _git_subcommand(argv)
+    if subcommand == "apply" and any(
+        arg.split("=", 1)[0] == "--unsafe-paths" for arg in subargs
+    ):
+        return True
     if subcommand == "diff" and any(
         arg in {"--ext-diff", "--textconv"} for arg in subargs
     ):
@@ -316,7 +363,7 @@ def _diff_is_read_only(args: list[str]) -> bool:
     )
 
 
-def _is_read_only_terminal(command: str) -> bool:
+def _is_read_only_terminal(command: str, workdir: Path) -> bool:
     if not str(command or "").strip():
         return True
     if shell_command_has_redirection(command):
@@ -325,21 +372,23 @@ def _is_read_only_terminal(command: str) -> bool:
     if not commands:
         return False
     prefix_environment = shell_command_prefix_environment(command)
-    if prefix_environment & _GIT_EXECUTION_ENV and any(
-        os.path.basename(argv[0]).lower() == "git" for argv in commands
-    ):
+    if prefix_environment & _COMMAND_EXECUTION_ENV:
         return False
     for argv in commands:
         policy = _command_policy(argv)
         if policy is None or policy.read_only is None:
+            return False
+        if not _policy_executable_is_trusted(argv, workdir):
             return False
         if not policy.read_only(argv):
             return False
     return True
 
 
-def _is_privileged_worker_command(command: str) -> bool:
+def _is_privileged_worker_command(command: str, workspace: Path) -> bool:
     prefix_environment = shell_command_prefix_environment(command)
+    if prefix_environment & _COMMAND_EXECUTION_ENV:
+        return True
     for argv in shell_command_argvs(command):
         executable = os.path.basename(argv[0]).lower()
         if (
@@ -366,6 +415,10 @@ def _is_privileged_worker_command(command: str) -> bool:
         ):
             return True
         policy = _command_policy(argv)
+        if policy is not None and not _policy_executable_is_trusted(
+            argv, workspace
+        ):
+            return True
         if policy and policy.privileged and policy.privileged(argv):
             return True
         if executable == "git" and prefix_environment & _GIT_EXECUTION_ENV:
@@ -528,6 +581,8 @@ def _git_targets(argv: list[str]) -> tuple[list[str], bool]:
     subcommand, subargs = _git_subcommand(argv)
     if subcommand == "diff":
         targets.extend(_option_paths(subargs, "--output"))
+    elif subcommand == "apply":
+        targets.extend(_option_paths(subargs, "--directory"))
     return targets, False
 
 
@@ -606,10 +661,31 @@ _TRUSTED_TEST_WRAPPER_POLICY = _CommandPolicy(
 
 
 def _command_policy(argv: list[str]) -> Optional[_CommandPolicy]:
-    executable = os.path.basename(argv[0]).lower()
+    raw_executable = argv[0]
+    executable = os.path.basename(raw_executable).lower()
     if executable == "run_tests.sh":
         return _TRUSTED_TEST_WRAPPER_POLICY
+    if "/" in raw_executable or "\\" in raw_executable:
+        return None
     return _COMMAND_POLICIES.get(executable)
+
+
+def _policy_executable_is_trusted(argv: list[str], workspace: Path) -> bool:
+    raw_executable = argv[0]
+    if os.path.basename(raw_executable).lower() == "run_tests.sh":
+        return True
+    if "/" in raw_executable or "\\" in raw_executable:
+        return False
+    resolved = shutil.which(raw_executable)
+    if not resolved:
+        return False
+    lexical = Path(os.path.abspath(resolved))
+    actual = lexical.resolve(strict=False)
+    return (
+        not _path_is_within(lexical, workspace)
+        and not _path_is_within(actual, workspace)
+        and actual.is_file()
+    )
 
 
 def _terminal_targets(
@@ -622,6 +698,9 @@ def _terminal_targets(
     for argv in shell_command_argvs(command):
         policy = _command_policy(argv)
         if policy is None:
+            ambiguous = True
+            continue
+        if not _policy_executable_is_trusted(argv, workdir):
             ambiguous = True
             continue
         if policy.targets is not None:
@@ -783,10 +862,6 @@ def _validate_worker(
     args: dict[str, Any],
     ambiguous_targets: bool,
 ) -> Optional[dict[str, str]]:
-    if tool_name == "terminal" and _is_privileged_worker_command(
-        str(args.get("command") or "")
-    ):
-        return _block("workers may not push, create branches, force-update refs, reset, or deploy")
     if ambiguous_targets:
         return _block("worker mutation targets could not be verified")
     try:
@@ -794,6 +869,13 @@ def _validate_worker(
         workspace = _resolved_path(task.workspace_path)
     except Exception as exc:
         return _block(f"worker ownership could not be verified: {exc}")
+    if tool_name == "terminal" and _is_privileged_worker_command(
+        str(args.get("command") or ""), workspace
+    ):
+        return _block(
+            "workers may not push, create branches, force-update refs, reset, "
+            "deploy, or execute untrusted command paths"
+        )
     if tool_name == "terminal":
         wrapper_error = _trusted_test_wrapper_error(
             str(args.get("command") or ""), workspace
@@ -831,14 +913,20 @@ def _on_pre_tool_call(
 ) -> Optional[dict[str, Any]]:
     normalized = _normalize_tool_name(tool_name)
     call_args = args if isinstance(args, dict) else {}
+    worker_task_id = str(os.getenv("HERMES_KANBAN_TASK") or "").strip()
+    task_context = str(task_id or session_id or "default")
     if normalized == "terminal":
-        if _is_read_only_terminal(str(call_args.get("command") or "")):
+        try:
+            workdir = _terminal_workdir(call_args, task_context)
+        except Exception as exc:
+            return _block(f"mutation target could not be resolved: {exc}")
+        if _is_read_only_terminal(
+            str(call_args.get("command") or ""), workdir
+        ):
             return None
     elif normalized not in _FILE_MUTATORS:
         return None
 
-    worker_task_id = str(os.getenv("HERMES_KANBAN_TASK") or "").strip()
-    task_context = str(task_id or session_id or "default")
     try:
         targets, ambiguous_targets = _effective_targets(
             normalized, call_args, task_context

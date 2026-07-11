@@ -170,6 +170,172 @@ def test_git_external_diff_cannot_create_outside_file_through_worker_gate(
     assert not marker.exists()
 
 
+@pytest.mark.parametrize("command", ["./git status", "./cat README.md"])
+def test_worker_repo_controlled_allowlisted_executable_is_blocked(
+    governed_workspace, monkeypatch, command
+):
+    mod = _load_plugin()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal",
+        {"command": command, "workdir": str(governed_workspace["repo"])},
+    )
+
+    assert decision is not None and decision["action"] == "block"
+
+
+def test_worker_path_spoof_cannot_execute_repo_controlled_git(
+    governed_workspace, monkeypatch
+):
+    """Exercise shell executable resolution, not only the argv classifier."""
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    marker = governed_workspace["outside"] / "spoofed-git-ran"
+    fake_git = repo / "git"
+    fake_git.write_text(
+        f"#!/bin/sh\ntouch {str(marker)!r}\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+    command = "PATH=.:$PATH git status"
+
+    decision = mod._on_pre_tool_call(
+        "terminal", {"command": command, "workdir": str(repo)}
+    )
+    if decision is None:
+        subprocess.run(command, cwd=repo, shell=True, check=False)
+
+    assert decision is not None and decision["action"] == "block"
+    assert not marker.exists()
+
+
+def test_worker_ambient_path_spoof_cannot_execute_repo_controlled_git(
+    governed_workspace, monkeypatch
+):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    marker = governed_workspace["outside"] / "ambient-path-git-ran"
+    fake_git = repo / "git"
+    fake_git.write_text(
+        f"#!/bin/sh\ntouch {str(marker)!r}\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+    monkeypatch.setenv("PATH", f"{repo}{os.pathsep}{os.environ['PATH']}")
+    command = "git status"
+
+    decision = mod._on_pre_tool_call(
+        "terminal", {"command": command, "workdir": str(repo)}
+    )
+    if decision is None:
+        subprocess.run(command, cwd=repo, shell=True, check=False)
+
+    assert decision is not None and decision["action"] == "block"
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git grep --open-files-in-pager='touch outside' governed",
+        "git grep -O'touch outside' governed",
+        "git grep --textconv governed",
+        "git cat-file --filters HEAD:README.md",
+        "git show --ext-diff HEAD",
+        "git log --ext-diff -p -1",
+        "git log --show-signature -1",
+        "git --paginate status",
+        "git --exec-path=./bin status",
+    ],
+)
+def test_worker_git_execution_options_fail_closed(
+    governed_workspace, monkeypatch, command
+):
+    mod = _load_plugin()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal",
+        {"command": command, "workdir": str(governed_workspace["repo"])},
+    )
+
+    assert decision is not None and decision["action"] == "block"
+
+
+def test_git_grep_pager_cannot_create_outside_file_through_worker_gate(
+    governed_workspace, monkeypatch
+):
+    """Exercise Git's real pager execution path against a temporary repo."""
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    marker = governed_workspace["outside"] / "git-grep-pager-ran"
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+    command = f"git grep --open-files-in-pager='touch {marker}' governed"
+
+    decision = mod._on_pre_tool_call(
+        "terminal", {"command": command, "workdir": str(repo)}
+    )
+    if decision is None:
+        subprocess.run(command, cwd=repo, shell=True, check=False)
+
+    assert decision is not None and decision["action"] == "block"
+    assert not marker.exists()
+
+
+def test_git_apply_unsafe_paths_cannot_create_outside_file(
+    governed_workspace, monkeypatch
+):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    marker = governed_workspace["outside"] / "unsafe-apply-ran"
+    patch_file = repo / "unsafe.patch"
+    patch_file.write_text(
+        "diff --git a/../outside/unsafe-apply-ran b/../outside/unsafe-apply-ran\n"
+        "new file mode 100644\n"
+        "index 0000000..7898192\n"
+        "--- /dev/null\n"
+        "+++ b/../outside/unsafe-apply-ran\n"
+        "@@ -0,0 +1 @@\n"
+        "+outside\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+    command = "git apply --unsafe-paths unsafe.patch"
+
+    decision = mod._on_pre_tool_call(
+        "terminal", {"command": command, "workdir": str(repo)}
+    )
+    if decision is None:
+        subprocess.run(command, cwd=repo, shell=True, check=False)
+
+    assert decision is not None and decision["action"] == "block"
+    assert not marker.exists()
+
+
+def test_worker_git_apply_directory_outside_workspace_is_blocked(
+    governed_workspace, monkeypatch
+):
+    mod = _load_plugin()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal",
+        {
+            "command": (
+                "git apply --directory="
+                f"{governed_workspace['outside']} change.patch"
+            ),
+            "workdir": str(governed_workspace["repo"]),
+        },
+    )
+
+    assert decision is not None and decision["action"] == "block"
+    assert "workspace" in decision["message"].lower()
+
+
 @pytest.mark.parametrize(
     "command",
     [
