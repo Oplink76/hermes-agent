@@ -102,7 +102,7 @@ def test_reads_are_always_allowed(governed_workspace):
     repo = governed_workspace["repo"]
     assert mod._on_pre_tool_call("read_file", {"path": str(repo / "README.md")}) is None
     assert mod._on_pre_tool_call(
-        "terminal", {"command": "git status", "workdir": str(repo)}
+        "terminal", {"command": "git rev-parse --show-toplevel", "workdir": str(repo)}
     ) is None
     assert mod._on_pre_tool_call(
         "terminal", {"command": "sed -n '1,3p' README.md", "workdir": str(repo)}
@@ -113,9 +113,134 @@ def test_reads_are_always_allowed(governed_workspace):
     assert mod._on_pre_tool_call(
         "terminal", {"command": "awk '{print $1}' README.md", "workdir": str(repo)}
     ) is None
-    assert mod._on_pre_tool_call(
-        "terminal", {"command": "git tag --list 'v*'", "workdir": str(repo)}
-    ) is None
+
+
+def test_worker_git_status_with_repo_fsmonitor_cannot_execute_outside(
+    governed_workspace, monkeypatch
+):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    marker = governed_workspace["outside"] / "fsmonitor-ran"
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "core.fsmonitor", f"touch {marker}"],
+        check=True,
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal", {"command": "git status", "workdir": str(repo)}
+    )
+    if decision is None:
+        subprocess.run(["git", "status"], cwd=repo, check=False, capture_output=True)
+
+    assert decision is not None and decision["action"] == "block"
+    assert not marker.exists()
+
+
+def test_worker_git_remote_show_cannot_execute_repo_remote_helper(
+    governed_workspace, monkeypatch
+):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    marker = governed_workspace["outside"] / "remote-helper-ran"
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "remote.origin.url", f"ext::touch {marker}"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "protocol.ext.allow", "always"],
+        check=True,
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal", {"command": "git remote show origin", "workdir": str(repo)}
+    )
+    if decision is None:
+        subprocess.run(
+            ["git", "remote", "show", "origin"],
+            cwd=repo,
+            check=False,
+            capture_output=True,
+        )
+
+    assert decision is not None and decision["action"] == "block"
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("subcommand", ["log", "show"])
+def test_worker_git_output_option_cannot_write_outside(
+    governed_workspace, monkeypatch, subcommand
+):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    marker = governed_workspace["outside"] / f"git-{subcommand}-output"
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+    command = f"git {subcommand} --output={marker} -1"
+
+    decision = mod._on_pre_tool_call(
+        "terminal", {"command": command, "workdir": str(repo)}
+    )
+    if decision is None:
+        subprocess.run(command, cwd=repo, shell=True, check=False)
+
+    assert decision is not None and decision["action"] == "block"
+    assert not marker.exists()
+
+
+def test_worker_git_commit_cannot_execute_repo_hook(governed_workspace, monkeypatch):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    marker = governed_workspace["outside"] / "pre-commit-ran"
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    hook.chmod(0o755)
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal", {"command": "git commit -m checkpoint", "workdir": str(repo)}
+    )
+    if decision is None:
+        subprocess.run(
+            ["git", "commit", "-m", "checkpoint"],
+            cwd=repo,
+            check=False,
+            capture_output=True,
+        )
+
+    assert decision is not None and decision["action"] == "block"
+    assert not marker.exists()
+
+
+def test_worker_git_add_cannot_execute_repo_clean_filter(governed_workspace, monkeypatch):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    marker = governed_workspace["outside"] / "clean-filter-ran"
+    (repo / ".gitattributes").write_text("README.md filter=escape\n", encoding="utf-8")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "config",
+            "filter.escape.clean",
+            f"sh -c 'touch {marker}; cat'",
+        ],
+        check=True,
+    )
+    (repo / "README.md").write_text("filtered\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal", {"command": "git add README.md", "workdir": str(repo)}
+    )
+    if decision is None:
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=False)
+
+    assert decision is not None and decision["action"] == "block"
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize(
@@ -232,6 +357,57 @@ def test_worker_ambient_path_spoof_cannot_execute_repo_controlled_git(
     )
     if decision is None:
         subprocess.run(command, cwd=repo, shell=True, check=False)
+
+    assert decision is not None and decision["action"] == "block"
+    assert not marker.exists()
+
+
+def test_worker_relative_ambient_path_is_resolved_from_actual_workdir(
+    governed_workspace, monkeypatch
+):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    marker = governed_workspace["outside"] / "relative-path-git-ran"
+    fake_git = repo / "git"
+    fake_git.write_text(f"#!/bin/sh\ntouch {str(marker)!r}\n", encoding="utf-8")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+    monkeypatch.setenv("PATH", f".{os.pathsep}{os.environ['PATH']}")
+
+    decision = mod._on_pre_tool_call(
+        "terminal", {"command": "git status", "workdir": str(repo)}
+    )
+    if decision is None:
+        subprocess.run("git status", cwd=repo, shell=True, check=False)
+
+    assert decision is not None and decision["action"] == "block"
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "command_template",
+    [
+        "env -i cat README.md",
+        "echo `touch {marker}`",
+    ],
+)
+def test_worker_shell_evaluation_and_environment_wrappers_fail_closed(
+    governed_workspace, monkeypatch, command_template
+):
+    mod = _load_plugin()
+    marker = governed_workspace["outside"] / "shell-evaluation-ran"
+    command = command_template.format(
+        marker=marker,
+        outside=governed_workspace["outside"],
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal",
+        {"command": command, "workdir": str(governed_workspace["repo"])},
+    )
+    if decision is None:
+        subprocess.run(command, cwd=governed_workspace["repo"], shell=True, check=False)
 
     assert decision is not None and decision["action"] == "block"
     assert not marker.exists()
@@ -454,6 +630,104 @@ def test_mutating_command_variants_are_governed(governed_workspace, command):
         "terminal", {"command": command, "workdir": str(governed_workspace["repo"])}
     )
     assert decision["action"] == "approve"
+
+
+@pytest.mark.parametrize(
+    "command_template",
+    [
+        "sed -n '1w {marker}' README.md",
+        "awk -v x=1 'BEGIN{{system(\"touch {marker}\")}}'",
+    ],
+)
+def test_worker_inline_utility_escape_cannot_write_outside(
+    governed_workspace, monkeypatch, command_template
+):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    marker = governed_workspace["outside"] / "utility-inline-ran"
+    command = command_template.format(marker=marker)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal", {"command": command, "workdir": str(repo)}
+    )
+    if decision is None:
+        subprocess.run(command, cwd=repo, shell=True, check=False)
+
+    assert decision is not None and decision["action"] == "block"
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("utility", ["sed", "awk"])
+def test_worker_utility_script_file_cannot_write_outside(
+    governed_workspace, monkeypatch, utility
+):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    marker = governed_workspace["outside"] / f"{utility}-script-ran"
+    script = repo / f"escape.{utility}"
+    if utility == "sed":
+        script.write_text(f"1w {marker}\n", encoding="utf-8")
+    else:
+        script.write_text(f'BEGIN{{system("touch {marker}")}}\n', encoding="utf-8")
+    command = f"{utility} -f {script.name} README.md"
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal", {"command": command, "workdir": str(repo)}
+    )
+    if decision is None:
+        subprocess.run(command, cwd=repo, shell=True, check=False)
+
+    assert decision is not None and decision["action"] == "block"
+    assert not marker.exists()
+
+
+def test_worker_ripgrep_preprocessor_cannot_execute_workspace_script(
+    governed_workspace, monkeypatch
+):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    marker = governed_workspace["outside"] / "ripgrep-pre-ran"
+    preprocessor = repo / "preprocessor"
+    preprocessor.write_text(
+        f"#!/bin/sh\ntouch {marker}\ncat \"$1\"\n",
+        encoding="utf-8",
+    )
+    preprocessor.chmod(0o755)
+    command = "rg --pre=./preprocessor governed README.md"
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal", {"command": command, "workdir": str(repo)}
+    )
+    if decision is None:
+        subprocess.run(command, cwd=repo, shell=True, check=False)
+
+    assert decision is not None and decision["action"] == "block"
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find . -fprint0 outside.bin",
+        "fd --exec touch outside {}",
+        "fd --exec-batch touch outside {}",
+    ],
+)
+def test_worker_utility_action_options_fail_closed(
+    governed_workspace, monkeypatch, command
+):
+    mod = _load_plugin()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal",
+        {"command": command, "workdir": str(governed_workspace["repo"])},
+    )
+
+    assert decision is not None and decision["action"] == "block"
 
 
 def test_human_write_outside_governed_project_is_allowed(governed_workspace):
@@ -700,7 +974,6 @@ def test_worker_opaque_terminal_mutator_fails_closed(
     "sed -i 's/governed/changed/' README.md",
     "dd if=/dev/null of=generated.txt",
     "diff --output=generated.diff README.md README.md",
-    "git diff --output=generated.diff",
     "find . -fprint generated.txt",
 ])
 def test_worker_known_terminal_mutation_inside_workspace_is_allowed(
@@ -714,41 +987,58 @@ def test_worker_known_terminal_mutation_inside_workspace_is_allowed(
     ) is None
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
-        "git add README.md",
-        "git commit -m 'worker checkpoint'",
-    ],
-)
-def test_worker_safe_git_workflow_commands_remain_allowed(
+@pytest.mark.parametrize("command", ["git add README.md", "git commit -m checkpoint"])
+def test_worker_git_workflow_commands_require_human_execution(
     governed_workspace, monkeypatch, command
 ):
     mod = _load_plugin()
     monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
 
-    assert mod._on_pre_tool_call(
+    decision = mod._on_pre_tool_call(
         "terminal",
         {"command": command, "workdir": str(governed_workspace["repo"])},
-    ) is None
+    )
+    assert decision is not None and decision["action"] == "block"
 
 
-def test_worker_repo_local_test_wrapper_is_allowed(governed_workspace, monkeypatch):
+def test_worker_editable_repo_test_wrapper_is_blocked(governed_workspace, monkeypatch):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    wrapper = repo / "scripts" / "run_tests.sh"
+    wrapper.parent.mkdir()
+    marker = governed_workspace["outside"] / "test-wrapper-ran"
+    wrapper.write_text(f"#!/usr/bin/env bash\ntouch {marker}\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal",
+        {
+            "command": "scripts/run_tests.sh tests/unit -q",
+            "workdir": str(repo),
+        },
+    )
+    if decision is None:
+        subprocess.run([str(wrapper), "tests/unit", "-q"], cwd=repo, check=False)
+    assert decision is not None and decision["action"] == "block"
+    assert not marker.exists()
+
+
+def test_human_repo_test_wrapper_requires_one_shot_approval(governed_workspace):
     mod = _load_plugin()
     repo = governed_workspace["repo"]
     wrapper = repo / "scripts" / "run_tests.sh"
     wrapper.parent.mkdir()
     wrapper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     wrapper.chmod(0o755)
-    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
 
-    assert mod._on_pre_tool_call(
+    decision = mod._on_pre_tool_call(
         "terminal",
-        {
-            "command": "scripts/run_tests.sh tests/unit -q",
-            "workdir": str(repo),
-        },
-    ) is None
+        {"command": "scripts/run_tests.sh tests/unit -q", "workdir": str(repo)},
+    )
+
+    assert decision is not None and decision["action"] == "approve"
+    assert decision["one_shot_override"]
 
 
 @pytest.mark.parametrize(
@@ -802,10 +1092,14 @@ def test_worker_repo_test_wrapper_symlink_outside_workspace_is_blocked(
     [
         "cp -t {outside} README.md",
         "cp --target-directory={outside} README.md",
+        "cp --target-dir={outside} README.md",
+        "cp --t={outside} README.md",
         "install -t {outside} README.md",
         "install --target-directory={outside} README.md",
+        "install --target-dir={outside} README.md",
         "install -d {outside}/first generated/second",
         "ln --target-directory={outside} README.md",
+        "ln --target-dir={outside} README.md",
         "mv --target-directory={outside} README.md",
     ],
 )
