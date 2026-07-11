@@ -241,6 +241,45 @@ def test_standalone_release_integrates_before_done_and_attaches_terminal_evidenc
         }
 
 
+def test_terminal_done_validation_rechecks_reviewed_integration_source(
+    release_home, tmp_path,
+):
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = "release-source-recheck"
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        task_id = _release_task(conn, board, repo, branch)
+        _seed_structured_evidence(conn, task_id, branch, source_sha)
+        result = kb.release_product_task(
+            conn,
+            task_id,
+            board,
+            lambda _candidate: True,
+            None,
+            measurement_note="source evidence recorded",
+        )
+        assert result.released is True
+        completed = next(
+            event for event in kb.list_events(conn, task_id) if event.kind == "completed"
+        )
+        evidence = completed.payload["release_evidence"]
+        integration_id = evidence["integration_event_id"]
+        integration = next(
+            event for event in kb.list_events(conn, task_id) if event.id == integration_id
+        )
+        tampered = dict(integration.payload, source_sha="0" * 40)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload=? WHERE id=?",
+                (json.dumps(tampered), integration_id),
+            )
+
+        with pytest.raises(kb.ReleaseEvidenceError) as exc_info:
+            kb._validate_done_evidence(conn, task_id, evidence)
+
+        assert "integrated_branch" in exc_info.value.missing
+
+
 @pytest.mark.parametrize("policy_name", ["manual", "not_required"])
 def test_non_deploy_policy_is_recorded_without_fake_deployment(
     release_home, tmp_path, policy_name,
@@ -536,6 +575,7 @@ def test_epic_child_integrates_before_child_done(release_home, tmp_path, monkeyp
                     "story_integrated_to_epic",
                     {
                         "source_branch": branch,
+                        "source_sha": source_sha,
                         "target_branch": kb.epic_branch_for(epic),
                         "candidate_sha": source_sha,
                     },
@@ -640,12 +680,14 @@ def test_epic_release_requires_every_child_done_and_integrated(
     with kb.connect(board=board) as conn:
         epic = _release_task(conn, board, repo, branch, title="Epic: release")
         child = kb.create_task(conn, title="Story: child", board=board, parents=[epic])
+        epic_branch = kb.epic_branch_for(epic)
+        _git(repo, "branch", epic_branch, branch)
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET status='done', current_step_key='done' WHERE id=?",
                 (child,),
             )
-        _seed_structured_evidence(conn, epic, branch, source_sha)
+        _seed_structured_evidence(conn, epic, epic_branch, source_sha)
         merge = Mock(return_value="merged")
         monkeypatch.setattr(kb, "merge_epic_to_main", merge)
 
@@ -676,6 +718,8 @@ def test_epic_release_requires_every_child_done_and_integrated(
                     epic_id,
                     "epic_merged",
                     {
+                        "source_branch": epic_branch,
+                        "source_sha": source_sha,
                         "target_branch": "main",
                         "candidate_sha": source_sha,
                     },
@@ -687,5 +731,74 @@ def test_epic_release_requires_every_child_done_and_integrated(
             conn, epic, board, lambda _path: True, None,
             measurement_note="epic release",
         )
+        assert result.released is True
+        assert kb.get_task(conn, epic).status == "done"
+
+
+def test_epic_release_evidence_binds_to_derived_integration_branch(
+    release_home, tmp_path, monkeypatch,
+):
+    repo, task_branch, _task_sha = _repo_with_story_branch(tmp_path)
+    board = "release-epic-reviewed-branch"
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        epic = _release_task(
+            conn, board, repo, task_branch, title="Epic: reviewed integration"
+        )
+        child = kb.create_task(
+            conn,
+            title="Story: integrated child",
+            board=board,
+            parents=[epic],
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='done', current_step_key='done' WHERE id=?",
+                (child,),
+            )
+
+        epic_branch = kb.epic_branch_for(epic)
+        _git(repo, "switch", "-c", epic_branch, "main")
+        (repo / "epic.txt").write_text("reviewed epic\n", encoding="utf-8")
+        _git(repo, "add", "epic.txt")
+        _git(repo, "commit", "-m", "integrated epic")
+        epic_sha = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "switch", "main")
+
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                child,
+                "story_integrated_to_epic",
+                {"target_branch": epic_branch, "candidate_sha": epic_sha},
+            )
+        _seed_structured_evidence(conn, epic, epic_branch, epic_sha)
+
+        def merge_reviewed_epic(inner_conn, epic_id, **kwargs):
+            assert kwargs["expected_source_sha"] == epic_sha
+            with kb.write_txn(inner_conn):
+                kb._append_event(
+                    inner_conn,
+                    epic_id,
+                    "epic_merged",
+                    {
+                        "source_branch": epic_branch,
+                        "source_sha": epic_sha,
+                        "target_branch": "main",
+                        "candidate_sha": epic_sha,
+                    },
+                )
+            return "merged"
+
+        monkeypatch.setattr(kb, "merge_epic_to_main", merge_reviewed_epic)
+        result = kb.release_product_task(
+            conn,
+            epic,
+            board,
+            lambda _path: True,
+            None,
+            measurement_note="reviewed epic released",
+        )
+
         assert result.released is True
         assert kb.get_task(conn, epic).status == "done"

@@ -1003,6 +1003,41 @@ def test_product_preflight_create_fix_task_waits_on_real_child(kanban_home):
     assert tid not in fix_parents
 
 
+def test_product_preflight_rejects_unlinked_fix_task(kanban_home):
+    board = "resolver-fix-unlinked"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        fix_id = kb.create_task(
+            conn,
+            title="Unrelated task from the same profile",
+            assignee="developer",
+            created_by="default",
+            board=board,
+        )
+
+        with pytest.raises(ValueError, match="linked"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Tried to reuse an unrelated task",
+                metadata={
+                    "resolver_action": {
+                        "action": "create_fix_task",
+                        "resolution": "Use this existing task",
+                        "fix_task_id": fix_id,
+                    }
+                },
+                expected_run_id=run_id,
+                board=board,
+            )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "running"
+        assert kb.parent_ids(conn, tid) == []
+        assert kb.parent_ids(conn, fix_id) == []
+
+
 def test_product_preflight_fix_cycle_rolls_back_state_and_graph(kanban_home):
     board = "resolver-fix-cycle"
     _v2_product_board(board)
@@ -9961,6 +9996,116 @@ def test_fast_forward_rejects_target_that_moved_after_candidate(tmp_path):
     assert _git_output(repo, "rev-parse", "main") == moved_sha
 
 
+def test_fast_forward_rejects_target_checked_out_after_candidate(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _make_epic_branch(repo, "wt/source")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", "operator"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate = kb._build_verified_merge_candidate(
+        repo, "main", "wt/source", "test candidate", lambda _path: True
+    )
+    assert candidate.target_worktree is None
+
+    late_checkout = tmp_path / "late-main"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", str(late_checkout), "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    pre_sha = _git_output(repo, "rev-parse", "main")
+
+    assert kb._fast_forward_target(candidate) is False
+    assert _git_output(repo, "rev-parse", "main") == pre_sha
+    assert _git_output(late_checkout, "status", "--porcelain") == ""
+
+
+def test_build_merge_candidate_rejects_reviewed_source_ref_drift(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    approved_sha = _make_epic_branch(repo, "wt/source")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "wt/source"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _commit_file(repo, "after-review.txt", "drift\n", "post-review drift")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    pre_sha = _git_output(repo, "rev-parse", "main")
+
+    with pytest.raises(kb.IntegrationCandidateError, match="source branch moved"):
+        kb._build_verified_merge_candidate(
+            repo,
+            "main",
+            "wt/source",
+            "test candidate",
+            lambda _path: True,
+            expected_source_sha=approved_sha,
+        )
+
+    assert _git_output(repo, "rev-parse", "main") == pre_sha
+
+
+def test_build_merge_candidate_rejects_source_drift_during_verification(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    approved_sha = _make_epic_branch(repo, "wt/source")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", "post-review", "wt/source"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    drift_sha = _commit_file(repo, "after-review.txt", "drift\n", "post-review drift")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    pre_sha = _git_output(repo, "rev-parse", "main")
+
+    def move_source_during_verify(_candidate: Path) -> bool:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "update-ref",
+                "refs/heads/wt/source",
+                drift_sha,
+                approved_sha,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return True
+
+    with pytest.raises(kb.IntegrationCandidateError, match="source branch moved"):
+        kb._build_verified_merge_candidate(
+            repo,
+            "main",
+            "wt/source",
+            "test candidate",
+            move_source_during_verify,
+            expected_source_sha=approved_sha,
+        )
+
+    assert _git_output(repo, "rev-parse", "main") == pre_sha
+
+
 def test_build_merge_candidate_preserves_dirty_scratch_on_cleanup_failure(tmp_path):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
@@ -11194,6 +11339,46 @@ def test_merge_standalone_story_to_main_happy_merges_and_never_pushes(kanban_hom
         capture_output=True, text=True,
     )
     assert ancestor.returncode == 0, "main must contain the story's commit"
+
+
+def test_release_reverifies_already_merged_standalone_story(
+    kanban_home, tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-standalone-already-merged-release"
+    _v2_product_board_with_repo(board, repo)
+    story, source_sha = _make_done_standalone_story(board, repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "merge", "--ff-only", "wt/story-1"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    observed: list[str] = []
+
+    def verify(candidate: Path) -> bool:
+        observed.append((candidate / "epic_work.txt").read_text(encoding="utf-8"))
+        return True
+
+    with kb.connect(board=board) as conn:
+        result = kb._merge_standalone_story_to_main(
+            conn,
+            story,
+            board=board,
+            candidate_verify_fn=verify,
+            expected_source_sha=source_sha,
+            allow_release_measure=True,
+        )
+        event = next(
+            event
+            for event in kb.list_events(conn, story)
+            if event.kind == "story_merged_to_main"
+        )
+
+    assert result == "already_merged"
+    assert observed == ["epic work\n"]
+    assert event.payload["source_sha"] == source_sha
 
 
 def test_merge_standalone_story_with_epic_returns_none(kanban_home, tmp_path):

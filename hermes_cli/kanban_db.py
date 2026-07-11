@@ -1983,7 +1983,8 @@ def _complete_product_workflow_step(
     # Provenance rejection must happen before the mutating transaction so the
     # audit event can commit while the card itself remains untouched.
     pre_row = conn.execute(
-        "SELECT workflow_template_id, current_step_key FROM tasks WHERE id = ?",
+        "SELECT status, current_run_id, workflow_template_id, current_step_key "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if pre_row is None:
@@ -1996,11 +1997,20 @@ def _complete_product_workflow_step(
     if unresolved_preflight:
         if expected_run_id is None:
             raise ValueError("expected_run_id is required for resolver_action")
+        if (
+            pre_row["status"] != "running"
+            or pre_row["current_run_id"] != int(expected_run_id)
+        ):
+            return False
         candidate_action = (
             metadata.get("resolver_action") if isinstance(metadata, dict) else None
         )
         action, resolution, fix_task_id = _validate_resolver_action(candidate_action)
         if action == "create_fix_task":
+            if fix_task_id not in child_ids(conn, task_id):
+                raise ValueError(
+                    "resolver_action.fix_task_id must name a real linked task"
+                )
             verified, phantom = _verify_created_cards(conn, task_id, [fix_task_id])
             if phantom or verified != [fix_task_id]:
                 raise ValueError("resolver_action.fix_task_id must name a real linked task")
@@ -8064,6 +8074,8 @@ def _resolve_worktree_workspace(
 class IntegrationCandidate:
     pre_sha: str
     candidate_sha: str
+    source_branch: str
+    source_sha: str
     target_branch: str
     target_worktree: Optional[Path]
     scratch_worktree: Path
@@ -8145,11 +8157,25 @@ def _build_verified_merge_candidate(
     source_branch: str,
     message: str,
     candidate_verify_fn: Optional[Callable[[Path], bool]] = None,
+    *,
+    expected_source_sha: Optional[str] = None,
 ) -> IntegrationCandidate:
     repo_root = repo_root.resolve()
     target_worktree = _checked_out_branch_worktree(repo_root, target_branch)
     if target_worktree is not None and not _worktree_is_clean(target_worktree):
         raise IntegrationCandidateError(f"target worktree is dirty: {target_worktree}")
+
+    source_result = _integration_git(
+        repo_root, ["rev-parse", f"refs/heads/{source_branch}"]
+    )
+    source_sha = (source_result.stdout or "").strip()
+    if source_result.returncode != 0 or not source_sha:
+        raise IntegrationCandidateError(f"could not resolve {source_branch}")
+    if expected_source_sha is not None and source_sha != expected_source_sha:
+        raise IntegrationCandidateError(
+            f"source branch moved: {source_branch} no longer matches reviewed SHA"
+        )
+    approved_source_sha = expected_source_sha or source_sha
 
     pre_result = _integration_git(repo_root, ["rev-parse", f"refs/heads/{target_branch}"])
     pre_sha = (pre_result.stdout or "").strip()
@@ -8167,7 +8193,7 @@ def _build_verified_merge_candidate(
 
     merged = _integration_git(
         scratch,
-        ["merge", "--no-ff", source_branch, "-m", message],
+        ["merge", "--no-ff", approved_source_sha, "-m", message],
         timeout=900,
     )
     if merged.returncode != 0:
@@ -8208,6 +8234,19 @@ def _build_verified_merge_candidate(
         _remove_clean_integration_worktree(repo_root, scratch)
         raise IntegrationCandidateError("candidate verification failed")
 
+    if expected_source_sha is not None:
+        current_source = _integration_git(
+            repo_root, ["rev-parse", f"refs/heads/{source_branch}"]
+        )
+        if (
+            current_source.returncode != 0
+            or (current_source.stdout or "").strip() != expected_source_sha
+        ):
+            _remove_clean_integration_worktree(repo_root, scratch)
+            raise IntegrationCandidateError(
+                f"source branch moved: {source_branch} no longer matches reviewed SHA"
+            )
+
     if not _worktree_is_clean(scratch):
         raise IntegrationCandidateError(
             f"scratch worktree is dirty; preserved at {scratch}",
@@ -8224,6 +8263,8 @@ def _build_verified_merge_candidate(
     return IntegrationCandidate(
         pre_sha=pre_sha,
         candidate_sha=candidate_sha,
+        source_branch=source_branch,
+        source_sha=approved_source_sha,
         target_branch=target_branch,
         target_worktree=target_worktree,
         scratch_worktree=scratch,
@@ -8238,14 +8279,20 @@ def _fast_forward_target(candidate: IntegrationCandidate) -> bool:
     if current.returncode != 0 or (current.stdout or "").strip() != candidate.pre_sha:
         return False
 
-    if candidate.target_worktree is not None:
-        if not _worktree_is_clean(candidate.target_worktree):
+    current_target_worktree = _checked_out_branch_worktree(
+        candidate.repo_root, candidate.target_branch
+    )
+    if current_target_worktree != candidate.target_worktree:
+        return False
+
+    if current_target_worktree is not None:
+        if not _worktree_is_clean(current_target_worktree):
             return False
-        branch = _integration_git(candidate.target_worktree, ["branch", "--show-current"])
+        branch = _integration_git(current_target_worktree, ["branch", "--show-current"])
         if branch.returncode != 0 or (branch.stdout or "").strip() != candidate.target_branch:
             return False
         applied = _integration_git(
-            candidate.target_worktree, ["merge", "--ff-only", candidate.candidate_sha]
+            current_target_worktree, ["merge", "--ff-only", candidate.candidate_sha]
         )
     else:
         applied = _integration_git(
@@ -8376,6 +8423,7 @@ def merge_epic_to_main(
     main_branch: str = "main",
     verify_fn: Optional[Callable[[str], bool]] = None,
     candidate_verify_fn: Optional[Callable[[Path], bool]] = None,
+    expected_source_sha: Optional[str] = None,
     notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
 ) -> Optional[str]:
     """Hermes-run merge of ``epic_id``'s integration branch into LOCAL main.
@@ -8435,6 +8483,7 @@ def merge_epic_to_main(
             epic_branch,
             f"merge epic {epic_id}",
             effective_verify_fn,
+            expected_source_sha=expected_source_sha,
         )
         if not _fast_forward_target(candidate):
             _fail(
@@ -8452,6 +8501,7 @@ def merge_epic_to_main(
                     {
                         "epic_branch": epic_branch,
                         "source_branch": epic_branch,
+                        "source_sha": candidate.source_sha,
                         "target_branch": main_branch,
                         "pre_sha": candidate.pre_sha,
                         "candidate_sha": candidate.candidate_sha,
@@ -8511,6 +8561,7 @@ def integrate_story_to_epic(
     board: Optional[str] = None,
     notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
     candidate_verify_fn: Any = _RECONCILE_INTEGRATION_VERIFY_UNSET,
+    expected_source_sha: Optional[str] = None,
 ) -> Optional[str]:
     """Merge a Done story's branch into its epic's integration branch, LOCALLY.
 
@@ -8594,6 +8645,7 @@ def integrate_story_to_epic(
         if (
             already_integrated
             and candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
+            and expected_source_sha is None
         ):
             with write_txn(conn):
                 _append_event(
@@ -8602,6 +8654,7 @@ def integrate_story_to_epic(
                     "story_integrated_to_epic",
                     {
                         "source_branch": story_branch,
+                        "source_sha": _git_ref_sha(repo_root, story_branch),
                         "target_branch": epic_branch,
                         "candidate_sha": _git_ref_sha(repo_root, epic_branch),
                         "already_integrated": True,
@@ -8609,14 +8662,23 @@ def integrate_story_to_epic(
                 )
             return "already_integrated"
 
-        if candidate_verify_fn is not _RECONCILE_INTEGRATION_VERIFY_UNSET:
+        if (
+            candidate_verify_fn is not _RECONCILE_INTEGRATION_VERIFY_UNSET
+            or expected_source_sha is not None
+        ):
             try:
+                effective_verify_fn = (
+                    None
+                    if candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
+                    else candidate_verify_fn
+                )
                 candidate = _build_verified_merge_candidate(
                     repo_root,
                     epic_branch,
                     story_branch,
                     f"integrate story {story_id}",
-                    candidate_verify_fn,
+                    effective_verify_fn,
+                    expected_source_sha=expected_source_sha,
                 )
                 if not _fast_forward_target(candidate):
                     reason = (
@@ -8648,6 +8710,7 @@ def integrate_story_to_epic(
                     "story_integrated_to_epic",
                     {
                         "source_branch": story_branch,
+                        "source_sha": candidate.source_sha,
                         "target_branch": epic_branch,
                         "pre_sha": candidate.pre_sha,
                         "candidate_sha": candidate.candidate_sha,
@@ -8688,6 +8751,7 @@ def integrate_story_to_epic(
                 "story_integrated_to_epic",
                 {
                     "source_branch": story_branch,
+                    "source_sha": _git_ref_sha(repo_root, story_branch),
                     "target_branch": epic_branch,
                     "candidate_sha": _git_ref_sha(repo_root, epic_branch),
                 },
@@ -8705,6 +8769,7 @@ def _merge_standalone_story_to_main(
     main_branch: str = "main",
     verify_fn: Optional[Callable[[str], bool]] = None,
     candidate_verify_fn: Optional[Callable[[Path], bool]] = None,
+    expected_source_sha: Optional[str] = None,
     notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
     allow_release_measure: bool = False,
 ) -> Optional[str]:
@@ -8767,7 +8832,8 @@ def _merge_standalone_story_to_main(
         ancestor_result = _integration_git(
             repo_root, ["merge-base", "--is-ancestor", story_branch, main_branch]
         )
-        if ancestor_result.returncode == 0:
+        already_merged = ancestor_result.returncode == 0
+        if already_merged and expected_source_sha is None:
             with write_txn(conn):
                 _append_event(
                     conn,
@@ -8776,6 +8842,7 @@ def _merge_standalone_story_to_main(
                     {
                         "branch": story_branch,
                         "source_branch": story_branch,
+                        "source_sha": _git_ref_sha(repo_root, story_branch),
                         "target_branch": main_branch,
                         "candidate_sha": _git_ref_sha(repo_root, main_branch),
                         "already_merged": True,
@@ -8793,6 +8860,7 @@ def _merge_standalone_story_to_main(
             story_branch,
             f"merge story {story_id}",
             effective_verify_fn,
+            expected_source_sha=expected_source_sha,
         )
         if not _fast_forward_target(candidate):
             _fail(
@@ -8810,6 +8878,7 @@ def _merge_standalone_story_to_main(
                     {
                         "branch": story_branch,
                         "source_branch": story_branch,
+                        "source_sha": candidate.source_sha,
                         "target_branch": main_branch,
                         "pre_sha": candidate.pre_sha,
                         "candidate_sha": candidate.candidate_sha,
@@ -8819,7 +8888,7 @@ def _merge_standalone_story_to_main(
                 )
         except Exception:
             pass
-        return "merged"
+        return "already_merged" if already_merged else "merged"
     except IntegrationCandidateError as exc:
         reason = str(exc)
         _fail(reason)
@@ -8944,6 +9013,8 @@ def _validate_done_evidence(
         not in {"story_merged_to_main", "story_integrated_to_epic", "epic_merged"}
         or not isinstance(integration.payload, dict)
         or integration.payload.get("candidate_sha") != evidence.get("integration_sha")
+        or integration.payload.get("source_branch") != evidence.get("source_branch")
+        or integration.payload.get("source_sha") != evidence.get("source_sha")
     ):
         missing.append("integrated_branch")
 
@@ -9014,7 +9085,13 @@ def release_product_task(
 
     repo_value = str(meta.get("default_workdir") or task.workspace_path or "").strip()
     repo_root = _git_toplevel(Path(repo_value).expanduser()) if repo_value else None
-    branch = str(task.branch_name or "").strip()
+    parents = parent_ids(conn, task_id)
+    children = child_ids(conn, task_id)
+    branch = (
+        epic_branch_for(task_id)
+        if children
+        else str(task.branch_name or "").strip()
+    )
     source_sha = _git_ref_sha(repo_root, branch) if repo_root and branch else None
     if repo_root is None or not branch or not source_sha:
         raise ReleaseEvidenceError(task_id, ["reviewed_candidate"])
@@ -9027,8 +9104,6 @@ def release_product_task(
     if not note:
         raise ReleaseEvidenceError(task_id, ["measurement_note"])
 
-    parents = parent_ids(conn, task_id)
-    children = child_ids(conn, task_id)
     if children:
         target_branch = epic_branch_for(task_id)
         integrated_children = all(
@@ -9050,6 +9125,7 @@ def release_product_task(
             task_id,
             board=board,
             candidate_verify_fn=candidate_verify_fn,
+            expected_source_sha=source_sha,
         )
         integration_kinds = {"epic_merged"}
     elif parents:
@@ -9058,6 +9134,7 @@ def release_product_task(
             task_id,
             board=board,
             candidate_verify_fn=candidate_verify_fn,
+            expected_source_sha=source_sha,
         )
         integration_kinds = {"story_integrated_to_epic"}
     else:
@@ -9066,6 +9143,7 @@ def release_product_task(
             task_id,
             board=board,
             candidate_verify_fn=candidate_verify_fn,
+            expected_source_sha=source_sha,
             allow_release_measure=True,
         )
         integration_kinds = {"story_merged_to_main"}
