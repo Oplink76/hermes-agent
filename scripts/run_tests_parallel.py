@@ -42,8 +42,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -224,6 +226,8 @@ def _run_one_file(
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    *,
+    basetemp: Path,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
@@ -250,7 +254,15 @@ def _run_one_file(
     orphan onto PID 1. This outer timeout exists only to
     bound a pathologically slow or hung file as a whole.
     """
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        str(file),
+        *pytest_args,
+        "--basetemp",
+        str(basetemp),
+    ]
     
     subproc_start = time.monotonic()
     # launch the pytest process
@@ -871,20 +883,36 @@ def main() -> int:
             if rc != 0:
                 _print_inline_failure(fpath, output, repo_root, pytest_passthrough)
 
-    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures: List[Future] = []
-        for file in files:
-            t0 = time.monotonic()
-            fut = pool.submit(
-                _run_one_file, file, pytest_passthrough, repo_root, args.file_timeout
-            )
-            fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
-            futures.append(fut)
-        # Block until everything's done. ThreadPoolExecutor.__exit__ waits
-        # for all submitted work, but doing it explicitly here makes the
-        # control flow obvious.
-        for fut in futures:
-            fut.result() if fut.exception() is None else None
+    # Pytest's implicit numbered temp directories share one parent and prune
+    # older siblings at process startup. With many per-file subprocesses, a
+    # later pytest can therefore remove an earlier process's still-live
+    # ``tmp_path`` tree. Give every file an explicit base under one
+    # runner-owned, uniquely named root instead.
+    run_basetemp = Path(tempfile.mkdtemp(prefix="hermes-pytest-run-"))
+    try:
+        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            futures: List[Future] = []
+            for index, file in enumerate(files):
+                t0 = time.monotonic()
+                fut = pool.submit(
+                    _run_one_file,
+                    file,
+                    pytest_passthrough,
+                    repo_root,
+                    args.file_timeout,
+                    basetemp=run_basetemp / f"file-{index:04d}",
+                )
+                fut.add_done_callback(
+                    lambda f, file=file, t0=t0: _on_done(file, t0, f)
+                )
+                futures.append(fut)
+            # Block until everything's done. ThreadPoolExecutor.__exit__ waits
+            # for all submitted work, but doing it explicitly here makes the
+            # control flow obvious.
+            for fut in futures:
+                fut.result() if fut.exception() is None else None
+    finally:
+        shutil.rmtree(run_basetemp, ignore_errors=True)
 
     elapsed = time.monotonic() - started
     print()
