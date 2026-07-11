@@ -202,6 +202,11 @@ def test_subprocess_killall_hermes_blocked():
         subprocess.run(["killall", "hermes"])
 
 
+def test_shell_wrapped_pkill_hermes_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["sh", "-c", "pkill -f hermes"])
+
+
 # ──────────────────── pass-through cases (must NOT raise) ──────
 
 
@@ -280,6 +285,22 @@ def test_normal_subprocess_run_passes_through():
     """Plain non-systemctl subprocess.run should work normally."""
     r = subprocess.run(["echo", "hello"], capture_output=True, text=True)
     assert r.stdout.strip() == "hello"
+
+
+def test_argument_containing_skill_is_not_a_process_killer():
+    """List argv boundaries must survive guard inspection.
+
+    A search pattern such as ``real skill`` is one argument, not the Solaris
+    ``skill`` process-killer command.
+    """
+    r = subprocess.run(
+        ["echo", "real skill", "/tmp/hermes-test"],
+        executable=sys.executable,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r is not None
 
 
 # ──────────────────── bypass marker ─────────────────────────────
