@@ -17,6 +17,12 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import projects_db as pdb
 
 
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="fixture exercises the required POSIX scripts/run_tests.sh project contract",
+)
+
+
 def _git(repo: Path, *args: str, check: bool = True) -> str:
     result = subprocess.run(
         ["git", "-C", str(repo), *args],
