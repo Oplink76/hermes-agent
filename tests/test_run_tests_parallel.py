@@ -30,6 +30,8 @@ from pathlib import Path
 
 import pytest
 
+from scripts import run_tests_parallel as runner
+
 
 # Both tests share the same handoff file: the leaker writes here, the
 # verifier reads here. We park it in $TMPDIR with a unique-per-run name
@@ -223,6 +225,54 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
         text=True,
         timeout=60,
     )
+
+
+def test_per_file_pytest_gets_an_isolated_basetemp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Parallel pytest processes must never share pytest's numbered temp root.
+
+    When every subprocess relies on pytest's implicit ``pytest-N`` directory,
+    later subprocesses can prune an earlier process's still-live temp tree.
+    The runner therefore owns and passes a distinct ``--basetemp`` for each
+    file.
+    """
+    captured: dict[str, object] = {}
+
+    class FakeProc:
+        pid = None
+        returncode = 0
+
+        def communicate(self, timeout: float):
+            captured["timeout"] = timeout
+            return ("1 passed in 0.01s\n", None)
+
+        def kill(self) -> None:
+            return None
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(runner.sys, "platform", "win32")
+    test_file = tmp_path / "test_probe.py"
+    test_file.write_text("def test_ok():\n    assert True\n")
+    basetemp = tmp_path / "isolated-basetemp"
+
+    runner._run_one_file(
+        test_file,
+        ["-q"],
+        tmp_path,
+        30.0,
+        basetemp=basetemp,
+    )
+
+    cmd = captured["cmd"]
+    assert isinstance(cmd, list)
+    assert "--basetemp" in cmd
+    assert cmd[cmd.index("--basetemp") + 1] == str(basetemp)
 
 
 def test_bare_q_flag_passes_through(tmp_path: Path) -> None:

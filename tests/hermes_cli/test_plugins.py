@@ -104,6 +104,142 @@ class TestPluginDiscovery:
         assert "hello_plugin" in mgr._plugins
         assert mgr._plugins["hello_plugin"].enabled
 
+    def test_kanban_governance_exact_nested_opt_in_enables_plugin(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes_test"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({
+                "plugins": {"kanban-governance": {"enabled": True}}
+            })
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr._plugins["kanban-governance"].enabled is True
+        assert (
+            mgr._plugins["kanban-governance"].manifest.config_gate
+            == "plugins.kanban-governance.enabled"
+        )
+
+    @pytest.mark.parametrize(
+        "plugins_config",
+        [
+            {"enabled": ["kanban-governance"]},
+            {
+                "enabled": ["kanban-governance"],
+                "kanban-governance": {"enabled": False},
+            },
+            {"kanban-governance": {"enabled": False}},
+            {"kanban-governance": {"enabled": 1}},
+            {"kanban-governance": {"enabled": "true"}},
+        ],
+    )
+    def test_kanban_governance_requires_literal_nested_true(
+        self, tmp_path, monkeypatch, plugins_config
+    ):
+        hermes_home = tmp_path / "hermes_test"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": plugins_config})
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr._plugins["kanban-governance"].enabled is False
+        assert "plugins.kanban-governance.enabled: true" in (
+            mgr._plugins["kanban-governance"].error or ""
+        )
+
+    @pytest.mark.parametrize("source", ["user", "project", "entrypoint"])
+    @pytest.mark.parametrize("allowlisted", [False, True])
+    def test_untrusted_manifest_gate_supplements_plugin_allowlist(
+        self, tmp_path, monkeypatch, source, allowlisted
+    ):
+        hermes_home = tmp_path / "hermes_test"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({
+                "gateway": {"enabled": True},
+                "plugins": {
+                    "enabled": ["gated-plugin"] if allowlisted else [],
+                },
+            })
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        if source == "project":
+            monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "1")
+        manifest = PluginManifest(
+            name="gated-plugin",
+            key="gated-plugin",
+            source=source,
+            config_gate="gateway.enabled",
+        )
+        mgr = PluginManager()
+        loaded = []
+        target_source = source
+
+        def fake_scan(_path, source, skip_names=None):
+            del skip_names
+            return (
+                [manifest]
+                if source == target_source and target_source != "entrypoint"
+                else []
+            )
+
+        monkeypatch.setattr(mgr, "_scan_directory", fake_scan)
+        monkeypatch.setattr(
+            mgr,
+            "_scan_entry_points",
+            lambda: [manifest] if target_source == "entrypoint" else [],
+        )
+        monkeypatch.setattr(mgr, "_load_plugin", loaded.append)
+
+        mgr.discover_and_load()
+
+        assert loaded == ([manifest] if allowlisted else [])
+
+    def test_user_manifest_gate_requires_allowlist_and_literal_gate(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes_test"
+        plugins_dir = hermes_home / "plugins"
+        marker = tmp_path / "loaded"
+        _make_plugin_dir(
+            plugins_dir,
+            "gated-plugin",
+            register_body=f"Path({str(marker)!r}).write_text('loaded')",
+            manifest_extra={"config_gate": "gateway.enabled"},
+            auto_enable=False,
+        )
+        init_path = plugins_dir / "gated-plugin" / "__init__.py"
+        init_path.write_text(
+            "from pathlib import Path\n"
+            f"def register(ctx):\n    Path({str(marker)!r}).write_text('loaded')\n"
+        )
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({"gateway": {"enabled": True}, "plugins": {"enabled": []}})
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr._plugins["gated-plugin"].enabled is False
+        assert not marker.exists()
+
+
+    def test_kanban_governance_config_defaults_off(self):
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["plugins"]["kanban-governance"]["enabled"] is False
+
     def test_plugin_can_register_and_invoke_middleware(self, tmp_path, monkeypatch):
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         _make_plugin_dir(
@@ -890,7 +1026,7 @@ class TestPreToolCallDirective:
         )
         assert get_pre_tool_call_directive("terminal", {}) == (None, None)
 
-    def test_first_directive_wins_across_actions(self, monkeypatch):
+    def test_block_is_deny_dominant_over_earlier_approval(self, monkeypatch):
         from hermes_cli.plugins import get_pre_tool_call_directive
         monkeypatch.setattr(
             "hermes_cli.plugins.invoke_hook",
@@ -900,7 +1036,65 @@ class TestPreToolCallDirective:
             ],
         )
         assert get_pre_tool_call_directive("terminal", {}) == (
-            "approve", "gate first")
+            "block", "block second")
+
+    @pytest.mark.parametrize("one_shot_first", [False, True])
+    def test_one_shot_approval_dominates_ordinary_approval_regardless_of_order(
+        self, monkeypatch, one_shot_first
+    ):
+        from hermes_cli.plugins import _get_pre_tool_call_directive_details
+
+        record = {"operation_hash": "exact"}
+
+        def consume(*args, **kwargs):
+            return None
+
+        ordinary = {
+            "action": "approve",
+            "message": "ordinary approval",
+            "rule_key": "ordinary",
+        }
+        one_shot = {
+            "action": "approve",
+            "message": "exact approval",
+            "rule_key": "kanban-governance:exact",
+            "one_shot_override": record,
+            "_consume_approved_override": consume,
+        }
+        results = [one_shot, ordinary] if one_shot_first else [ordinary, one_shot]
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: results,
+        )
+
+        details = _get_pre_tool_call_directive_details("write_file", {"path": "x"})
+
+        assert details.message == "exact approval"
+        assert details.rule_key == "kanban-governance:exact"
+        assert details.one_shot_override is record
+        assert details.override_consumer is consume
+
+    def test_block_dominates_one_shot_and_ordinary_approvals(self, monkeypatch):
+        from hermes_cli.plugins import _get_pre_tool_call_directive_details
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "approve", "message": "ordinary"},
+                {
+                    "action": "approve",
+                    "message": "exact",
+                    "one_shot_override": {"operation_hash": "exact"},
+                    "_consume_approved_override": lambda *args, **kwargs: None,
+                },
+                {"action": "block", "message": "denied"},
+            ],
+        )
+
+        details = _get_pre_tool_call_directive_details("write_file", {"path": "x"})
+
+        assert details.action == "block"
+        assert details.message == "denied"
 
     def test_shim_ignores_approve(self, monkeypatch):
         """Back-compat shim only reports block, never approve."""
@@ -1022,6 +1216,76 @@ class TestResolvePreToolBlock:
         monkeypatch.setattr("tools.approval.request_tool_approval", _boom)
         msg = resolve_pre_tool_block("terminal", {})
         assert msg is not None and "gate failed" in msg  # fail-closed
+
+    def test_one_shot_approval_metadata_is_consumed_before_allowing(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        record = {"operation_hash": "abc123"}
+        consumed = {}
+
+        def _consume(tool_name, args, override, *, actor):
+            consumed.update(
+                tool_name=tool_name,
+                args=args,
+                override=override,
+                actor=actor,
+            )
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{
+                "action": "approve",
+                "message": "exact operation only",
+                "rule_key": "kanban-governance:abc123",
+                "one_shot_override": record,
+                "_consume_approved_override": _consume,
+            }],
+        )
+
+        seen = {}
+
+        def _approve(tool_name, reason, **kwargs):
+            seen.update(tool_name=tool_name, reason=reason, **kwargs)
+            return {
+                "approved": True,
+                "message": None,
+                "actor": "human:test",
+            }
+
+        monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
+
+        args = {"path": "/repo/file.txt", "content": "exact"}
+        assert resolve_pre_tool_block("write_file", args) is None
+        assert seen["one_shot_override"] == record
+        assert consumed == {
+            "tool_name": "write_file",
+            "args": args,
+            "override": record,
+            "actor": "human:test",
+        }
+
+    def test_one_shot_consumption_failure_blocks(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        def _consume(*args, **kwargs):
+            raise ValueError("already consumed")
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{
+                "action": "approve",
+                "one_shot_override": {"operation_hash": "abc123"},
+                "_consume_approved_override": _consume,
+            }],
+        )
+        monkeypatch.setattr(
+            "tools.approval.request_tool_approval",
+            lambda *args, **kwargs: {"approved": True, "actor": "human:test"},
+        )
+
+        message = resolve_pre_tool_block("write_file", {"path": "/repo/file.txt"})
+        assert message is not None
+        assert "one-shot override" in message
 
 
 class TestGetPreVerifyContinueMessage:

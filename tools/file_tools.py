@@ -1747,6 +1747,21 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         return tool_error(str(e))
 
 
+def extract_v4a_patch_paths(patch: str) -> list[str]:
+    """Return every filesystem endpoint parsed from a V4A patch."""
+    from tools.patch_parser import parse_v4a_patch
+
+    operations, error = parse_v4a_patch(str(patch or ""))
+    if error:
+        return []
+    paths: list[str] = []
+    for operation in operations:
+        paths.append(operation.file_path)
+        if operation.new_path:
+            paths.append(operation.new_path)
+    return paths
+
+
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default", cross_profile: bool = False,
@@ -1762,7 +1777,6 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     if path:
         _paths_to_check.append(path)
     if mode == "patch" and patch:
-        import re as _re
         from tools.path_security import has_traversal_component
         def _reject_v4a_traversal(v4a_path: str) -> str | None:
             # V4A path headers come from patch CONTENT, not the explicit
@@ -1782,26 +1796,13 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 )
             return None
 
-        # ``\s*`` (not ``\s+``) after ``***`` matches patch_parser leniency:
-        # it accepts ``***Update File:`` with no space after the asterisks
-        # (patch_parser.py uses ``\*\*\*\s*Update\s+File:``). Requiring a space
-        # here let a no-space header parse + apply while skipping this check.
-        for _m in _re.finditer(r'^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
-            v4a_path = _m.group(1).strip()
+        # Share the actual V4A parser so policy checks cannot drift from the
+        # operations the file tool will execute.
+        for v4a_path in extract_v4a_patch_paths(patch):
             _err = _reject_v4a_traversal(v4a_path)
             if _err:
                 return _err
             _paths_to_check.append(v4a_path)
-        # ``*** Move File: src -> dst`` is a valid V4A op (patch_parser.py:114)
-        # but was never extracted, so a Move targeting /etc/crontab skipped the
-        # sensitive-path pre-check. Check BOTH endpoints, and run them through
-        # the same ``..`` traversal rejection as the other headers.
-        for _m in _re.finditer(r'^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$', patch, _re.MULTILINE):
-            for v4a_path in (_m.group(1).strip(), _m.group(2).strip()):
-                _err = _reject_v4a_traversal(v4a_path)
-                if _err:
-                    return _err
-                _paths_to_check.append(v4a_path)
     for _p in _paths_to_check:
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:

@@ -29,6 +29,21 @@ from agent.anthropic_adapter import (
 from agent.transports import get_transport
 
 
+@pytest.fixture(autouse=True)
+def _isolate_macos_keychain(monkeypatch):
+    """Keep adapter tests independent of machine-local Claude credentials.
+
+    The Keychain reader has dedicated coverage in
+    ``test_anthropic_keychain.py``. Tests in this module exercise explicit
+    environment and temporary-file precedence, so a developer's real macOS
+    Keychain entry must not participate.
+    """
+    monkeypatch.setattr(
+        "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
+        lambda: None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
@@ -225,13 +240,6 @@ class TestBuildAnthropicClient:
 
 
 class TestReadClaudeCodeCredentials:
-    @pytest.fixture(autouse=True)
-    def no_keychain(self, monkeypatch):
-        monkeypatch.setattr(
-            "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
-            lambda: None,
-        )
-
     def test_reads_valid_credentials(self, tmp_path, monkeypatch):
         cred_file = tmp_path / ".claude" / ".credentials.json"
         cred_file.parent.mkdir(parents=True)

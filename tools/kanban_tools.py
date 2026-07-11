@@ -614,6 +614,19 @@ def _handle_complete(args: dict, **kw) -> str:
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
+    for field in ("workflow_outcome", "resolver_action"):
+        value = args.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            return tool_error(f"{field} must be an object/dict")
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            return tool_error(
+                f"metadata must be an object/dict, got {type(metadata).__name__}"
+            )
+        metadata[field] = value
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
     if result:
@@ -724,6 +737,30 @@ def _handle_complete(args: dict, **kw) -> str:
                     )
 
             try:
+                if (
+                    task
+                    and task.workflow_template_id == "product"
+                    and task.current_step_key == "release_measure"
+                    and _product_workflow_enabled()
+                ):
+                    release = kb.release_product_task(
+                        conn,
+                        tid,
+                        board,
+                        None,
+                        None,
+                        measurement_note=summary or result,
+                        completion_metadata=metadata,
+                        created_cards=created_cards,
+                        expected_run_id=_worker_run_id(tid),
+                    )
+                    if not release.released:
+                        return tool_error(
+                            f"kanban_complete release blocked: {release.status}. "
+                            "The task remains in release_measure."
+                        )
+                    run = kb.latest_run(conn, tid)
+                    return _ok(task_id=tid, run_id=run.id if run else None)
                 ok = kb.complete_task(
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
@@ -752,6 +789,12 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"Retry kanban_complete with the same summary/metadata "
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
+                )
+            except kb.ReleaseEvidenceError as release_err:
+                return tool_error(
+                    "kanban_complete blocked by release evidence policy. "
+                    f"Missing: {', '.join(release_err.missing)}. "
+                    "The task remains in release_measure."
                 )
             except kb.ProductProvenanceError as prov_err:
                 missing = getattr(prov_err, "missing", None) or []
@@ -1418,6 +1461,67 @@ KANBAN_COMPLETE_SCHEMA = {
                     "must differ from writer. Include branch/worktree/commit "
                     "when available."
                 ),
+            },
+            "workflow_outcome": {
+                "type": "object",
+                "description": (
+                    "Structured product test/review outcome. Rejections require "
+                    "verdict, target_step, and non-empty findings."
+                ),
+                "properties": {
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["passed", "approved", "changes_requested", "architecture_invalid"],
+                    },
+                    "target_step": {
+                        "type": "string",
+                        "enum": ["architecture", "development"],
+                    },
+                    "findings": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["verdict"],
+                "additionalProperties": False,
+                "allOf": [
+                    {
+                        "if": {
+                            "properties": {
+                                "verdict": {
+                                    "enum": ["changes_requested", "architecture_invalid"]
+                                }
+                            }
+                        },
+                        "then": {"required": ["target_step", "findings"]},
+                    },
+                    {
+                        "if": {
+                            "properties": {
+                                "verdict": {"enum": ["passed", "approved"]}
+                            }
+                        },
+                        "then": {
+                            "not": {
+                                "anyOf": [
+                                    {"required": ["target_step"]},
+                                    {"required": ["findings"]},
+                                ]
+                            }
+                        },
+                    },
+                ],
+            },
+            "resolver_action": {
+                "type": "object",
+                "description": "Required when resolving a product human-input preflight.",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["resume", "create_fix_task", "escalate"],
+                    },
+                    "resolution": {"type": "string"},
+                    "fix_task_id": {"type": ["string", "null"]},
+                },
+                "required": ["action", "resolution", "fix_task_id"],
+                "additionalProperties": False,
             },
             "result": {
                 "type": "string",

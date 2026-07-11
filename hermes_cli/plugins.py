@@ -268,6 +268,21 @@ def _get_enabled_plugins() -> Optional[set]:
         return None
 
 
+def _manifest_config_gate_enabled(dot_path: str) -> bool:
+    """Return True only when a manifest's nested config gate is literal true."""
+    try:
+        from hermes_cli.config import load_config
+
+        value: Any = load_config()
+        for key in dot_path.split("."):
+            if not key or not isinstance(value, dict) or key not in value:
+                return False
+            value = value[key]
+        return value is True
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -310,6 +325,9 @@ class PluginManifest:
     # category plugin at ``plugins/image_gen/openai/`` the key is
     # ``image_gen/openai``. When empty, falls back to ``name``.
     key: str = ""
+    # Optional dot-path whose literal boolean value exclusively controls
+    # activation instead of the generic ``plugins.enabled`` allow-list.
+    config_gate: str = ""
 
 
 @dataclass
@@ -1449,16 +1467,36 @@ class PluginManager:
             # entry-point plugins) is opt-in via plugins.enabled.
             # Accept both the path-derived key and the legacy bare name
             # so existing configs keep working.
-            is_enabled = (
+            allowlisted = (
                 enabled is not None
                 and (lookup_key in enabled or manifest.name in enabled)
             )
+            gate_enabled = (
+                _manifest_config_gate_enabled(manifest.config_gate)
+                if manifest.config_gate else True
+            )
+            # Only repository-bundled manifests are trusted to replace the
+            # generic allow-list with an exact product-specific config gate.
+            # User/project/entry-point manifests remain explicitly opt-in and
+            # must satisfy their declared gate as an additional condition.
+            is_enabled = (
+                gate_enabled
+                if manifest.source == "bundled" and manifest.config_gate
+                else allowlisted and gate_enabled
+            )
             if not is_enabled:
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
-                loaded.error = (
-                    "not enabled in config (run `hermes plugins enable {}` to activate)"
-                    .format(lookup_key)
-                )
+                if manifest.config_gate and not gate_enabled:
+                    loaded.error = (
+                        f"not enabled in config (set "
+                        f"{manifest.config_gate}: true to activate)"
+                    )
+                else:
+                    loaded.error = (
+                        "not enabled in config "
+                        "(run `hermes plugins enable {}` to activate)"
+                        .format(lookup_key)
+                    )
                 self._plugins[lookup_key] = loaded
                 logger.debug(
                     "Skipping '%s' (not in plugins.enabled)", lookup_key
@@ -1642,6 +1680,11 @@ class PluginManager:
                 path=str(plugin_dir),
                 kind=kind,
                 key=key,
+                config_gate=(
+                    data.get("config_gate", "").strip()
+                    if isinstance(data.get("config_gate"), str)
+                    else ""
+                ),
             )
         except Exception as exc:
             logger.warning(
@@ -2082,6 +2125,8 @@ class _PreToolCallDirective:
     action: Optional[str] = None
     message: Optional[str] = None
     rule_key: Optional[str] = None
+    one_shot_override: Optional[Dict[str, Any]] = None
+    override_consumer: Optional[Callable] = None
 
 
 def set_thread_tool_whitelist(
@@ -2129,8 +2174,9 @@ def _get_pre_tool_call_directive_details(
     - ``rule_key`` is optional and only honored for ``approve`` directives. It
       lets plugins choose the allowlist grain for `[a]lways` approvals.
 
-    The first valid directive wins. Invalid or irrelevant hook return values
-    are silently ignored so existing observer-only hooks are unaffected.
+    Blocks are deny-dominant across every valid hook result. When no block is
+    present, the first valid approval wins. Invalid or irrelevant hook return
+    values are silently ignored so existing observer-only hooks are unaffected.
     """
     allowed = getattr(_thread_tool_whitelist, "allowed", None)
     if allowed is not None and tool_name not in allowed:
@@ -2152,6 +2198,8 @@ def _get_pre_tool_call_directive_details(
         middleware_trace=list(middleware_trace or []),
     )
 
+    first_one_shot_approval: Optional[_PreToolCallDirective] = None
+    first_approval: Optional[_PreToolCallDirective] = None
     for result in hook_results:
         if not isinstance(result, dict):
             continue
@@ -2168,9 +2216,32 @@ def _get_pre_tool_call_directive_details(
         rule_key = rule_key.strip() if isinstance(rule_key, str) else None
         if not rule_key:
             rule_key = None
-        return _PreToolCallDirective(action=action, message=message, rule_key=rule_key)
+        one_shot_override = (
+            result.get("one_shot_override") if action == "approve" else None
+        )
+        if not isinstance(one_shot_override, dict):
+            one_shot_override = None
+        override_consumer = (
+            result.get("_consume_approved_override")
+            if one_shot_override is not None else None
+        )
+        if not callable(override_consumer):
+            override_consumer = None
+        directive = _PreToolCallDirective(
+            action=action,
+            message=message,
+            rule_key=rule_key,
+            one_shot_override=one_shot_override,
+            override_consumer=override_consumer,
+        )
+        if action == "block":
+            return directive
+        if one_shot_override is not None and first_one_shot_approval is None:
+            first_one_shot_approval = directive
+        elif one_shot_override is None and first_approval is None:
+            first_approval = directive
 
-    return _PreToolCallDirective()
+    return first_one_shot_approval or first_approval or _PreToolCallDirective()
 
 
 def get_pre_tool_call_directive(
@@ -2257,10 +2328,13 @@ def resolve_pre_tool_block(
     if details.action == "approve":
         try:
             from tools.approval import request_tool_approval
+            approval_kwargs: Dict[str, Any] = {
+                "rule_key": details.rule_key or tool_name,
+            }
+            if details.one_shot_override is not None:
+                approval_kwargs["one_shot_override"] = details.one_shot_override
             result = request_tool_approval(
-                tool_name,
-                details.message or "",
-                rule_key=details.rule_key or tool_name,
+                tool_name, details.message or "", **approval_kwargs
             )
         except Exception:
             # Fail-closed: if the gate itself errors, block rather than
@@ -2271,6 +2345,18 @@ def resolve_pre_tool_block(
                 result.get("message")
                 or f"BLOCKED: plugin approval required for {tool_name}"
             )
+        if details.one_shot_override is not None:
+            if details.override_consumer is None:
+                return "BLOCKED: governed one-shot override has no audit consumer"
+            try:
+                details.override_consumer(
+                    tool_name,
+                    args if isinstance(args, dict) else {},
+                    details.one_shot_override,
+                    actor=str(result.get("actor") or "human:approval"),
+                )
+            except Exception:
+                return "BLOCKED: governed one-shot override could not be consumed"
     return None
 
 

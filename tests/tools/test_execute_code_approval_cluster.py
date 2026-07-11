@@ -113,10 +113,17 @@ def gw_session(monkeypatch):
     monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
     # Force manual mode regardless of host config.
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
+    # approval.py is imported during collection, before the autouse fixture can
+    # point HERMES_HOME at tmp_path.  Do not let the developer's import-time
+    # --yolo/permanent allowlist state short-circuit this decision matrix.
+    monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
 
     session_key = "cluster-test-session"
     token = A.set_current_session_key(session_key)
     with A._lock:
+        permanent_was_approved = "execute_code" in A._permanent_approved
+        A._permanent_approved.discard("execute_code")
+        A._session_approved.pop(session_key, None)
         A._gateway_queues.pop(session_key, None)
         A._gateway_notify_cbs.pop(session_key, None)
     try:
@@ -124,6 +131,11 @@ def gw_session(monkeypatch):
     finally:
         A.reset_current_session_key(token)
         with A._lock:
+            A._session_approved.pop(session_key, None)
+            if permanent_was_approved:
+                A._permanent_approved.add("execute_code")
+            else:
+                A._permanent_approved.discard("execute_code")
             A._gateway_queues.pop(session_key, None)
             A._gateway_notify_cbs.pop(session_key, None)
 

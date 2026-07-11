@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 
 import pytest
 
@@ -201,14 +202,21 @@ def test_subprocess_killall_hermes_blocked():
         subprocess.run(["killall", "hermes"])
 
 
+def test_shell_wrapped_pkill_hermes_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["sh", "-c", "pkill -f hermes"])
+
+
 # ──────────────────── pass-through cases (must NOT raise) ──────
 
 
 def test_systemctl_status_passes_through():
     """Read-only systemctl probes (status/show/list-units) are fine."""
-    # Run with check=False so we don't fail on the gateway's exit code.
+    # Override the executable so this test exercises the guard's command
+    # matcher without requiring systemctl or a live systemd instance.
     r = subprocess.run(
         ["systemctl", "--user", "status", "hermes-gateway", "--no-pager"],
+        executable=sys.executable,
         capture_output=True,
         text=True,
         check=False,
@@ -219,6 +227,7 @@ def test_systemctl_status_passes_through():
 def test_systemctl_show_passes_through():
     r = subprocess.run(
         ["systemctl", "--user", "show", "hermes-gateway", "--no-pager"],
+        executable=sys.executable,
         capture_output=True,
         text=True,
         check=False,
@@ -229,6 +238,7 @@ def test_systemctl_show_passes_through():
 def test_systemctl_list_units_passes_through():
     r = subprocess.run(
         ["systemctl", "--user", "list-units", "fake-not-real-unit*", "--no-pager"],
+        executable=sys.executable,
         capture_output=True,
         text=True,
         check=False,
@@ -237,13 +247,12 @@ def test_systemctl_list_units_passes_through():
 
 
 def test_systemctl_unrelated_unit_passes_through():
-    """systemctl restart of a non-hermes unit is allowed (we only protect hermes)."""
-    # Use --dry-run so we don't actually try to restart anything; just
-    # verify the guard doesn't block the call. systemctl supports
-    # --dry-run via the privileged API; on user scope it usually fails
-    # quickly without side effects.
+    """A read-only systemctl probe of a non-Hermes unit is allowed."""
+    # As above, substitute the Python executable after the guard inspects the
+    # argv so the test cannot touch a host service.
     r = subprocess.run(
         ["systemctl", "--user", "show", "fake-not-real-unit"],
+        executable=sys.executable,
         capture_output=True,
         text=True,
         check=False,
@@ -276,6 +285,22 @@ def test_normal_subprocess_run_passes_through():
     """Plain non-systemctl subprocess.run should work normally."""
     r = subprocess.run(["echo", "hello"], capture_output=True, text=True)
     assert r.stdout.strip() == "hello"
+
+
+def test_argument_containing_skill_is_not_a_process_killer():
+    """List argv boundaries must survive guard inspection.
+
+    A search pattern such as ``real skill`` is one argument, not the Solaris
+    ``skill`` process-killer command.
+    """
+    r = subprocess.run(
+        ["echo", "real skill", "/tmp/hermes-test"],
+        executable=sys.executable,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r is not None
 
 
 # ──────────────────── bypass marker ─────────────────────────────

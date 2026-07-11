@@ -183,6 +183,18 @@ DEFAULT_PRODUCT_WORKFLOW: dict[str, Any] = {
 }
 PRODUCT_HUMAN_BLOCK_KINDS = {None, "needs_input", "capability"}
 PRODUCT_WORKFLOW_PRECHECK_EVENT = "human_input_preflight"
+PRODUCT_REWORK_ROUTES = {
+    ("test", "changes_requested"): "development",
+    ("review", "changes_requested"): "development",
+    ("review", "architecture_invalid"): "architecture",
+}
+PRODUCT_POSITIVE_OUTCOMES = {
+    "test": "passed",
+    "review": "approved",
+}
+PRODUCT_POSITIVE_OUTCOME_STEPS = {
+    verdict: step for step, verdict in PRODUCT_POSITIVE_OUTCOMES.items()
+}
 PRODUCT_PROVENANCE_REQUIRED_STEPS = {"development", "test", "review"}
 _PRODUCT_COMMIT_REQUIRED_STEPS = {"development"}
 PRODUCT_WORKFLOW_COMMIT_REQUIRED_STEPS = _PRODUCT_COMMIT_REQUIRED_STEPS
@@ -836,6 +848,7 @@ def product_workflow_defaults_for_board(board: Optional[str] = None) -> dict:
         "columns": [dict(column) for column in PRODUCT_BOARD_COLUMNS],
         "product_workflow": {
             "handoff_v2": True,
+            "deployment_policy": "manual",
             "assignees": dict(PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES),
         },
         **({"slug": slug} if slug else {}),
@@ -895,6 +908,7 @@ def ensure_product_board_defaults(
     existing_wf = meta.get("product_workflow")
     wf = dict(existing_wf) if isinstance(existing_wf, dict) else {}
     wf["handoff_v2"] = True
+    wf.setdefault("deployment_policy", "manual")
     existing_assignees = wf.get("assignees") if isinstance(wf.get("assignees"), dict) else {}
     assignees = dict(PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES)
     assignees.update({str(k): str(v) for k, v in existing_assignees.items() if str(v).strip()})
@@ -1110,19 +1124,102 @@ def _looks_like_product_story(title: str) -> bool:
     return lowered.startswith(("user story:", "story:", "user story -", "story -"))
 
 
+class ProductWorkflowStateError(ValueError):
+    def __init__(self, task_id: str, step_key: Optional[str], reason: str):
+        self.task_id = task_id
+        self.step_key = step_key
+        self.reason = reason
+        super().__init__(
+            f"invalid product workflow step for {task_id}: {step_key!r} ({reason})"
+        )
+
+
+def _validate_product_workflow_state(
+    template_id: Optional[str],
+    step_key: Optional[str],
+    *,
+    allow_terminal: bool = True,
+) -> None:
+    template = str(template_id or "").strip() or None
+    step = str(step_key or "").strip() or None
+    if template == PRODUCT_WORKFLOW_TEMPLATE_ID:
+        allowed = PRODUCT_WORKFLOW_STEP_SET
+        if not allow_terminal:
+            allowed = allowed - {"done"}
+        if step not in allowed:
+            raise ProductWorkflowStateError(
+                "<unsaved>",
+                step,
+                f"valid steps: {', '.join(sorted(allowed))}",
+            )
+
+
+def _validate_stored_product_workflow_state(
+    conn: sqlite3.Connection, task_id: str
+) -> None:
+    row = conn.execute(
+        "SELECT workflow_template_id, current_step_key FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+    try:
+        _validate_product_workflow_state(
+            row["workflow_template_id"], row["current_step_key"]
+        )
+    except ProductWorkflowStateError as exc:
+        error = ProductWorkflowStateError(task_id, row["current_step_key"], exc.reason)
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_invalid_workflow",
+                {
+                    "workflow_template_id": row["workflow_template_id"],
+                    "current_step_key": row["current_step_key"],
+                    "reason": exc.reason,
+                },
+            )
+        raise error from exc
+
+
 def _infer_product_step(
-    *, title: str, assignee: Optional[str], explicit_step: Optional[str]
+    *,
+    title: str,
+    assignee: Optional[str],
+    explicit_step: Optional[str],
+    product_intent: bool = False,
 ) -> Optional[str]:
     """Infer the product workflow step for a card from an explicit step, its
     role assignee (architect -> architecture, ...), or a story-shaped title."""
     if explicit_step:
         return explicit_step
     role = (assignee or "").strip().lower()
-    if role in PRODUCT_WORKFLOW_ROLE_TO_STEP:
+    if product_intent and role in PRODUCT_WORKFLOW_ROLE_TO_STEP:
         return PRODUCT_WORKFLOW_ROLE_TO_STEP[role]
     if _looks_like_product_story(title):
         return "backlog"
     return None
+
+
+def _project_is_bound_to_product_board(
+    project_id: Optional[str], board_slug: str
+) -> bool:
+    if not project_id:
+        return False
+    try:
+        from hermes_cli import projects_db as _pdb
+
+        with _pdb.connect_closing() as project_conn:
+            project = _pdb.get_project(project_conn, project_id)
+        return bool(
+            project is not None
+            and project.board_slug
+            and _normalize_board_slug(project.board_slug)
+            == _normalize_board_slug(board_slug)
+        )
+    except Exception:
+        return False
 
 
 def _repair_product_workflow_metadata_if_needed(
@@ -1147,7 +1244,7 @@ def _repair_product_workflow_metadata_if_needed(
     if not _is_product_board_metadata(meta):
         return None
     row = conn.execute(
-        "SELECT id, title, assignee, status, workflow_template_id, current_step_key, "
+        "SELECT id, title, assignee, status, project_id, workflow_template_id, current_step_key, "
         "workspace_kind, workspace_path FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
@@ -1166,6 +1263,11 @@ def _repair_product_workflow_metadata_if_needed(
         title=row["title"] or "",
         assignee=row["assignee"],
         explicit_step=current_step if current_step in PRODUCT_WORKFLOW_STEP_SET else None,
+        product_intent=bool(
+            workflow_template == PRODUCT_WORKFLOW_TEMPLATE_ID
+            or _project_is_bound_to_product_board(row["project_id"], board_slug)
+            or _looks_like_product_story(row["title"] or "")
+        ),
     )
     if not inferred:
         return None
@@ -1175,12 +1277,6 @@ def _repair_product_workflow_metadata_if_needed(
     if row["status"] in {"ready", "review"} and target_status != row["status"]:
         updates.append("status = ?")
         params.append(target_status)
-    if row["workspace_kind"] == "scratch" and not row["workspace_path"]:
-        board_default = meta.get("default_workdir") if isinstance(meta, dict) else None
-        if board_default:
-            updates.append("workspace_kind = ?")
-            updates.append("workspace_path = ?")
-            params.extend(["dir", str(board_default)])
     params.append(task_id)
     conn.execute(
         f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?",
@@ -1404,6 +1500,7 @@ def set_phase(
     meta = product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return False
+    _validate_product_workflow_state(PRODUCT_WORKFLOW_TEMPLATE_ID, phase)
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET current_step_key = ? WHERE id = ?",
@@ -1886,7 +1983,8 @@ def _complete_product_workflow_step(
     # Provenance rejection must happen before the mutating transaction so the
     # audit event can commit while the card itself remains untouched.
     pre_row = conn.execute(
-        "SELECT workflow_template_id, current_step_key FROM tasks WHERE id = ?",
+        "SELECT status, current_run_id, workflow_template_id, current_step_key "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if pre_row is None:
@@ -1894,7 +1992,22 @@ def _complete_product_workflow_step(
     pre_step = pre_row["current_step_key"]
     if pre_row["workflow_template_id"] != "product" and not pre_step:
         return None
-    if not _latest_unresolved_product_preflight(conn, task_id):
+    unresolved_preflight = _latest_unresolved_product_preflight(conn, task_id)
+    resolver_action: Optional[dict] = None
+    if unresolved_preflight:
+        if expected_run_id is None:
+            raise ValueError("expected_run_id is required for resolver_action")
+        if (
+            pre_row["status"] != "running"
+            or pre_row["current_run_id"] != int(expected_run_id)
+        ):
+            return False
+        candidate_action = (
+            metadata.get("resolver_action") if isinstance(metadata, dict) else None
+        )
+        _validate_resolver_action(candidate_action)
+        resolver_action = candidate_action
+    else:
         transition = PRODUCT_WORKFLOW_TRANSITIONS.get(str(pre_step or ""))
         if transition is not None and transition.get("next_step"):
             _validate_product_ai_provenance(
@@ -1915,6 +2028,8 @@ def _complete_product_workflow_step(
 
         preflight = _latest_unresolved_product_preflight(conn, task_id)
         if preflight:
+            action = str((resolver_action or {}).get("action") or "")
+            resolution = str((resolver_action or {}).get("resolution") or "")
             resume_step = str(preflight.get("step_key") or step_key or "backlog")
             resume_status = str(
                 preflight.get("resume_status")
@@ -1924,6 +2039,123 @@ def _complete_product_workflow_step(
             if resume_status not in VALID_STATUSES or resume_status in {"running", "done", "archived", "blocked"}:
                 resume_status = _column_status_for_step(meta, resume_step)
             original_assignee = str(preflight.get("original_assignee") or "").strip() or None
+            if action == "create_fix_task":
+                fix_task_id = str((resolver_action or {}).get("fix_task_id") or "")
+                cur = conn.execute(
+                    "UPDATE tasks SET status='todo', assignee=?, running=0, blocked=0, "
+                    "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+                    "WHERE id=? AND current_run_id=?",
+                    (original_assignee, task_id, int(expected_run_id)),
+                )
+                if cur.rowcount != 1:
+                    return False
+                # Revalidate both the direct prelink and task provenance while
+                # holding the same write lock as the exact-run CAS. A link
+                # removed after the outer preflight must not be resurrected in
+                # the opposite direction by a stale resolver.
+                if fix_task_id not in child_ids(conn, task_id):
+                    raise ValueError(
+                        "resolver_action.fix_task_id must name a real linked task"
+                    )
+                verified, phantom = _verify_created_cards(
+                    conn, task_id, [fix_task_id]
+                )
+                if phantom or verified != [fix_task_id]:
+                    raise ValueError(
+                        "resolver_action.fix_task_id must name a real linked task"
+                    )
+                if fix_task_id not in child_ids(conn, task_id):
+                    raise ValueError(
+                        "resolver_action.fix_task_id must name a real linked task"
+                    )
+                # A fix task is commonly created as a child of the card that
+                # discovered the blocker. Dependency wait needs the opposite
+                # direction: the original card waits for the fix. Reverse the
+                # direct edge atomically, then validate that no alternate path
+                # would make the new edge cyclic. Any error rolls back the task
+                # CAS and both graph mutations together.
+                conn.execute(
+                    "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
+                    (task_id, fix_task_id),
+                )
+                if _would_cycle(conn, fix_task_id, task_id):
+                    raise ValueError(
+                        f"linking {fix_task_id} -> {task_id} would create a cycle"
+                    )
+                conn.execute(
+                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                    (fix_task_id, task_id),
+                )
+                run_id = _end_run(
+                    conn,
+                    task_id,
+                    outcome="preflight_fix_task_created",
+                    status="completed",
+                    summary=summary if summary is not None else result,
+                    metadata=metadata,
+                    expected_run_id=expected_run_id,
+                )
+                if run_id is None:
+                    raise RuntimeError("resolver run ownership changed")
+                _append_event(
+                    conn,
+                    task_id,
+                    "human_input_preflight_resolved",
+                    {
+                        "action": action,
+                        "resolution": resolution,
+                        "fix_task_id": fix_task_id,
+                        "step_key": resume_step,
+                        "status": "todo",
+                    },
+                    run_id=run_id,
+                )
+                return True
+            if action == "escalate":
+                cur = conn.execute(
+                    "UPDATE tasks SET status='blocked', assignee='default', running=0, "
+                    "blocked=1, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+                    "WHERE id=? AND current_run_id=?",
+                    (task_id, int(expected_run_id)),
+                )
+                if cur.rowcount != 1:
+                    return False
+                run_id = _end_run(
+                    conn,
+                    task_id,
+                    outcome="preflight_escalated",
+                    status="blocked",
+                    summary=summary if summary is not None else result,
+                    metadata=metadata,
+                    expected_run_id=expected_run_id,
+                )
+                if run_id is None:
+                    raise RuntimeError("resolver run ownership changed")
+                _append_event(
+                    conn,
+                    task_id,
+                    "human_input_preflight_resolved",
+                    {
+                        "action": action,
+                        "resolution": resolution,
+                        "step_key": resume_step,
+                        "status": "blocked",
+                    },
+                    run_id=run_id,
+                )
+                _append_event(
+                    conn,
+                    task_id,
+                    "blocked",
+                    {
+                        "reason": str(preflight.get("reason") or "unspecified"),
+                        "kind": "resolver_escalation",
+                        "attempted_resolutions": preflight.get("attempted_resolutions") or [],
+                        "resolution": resolution,
+                    },
+                    run_id=run_id,
+                )
+                return True
             sql = """
                 UPDATE tasks
                    SET status        = ?,
@@ -1934,6 +2166,8 @@ def _complete_product_workflow_step(
                        worker_pid    = NULL,
                        block_kind    = NULL,
                        block_recurrences = 0,
+                       running       = 0,
+                       blocked       = 0,
                        workflow_template_id = 'product',
                        current_step_key = ?
                  WHERE id = ?
@@ -1953,20 +2187,17 @@ def _complete_product_workflow_step(
                 status="completed",
                 summary=summary if summary is not None else result,
                 metadata=metadata,
+                expected_run_id=expected_run_id,
             )
-            if run_id is None and (summary or result or metadata):
-                run_id = _synthesize_ended_run(
-                    conn, task_id,
-                    outcome="preflight_resolved",
-                    summary=summary if summary is not None else result,
-                    metadata=metadata,
-                    step_key=resume_step,
-                )
+            if run_id is None:
+                raise RuntimeError("resolver run ownership changed")
             _append_event(
                 conn,
                 task_id,
                 "human_input_preflight_resolved",
                 {
+                    "action": action,
+                    "resolution": resolution,
                     "summary": (summary if summary is not None else result),
                     "step_key": resume_step,
                     "assignee": original_assignee,
@@ -2017,7 +2248,10 @@ def _complete_product_workflow_step(
             status="completed",
             summary=summary if summary is not None else result,
             metadata=metadata,
+            expected_run_id=expected_run_id,
         )
+        if expected_run_id is not None and run_id is None:
+            raise RuntimeError("workflow run ownership changed")
         if run_id is None and (summary or result or metadata):
             run_id = _synthesize_ended_run(
                 conn, task_id,
@@ -2327,6 +2561,7 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    rework_count: int = 0
     # Canonical handoff_v2 state flags (see ``_apply_v2_flags`` /
     # ``_legacy_status``). Always False on legacy (non-v2) boards and on
     # rows read before these columns existed.
@@ -2414,6 +2649,11 @@ class Task:
             block_recurrences=(
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
+                else 0
+            ),
+            rework_count=(
+                int(row["rework_count"])
+                if "rework_count" in keys and row["rework_count"] is not None
                 else 0
             ),
             running=bool(row["running"]) if "running" in keys else False,
@@ -2596,6 +2836,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    rework_count         INTEGER NOT NULL DEFAULT 0,
     -- Orthogonal handoff_v2 state-model flags. ``phase`` (the card's single
     -- position, canonically ``current_step_key`` above) plus these two
     -- independent booleans replace the old single-``status`` enum. Neither
@@ -3413,6 +3654,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "rework_count" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "rework_count", "rework_count INTEGER NOT NULL DEFAULT 0"
+        )
+
     if "running" not in cols:
         # Orthogonal handoff_v2 state-model flag. Existing rows default to 0
         # (not running), which matches their pre-migration behaviour.
@@ -3756,6 +4002,19 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
+    if getattr(conn, "in_transaction", False):
+        savepoint = f"kanban_nested_{secrets.token_hex(8)}"
+        conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            yield conn
+        except Exception:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        return
+
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn
@@ -3782,6 +4041,116 @@ def write_txn(conn: sqlite3.Connection):
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
+
+
+TASK_SNAPSHOT_FIELDS = (
+    "status",
+    "title",
+    "assignee",
+    "current_step_key",
+    "current_run_id",
+)
+
+
+class TaskSnapshotConflict(RuntimeError):
+    """Raised when an operator mutation loses its expected task snapshot."""
+
+    def __init__(self, action: str, current: dict[str, Any]):
+        super().__init__(f"task changed; refresh before {action}")
+        self.current = current
+
+
+def task_snapshot_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "status": row["status"],
+        "title": row["title"],
+        "assignee": _canonical_assignee(row["assignee"]),
+        "current_step_key": row["current_step_key"],
+        "current_run_id": row["current_run_id"],
+    }
+
+
+def assert_task_snapshot(
+    row: sqlite3.Row,
+    expected: dict[str, Any],
+    *,
+    action: str,
+) -> None:
+    current = task_snapshot_from_row(row)
+    for field, value in expected.items():
+        if field not in TASK_SNAPSHOT_FIELDS:
+            continue
+        if field == "assignee":
+            value = _canonical_assignee(value)
+        if current[field] != value:
+            raise TaskSnapshotConflict(action, current)
+
+
+@contextlib.contextmanager
+def conditional_task_write(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected: dict[str, Any],
+    *,
+    action: str,
+):
+    """Hold one write lock across snapshot validation and canonical mutation."""
+    with write_txn(conn):
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is not None:
+            assert_task_snapshot(row, expected, action=action)
+        yield row
+
+
+@contextlib.contextmanager
+def conditional_tasks_write(
+    conn: sqlite3.Connection,
+    expected_by_task_id: dict[str, dict[str, Any]],
+    *,
+    action: str,
+):
+    """Hold one write lock while validating and mutating a task batch."""
+    with write_txn(conn):
+        for task_id, expected in expected_by_task_id.items():
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is not None:
+                assert_task_snapshot(row, expected, action=action)
+        yield
+
+
+_SCOPED_EXPECTED_TASK_SNAPSHOT: ContextVar[
+    Optional[tuple[str, dict[str, Any], str]]
+] = ContextVar("kanban_expected_task_snapshot", default=None)
+
+
+@contextlib.contextmanager
+def scoped_expected_task_snapshot(
+    task_id: str,
+    expected: dict[str, Any],
+    *,
+    action: str,
+):
+    token = _SCOPED_EXPECTED_TASK_SNAPSHOT.set((task_id, expected, action))
+    try:
+        yield
+    finally:
+        _SCOPED_EXPECTED_TASK_SNAPSHOT.reset(token)
+
+
+def _assert_scoped_expected_task_snapshot(
+    row: sqlite3.Row,
+    task_id: str,
+    *,
+    default_action: str,
+) -> None:
+    scoped = _SCOPED_EXPECTED_TASK_SNAPSHOT.get()
+    if scoped is None or scoped[0] != task_id:
+        return
+    _, expected, action = scoped
+    assert_task_snapshot(row, expected, action=action or default_action)
 
 
 # ---------------------------------------------------------------------------
@@ -3913,10 +4282,7 @@ def create_task(
         except Exception:
             project_obj = None
         if project_obj is None:
-            # A project id/slug that doesn't resolve must not crash task
-            # creation or persist a dangling reference — drop the link and
-            # create the task as an ordinary (scratch) task.
-            project_id = None
+            raise ValueError(f"unknown project: {project_id}")
         else:
             # Canonicalise (a slug may have been passed) and anchor the
             # worktree under the project's primary repo.
@@ -3982,21 +4348,29 @@ def create_task(
     )
     if workflow_template_id == PRODUCT_WORKFLOW_TEMPLATE_ID and not current_step_key:
         _inferred_step = _infer_product_step(
-            title=title, assignee=assignee, explicit_step=None
+            title=title,
+            assignee=assignee,
+            explicit_step=None,
+            product_intent=True,
         )
         if _inferred_step:
             current_step_key = _inferred_step
     elif (
         workflow_template_id is None
         and _is_product_board_metadata(_wf_board_meta)
-        and (not current_step_key or current_step_key in PRODUCT_WORKFLOW_STEP_SET)
+        and current_step_key is None
     ):
         _inferred_step = _infer_product_step(
-            title=title, assignee=assignee, explicit_step=current_step_key
+            title=title,
+            assignee=assignee,
+            explicit_step=None,
+            product_intent=_looks_like_product_story(title),
         )
         if _inferred_step:
             workflow_template_id = PRODUCT_WORKFLOW_TEMPLATE_ID
             current_step_key = _inferred_step
+
+    _validate_product_workflow_state(workflow_template_id, current_step_key)
 
     parents = tuple(p for p in parents if p)
 
@@ -4655,6 +5029,7 @@ def _end_run(
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
     status: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> Optional[int]:
     """Close the currently-active run for ``task_id`` and clear the pointer.
 
@@ -4671,8 +5046,20 @@ def _end_run(
     ).fetchone()
     if not row or not row["current_run_id"]:
         return None
-    run_id = int(row["current_run_id"])
-    conn.execute(
+    run_id = (
+        int(expected_run_id)
+        if expected_run_id is not None
+        else int(row["current_run_id"])
+    )
+    if int(row["current_run_id"]) != run_id:
+        return None
+    active = conn.execute(
+        "SELECT id FROM task_runs WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+        (run_id, task_id),
+    ).fetchone()
+    if active is None:
+        return None
+    closed = conn.execute(
         """
         UPDATE task_runs
            SET status        = ?,
@@ -4685,6 +5072,7 @@ def _end_run(
                claim_expires = NULL,
                worker_pid    = NULL
          WHERE id = ?
+           AND task_id = ?
            AND ended_at IS NULL
         """,
         (
@@ -4695,11 +5083,15 @@ def _end_run(
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
             now,
             run_id,
+            task_id,
         ),
     )
-    conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+    cleared = conn.execute(
+        "UPDATE tasks SET current_run_id = NULL WHERE id = ? AND current_run_id = ?",
+        (task_id, run_id),
     )
+    if closed.rowcount != 1 or cleared.rowcount != 1:
+        return None
     return run_id
 
 
@@ -5551,6 +5943,232 @@ class ProductProvenanceError(ValueError):
         super().__init__(reason)
 
 
+class ReleaseEvidenceError(ValueError):
+    """Raised when a product task lacks evidence required to reach Done."""
+
+    def __init__(self, task_id: str, missing: list[str]):
+        self.task_id = task_id
+        self.missing = list(dict.fromkeys(missing))
+        super().__init__(
+            f"release blocked for {task_id}; missing evidence: "
+            f"{', '.join(self.missing)}"
+        )
+
+
+_RELEASE_SUCCESS_WORDS = frozenset(
+    {"green", "healthy", "ok", "pass", "passed", "success", "succeeded"}
+)
+
+
+def _release_evidence_succeeded(value: Any) -> bool:
+    """Return true only for an explicit positive release-evidence result."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in _RELEASE_SUCCESS_WORDS
+    if not isinstance(value, dict):
+        return False
+    results = [
+        _release_evidence_succeeded(value[key])
+        for key in ("success", "passed", "healthy", "status", "result", "health")
+        if key in value
+    ]
+    return bool(results) and all(results)
+
+
+def _validate_resolver_action(candidate: Any) -> tuple[str, str, Optional[str]]:
+    if not isinstance(candidate, dict):
+        raise ValueError("resolver_action is required to complete a product preflight")
+    expected_keys = {"action", "resolution", "fix_task_id"}
+    if set(candidate) != expected_keys:
+        raise ValueError(
+            "resolver_action must contain exactly action, resolution, and fix_task_id"
+        )
+    action = candidate.get("action")
+    resolution = candidate.get("resolution")
+    fix_task_id = candidate.get("fix_task_id")
+    if action not in {"resume", "create_fix_task", "escalate"}:
+        raise ValueError(
+            "resolver_action.action must be resume, create_fix_task, or escalate"
+        )
+    if not isinstance(resolution, str) or not resolution.strip():
+        raise ValueError("resolver_action.resolution is required")
+    if action == "create_fix_task":
+        if not isinstance(fix_task_id, str) or not fix_task_id.strip():
+            raise ValueError("resolver_action.fix_task_id is required for create_fix_task")
+        fix_task_id = fix_task_id.strip()
+    elif fix_task_id is not None:
+        raise ValueError("resolver_action.fix_task_id must be null unless creating a fix task")
+    return str(action), resolution.strip(), fix_task_id
+
+
+def _validate_product_workflow_outcome(
+    outcome: Any,
+    current_step: str,
+) -> tuple[str, Optional[str], list[str]]:
+    if not isinstance(outcome, dict):
+        raise ValueError("workflow_outcome must be an object")
+    verdict = outcome.get("verdict")
+    positive = PRODUCT_POSITIVE_OUTCOMES.get(current_step)
+    if verdict in {"passed", "approved"}:
+        if set(outcome) != {"verdict"} or verdict != positive:
+            raise ValueError(
+                f"invalid workflow_outcome for {current_step}: verdict={verdict!r}"
+            )
+        return str(verdict), None, []
+
+    if set(outcome) != {"verdict", "target_step", "findings"}:
+        raise ValueError(
+            "rework workflow_outcome must contain exactly verdict, target_step, and findings"
+        )
+    target_step = outcome.get("target_step")
+    expected_target = PRODUCT_REWORK_ROUTES.get((current_step, verdict))
+    if expected_target is None or target_step != expected_target:
+        raise ValueError(
+            f"invalid workflow_outcome for {current_step}: verdict={verdict!r}, "
+            f"target_step={target_step!r}"
+        )
+    raw_findings = outcome.get("findings")
+    if (
+        not isinstance(raw_findings, list)
+        or not raw_findings
+        or not all(isinstance(item, str) and item.strip() for item in raw_findings)
+    ):
+        raise ValueError(
+            "workflow_outcome findings must be a non-empty list of non-empty strings"
+        )
+    return str(verdict), str(target_step), [item.strip() for item in raw_findings]
+
+
+def _route_product_rework_if_requested(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str],
+    metadata: Optional[dict],
+    summary: Optional[str],
+    expected_run_id: Optional[int],
+    product_role_assignees: Optional[dict[str, str]],
+) -> Optional[bool]:
+    outcome = metadata.get("workflow_outcome") if isinstance(metadata, dict) else None
+    if outcome is None:
+        return None
+    meta = product_board_metadata(board) or {}
+    policy = meta.get("product_workflow") if isinstance(meta, dict) else {}
+    try:
+        max_cycles = int((policy or {}).get("max_rework_cycles", 3))
+    except (TypeError, ValueError):
+        max_cycles = 3
+    max_cycles = max(1, max_cycles)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT title, assignee, status, current_step_key, "
+            "current_run_id, rework_count FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        observed_step = row["current_step_key"]
+        current_step = str(observed_step or "").strip()
+        if not current_step:
+            current_step = str(
+                _infer_product_step(
+                    title=row["title"] or "",
+                    assignee=row["assignee"],
+                    explicit_step=None,
+                    product_intent=True,
+                )
+                or ""
+            )
+        verdict, target_step, findings = _validate_product_workflow_outcome(
+            outcome, current_step
+        )
+        if verdict in {"passed", "approved"}:
+            return None
+        if expected_run_id is None:
+            raise ValueError("expected_run_id is required for structured rework")
+        if (
+            row["status"] != "running"
+            or row["current_run_id"] != int(expected_run_id)
+        ):
+            return False
+
+        observed_count = int(row["rework_count"] or 0)
+        next_count = observed_count + 1
+        limit_reached = next_count > max_cycles
+        if limit_reached:
+            next_status = "blocked"
+            next_assignee = "default"
+        else:
+            next_status = _column_status_for_step(meta, target_step)
+            role = "developer" if target_step == "development" else "architect"
+            next_assignee = _product_role_assignee(
+                meta, role, product_role_assignees
+            )
+        sql = (
+            "UPDATE tasks SET rework_count = ?, current_step_key = ?, status = ?, "
+            "assignee = ?, running = 0, blocked = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, workflow_template_id = 'product' "
+            "WHERE id = ? AND status = ? AND current_step_key IS ? "
+            "AND rework_count = ? AND current_run_id = ?"
+        )
+        params: tuple[Any, ...] = (
+            next_count,
+            target_step,
+            next_status,
+            next_assignee,
+            1 if limit_reached else 0,
+            task_id,
+            row["status"],
+            observed_step,
+            observed_count,
+            int(expected_run_id),
+        )
+        updated = conn.execute(sql, params)
+        if updated.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="rework_requested",
+            status="blocked" if limit_reached else "completed",
+            summary=summary,
+            metadata=metadata,
+            expected_run_id=expected_run_id,
+        )
+        if expected_run_id is not None and run_id is None:
+            raise RuntimeError("rework run ownership changed")
+        _append_event(
+            conn,
+            task_id,
+            "rework_limit_reached" if limit_reached else "rework_requested",
+            {
+                "from_step": current_step,
+                "target_step": target_step,
+                "verdict": verdict,
+                "findings": findings,
+                "rework_count": next_count,
+                "max_rework_cycles": max_cycles,
+            },
+            run_id=run_id,
+        )
+        if limit_reached:
+            _append_event(
+                conn,
+                task_id,
+                "blocked",
+                {
+                    "reason": "maximum product rework cycles exceeded",
+                    "kind": "rework_limit",
+                    "findings": findings,
+                    "rework_count": next_count,
+                    "max_rework_cycles": max_cycles,
+                },
+                run_id=run_id,
+            )
+    return True
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5563,6 +6181,7 @@ def complete_task(
     board: Optional[str] = None,
     product_role_assignees: Optional[dict[str, str]] = None,
     product_workflow_enabled: bool = True,
+    _release_evidence: Optional[dict] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -5624,6 +6243,41 @@ def complete_task(
     if product_workflow_enabled:
         meta = product_board_metadata(board)
         if meta is not None and _handoff_v2_enabled(meta):
+            validated_positive_phase: Optional[str] = None
+            _validate_stored_product_workflow_state(conn, task_id)
+            if _latest_unresolved_product_preflight(conn, task_id):
+                resolver_result = _complete_product_workflow_step(
+                    conn,
+                    task_id,
+                    board=board,
+                    result=result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=expected_run_id,
+                    product_role_assignees=product_role_assignees,
+                )
+                if resolver_result is not None:
+                    return resolver_result
+            rework_routed = _route_product_rework_if_requested(
+                conn,
+                task_id,
+                board=board,
+                metadata=metadata,
+                summary=summary if summary is not None else result,
+                expected_run_id=expected_run_id,
+                product_role_assignees=product_role_assignees,
+            )
+            if rework_routed is not None:
+                return rework_routed
+            workflow_outcome = (
+                metadata.get("workflow_outcome")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if isinstance(workflow_outcome, dict):
+                validated_positive_phase = PRODUCT_POSITIVE_OUTCOME_STEPS.get(
+                    workflow_outcome.get("verdict")
+                )
             # Completion preflight: repair a plain/legacy role card's missing
             # product metadata before the transition is evaluated, so handoff_v2
             # advances the correct step (re-applied from f55580879). Repair only
@@ -5657,6 +6311,7 @@ def complete_task(
                 advanced = handoff(
                     conn, task_id, board=board, summary=summary, metadata=metadata,
                     expected_run_id=expected_run_id,
+                    expected_phase=validated_positive_phase,
                 )
                 if not advanced:
                     # Required source-commit gate failed (for source-producing
@@ -5664,14 +6319,6 @@ def complete_task(
                     # -- do NOT fall through to the terminal-done UPDATE,
                     # which would wrongly mark an uncommitted card done.
                     return False
-                with write_txn(conn):
-                    _end_run(
-                        conn, task_id,
-                        outcome="advanced",
-                        status="completed",
-                        summary=summary if summary is not None else result,
-                        metadata=metadata,
-                    )
                 return True
             # Terminal / non-advancing v2 step (e.g. release_measure, or no
             # transition at all): fall through to the existing legacy path
@@ -5691,9 +6338,21 @@ def complete_task(
             return product_transition
 
     with write_txn(conn):
+        terminal_row = conn.execute(
+            "SELECT current_step_key FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        terminal_meta = product_board_metadata(board)
+        if (
+            terminal_row is not None
+            and terminal_row["current_step_key"] == "release_measure"
+            and terminal_meta is not None
+            and _handoff_v2_enabled(terminal_meta)
+        ):
+            _validate_done_evidence(conn, task_id, _release_evidence or {})
+        release_status = ", 'todo'" if _release_evidence is not None else ""
         if expected_run_id is None:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE tasks
                    SET status       = 'done',
                        result       = ?,
@@ -5706,13 +6365,13 @@ def complete_task(
                        running      = 0,
                        blocked      = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked'{release_status})
                 """,
                 (result, now, task_id),
             )
         else:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE tasks
                    SET status       = 'done',
                        result       = ?,
@@ -5725,7 +6384,7 @@ def complete_task(
                        running      = 0,
                        blocked      = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked'{release_status})
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
@@ -5772,6 +6431,8 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if _release_evidence is not None:
+            completed_payload["release_evidence"] = dict(_release_evidence)
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -6213,8 +6874,12 @@ def block_task(
     expected_run_id: Optional[int] = None,
     board: Optional[str] = None,
     human_escalation_assignee: Optional[str] = "default",
+    allow_todo: bool = False,
 ) -> bool:
-    """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+    """Transition a blockable task to ``blocked`` (or route elsewhere).
+
+    ``allow_todo`` extends the operator path to idle ``todo`` cards without
+    changing the worker-facing default.
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
     un-typed block) drives routing instead of every block landing in one
@@ -6290,10 +6955,11 @@ def block_task(
                        worker_pid    = NULL,
                        block_kind    = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'review')
+                   AND (status IN ('running', 'ready', 'review')
+                        OR (? AND status = 'todo'))
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
+                (kind, task_id, int(allow_todo)) if expected_run_id is None
+                else (kind, task_id, int(allow_todo), int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -6354,10 +7020,11 @@ def block_task(
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'review')
+                   AND (status IN ('running', 'ready', 'review')
+                        OR (? AND status = 'todo'))
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                (kind, recurrences, task_id, int(allow_todo)) if expected_run_id is None
+                else (kind, recurrences, task_id, int(allow_todo), int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -6402,9 +7069,10 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready', 'review')
+                       AND (status IN ('running', 'ready', 'review')
+                            OR (? AND status = 'todo'))
                     """,
-                    (kind, recurrences, task_id),
+                    (kind, recurrences, task_id, int(allow_todo)),
                 )
             else:
                 cur = conn.execute(
@@ -6417,10 +7085,17 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready', 'review')
+                       AND (status IN ('running', 'ready', 'review')
+                            OR (? AND status = 'todo'))
                        AND current_run_id = ?
                     """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
+                    (
+                        kind,
+                        recurrences,
+                        task_id,
+                        int(allow_todo),
+                        int(expected_run_id),
+                    ),
                 )
             if cur.rowcount != 1:
                 return False
@@ -6731,11 +7406,16 @@ def specify_triage_task(
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT * FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
             return False
+        _assert_scoped_expected_task_snapshot(
+            existing,
+            task_id,
+            default_action="specifying the task",
+        )
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
@@ -6760,9 +7440,7 @@ def specify_triage_task(
         if cur.rowcount != 1:
             return False
         if changed_fields and author and author.strip():
-            # Inline INSERT (rather than ``add_comment``) because we're
-            # already inside this function's write_txn — nested BEGIN
-            # IMMEDIATE would raise OperationalError. We also skip the
+            # Inline INSERT avoids an unnecessary nested savepoint. We also skip the
             # 'commented' event that ``add_comment`` emits, since the
             # 'specified' event below already records the change.
             conn.execute(
@@ -6783,8 +7461,8 @@ def specify_triage_task(
             "specified",
             {"changed_fields": changed_fields} if changed_fields else None,
         )
-    # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
-    # ready-promotion pass opens its own IMMEDIATE txn. This runs the same
+    # Outside the write_txn above, the ready-promotion pass opens its own
+    # IMMEDIATE txn. This runs the same
     # logic the dispatcher would on its next tick, so a specified task
     # with no open parents flips straight to 'ready' here instead of
     # idling in 'todo' until the next sweep.
@@ -6885,12 +7563,16 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
-            "FROM tasks WHERE id = ?",
+            "SELECT * FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if root_row is None:
             return None
+        _assert_scoped_expected_task_snapshot(
+            root_row,
+            task_id,
+            default_action="decomposing the task",
+        )
         if root_row["status"] != "triage":
             return None
         tenant = root_row["tenant"]
@@ -7130,6 +7812,21 @@ def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
     except Exception:
         return False
     return result.returncode == 0
+
+
+def _git_ref_sha(repo_root: Path, branch_name: str) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", f"refs/heads/{branch_name}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    value = (result.stdout or "").strip()
+    return value if result.returncode == 0 and value else None
 
 
 def _git_common_dir(path: Path) -> Optional[Path]:
@@ -7384,6 +8081,253 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
+@dataclass(frozen=True)
+class IntegrationCandidate:
+    pre_sha: str
+    candidate_sha: str
+    source_branch: str
+    source_sha: str
+    target_branch: str
+    target_worktree: Optional[Path]
+    scratch_worktree: Path
+    repo_root: Path
+    candidate_ref: str
+
+
+_RECONCILE_INTEGRATION_VERIFY_UNSET = object()
+
+
+@dataclass(frozen=True)
+class ReleaseResult:
+    released: bool
+    status: str
+    integration_event_id: Optional[int] = None
+    integration_sha: Optional[str] = None
+    deployment_policy_event_id: Optional[int] = None
+    deployment_record_event_id: Optional[int] = None
+
+
+class IntegrationCandidateError(RuntimeError):
+    def __init__(self, message: str, *, scratch_worktree: Optional[Path] = None):
+        super().__init__(message)
+        self.scratch_worktree = scratch_worktree
+
+
+def _integration_git(
+    cwd: Path, args: list[str], *, timeout: int = 120
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except Exception as exc:
+        raise IntegrationCandidateError(f"git command failed: {args[0]}") from exc
+
+
+def _checked_out_branch_worktree(repo_root: Path, branch: str) -> Optional[Path]:
+    listed = _integration_git(repo_root, ["worktree", "list", "--porcelain"])
+    if listed.returncode != 0:
+        raise IntegrationCandidateError("could not list repository worktrees")
+    wanted = f"refs/heads/{branch}"
+    for block in (listed.stdout or "").strip().split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in block.splitlines():
+            key, _, value = line.partition(" ")
+            fields[key] = value
+        if fields.get("branch") == wanted and fields.get("worktree"):
+            return Path(fields["worktree"]).resolve()
+    return None
+
+
+def _worktree_is_clean(path: Path) -> bool:
+    status = _integration_git(path, ["status", "--porcelain", "--untracked-files=all"])
+    return status.returncode == 0 and not (status.stdout or "").strip()
+
+
+def _remove_clean_integration_worktree(repo_root: Path, scratch: Path) -> None:
+    if not _worktree_is_clean(scratch):
+        raise IntegrationCandidateError(
+            f"scratch worktree is dirty; preserved at {scratch}",
+            scratch_worktree=scratch,
+        )
+    removed = _integration_git(repo_root, ["worktree", "remove", str(scratch)])
+    if removed.returncode != 0:
+        raise IntegrationCandidateError(
+            f"could not remove scratch worktree; preserved at {scratch}",
+            scratch_worktree=scratch,
+        )
+
+
+def _build_verified_merge_candidate(
+    repo_root: Path,
+    target_branch: str,
+    source_branch: str,
+    message: str,
+    candidate_verify_fn: Optional[Callable[[Path], bool]] = None,
+    *,
+    expected_source_sha: Optional[str] = None,
+) -> IntegrationCandidate:
+    repo_root = repo_root.resolve()
+    target_worktree = _checked_out_branch_worktree(repo_root, target_branch)
+    if target_worktree is not None and not _worktree_is_clean(target_worktree):
+        raise IntegrationCandidateError(f"target worktree is dirty: {target_worktree}")
+
+    source_result = _integration_git(
+        repo_root, ["rev-parse", f"refs/heads/{source_branch}"]
+    )
+    source_sha = (source_result.stdout or "").strip()
+    if source_result.returncode != 0 or not source_sha:
+        raise IntegrationCandidateError(f"could not resolve {source_branch}")
+    if expected_source_sha is not None and source_sha != expected_source_sha:
+        raise IntegrationCandidateError(
+            f"source branch moved: {source_branch} no longer matches reviewed SHA"
+        )
+    approved_source_sha = expected_source_sha or source_sha
+
+    pre_result = _integration_git(repo_root, ["rev-parse", f"refs/heads/{target_branch}"])
+    pre_sha = (pre_result.stdout or "").strip()
+    if pre_result.returncode != 0 or not pre_sha:
+        raise IntegrationCandidateError(f"could not resolve {target_branch}")
+
+    nonce = secrets.token_hex(6)
+    scratch = repo_root / ".worktrees" / f"integration-{nonce}"
+    scratch.parent.mkdir(parents=True, exist_ok=True)
+    added = _integration_git(
+        repo_root, ["worktree", "add", "--detach", str(scratch), pre_sha]
+    )
+    if added.returncode != 0:
+        raise IntegrationCandidateError("could not create integration worktree")
+
+    merged = _integration_git(
+        scratch,
+        ["merge", "--no-ff", approved_source_sha, "-m", message],
+        timeout=900,
+    )
+    if merged.returncode != 0:
+        _integration_git(scratch, ["merge", "--abort"])
+        _remove_clean_integration_worktree(repo_root, scratch)
+        raise IntegrationCandidateError("merge conflict")
+
+    candidate_result = _integration_git(scratch, ["rev-parse", "HEAD"])
+    candidate_sha = (candidate_result.stdout or "").strip()
+    if candidate_result.returncode != 0 or not candidate_sha:
+        raise IntegrationCandidateError(
+            "could not resolve integration candidate", scratch_worktree=scratch
+        )
+
+    if candidate_verify_fn is None:
+        script = scratch / "scripts" / "run_tests.sh"
+        if not script.is_file():
+            verified = False
+        else:
+            try:
+                result = subprocess.run(
+                    ["bash", "scripts/run_tests.sh"],
+                    cwd=scratch,
+                    capture_output=True,
+                    text=True,
+                    timeout=1800,
+                    check=False,
+                )
+                verified = result.returncode == 0
+            except Exception:
+                verified = False
+    else:
+        try:
+            verified = bool(candidate_verify_fn(scratch))
+        except Exception:
+            verified = False
+    if not verified:
+        _remove_clean_integration_worktree(repo_root, scratch)
+        raise IntegrationCandidateError("candidate verification failed")
+
+    if expected_source_sha is not None:
+        current_source = _integration_git(
+            repo_root, ["rev-parse", f"refs/heads/{source_branch}"]
+        )
+        if (
+            current_source.returncode != 0
+            or (current_source.stdout or "").strip() != expected_source_sha
+        ):
+            _remove_clean_integration_worktree(repo_root, scratch)
+            raise IntegrationCandidateError(
+                f"source branch moved: {source_branch} no longer matches reviewed SHA"
+            )
+
+    if not _worktree_is_clean(scratch):
+        raise IntegrationCandidateError(
+            f"scratch worktree is dirty; preserved at {scratch}",
+            scratch_worktree=scratch,
+        )
+
+    candidate_ref = f"refs/hermes/integration-candidates/{nonce}"
+    retained = _integration_git(repo_root, ["update-ref", candidate_ref, candidate_sha])
+    if retained.returncode != 0:
+        raise IntegrationCandidateError(
+            "could not retain integration candidate", scratch_worktree=scratch
+        )
+    _remove_clean_integration_worktree(repo_root, scratch)
+    return IntegrationCandidate(
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+        source_branch=source_branch,
+        source_sha=approved_source_sha,
+        target_branch=target_branch,
+        target_worktree=target_worktree,
+        scratch_worktree=scratch,
+        repo_root=repo_root,
+        candidate_ref=candidate_ref,
+    )
+
+
+def _fast_forward_target(candidate: IntegrationCandidate) -> bool:
+    target_ref = f"refs/heads/{candidate.target_branch}"
+    current = _integration_git(candidate.repo_root, ["rev-parse", target_ref])
+    if current.returncode != 0 or (current.stdout or "").strip() != candidate.pre_sha:
+        return False
+
+    current_target_worktree = _checked_out_branch_worktree(
+        candidate.repo_root, candidate.target_branch
+    )
+    if current_target_worktree != candidate.target_worktree:
+        return False
+
+    if current_target_worktree is not None:
+        if not _worktree_is_clean(current_target_worktree):
+            return False
+        branch = _integration_git(current_target_worktree, ["branch", "--show-current"])
+        if branch.returncode != 0 or (branch.stdout or "").strip() != candidate.target_branch:
+            return False
+        current = _integration_git(candidate.repo_root, ["rev-parse", target_ref])
+        if current.returncode != 0 or (current.stdout or "").strip() != candidate.pre_sha:
+            return False
+        applied = _integration_git(
+            current_target_worktree, ["merge", "--ff-only", candidate.candidate_sha]
+        )
+    else:
+        applied = _integration_git(
+            candidate.repo_root,
+            ["update-ref", target_ref, candidate.candidate_sha, candidate.pre_sha],
+        )
+    if applied.returncode != 0:
+        return False
+    applied_ref = _integration_git(candidate.repo_root, ["rev-parse", target_ref])
+    if (
+        applied_ref.returncode != 0
+        or (applied_ref.stdout or "").strip() != candidate.candidate_sha
+    ):
+        return False
+    _integration_git(
+        candidate.repo_root,
+        ["update-ref", "-d", candidate.candidate_ref, candidate.candidate_sha],
+    )
+    return True
+
+
 def _default_epic_verify(epic_branch: str) -> bool:
     """Run the project's test suite against ``epic_branch`` and report green.
 
@@ -7498,6 +8442,9 @@ def merge_epic_to_main(
     board: Optional[str] = None,
     main_branch: str = "main",
     verify_fn: Optional[Callable[[str], bool]] = None,
+    candidate_verify_fn: Optional[Callable[[Path], bool]] = None,
+    expected_source_sha: Optional[str] = None,
+    before_apply_fn: Optional[Callable[[], bool]] = None,
     notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
 ) -> Optional[str]:
     """Hermes-run merge of ``epic_id``'s integration branch into LOCAL main.
@@ -7507,9 +8454,8 @@ def merge_epic_to_main(
     says the epic isn't mergeable yet, or the repo/branch can't be resolved
     (no git mutation in either case); ``"conflict"`` when the merge itself
     fails (aborted, main left exactly as it was); ``"verify_failed"`` when the
-    merge succeeds but the post-merge working tree isn't clean or the suite
-    isn't green on main (undone via ``reset --hard`` back to the pre-merge
-    sha); ``"merged"`` on success.
+    candidate merge succeeds but its isolated verification fails;
+    ``"merged"`` only after an atomic fast-forward of the unchanged target.
 
     On both failure outcomes the epic is cleared of ``running``, marked
     ``blocked``, and ``notify_fn`` (the Slack hook) is invoked -- see
@@ -7523,13 +8469,15 @@ def merge_epic_to_main(
     # boundary for Hermes. This function must NEVER call `git push`, and must
     # NEVER import or call web_git.py's push helpers (`_review_push` /
     # `review_push` / `review_create_pr`). Only local git verbs below:
-    # rev-parse, switch/checkout, merge, merge --abort, reset --hard, status.
+    # rev-parse, worktree, merge, merge --abort, status, and update-ref.
     # =========================================================================
     meta = product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return None
+    _validate_stored_product_workflow_state(conn, epic_id)
 
-    if not epic_ready(conn, epic_id, board=board, verify_fn=verify_fn):
+    readiness_verify = (lambda _branch: True) if candidate_verify_fn else verify_fn
+    if not epic_ready(conn, epic_id, board=board, verify_fn=readiness_verify):
         return "not_ready"
 
     try:
@@ -7541,77 +8489,60 @@ def merge_epic_to_main(
     except Exception:
         return "not_ready"
 
-    def _run(args: list[str], *, timeout: int = 60):
-        try:
-            return subprocess.run(
-                ["git", "-C", str(repo_root), *args],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-        except Exception:
-            return None
-
     def _fail(reason: str) -> None:
         _merge_epic_fail_safe(conn, epic_id, reason, board=board, notify_fn=notify_fn)
 
-    pre_sha = ""
     try:
-        pre_sha_result = _run(["rev-parse", main_branch])
-        pre_sha = (pre_sha_result.stdout or "").strip() if pre_sha_result else ""
-        if pre_sha_result is None or pre_sha_result.returncode != 0 or not pre_sha:
-            _fail(f"could not resolve {main_branch}")
-            return "verify_failed"
-
-        switch_result = _run(["switch", main_branch])
-        if switch_result is None or switch_result.returncode != 0:
-            switch_result = _run(["checkout", main_branch])
-        if switch_result is None or switch_result.returncode != 0:
-            _fail(f"could not switch to {main_branch}")
-            return "verify_failed"
-
-        merge_result = _run(
-            ["merge", "--no-ff", epic_branch, "-m", f"merge epic {epic_id}"],
-            timeout=120,
+        effective_verify_fn = candidate_verify_fn or (
+            (lambda _path: bool(verify_fn(main_branch)))
+            if verify_fn is not None
+            else None
         )
-        if merge_result is None or merge_result.returncode != 0:
-            _run(["merge", "--abort"])
-            _fail("merge conflict")
-            return "conflict"
-
-        status_result = _run(["status", "--porcelain", "--untracked-files=no"])
-        clean = bool(
-            status_result is not None
-            and status_result.returncode == 0
-            and not (status_result.stdout or "").strip()
+        candidate = _build_verified_merge_candidate(
+            repo_root,
+            main_branch,
+            epic_branch,
+            f"merge epic {epic_id}",
+            effective_verify_fn,
+            expected_source_sha=expected_source_sha,
         )
-        verify = verify_fn or _default_epic_verify
-        try:
-            verified = bool(verify(main_branch))
-        except Exception:
-            verified = False
-
-        if not clean or not verified:
-            _run(["reset", "--hard", pre_sha])
-            _fail("post-merge verify failed")
+        if before_apply_fn is not None and not before_apply_fn():
+            return "ownership_conflict"
+        if not _fast_forward_target(candidate):
+            _fail(
+                "target moved or became dirty; candidate retained at "
+                f"{candidate.candidate_ref}"
+            )
             return "verify_failed"
 
         try:
             with write_txn(conn):
                 _append_event(
-                    conn, epic_id, "epic_merged",
-                    {"epic_branch": epic_branch, "pre_sha": pre_sha},
+                    conn,
+                    epic_id,
+                    "epic_merged",
+                    {
+                        "epic_branch": epic_branch,
+                        "source_branch": epic_branch,
+                        "source_sha": candidate.source_sha,
+                        "target_branch": main_branch,
+                        "pre_sha": candidate.pre_sha,
+                        "candidate_sha": candidate.candidate_sha,
+                        "target": str(candidate.target_worktree or main_branch),
+                        "test_command": "bash scripts/run_tests.sh",
+                    },
                 )
         except Exception:
             pass
         return "merged"
+    except IntegrationCandidateError as exc:
+        reason = str(exc)
+        _fail(reason)
+        if "merge conflict" in reason:
+            return "conflict"
+        return "verify_failed"
     except Exception:
-        # Never leave a partial merge: best-effort undo, then fail-safe.
-        _run(["merge", "--abort"])
-        if pre_sha:
-            _run(["reset", "--hard", pre_sha])
-        _fail("unexpected error during merge")
+        _fail("unexpected error while building integration candidate")
         return "verify_failed"
 
 
@@ -7652,6 +8583,9 @@ def integrate_story_to_epic(
     *,
     board: Optional[str] = None,
     notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
+    candidate_verify_fn: Any = _RECONCILE_INTEGRATION_VERIFY_UNSET,
+    expected_source_sha: Optional[str] = None,
+    before_apply_fn: Optional[Callable[[], bool]] = None,
 ) -> Optional[str]:
     """Merge a Done story's branch into its epic's integration branch, LOCALLY.
 
@@ -7691,6 +8625,7 @@ def integrate_story_to_epic(
     meta = product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return None
+    _validate_stored_product_workflow_state(conn, story_id)
 
     parents = parent_ids(conn, story_id)
     if not parents:
@@ -7730,11 +8665,96 @@ def integrate_story_to_epic(
         ancestor_result = _run(
             ["merge-base", "--is-ancestor", story_branch, epic_branch], cwd=repo_root,
         )
-        if ancestor_result is not None and ancestor_result.returncode == 0:
+        already_integrated = ancestor_result is not None and ancestor_result.returncode == 0
+        if (
+            already_integrated
+            and candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
+            and expected_source_sha is None
+        ):
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    story_id,
+                    "story_integrated_to_epic",
+                    {
+                        "source_branch": story_branch,
+                        "source_sha": _git_ref_sha(repo_root, story_branch),
+                        "target_branch": epic_branch,
+                        "candidate_sha": _git_ref_sha(repo_root, epic_branch),
+                        "already_integrated": True,
+                    },
+                )
             return "already_integrated"
+
+        if (
+            candidate_verify_fn is not _RECONCILE_INTEGRATION_VERIFY_UNSET
+            or expected_source_sha is not None
+        ):
+            try:
+                effective_verify_fn = (
+                    None
+                    if candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
+                    else candidate_verify_fn
+                )
+                candidate = _build_verified_merge_candidate(
+                    repo_root,
+                    epic_branch,
+                    story_branch,
+                    f"integrate story {story_id}",
+                    effective_verify_fn,
+                    expected_source_sha=expected_source_sha,
+                )
+                if before_apply_fn is not None and not before_apply_fn():
+                    return "ownership_conflict"
+                if not _fast_forward_target(candidate):
+                    reason = (
+                        "epic target moved or became dirty; candidate retained at "
+                        f"{candidate.candidate_ref}"
+                    )
+                    with write_txn(conn):
+                        _append_event(
+                            conn,
+                            story_id,
+                            "story_integration_failed",
+                            {"reason": reason, "release_candidate": True},
+                        )
+                    return "verify_failed"
+            except IntegrationCandidateError as exc:
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        story_id,
+                        "story_integration_failed",
+                        {"reason": str(exc), "release_candidate": True},
+                    )
+                return "conflict" if "merge conflict" in str(exc) else "verify_failed"
+
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    story_id,
+                    "story_integrated_to_epic",
+                    {
+                        "source_branch": story_branch,
+                        "source_sha": candidate.source_sha,
+                        "target_branch": epic_branch,
+                        "pre_sha": candidate.pre_sha,
+                        "candidate_sha": candidate.candidate_sha,
+                        "target": str(candidate.target_worktree or epic_branch),
+                        "test_command": "bash scripts/run_tests.sh",
+                        "already_integrated": already_integrated,
+                    },
+                )
+            return "already_integrated" if already_integrated else "integrated"
 
         epic_worktree = repo_root / ".worktrees" / f"epic-{epic_id}"
         _ensure_git_worktree(repo_root, epic_worktree, epic_branch)
+        if not _worktree_is_clean(epic_worktree):
+            reason = f"epic integration worktree is dirty; preserved at {epic_worktree}"
+            _integrate_story_fail_safe(
+                conn, story_id, reason, board=board, notify_fn=notify_fn
+            )
+            return "verify_failed"
 
         merge_result = _run(
             ["merge", "--no-ff", story_branch, "-m", f"integrate story {story_id}"],
@@ -7742,10 +8762,26 @@ def integrate_story_to_epic(
         )
         if merge_result is None or merge_result.returncode != 0:
             _run(["merge", "--abort"], cwd=epic_worktree)
-            reason = "story→epic merge conflict"
+            reason = (
+                "story→epic merge conflict"
+                if _worktree_is_clean(epic_worktree)
+                else f"story→epic merge conflict; preserved dirty worktree at {epic_worktree}"
+            )
             _integrate_story_fail_safe(conn, story_id, reason, board=board, notify_fn=notify_fn)
             return "conflict"
 
+        with write_txn(conn):
+            _append_event(
+                conn,
+                story_id,
+                "story_integrated_to_epic",
+                {
+                    "source_branch": story_branch,
+                    "source_sha": _git_ref_sha(repo_root, story_branch),
+                    "target_branch": epic_branch,
+                    "candidate_sha": _git_ref_sha(repo_root, epic_branch),
+                },
+            )
         return "integrated"
     except Exception:
         return None
@@ -7758,7 +8794,11 @@ def _merge_standalone_story_to_main(
     board: Optional[str] = None,
     main_branch: str = "main",
     verify_fn: Optional[Callable[[str], bool]] = None,
+    candidate_verify_fn: Optional[Callable[[Path], bool]] = None,
+    expected_source_sha: Optional[str] = None,
+    before_apply_fn: Optional[Callable[[], bool]] = None,
     notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
+    allow_release_measure: bool = False,
 ) -> Optional[str]:
     """Merge a Done, epic-LESS product story's branch into LOCAL main.
 
@@ -7775,8 +8815,8 @@ def _merge_standalone_story_to_main(
     mutation); ``"already_merged"`` when the story branch is already an ancestor
     of main (idempotent); ``"conflict"`` when the merge fails (aborted, main
     left exactly as it was); ``"verify_failed"`` when the merge succeeds but the
-    post-merge tree isn't clean or the suite isn't green (undone via
-    ``reset --hard``); ``"merged"`` on success. On both failure outcomes the
+    isolated candidate is dirty or the suite isn't green (the target remains
+    unchanged); ``"merged"`` on success. On both failure outcomes the
     STORY (not an epic) is cleared of ``running``, blocked, and ``notify_fn``
     invoked -- see :func:`_integrate_story_fail_safe`.
     """
@@ -7788,11 +8828,15 @@ def _merge_standalone_story_to_main(
     meta = product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return None
+    _validate_stored_product_workflow_state(conn, story_id)
     # A story WITH an epic goes through integrate_story_to_epic + merge_epic_to_main.
     if parent_ids(conn, story_id):
         return None
     story = get_task(conn, story_id)
-    if story is None or story.status != "done":
+    if story is None or (
+        story.status != "done"
+        and not (allow_release_measure and story.current_step_key == "release_measure")
+    ):
         return "not_ready"
 
     try:
@@ -7808,81 +8852,488 @@ def _merge_standalone_story_to_main(
     except Exception:
         return "not_ready"
 
-    def _run(args: list[str], *, timeout: int = 60):
-        try:
-            return subprocess.run(
-                ["git", "-C", str(repo_root), *args],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-        except Exception:
-            return None
-
     def _fail(reason: str) -> None:
         _integrate_story_fail_safe(conn, story_id, reason, board=board, notify_fn=notify_fn)
 
-    pre_sha = ""
     try:
-        ancestor_result = _run(["merge-base", "--is-ancestor", story_branch, main_branch])
-        if ancestor_result is not None and ancestor_result.returncode == 0:
+        ancestor_result = _integration_git(
+            repo_root, ["merge-base", "--is-ancestor", story_branch, main_branch]
+        )
+        already_merged = ancestor_result.returncode == 0
+        if already_merged and expected_source_sha is None:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    story_id,
+                    "story_merged_to_main",
+                    {
+                        "branch": story_branch,
+                        "source_branch": story_branch,
+                        "source_sha": _git_ref_sha(repo_root, story_branch),
+                        "target_branch": main_branch,
+                        "candidate_sha": _git_ref_sha(repo_root, main_branch),
+                        "already_merged": True,
+                    },
+                )
             return "already_merged"
-
-        pre_sha_result = _run(["rev-parse", main_branch])
-        pre_sha = (pre_sha_result.stdout or "").strip() if pre_sha_result else ""
-        if pre_sha_result is None or pre_sha_result.returncode != 0 or not pre_sha:
-            _fail(f"could not resolve {main_branch}")
-            return "verify_failed"
-
-        switch_result = _run(["switch", main_branch])
-        if switch_result is None or switch_result.returncode != 0:
-            switch_result = _run(["checkout", main_branch])
-        if switch_result is None or switch_result.returncode != 0:
-            _fail(f"could not switch to {main_branch}")
-            return "verify_failed"
-
-        merge_result = _run(
-            ["merge", "--no-ff", story_branch, "-m", f"merge story {story_id}"],
-            timeout=120,
+        effective_verify_fn = candidate_verify_fn or (
+            (lambda _path: bool(verify_fn(main_branch)))
+            if verify_fn is not None
+            else None
         )
-        if merge_result is None or merge_result.returncode != 0:
-            _run(["merge", "--abort"])
-            _fail("story→main merge conflict")
-            return "conflict"
-
-        status_result = _run(["status", "--porcelain", "--untracked-files=no"])
-        clean = bool(
-            status_result is not None
-            and status_result.returncode == 0
-            and not (status_result.stdout or "").strip()
+        candidate = _build_verified_merge_candidate(
+            repo_root,
+            main_branch,
+            story_branch,
+            f"merge story {story_id}",
+            effective_verify_fn,
+            expected_source_sha=expected_source_sha,
         )
-        verify = verify_fn or _default_epic_verify
-        try:
-            verified = bool(verify(main_branch))
-        except Exception:
-            verified = False
-
-        if not clean or not verified:
-            _run(["reset", "--hard", pre_sha])
-            _fail("post-merge verify failed")
+        if before_apply_fn is not None and not before_apply_fn():
+            return "ownership_conflict"
+        if not _fast_forward_target(candidate):
+            _fail(
+                "target moved or became dirty; candidate retained at "
+                f"{candidate.candidate_ref}"
+            )
             return "verify_failed"
 
         try:
             with write_txn(conn):
                 _append_event(
-                    conn, story_id, "story_merged_to_main",
-                    {"branch": story_branch, "pre_sha": pre_sha},
+                    conn,
+                    story_id,
+                    "story_merged_to_main",
+                    {
+                        "branch": story_branch,
+                        "source_branch": story_branch,
+                        "source_sha": candidate.source_sha,
+                        "target_branch": main_branch,
+                        "pre_sha": candidate.pre_sha,
+                        "candidate_sha": candidate.candidate_sha,
+                        "target": str(candidate.target_worktree or main_branch),
+                        "test_command": "bash scripts/run_tests.sh",
+                    },
                 )
         except Exception:
             pass
-        return "merged"
-    except Exception:
-        _run(["merge", "--abort"])
-        if pre_sha:
-            _run(["reset", "--hard", pre_sha])
-        _fail("unexpected error during story merge")
+        return "already_merged" if already_merged else "merged"
+    except IntegrationCandidateError as exc:
+        reason = str(exc)
+        _fail(reason)
+        if "merge conflict" in reason:
+            return "conflict"
         return "verify_failed"
+    except Exception:
+        _fail("unexpected error while building story integration candidate")
+        return "verify_failed"
+
+
+def _event_by_id(
+    conn: sqlite3.Connection, task_id: str, event_id: Any
+) -> Optional[Event]:
+    if not isinstance(event_id, int):
+        return None
+    return next((event for event in list_events(conn, task_id) if event.id == event_id), None)
+
+
+def _latest_event_of_kind(
+    conn: sqlite3.Connection, task_id: str, kinds: set[str]
+) -> Optional[Event]:
+    events = [event for event in list_events(conn, task_id) if event.kind in kinds]
+    return events[-1] if events else None
+
+
+def _release_run_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    branch: str,
+    source_sha: str,
+) -> dict[str, int]:
+    test_run: Optional[Run] = None
+    review_run: Optional[Run] = None
+    writer_agent: Optional[str] = None
+    reviewer_agent: Optional[str] = None
+    reviewed_writer_agent: Optional[str] = None
+    reviewed_branch: Optional[str] = None
+    reviewed_commit: Optional[str] = None
+
+    for run in list_runs(conn, task_id, include_active=False):
+        metadata = run.metadata if isinstance(run.metadata, dict) else {}
+        run_writer = _writer_agent_from_metadata(metadata)
+        if run_writer:
+            writer_agent = run_writer
+        provenance = _provenance_payload(metadata)
+        workflow = metadata.get("workflow_outcome")
+        if run.step_key == "test":
+            tester = provenance.get("tester")
+            if (
+                isinstance(workflow, dict)
+                and workflow.get("verdict") == "passed"
+                and isinstance(tester, dict)
+                and tester.get("result") == "passed"
+                and _tester_agent_from_metadata(metadata)
+            ):
+                test_run = run
+        if run.step_key == "review":
+            reviewer = provenance.get("reviewer")
+            if (
+                isinstance(workflow, dict)
+                and workflow.get("verdict") == "approved"
+                and isinstance(reviewer, dict)
+                and reviewer.get("verdict") == "approved"
+                and _reviewer_agent_from_metadata(metadata)
+            ):
+                review_run = run
+                reviewer_agent = _reviewer_agent_from_metadata(metadata)
+                reviewed_branch = str(reviewer.get("reviewed_branch") or "").strip()
+                reviewed_commit = str(reviewer.get("reviewed_commit") or "").strip()
+                reviewed_writer_agent = run_writer or writer_agent
+
+    missing: list[str] = []
+    if test_run is None:
+        missing.append("tester_pass")
+    if review_run is None:
+        missing.append("reviewer_approval")
+    if (
+        review_run is not None
+        and reviewed_writer_agent
+        and reviewer_agent
+        and _agent_compare_key(reviewed_writer_agent)
+        == _agent_compare_key(reviewer_agent)
+    ):
+        missing.append("independent_reviewer")
+    if review_run is not None and (
+        reviewed_branch != branch or reviewed_commit != source_sha
+    ):
+        missing.append("reviewed_candidate")
+    if not reviewed_writer_agent:
+        missing.append("writer_evidence")
+    if review_run is not None and not reviewer_agent:
+        missing.append("independent_reviewer")
+    if missing:
+        raise ReleaseEvidenceError(task_id, missing)
+    return {"test_run_id": test_run.id, "review_run_id": review_run.id}
+
+
+def _validate_done_evidence(
+    conn: sqlite3.Connection, task_id: str, evidence: dict
+) -> None:
+    """Validate terminal evidence while ``complete_task`` holds its write txn."""
+    missing: list[str] = []
+    try:
+        run_evidence = _release_run_evidence(
+            conn,
+            task_id,
+            str(evidence.get("source_branch") or ""),
+            str(evidence.get("source_sha") or ""),
+        )
+        if run_evidence.get("test_run_id") != evidence.get("test_run_id"):
+            missing.append("tester_pass")
+        if run_evidence.get("review_run_id") != evidence.get("review_run_id"):
+            missing.append("reviewer_approval")
+    except ReleaseEvidenceError as exc:
+        missing.extend(exc.missing)
+
+    integration = _event_by_id(conn, task_id, evidence.get("integration_event_id"))
+    if (
+        integration is None
+        or integration.kind
+        not in {"story_merged_to_main", "story_integrated_to_epic", "epic_merged"}
+        or not isinstance(integration.payload, dict)
+        or integration.payload.get("candidate_sha") != evidence.get("integration_sha")
+        or integration.payload.get("source_branch") != evidence.get("source_branch")
+        or integration.payload.get("source_sha") != evidence.get("source_sha")
+    ):
+        missing.append("integrated_branch")
+
+    policy = _event_by_id(conn, task_id, evidence.get("deployment_policy_event_id"))
+    if policy is None or policy.kind != "deployment_policy_evaluated":
+        missing.append("deployment_policy")
+    policy_payload = policy.payload if policy and isinstance(policy.payload, dict) else {}
+    if policy_payload.get("policy") not in {"manual", "not_required", "required"}:
+        missing.append("deployment_policy")
+    if policy_payload.get("deployment_required") is True:
+        deployment = _event_by_id(
+            conn, task_id, evidence.get("deployment_record_event_id")
+        )
+        deployment_payload = (
+            deployment.payload
+            if deployment and isinstance(deployment.payload, dict)
+            else {}
+        )
+        if deployment is None or deployment.kind != "deployment_recorded":
+            missing.extend(["smoke_evidence", "rollback_evidence", "runtime_evidence"])
+        else:
+            if deployment_payload.get("revision") != evidence.get("integration_sha"):
+                missing.append("deployment_revision")
+            if not deployment_payload.get("environment"):
+                missing.append("deployment_environment")
+            if not _release_evidence_succeeded(deployment_payload.get("smoke_result")):
+                missing.append("smoke_evidence")
+            if not deployment_payload.get("rollback_target"):
+                missing.append("rollback_evidence")
+            if not _release_evidence_succeeded(
+                deployment_payload.get("runtime_evidence")
+            ):
+                missing.append("runtime_evidence")
+    if not str(evidence.get("measurement_note") or "").strip():
+        missing.append("measurement_note")
+    board_meta = product_board_metadata(_board_slug_for_connection(conn)) or {}
+    if (
+        _product_workflow_dict(board_meta).get("pull_request_required") is True
+        and not evidence.get("pull_request")
+    ):
+        missing.append("pull_request")
+    if missing:
+        raise ReleaseEvidenceError(task_id, missing)
+
+
+def _release_run_is_current(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_run_id: Optional[int],
+) -> bool:
+    """Return whether a worker-owned release still has its exact run lease."""
+    if expected_run_id is None:
+        return True
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    return bool(
+        row is not None
+        and row["status"] == "running"
+        and row["current_run_id"] == int(expected_run_id)
+    )
+
+
+def release_product_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    board: Optional[str],
+    candidate_verify_fn: Optional[Callable[[Path], bool]],
+    release_adapter: Optional[Any],
+    *,
+    measurement_note: Optional[str] = None,
+    completion_metadata: Optional[dict] = None,
+    created_cards: Optional[Iterable[str]] = None,
+    expected_run_id: Optional[int] = None,
+) -> ReleaseResult:
+    """Integrate, evaluate deployment policy, then atomically finish a product task."""
+    task = get_task(conn, task_id)
+    meta = product_board_metadata(board)
+    if (
+        task is None
+        or meta is None
+        or not _handoff_v2_enabled(meta)
+        or task.current_step_key != "release_measure"
+    ):
+        raise ReleaseEvidenceError(task_id, ["release_measure_state"])
+    if not _release_run_is_current(conn, task_id, expected_run_id):
+        return ReleaseResult(False, "completion_conflict")
+
+    def before_apply_fn() -> bool:
+        return _release_run_is_current(conn, task_id, expected_run_id)
+
+    repo_value = str(meta.get("default_workdir") or task.workspace_path or "").strip()
+    repo_root = _git_toplevel(Path(repo_value).expanduser()) if repo_value else None
+    parents = parent_ids(conn, task_id)
+    children = child_ids(conn, task_id)
+    branch = (
+        epic_branch_for(task_id)
+        if children
+        else str(task.branch_name or "").strip()
+    )
+    source_sha = _git_ref_sha(repo_root, branch) if repo_root and branch else None
+    if repo_root is None or not branch or not source_sha:
+        raise ReleaseEvidenceError(task_id, ["reviewed_candidate"])
+
+    evidence: dict[str, Any] = _release_run_evidence(
+        conn, task_id, branch, source_sha
+    )
+    evidence.update(source_branch=branch, source_sha=source_sha)
+    note = str(measurement_note or "").strip()
+    if not note:
+        raise ReleaseEvidenceError(task_id, ["measurement_note"])
+
+    if children:
+        target_branch = epic_branch_for(task_id)
+        integrated_children = all(
+            (child := get_task(conn, child_id)) is not None
+            and child.status == "done"
+            and any(
+                event.kind == "story_integrated_to_epic"
+                and isinstance(event.payload, dict)
+                and event.payload.get("target_branch") == target_branch
+                and bool(event.payload.get("candidate_sha"))
+                for event in list_events(conn, child_id)
+            )
+            for child_id in children
+        )
+        if not integrated_children:
+            raise ReleaseEvidenceError(task_id, ["integrated_children"])
+        integration_status = merge_epic_to_main(
+            conn,
+            task_id,
+            board=board,
+            candidate_verify_fn=candidate_verify_fn,
+            expected_source_sha=source_sha,
+            before_apply_fn=before_apply_fn,
+        )
+        integration_kinds = {"epic_merged"}
+    elif parents:
+        integration_status = integrate_story_to_epic(
+            conn,
+            task_id,
+            board=board,
+            candidate_verify_fn=candidate_verify_fn,
+            expected_source_sha=source_sha,
+            before_apply_fn=before_apply_fn,
+        )
+        integration_kinds = {"story_integrated_to_epic"}
+    else:
+        integration_status = _merge_standalone_story_to_main(
+            conn,
+            task_id,
+            board=board,
+            candidate_verify_fn=candidate_verify_fn,
+            expected_source_sha=source_sha,
+            before_apply_fn=before_apply_fn,
+            allow_release_measure=True,
+        )
+        integration_kinds = {"story_merged_to_main"}
+
+    if integration_status == "ownership_conflict":
+        return ReleaseResult(False, "completion_conflict")
+    if integration_status not in {
+        "merged", "already_merged", "integrated", "already_integrated"
+    }:
+        raise ReleaseEvidenceError(task_id, ["integrated_branch"])
+    integration = _latest_event_of_kind(conn, task_id, integration_kinds)
+    if integration is None or not isinstance(integration.payload, dict):
+        raise ReleaseEvidenceError(task_id, ["integrated_branch"])
+    integration_sha = str(integration.payload.get("candidate_sha") or "").strip()
+    if not integration_sha:
+        raise ReleaseEvidenceError(task_id, ["integrated_branch"])
+    evidence.update(
+        integration_event_id=integration.id,
+        integration_sha=integration_sha,
+        measurement_note=note,
+    )
+
+    workflow = _product_workflow_dict(meta)
+    policy_name = str(workflow.get("deployment_policy") or "manual").strip()
+    if policy_name not in {"manual", "not_required", "required"}:
+        raise ReleaseEvidenceError(task_id, ["deployment_policy"])
+    with write_txn(conn):
+        if not _release_run_is_current(conn, task_id, expected_run_id):
+            return ReleaseResult(False, "completion_conflict")
+        _append_event(
+            conn,
+            task_id,
+            "deployment_policy_evaluated",
+            {
+                "policy": policy_name,
+                "deployment_required": policy_name == "required",
+                "deployment_occurred": False,
+            },
+        )
+    policy_event = _latest_event_of_kind(
+        conn, task_id, {"deployment_policy_evaluated"}
+    )
+    evidence["deployment_policy_event_id"] = policy_event.id if policy_event else None
+    evidence["deployment_record_event_id"] = None
+
+    if policy_name == "required":
+        if release_adapter is None:
+            with write_txn(conn):
+                if not _release_run_is_current(conn, task_id, expected_run_id):
+                    return ReleaseResult(False, "completion_conflict")
+                _append_event(
+                    conn,
+                    task_id,
+                    "release_adapter_missing",
+                    {"policy": policy_name, "integration_sha": integration_sha},
+                )
+            return ReleaseResult(
+                False,
+                "release_adapter_missing",
+                integration.id,
+                integration_sha,
+                policy_event.id if policy_event else None,
+                None,
+            )
+        if not _release_run_is_current(conn, task_id, expected_run_id):
+            return ReleaseResult(False, "completion_conflict")
+        deployment = release_adapter.release(task_id, integration_sha)
+        deployment = deployment if isinstance(deployment, dict) else {}
+        deployment_missing: list[str] = []
+        if not deployment.get("environment"):
+            deployment_missing.append("deployment_environment")
+        if deployment.get("revision") != integration_sha:
+            deployment_missing.append("deployment_revision")
+        if not _release_evidence_succeeded(deployment.get("smoke_result")):
+            deployment_missing.append("smoke_evidence")
+        if not deployment.get("rollback_target"):
+            deployment_missing.append("rollback_evidence")
+        if not _release_evidence_succeeded(deployment.get("runtime_evidence")):
+            deployment_missing.append("runtime_evidence")
+        if deployment_missing:
+            raise ReleaseEvidenceError(task_id, deployment_missing)
+        with write_txn(conn):
+            _append_event(conn, task_id, "deployment_recorded", deployment)
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (
+                    json.dumps(
+                        {
+                            "policy": policy_name,
+                            "deployment_required": True,
+                            "deployment_occurred": True,
+                        }
+                    ),
+                    policy_event.id,
+                ),
+            )
+        deployment_event = _latest_event_of_kind(
+            conn, task_id, {"deployment_recorded"}
+        )
+        evidence["deployment_record_event_id"] = (
+            deployment_event.id if deployment_event else None
+        )
+
+    pr_required = workflow.get("pull_request_required") is True
+    pull_request = (
+        completion_metadata.get("pull_request")
+        if isinstance(completion_metadata, dict)
+        else None
+    )
+    if pr_required and not pull_request:
+        raise ReleaseEvidenceError(task_id, ["pull_request"])
+    evidence["pull_request"] = pull_request
+
+    released = complete_task(
+        conn,
+        task_id,
+        result=note,
+        summary=note,
+        metadata=completion_metadata,
+        created_cards=created_cards,
+        expected_run_id=expected_run_id,
+        board=board,
+        _release_evidence=evidence,
+    )
+    if not released:
+        return ReleaseResult(False, "completion_conflict")
+    return ReleaseResult(
+        True,
+        "released",
+        integration.id,
+        integration_sha,
+        policy_event.id if policy_event else None,
+        evidence.get("deployment_record_event_id"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -8298,6 +9749,7 @@ def handoff(
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
+    expected_phase: Optional[str] = None,
 ) -> bool:
     """Atomically advance a handoff_v2 product card.
 
@@ -8336,6 +9788,7 @@ def handoff(
     ).fetchone()
     if row is None:
         return False
+    _validate_stored_product_workflow_state(conn, task_id)
     step = row["current_step_key"]
     transition = PRODUCT_WORKFLOW_TRANSITIONS.get(str(step or ""))
     if not transition or not transition.get("next_step"):
@@ -8346,6 +9799,11 @@ def handoff(
     ):
         # Ownership was reclaimed out from under this worker -- refuse
         # before the commit-first gate so we never create a stale commit.
+        return False
+    if expected_phase is not None and row["current_step_key"] != expected_phase:
+        # A structured positive verdict was validated for a different phase.
+        # Refuse before the commit-first gate so a same-run set_phase cannot
+        # carry Test evidence through Review (or vice versa).
         return False
 
     _validate_product_ai_provenance(conn, task_id, step, metadata, meta)
@@ -8358,8 +9816,9 @@ def handoff(
     next_role = transition.get("assignee_role")
     next_assignee = _product_role_assignee(meta, next_role)
 
-    with write_txn(conn):
-        sql = (
+    try:
+        with write_txn(conn):
+            sql = (
             # Release the completing worker's claim as part of the atomic advance:
             # the card is being handed to a NEW assignee, so the old claim is dead.
             # Without this, the handed-off card stays ready+claimed, which
@@ -8368,28 +9827,46 @@ def handoff(
             "UPDATE tasks SET current_step_key = ?, running = 0, assignee = ?, result = ?, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ?"
-        ) + ("" if expected_run_id is None else " AND status = 'running' AND current_run_id = ?")
-        params = (
-            (next_step, next_assignee, summary, task_id)
-            if expected_run_id is None
-            else (next_step, next_assignee, summary, task_id, int(expected_run_id))
-        )
-        cur = conn.execute(sql, params)
-        if cur.rowcount != 1:
+            )
+            params: list[Any] = [next_step, next_assignee, summary, task_id]
+            if expected_run_id is not None:
+                sql += " AND status = 'running' AND current_run_id = ?"
+                params.append(int(expected_run_id))
+            if expected_phase is not None:
+                sql += " AND current_step_key = ?"
+                params.append(expected_phase)
+            cur = conn.execute(sql, tuple(params))
+            if cur.rowcount != 1:
+                raise RuntimeError("handoff run ownership changed")
+            _sync_legacy_status(conn, task_id, meta)
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="advanced",
+                status="completed",
+                summary=summary,
+                metadata=metadata,
+                expected_run_id=expected_run_id,
+            )
+            if expected_run_id is not None and run_id is None:
+                raise RuntimeError("handoff run ownership changed")
+            _append_event(
+                conn,
+                task_id,
+                "handoff",
+                {
+                    "from_step": step,
+                    "to_step": next_step,
+                    "sha": sha,
+                    "assignee": next_assignee,
+                    "summary": summary,
+                },
+                run_id=run_id,
+            )
+    except RuntimeError as exc:
+        if str(exc) == "handoff run ownership changed":
             return False
-        _sync_legacy_status(conn, task_id, meta)
-        _append_event(
-            conn,
-            task_id,
-            "handoff",
-            {
-                "from_step": step,
-                "to_step": next_step,
-                "sha": sha,
-                "assignee": next_assignee,
-                "summary": summary,
-            },
-        )
+        raise
     return True
 
 
@@ -11294,6 +12771,29 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.body and task.body.strip():
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
+        lines.append("")
+
+    unresolved_preflight = _latest_unresolved_product_preflight(conn, task_id)
+    if unresolved_preflight:
+        board_slug = _board_slug_for_connection(conn)
+        board_meta = product_board_metadata(board_slug) or {}
+        board_policy = _product_workflow_dict(board_meta)
+        lines.append("## Required resolver action")
+        lines.append(
+            f"Original blocker: {_cap(str(unresolved_preflight.get('reason') or 'unspecified'))}"
+        )
+        attempts = unresolved_preflight.get("attempted_resolutions") or []
+        if attempts:
+            lines.append("Attempted resolutions: " + "; ".join(map(str, attempts)))
+        lines.append(
+            "Board policy: "
+            + _cap(json.dumps(board_policy, sort_keys=True, ensure_ascii=False))
+        )
+        lines.append(
+            "Complete only with resolver_action: action must be resume, "
+            "create_fix_task, or escalate; resolution is required; "
+            "create_fix_task also requires a real fix_task_id."
+        )
         lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,

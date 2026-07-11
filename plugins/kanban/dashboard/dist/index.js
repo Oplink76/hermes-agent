@@ -195,6 +195,57 @@
   const API = "/api/plugins/kanban";
   const MIME_TASK = "text/x-hermes-task";
 
+  // Existing-card writes are compare-and-swap operations. Snapshot values
+  // are copied from the card currently rendered to the operator; placing
+  // them last prevents a mutation payload from overriding current state.
+  function expectedTaskSnapshot(task) {
+    return {
+      expected_status: task.status,
+      expected_title: task.title,
+      expected_assignee: task.assignee == null ? null : task.assignee,
+      expected_current_step_key: task.current_step_key == null ? null : task.current_step_key,
+      expected_current_run_id: task.current_run_id == null ? null : task.current_run_id,
+    };
+  }
+
+  function sendTaskMutation(task, url, method, payload) {
+    const body = Object.assign({}, payload || {}, expectedTaskSnapshot(task));
+    return SDK.fetchJSON(url, {
+      method: method,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  function sendBulkMutation(tasks, url, payload) {
+    const expectedSnapshots = {};
+    for (const task of tasks) {
+      expectedSnapshots[task.id] = expectedTaskSnapshot(task);
+    }
+    const body = Object.assign({}, payload || {}, {
+      expected_snapshots: expectedSnapshots,
+    });
+    return SDK.fetchJSON(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  function appendExpectedTaskSnapshot(formData, task) {
+    formData.append("expected_snapshot", JSON.stringify(expectedTaskSnapshot(task)));
+  }
+
+  function findTaskInBoard(boardData, taskId) {
+    for (const column of (boardData && boardData.columns) || []) {
+      const task = (column.tasks || []).find(function (candidate) {
+        return candidate.id === taskId;
+      });
+      if (task) return task;
+    }
+    return null;
+  }
+
   // Docs link — surfaced as a `?` icon next to the board switcher and as
   // `title=` hints on unlabelled controls. Kept in one place so rebrands or
   // path changes are a single edit.
@@ -720,6 +771,12 @@
       if (confirmMsg && !window.confirm(confirmMsg)) return;
       const patch = withCompletionSummary({ status: newStatus }, 1, t);
       if (!patch) return;
+      const currentTask = findTaskInBoard(boardData, taskId);
+      if (!currentTask) {
+        setError(tx(t, "moveFailed", "Move failed: ") + "task snapshot unavailable; refresh and retry");
+        loadBoard();
+        return;
+      }
       setBoardData(function (b) {
         if (!b) return b;
         let moved = null;
@@ -736,15 +793,16 @@
         }
         return Object.assign({}, b, { columns });
       });
-      SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(patch),
-      }).catch(function (err) {
+      sendTaskMutation(
+        currentTask,
+        withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board),
+        "PATCH",
+        patch,
+      ).catch(function (err) {
         setError(tx(t, "moveFailed", "Move failed: ") + parseApiErrorMessage(err));
         loadBoard();
       });
-    }, [loadBoard, board, t]);
+    }, [boardData, loadBoard, board, t]);
 
     const clearSelected = useCallback(function () {
       setSelectedIds(new Set());
@@ -758,6 +816,12 @@
       const patch = withCompletionSummary({ status: newStatus }, selectedIds.size);
       if (!patch) return;
       const ids = Array.from(selectedIds);
+      const tasks = ids.map(function (id) { return findTaskInBoard(boardData, id); });
+      if (tasks.some(function (task) { return !task; })) {
+        setError("Bulk move failed: task snapshot unavailable; refresh and retry");
+        loadBoard();
+        return;
+      }
       // Optimistic UI: remove selected from all columns and prepend to target.
       setBoardData(function (b) {
         if (!b) return b;
@@ -774,11 +838,11 @@
         if (dest) dest.tasks = moved.concat(dest.tasks);
         return Object.assign({}, b, { columns });
       });
-      SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, board), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(Object.assign({ ids }, patch)),
-      }).then(function (res) {
+      sendBulkMutation(
+        tasks,
+        withBoard(`${API}/tasks/bulk`, board),
+        Object.assign({ ids }, patch),
+      ).then(function (res) {
         const failed = (res.results || []).filter(function (r) { return !r.ok; });
         if (failed.length > 0) {
           setError(`Bulk move: ${failed.length} of ${res.results.length} failed`);
@@ -794,7 +858,7 @@
         setFailedIds(new Set(selectedIds));
         loadBoard();
       });
-    }, [selectedIds, loadBoard, board]);
+    }, [selectedIds, boardData, loadBoard, board]);
 
     const createTask = useCallback(function (body) {
       return SDK.fetchJSON(withBoard(`${API}/tasks`, board), {
@@ -894,7 +958,14 @@
       if (confirmMsg && !window.confirm(confirmMsg)) return;
       const finalPatch = withCompletionSummary(patch, selectedIds.size, t);
       if (!finalPatch) return;
-      const body = Object.assign({ ids: Array.from(selectedIds) }, finalPatch);
+      const ids = Array.from(selectedIds);
+      const tasks = ids.map(function (id) { return findTaskInBoard(boardData, id); });
+      if (tasks.some(function (task) { return !task; })) {
+        setError(tx(t, "bulkFailed", "Bulk: ") + "task snapshot unavailable; refresh and retry");
+        loadBoard();
+        return;
+      }
+      const body = Object.assign({ ids: ids }, finalPatch);
       // Optimistic UI for status moves (same pattern as moveSelected).
       if (finalPatch.status) {
         setBoardData(function (b) {
@@ -913,11 +984,7 @@
           return Object.assign({}, b, { columns });
         });
       }
-      SDK.fetchJSON(withBoard(`${API}/tasks/bulk`, board), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      })
+      sendBulkMutation(tasks, withBoard(`${API}/tasks/bulk`, board), body)
         .then(function (res) {
           const failed = (res.results || []).filter(function (r) { return !r.ok; });
           if (failed.length > 0) {
@@ -937,7 +1004,7 @@
           setFailedIds(new Set(selectedIds));
           loadBoard();
         });
-    }, [selectedIds, loadBoard, board, t]);
+    }, [selectedIds, boardData, loadBoard, board, t]);
 
     // --- board switching ----------------------------------------------------
     const switchBoard = useCallback(function (nextSlug) {
@@ -983,9 +1050,18 @@
 
    const deleteTask = useCallback(function (taskId) {
      if (!window.confirm(tx(t, "trash.confirm", FALLBACK_TRASH.confirm))) return Promise.resolve();
-     return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(taskId)}`, {
-       method: "DELETE",
-     }).then(function () {
+     const currentTask = findTaskInBoard(boardData, taskId);
+     if (!currentTask) {
+       setError("Delete failed: task snapshot unavailable; refresh and retry");
+       loadBoard();
+       return Promise.resolve();
+     }
+     return sendTaskMutation(
+       currentTask,
+       withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board),
+       "DELETE",
+       {},
+     ).then(function () {
        loadBoard();
        setSelectedIds(function (prev) {
          const next = new Set(prev);
@@ -993,19 +1069,30 @@
          return next;
        });
      }).catch(function (e) { setError(String(e.message || e)); });
-   }, [board, loadBoard, t]);
+   }, [boardData, board, loadBoard, t]);
 
     const deleteSelected = useCallback(function (count) {
       if (selectedIds.size === 0) return Promise.resolve();
       if (!window.confirm(tx(t, "trash.confirmMany", "Permanently delete {n} selected tasks? This cannot be undone.", { n: count }))) return Promise.resolve();
       const ids = Array.from(selectedIds);
+      const tasks = ids.map(function (id) { return findTaskInBoard(boardData, id); });
+      if (tasks.some(function (task) { return !task; })) {
+        setError("Delete failed: task snapshot unavailable; refresh and retry");
+        loadBoard();
+        return Promise.resolve();
+      }
       setSelectedIds(new Set());
-      return Promise.all(ids.map(function (id) {
-        return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(id)}`, { method: "DELETE" });
+      return Promise.all(tasks.map(function (task) {
+        return sendTaskMutation(
+          task,
+          withBoard(`${API}/tasks/${encodeURIComponent(task.id)}`, board),
+          "DELETE",
+          {},
+        );
       })).then(function () {
         loadBoard();
       }).catch(function (e) { setError(String(e.message || e)); });
-    }, [selectedIds, board, loadBoard, t]);
+    }, [selectedIds, boardData, board, loadBoard, t]);
 
     // --- render -------------------------------------------------------------
     if (loading && !boardData) {
@@ -1319,11 +1406,7 @@
       if (action.kind === "unblock") {
         setBusy(true); setMsg(null);
         const url = withBoard(`${API}/tasks/${encodeURIComponent(task.id)}`, boardSlug);
-        SDK.fetchJSON(url, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ status: "ready" }),
-        }).then(function () {
+        sendTaskMutation(task, url, "PATCH", { status: "ready" }).then(function () {
           setMsg({ ok: true, text: tx(t, "unblockedMessage",
             "Unblocked {id}. Task is ready for the next tick.", { id: task.id }) });
           if (onRefresh) onRefresh();
@@ -1335,10 +1418,8 @@
       if (action.kind === "reclaim") {
         setBusy(true); setMsg(null);
         const url = withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/reclaim`, boardSlug);
-        SDK.fetchJSON(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ reason: `recovery action for ${diag.kind}` }),
+        sendTaskMutation(task, url, "POST", {
+          reason: `recovery action for ${diag.kind}`,
         }).then(function () {
           setMsg({ ok: true, text: tx(t, "reclaimedMessage",
             "Reclaimed {id}. Task is back to ready.", { id: task.id }) });
@@ -1360,11 +1441,7 @@
           reclaim_first: !!(action.payload && action.payload.reclaim_first),
           reason: `recovery action for ${diag.kind}`,
         };
-        SDK.fetchJSON(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        }).then(function () {
+        sendTaskMutation(task, url, "POST", body).then(function () {
           setMsg({
             ok: true,
             text: tx(t, "reassignedMessage", "Reassigned {id} to {profile}.",
@@ -3073,11 +3150,12 @@
     const handleComment = function () {
       const body = newComment.trim();
       if (!body) return;
-      SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/comments`, boardSlug), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body }),
-      }).then(function () {
+      sendTaskMutation(
+        data.task,
+        withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/comments`, boardSlug),
+        "POST",
+        { body: body },
+      ).then(function () {
         setNewComment("");
         load();
         props.onRefresh();
@@ -3099,6 +3177,7 @@
         chain = chain.then(function () {
           const fd = new FormData();
           fd.append("file", f, f.name);
+          appendExpectedTaskSnapshot(fd, data.task);
           // SDK.authedFetch handles auth in BOTH modes (loopback token header /
           // gated cookie) and applies the dashboard base-path prefix. The old
           // hand-rolled Authorization:Bearer + credentials:'same-origin' sent
@@ -3124,7 +3203,12 @@
     };
 
     const handleDeleteAttachment = function (attachmentId) {
-      return SDK.fetchJSON(withBoard(`${API}/attachments/${attachmentId}`, boardSlug), { method: "DELETE" })
+      return sendTaskMutation(
+        data.task,
+        withBoard(`${API}/attachments/${attachmentId}`, boardSlug),
+        "DELETE",
+        {},
+      )
         .then(function () { load(); props.onRefresh(); })
         .catch(function (e) { setUploadErr(String(e.message || e)); });
     };
@@ -3136,11 +3220,12 @@
       const finalPatch = withCompletionSummary(patch, 1);
       if (!finalPatch) return Promise.resolve();
       setPatchErr(null);
-      return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}`, boardSlug), {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(finalPatch),
-      }).then(function () { load(); props.onRefresh(); })
+      return sendTaskMutation(
+        data.task,
+        withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}`, boardSlug),
+        "PATCH",
+        finalPatch,
+      ).then(function () { load(); props.onRefresh(); })
         .catch(function (e) { setPatchErr(parseApiErrorMessage(e)); });
     };
 
@@ -3153,13 +3238,11 @@
     // comment — or fail with a human-readable reason that the UI
     // surfaces inline without treating it as an HTTP error).
     const doSpecify = function () {
-      return SDK.fetchJSON(
+      return sendTaskMutation(
+        data.task,
         withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/specify`, boardSlug),
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
-        }
+        "POST",
+        {},
       ).then(function (res) {
         load();
         props.onRefresh();
@@ -3172,13 +3255,11 @@
     // Refreshes both the drawer (so the user sees the root flip to
     // todo) and the board (so the new children appear in the columns).
     const doDecompose = function () {
-      return SDK.fetchJSON(
+      return sendTaskMutation(
+        data.task,
         withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/decompose`, boardSlug),
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
-        }
+        "POST",
+        {},
       ).then(function (res) {
         load();
         props.onRefresh();
@@ -3187,30 +3268,42 @@
     };
 
     const addLink = function (parentId) {
-      return SDK.fetchJSON(withBoard(`${API}/links`, boardSlug), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ parent_id: parentId, child_id: props.taskId }),
-      }).then(function () { load(); props.onRefresh(); })
+      return sendTaskMutation(
+        data.task,
+        withBoard(`${API}/links`, boardSlug),
+        "POST",
+        { parent_id: parentId, child_id: props.taskId, expected_task_id: props.taskId },
+      ).then(function () { load(); props.onRefresh(); })
         .catch(function (e) { setErr(String(e.message || e)); });
     };
     const removeLink = function (parentId) {
       const qs = new URLSearchParams({ parent_id: parentId, child_id: props.taskId });
-      return SDK.fetchJSON(withBoard(`${API}/links?${qs}`, boardSlug), { method: "DELETE" })
+      return sendTaskMutation(
+        data.task,
+        withBoard(`${API}/links?${qs}`, boardSlug),
+        "DELETE",
+        { expected_task_id: props.taskId },
+      )
         .then(function () { load(); props.onRefresh(); })
         .catch(function (e) { setErr(String(e.message || e)); });
     };
     const addChild = function (childId) {
-      return SDK.fetchJSON(withBoard(`${API}/links`, boardSlug), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ parent_id: props.taskId, child_id: childId }),
-      }).then(function () { load(); props.onRefresh(); })
+      return sendTaskMutation(
+        data.task,
+        withBoard(`${API}/links`, boardSlug),
+        "POST",
+        { parent_id: props.taskId, child_id: childId, expected_task_id: props.taskId },
+      ).then(function () { load(); props.onRefresh(); })
         .catch(function (e) { setErr(String(e.message || e)); });
     };
     const removeChild = function (childId) {
       const qs = new URLSearchParams({ parent_id: props.taskId, child_id: childId });
-      return SDK.fetchJSON(withBoard(`${API}/links?${qs}`, boardSlug), { method: "DELETE" })
+      return sendTaskMutation(
+        data.task,
+        withBoard(`${API}/links?${qs}`, boardSlug),
+        "DELETE",
+        { expected_task_id: props.taskId },
+      )
         .then(function () { load(); props.onRefresh(); })
         .catch(function (e) { setErr(String(e.message || e)); });
     };
@@ -3230,7 +3323,7 @@
         `${API}/tasks/${encodeURIComponent(props.taskId)}/home-subscribe/${encodeURIComponent(platform)}`,
         boardSlug,
       );
-      return SDK.fetchJSON(url, { method: method })
+      return sendTaskMutation(data.task, url, method, {})
         .then(function () { return loadHomeChannels(); })
         .catch(function (e) {
           // Revert optimistic flip on failure.
@@ -4112,6 +4205,15 @@
   // -------------------------------------------------------------------------
   // Register
   // -------------------------------------------------------------------------
+
+  // Runtime contract harness only; absent in the dashboard host.
+  if (window.__HERMES_KANBAN_TEST_HOOK__) {
+    Object.assign(window.__HERMES_KANBAN_TEST_HOOK__, {
+      sendTaskMutation: sendTaskMutation,
+      sendBulkMutation: sendBulkMutation,
+      appendExpectedTaskSnapshot: appendExpectedTaskSnapshot,
+    });
+  }
 
   if (window.__HERMES_PLUGINS__ && typeof window.__HERMES_PLUGINS__.register === "function") {
     window.__HERMES_PLUGINS__.register("kanban", KanbanPage);

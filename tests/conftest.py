@@ -712,10 +712,27 @@ def _live_system_guard(request, monkeypatch):
 
     def _is_process_killer(cmd) -> bool:
         cmd_str = _cmd_to_string(cmd)
-        try:
-            tokens = _shlex.split(cmd_str)
-        except ValueError:
-            tokens = cmd_str.split()
+        if isinstance(cmd, (list, tuple)):
+            # Preserve argv boundaries. Joining then shlex-splitting turns a
+            # harmless single argument such as ``"real skill"`` into the
+            # Solaris process-killer executable name ``skill``.
+            tokens = [str(token) for token in cmd]
+            # Shell payloads are the exception: inspect the command string
+            # passed after -c without flattening unrelated argv elements.
+            if tokens:
+                shell = tokens[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                if shell in {"sh", "bash", "zsh", "fish"} and "-c" in tokens:
+                    index = tokens.index("-c")
+                    if index + 1 < len(tokens):
+                        try:
+                            tokens.extend(_shlex.split(tokens[index + 1]))
+                        except ValueError:
+                            tokens.extend(tokens[index + 1].split())
+        else:
+            try:
+                tokens = _shlex.split(cmd_str)
+            except ValueError:
+                tokens = cmd_str.split()
         if not tokens:
             return False
         for tok in tokens:

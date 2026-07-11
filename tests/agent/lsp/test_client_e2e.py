@@ -19,6 +19,12 @@ from agent.lsp.client import LSPClient
 
 MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
 
+# These integration tests intentionally terminate the mock LSP subprocesses
+# they create. Under load a just-exited child can be re-parented before the
+# live-system guard walks its ancestry, so the file must use the guard's
+# explicit real-signal escape hatch.
+pytestmark = pytest.mark.live_system_guard_bypass
+
 
 def _client(workspace: Path, script: str = "clean") -> LSPClient:
     env = {"MOCK_LSP_SCRIPT": script, "PYTHONPATH": os.environ.get("PYTHONPATH", "")}

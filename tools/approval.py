@@ -1350,6 +1350,179 @@ def _iter_shell_command_word_spans(command: str):
             break
 
 
+def _shell_command_raw_argvs(command: str) -> list[list[str]]:
+    """Return quote-aware argv lists before wrapper/prefix normalization."""
+    normalized = _normalize_command_for_detection(str(command or ""))
+    commands: list[list[str]] = []
+    for command_start in _iter_shell_command_starts(normalized):
+        argv: list[str] = []
+        pos = command_start
+        for _ in range(128):
+            pos = _skip_shell_whitespace(normalized, pos)
+            if pos >= len(normalized) or normalized[pos] in ";&|":
+                break
+            word_start, word_end, word = _read_shell_word(normalized, pos)
+            if word_start == word_end:
+                break
+            value = _deobfuscate_shell_word_for_detection(word)
+            if value:
+                argv.append(value)
+            pos = word_end
+        if not argv:
+            continue
+        commands.append(argv)
+    return commands
+
+
+def shell_command_prefix_environment(command: str) -> set[str]:
+    """Return environment variable names assigned before shell commands."""
+    names: set[str] = set()
+    for argv in _shell_command_raw_argvs(command):
+        index = 0
+        while index < len(argv):
+            word = argv[index]
+            lower = os.path.basename(word).lower()
+            if _ENV_ASSIGNMENT_RE.fullmatch(word):
+                names.add(word.split("=", 1)[0].upper())
+                index += 1
+                continue
+            if lower in {"sudo", "env"}:
+                index += 1
+                while index < len(argv) and argv[index].startswith("-"):
+                    option = argv[index].split("=", 1)[0].lower()
+                    index += 1
+                    if (
+                        lower == "sudo"
+                        and option in _SUDO_OPTIONS_WITH_ARG
+                        and "=" not in argv[index - 1]
+                    ):
+                        index += 1
+                continue
+            if lower in _COMMAND_WRAPPER_WORDS:
+                index += 1
+                continue
+            break
+    return names
+
+
+def shell_command_argvs(command: str) -> list[list[str]]:
+    """Return quote-aware argv lists for each shell command segment.
+
+    This intentionally reuses the approval detector's non-executing shell
+    scanner so policy plugins do not grow a second, less capable parser.
+    Leading environment assignments and standard command wrappers are removed;
+    quoted operators remain ordinary arguments.
+    """
+    commands: list[list[str]] = []
+    for argv in _shell_command_raw_argvs(command):
+
+        index = 0
+        while index < len(argv):
+            word = argv[index]
+            lower = os.path.basename(word).lower()
+            if _ENV_ASSIGNMENT_RE.fullmatch(word):
+                index += 1
+                continue
+            if lower == "env":
+                index += 1
+                while index < len(argv) and (
+                    argv[index].startswith("-")
+                    or _ENV_ASSIGNMENT_RE.fullmatch(argv[index])
+                ):
+                    index += 1
+                continue
+            if lower == "sudo":
+                index += 1
+                while index < len(argv) and argv[index].startswith("-"):
+                    option = argv[index].split("=", 1)[0].lower()
+                    index += 1
+                    if option in _SUDO_OPTIONS_WITH_ARG and "=" not in argv[index - 1]:
+                        index += 1
+                continue
+            if lower in _COMMAND_WRAPPER_WORDS:
+                index += 1
+                continue
+            break
+        effective = argv[index:]
+        if effective:
+            commands.append(effective)
+    return commands
+
+
+def shell_command_has_redirection(command: str) -> bool:
+    """Return whether a command contains an unquoted shell redirection."""
+    normalized = _normalize_command_for_detection(str(command or ""))
+    quote: str | None = None
+    index = 0
+    while index < len(normalized):
+        char = normalized[index]
+        if quote:
+            if char == "\\" and quote == '"' and index + 1 < len(normalized):
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(normalized):
+            index += 2
+            continue
+        if char in "<>":
+            return True
+        index += 1
+    return False
+
+
+def shell_command_output_paths(command: str) -> list[str]:
+    """Return literal targets of unquoted shell output redirections.
+
+    The scan shares the approval detector's normalization and word reader, so
+    quoted ``>`` characters remain data while ``>``, ``>>``, ``>|`` and file
+    descriptor-prefixed variants expose their following filesystem word.
+    Descriptor duplication (for example ``2>&1``) is not a filesystem target.
+    """
+    normalized = _normalize_command_for_detection(str(command or ""))
+    targets: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(normalized):
+        char = normalized[index]
+        if quote:
+            if char == "\\" and quote == '"' and index + 1 < len(normalized):
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(normalized):
+            index += 2
+            continue
+        if char != ">":
+            index += 1
+            continue
+
+        index += 1
+        if index < len(normalized) and normalized[index] in ">|":
+            index += 1
+        word_start, word_end, word = _read_shell_word(normalized, index)
+        if word_start == word_end:
+            continue
+        target = _deobfuscate_shell_word_for_detection(word)
+        if target and not target.startswith(("&", "(")):
+            targets.append(target)
+        index = word_end
+    return targets
+
+
 def _command_detection_variants(command: str):
     normalized = _normalize_command_for_detection(command)
     seen = {normalized}
@@ -2006,6 +2179,7 @@ def _run_approval_gate(
     autoapprove_log_prefix: str,
     fail_closed_when_no_human: bool = False,
     no_human_block_message: str = "",
+    one_shot: bool = False,
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -2050,11 +2224,11 @@ def _run_approval_gate(
     # --yolo bypasses all approval prompts (session- or process-scoped).
     # Hardline blocks are handled by the caller BEFORE this gate, so yolo
     # here only skips the recoverable approval layer.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    if not one_shot and (_YOLO_MODE_FROZEN or is_current_session_yolo_enabled()):
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
-    if is_approved(session_key, pattern_key):
+    if not one_shot and is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
     if approval_callback is None:
@@ -2068,6 +2242,21 @@ def _run_approval_gate(
     is_gateway = _is_gateway_approval_context()
 
     if not is_cli and not is_gateway:
+        if one_shot:
+            logger.warning(
+                "%s (pattern: %s): exact one-shot approval requires a present human; "
+                "BLOCKED (fail-closed).",
+                autoapprove_log_prefix, pattern_key,
+            )
+            return {
+                "approved": False,
+                "message": no_human_block_message or (
+                    f"BLOCKED: exact one-shot approval required ({description}) but "
+                    "no interactive user or gateway is present."
+                ),
+                "pattern_key": pattern_key,
+                "description": description,
+            }
         # Cron sessions: respect cron_mode config
         if env_var_enabled("HERMES_CRON_SESSION"):
             if _get_cron_approval_mode() == "deny":
@@ -2123,7 +2312,8 @@ def _run_approval_gate(
                 "pattern_key": pattern_key,
                 "pattern_keys": [pattern_key],
                 "description": redact_sensitive_text(description),
-                "allow_permanent": True,
+                "allow_permanent": not one_shot,
+                "one_shot": one_shot,
             }
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface="gateway"
@@ -2162,13 +2352,29 @@ def _run_approval_gate(
                     "user_consent": False,
                 }
 
+            if one_shot and choice != "once":
+                return {
+                    "approved": False,
+                    "message": (
+                        "BLOCKED: This governed operation requires an exact "
+                        "one-shot approval; session and permanent approvals are invalid."
+                    ),
+                    "pattern_key": pattern_key,
+                    "description": description,
+                    "user_consent": False,
+                }
+
             if choice == "session":
                 approve_session(session_key, pattern_key)
             elif choice == "always":
                 approve_session(session_key, pattern_key)
                 approve_permanent(pattern_key)
                 save_permanent_allowlist(_permanent_approved)
-            return {"approved": True, "message": None}
+            return {
+                "approved": True,
+                "message": None,
+                "actor": "human:gateway",
+            }
 
         # No notify callback (e.g. API server without an attached chat):
         # queue for /approve /deny review, agent sees approval_required.
@@ -2189,8 +2395,12 @@ def _run_approval_gate(
             ),
         }
 
-    choice = prompt_dangerous_approval(display_target, description,
-                                       approval_callback=approval_callback)
+    choice = prompt_dangerous_approval(
+        display_target,
+        description,
+        allow_permanent=not one_shot,
+        approval_callback=approval_callback,
+    )
 
     if choice == "deny":
         return {
@@ -2204,6 +2414,17 @@ def _run_approval_gate(
             "description": description,
         }
 
+    if one_shot and choice != "once":
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: This governed operation requires an exact one-shot "
+                "approval; session and permanent approvals are invalid."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+        }
+
     if choice == "session":
         approve_session(session_key, pattern_key)
     elif choice == "always":
@@ -2211,7 +2432,7 @@ def _run_approval_gate(
         approve_permanent(pattern_key)
         save_permanent_allowlist(_permanent_approved)
 
-    return {"approved": True, "message": None}
+    return {"approved": True, "message": None, "actor": "human:cli"}
 
 
 def _should_skip_container_guards(env_type: str, has_host_access: bool = False) -> bool:
@@ -2304,6 +2525,7 @@ def request_tool_approval(
     *,
     rule_key: str = "",
     approval_callback=None,
+    one_shot_override: Optional[dict] = None,
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
@@ -2361,7 +2583,7 @@ def request_tool_approval(
     # executes; it only labels the gate. Namespaced identically.
     display_target = f"<{tool_name}> (plugin approval rule)"
 
-    return _run_approval_gate(
+    result = _run_approval_gate(
         pattern_key=pattern_key,
         description=description,
         display_target=display_target,
@@ -2382,7 +2604,12 @@ def request_tool_approval(
             "but no interactive user or gateway is present to approve it. "
             "A plugin flagged this action for human confirmation."
         ),
+        one_shot=one_shot_override is not None,
     )
+    if result.get("approved") and one_shot_override is not None:
+        result["one_shot_override"] = one_shot_override
+        result.setdefault("actor", "human:approval")
+    return result
 
 
 # =========================================================================

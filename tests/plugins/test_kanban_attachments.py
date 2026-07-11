@@ -13,6 +13,7 @@ The plugin router is attached to a bare FastAPI app — same approach as
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -210,6 +211,15 @@ def _create_task_via_api(client) -> str:
     return r.json()["task"]["id"]
 
 
+def _expected_snapshot(task_id: str) -> dict:
+    with kb.connect() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return {
+        f"expected_{field}": value
+        for field, value in kb.task_snapshot_from_row(row).items()
+    }
+
+
 def test_upload_list_download_delete_roundtrip(client):
     task_id = _create_task_via_api(client)
     content = b"hello attachment world"
@@ -218,6 +228,7 @@ def test_upload_list_download_delete_roundtrip(client):
     r = client.post(
         f"/api/plugins/kanban/tasks/{task_id}/attachments",
         files={"file": ("notes.txt", content, "text/plain")},
+        data={"expected_snapshot": json.dumps(_expected_snapshot(task_id))},
     )
     assert r.status_code == 200, r.text
     att = r.json()["attachment"]
@@ -240,7 +251,11 @@ def test_upload_list_download_delete_roundtrip(client):
     assert r.content == content
 
     # Delete removes the row and the file
-    r = client.delete(f"/api/plugins/kanban/attachments/{att_id}")
+    r = client.request(
+        "DELETE",
+        f"/api/plugins/kanban/attachments/{att_id}",
+        json=_expected_snapshot(task_id),
+    )
     assert r.status_code == 200
     assert client.get(f"/api/plugins/kanban/attachments/{att_id}").status_code == 404
     assert client.get(
@@ -253,6 +268,7 @@ def test_upload_sanitizes_traversal_filename(client):
     r = client.post(
         f"/api/plugins/kanban/tasks/{task_id}/attachments",
         files={"file": ("../../../../etc/passwd", b"x", "text/plain")},
+        data={"expected_snapshot": json.dumps(_expected_snapshot(task_id))},
     )
     assert r.status_code == 200, r.text
     stored_path = r.json()["attachment"]["stored_path"]
@@ -268,6 +284,7 @@ def test_upload_name_collision_gets_suffixed(client):
         r = client.post(
             f"/api/plugins/kanban/tasks/{task_id}/attachments",
             files={"file": ("dup.txt", b"a", "text/plain")},
+            data={"expected_snapshot": json.dumps(_expected_snapshot(task_id))},
         )
         assert r.status_code == 200, r.text
     names = sorted(
@@ -287,5 +304,19 @@ def test_upload_unknown_task_404(client):
     assert r.status_code == 404
 
 
+def test_upload_existing_task_without_snapshot_is_422(client):
+    task_id = _create_task_via_api(client)
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/attachments",
+        files={"file": ("x.txt", b"x", "text/plain")},
+    )
+    assert response.status_code == 422
+
+
 def test_download_unknown_attachment_404(client):
     assert client.get("/api/plugins/kanban/attachments/424242").status_code == 404
+
+
+def test_delete_unknown_attachment_404_before_snapshot_validation(client):
+    response = client.delete("/api/plugins/kanban/attachments/424242")
+    assert response.status_code == 404

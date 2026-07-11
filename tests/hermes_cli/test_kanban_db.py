@@ -220,12 +220,13 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_events_run" in indexes
 
 
-def test_fresh_db_has_running_and_blocked_columns(kanban_home):
-    """New handoff_v2 state-model flags exist on brand-new DBs (T1.1)."""
+def test_fresh_db_has_running_blocked_and_rework_columns(kanban_home):
+    """New state-model and bounded-rework columns exist on fresh DBs."""
     with kb.connect() as conn:
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     assert "running" in cols
     assert "blocked" in cols
+    assert "rework_count" in cols
 
 
 def test_legacy_db_gains_running_and_blocked_columns_without_data_loss(tmp_path):
@@ -268,7 +269,7 @@ def test_legacy_db_gains_running_and_blocked_columns_without_data_loss(tmp_path)
     with kb.connect(db_path) as migrated:
         cols = {row["name"] for row in migrated.execute("PRAGMA table_info(tasks)")}
         row = migrated.execute(
-            "SELECT title, status, created_at, running, blocked FROM tasks "
+            "SELECT title, status, created_at, running, blocked, rework_count FROM tasks "
             "WHERE id = 'legacy'"
         ).fetchone()
 
@@ -281,6 +282,7 @@ def test_legacy_db_gains_running_and_blocked_columns_without_data_loss(tmp_path)
     # New columns default to 0 on the pre-existing row.
     assert row["running"] == 0
     assert row["blocked"] == 0
+    assert row["rework_count"] == 0
 
     # Idempotent: connecting again does not error or duplicate columns.
     with kb.connect(db_path) as migrated_again:
@@ -289,6 +291,7 @@ def test_legacy_db_gains_running_and_blocked_columns_without_data_loss(tmp_path)
         ]
     assert cols_again.count("running") == 1
     assert cols_again.count("blocked") == 1
+    assert cols_again.count("rework_count") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +375,840 @@ def _seed_v2_card(board: str, *, step: str = "development") -> str:
             current_step_key=step,
         )
     return tid
+
+
+@pytest.mark.parametrize("step", sorted(kb.PRODUCT_WORKFLOW_STEP_SET))
+def test_create_task_accepts_each_product_step(kanban_home, step):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: valid state",
+            workflow_template_id="product",
+            current_step_key=step,
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.current_step_key == step
+
+
+def test_create_task_infers_missing_product_step_from_explicit_intent(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Implementation work",
+            assignee="developer",
+            workflow_template_id="product",
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.current_step_key == "development"
+
+
+def test_create_task_allows_custom_workflow_step(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Custom flow",
+            workflow_template_id="custom",
+            current_step_key="bespoke-review",
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.current_step_key == "bespoke-review"
+
+
+def test_create_task_keeps_legacy_step_without_product_template(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Legacy flow", current_step_key="in_progress")
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.workflow_template_id is None
+    assert task.current_step_key == "in_progress"
+
+
+def test_create_task_rejects_unknown_project(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="unknown project"):
+            kb.create_task(conn, title="Lost governance", project_id="missing-project")
+
+
+@pytest.mark.parametrize(
+    ("step", "verdict", "target"),
+    [
+        ("test", "changes_requested", "development"),
+        ("review", "changes_requested", "development"),
+        ("review", "architecture_invalid", "architecture"),
+    ],
+)
+def test_product_rejection_routes_backward(
+    kanban_home, step, verdict, target
+):
+    board = f"rework-{step}-{target}"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: rework",
+            assignee="tester" if step == "test" else "reviewer",
+            workflow_template_id="product",
+            current_step_key=step,
+            board=board,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Needs revision",
+            metadata={
+                "workflow_outcome": {
+                    "verdict": verdict,
+                    "target_step": target,
+                    "findings": ["Concrete finding"],
+                }
+            },
+            expected_run_id=claimed.current_run_id,
+            board=board,
+            product_role_assignees={
+                "developer": "custom-developer",
+                "architect": "custom-architect",
+            },
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert task is not None
+    assert task.current_step_key == target
+    assert task.rework_count == 1
+    assert task.assignee == (
+        "custom-developer" if target == "development" else "custom-architect"
+    )
+    assert any(event.kind == "rework_requested" for event in events)
+
+
+@pytest.mark.parametrize(
+    "findings",
+    [[], "not-a-list", [""], [1], ["Concrete", ""]],
+)
+def test_product_rework_requires_nonempty_string_findings(kanban_home, findings):
+    board = "rework-findings"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: rework",
+            assignee="tester",
+            workflow_template_id="product",
+            current_step_key="test",
+            board=board,
+        )
+        claimed = kb.claim_task(conn, tid)
+        with pytest.raises(ValueError, match="findings"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Needs revision",
+                metadata={
+                    "workflow_outcome": {
+                        "verdict": "changes_requested",
+                        "target_step": "development",
+                        "findings": findings,
+                    }
+                },
+                expected_run_id=claimed.current_run_id,
+                board=board,
+            )
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.current_step_key == "test"
+
+
+def test_product_rework_requires_expected_run_id(kanban_home):
+    board = "rework-run-required"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: rework",
+            assignee="tester",
+            workflow_template_id="product",
+            current_step_key="test",
+            board=board,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        with pytest.raises(ValueError, match="expected_run_id"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Needs revision",
+                metadata={
+                    "workflow_outcome": {
+                        "verdict": "changes_requested",
+                        "target_step": "development",
+                        "findings": ["Concrete finding"],
+                    }
+                },
+                board=board,
+            )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_step_key == "test"
+    assert task.rework_count == 0
+    assert task.current_run_id == claimed.current_run_id
+
+
+@pytest.mark.parametrize(
+    ("step", "verdict", "next_step", "provenance"),
+    [
+        (
+            "test",
+            "passed",
+            "review",
+            {"tester": {"agent": "hermes", "result": "passed"}},
+        ),
+        (
+            "review",
+            "approved",
+            "release_measure",
+            {
+                "writer": {"agent": "claude-code"},
+                "reviewer": {"agent": "codex"},
+            },
+        ),
+    ],
+)
+def test_product_positive_rework_outcome_uses_forward_handoff(
+    kanban_home, step, verdict, next_step, provenance
+):
+    board = f"rework-positive-{step}"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: accepted",
+            assignee="tester" if step == "test" else "reviewer",
+            workflow_template_id="product",
+            current_step_key=step,
+            board=board,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Accepted",
+            metadata={
+                "workflow_outcome": {"verdict": verdict},
+                "ai_provenance": provenance,
+            },
+            expected_run_id=claimed.current_run_id,
+            board=board,
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert task is not None
+    assert task.current_step_key == next_step
+    # handoff_v2 reads board role policy; the important contract is that a
+    # positive outcome advances normally rather than incrementing rework.
+    assert task.rework_count == 0
+    assert any(event.kind == "handoff" for event in events)
+    assert not any(event.kind == "rework_requested" for event in events)
+
+
+@pytest.mark.parametrize(
+    ("step", "verdict", "provenance"),
+    [
+        (
+            "test",
+            "approved",
+            {"tester": {"agent": "hermes", "result": "passed"}},
+        ),
+        (
+            "review",
+            "passed",
+            {
+                "writer": {"agent": "claude-code"},
+                "reviewer": {"agent": "codex"},
+            },
+        ),
+    ],
+)
+def test_product_positive_rework_verdict_must_match_phase(
+    kanban_home, step, verdict, provenance
+):
+    board = f"rework-positive-invalid-{step}"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: invalid verdict",
+            assignee="tester" if step == "test" else "reviewer",
+            workflow_template_id="product",
+            current_step_key=step,
+            board=board,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        with pytest.raises(ValueError, match="invalid workflow_outcome"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Wrong verdict",
+                metadata={
+                    "workflow_outcome": {"verdict": verdict},
+                    "ai_provenance": provenance,
+                },
+                expected_run_id=claimed.current_run_id,
+                board=board,
+            )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.current_step_key == step
+    assert task.status == "running"
+
+
+def test_product_positive_rework_rejects_same_run_phase_change_before_handoff(
+    kanban_home, monkeypatch
+):
+    board = "rework-positive-phase-cas"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: phase-bound verdict",
+            assignee="tester",
+            workflow_template_id="product",
+            current_step_key="test",
+            board=board,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+
+        original_route = kb._route_product_rework_if_requested
+
+        def route_then_change_phase(*args, **kwargs):
+            routed = original_route(*args, **kwargs)
+            assert routed is None
+            assert kb.set_phase(conn, tid, "review", board=board)
+            return routed
+
+        monkeypatch.setattr(
+            kb, "_route_product_rework_if_requested", route_then_change_phase
+        )
+        completed = kb.complete_task(
+            conn,
+            tid,
+            summary="Test verdict must stay bound to Test",
+            metadata={
+                "workflow_outcome": {"verdict": "passed"},
+                "ai_provenance": {
+                    "tester": {"agent": "hermes", "result": "passed"},
+                    "writer": {"agent": "claude-code"},
+                    "reviewer": {"agent": "codex"},
+                },
+            },
+            expected_run_id=claimed.current_run_id,
+            board=board,
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert completed is False
+    assert task is not None
+    assert task.current_step_key == "review"
+    assert task.status == "running"
+    assert task.running is True
+    assert task.current_run_id == claimed.current_run_id
+    assert not any(event.kind == "handoff" for event in events)
+
+
+def test_invalid_product_rework_does_not_commit_workflow_repair(kanban_home):
+    board = "rework-invalid-no-repair"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: legacy tester card",
+            assignee="tester",
+            workflow_template_id="product",
+            current_step_key="test",
+            board=board,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        conn.execute(
+            "UPDATE tasks SET workflow_template_id=NULL, current_step_key=NULL "
+            "WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        with pytest.raises(ValueError, match="invalid workflow_outcome"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Invalid route",
+                metadata={
+                    "workflow_outcome": {
+                        "verdict": "architecture_invalid",
+                        "target_step": "architecture",
+                        "findings": ["Not valid from Test"],
+                    }
+                },
+                expected_run_id=claimed.current_run_id,
+                board=board,
+            )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert task is not None
+    assert task.workflow_template_id is None
+    assert task.current_step_key is None
+    assert not any(event.kind == "workflow_repaired" for event in events)
+
+
+def test_fourth_product_rejection_routes_to_human_block(kanban_home):
+    board = "rework-limit"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: bounded rework",
+            assignee="reviewer",
+            workflow_template_id="product",
+            current_step_key="review",
+            board=board,
+        )
+        conn.execute("UPDATE tasks SET rework_count=3 WHERE id=?", (tid,))
+        conn.commit()
+        claimed = kb.claim_task(conn, tid)
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Fourth rejection",
+            metadata={
+                "workflow_outcome": {
+                    "verdict": "changes_requested",
+                    "target_step": "development",
+                    "findings": ["Still unsafe"],
+                }
+            },
+            expected_run_id=claimed.current_run_id,
+            board=board,
+        )
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.blocked is True
+    assert task.rework_count == 4
+    blocked = [event for event in events if event.kind == "blocked"]
+    assert blocked
+    assert blocked[-1].payload["kind"] == "rework_limit"
+    assert blocked[-1].payload["findings"] == ["Still unsafe"]
+
+
+def _route_task_to_resolver(
+    conn, board: str, *, step: str = "development"
+) -> tuple[str, int]:
+    assignee = {
+        "development": "developer",
+        "test": "tester",
+        "review": "reviewer",
+    }[step]
+    tid = kb.create_task(
+        conn,
+        title="Story: resolver",
+        assignee=assignee,
+        workflow_template_id="product",
+        current_step_key=step,
+        board=board,
+    )
+    first = kb.claim_task(conn, tid)
+    assert first is not None and first.current_run_id is not None
+    assert kb.block_task(
+        conn,
+        tid,
+        reason="Need a decision",
+        kind="needs_input",
+        attempted_resolutions=["read docs"],
+        expected_run_id=first.current_run_id,
+        board=board,
+    )
+    if step == "review":
+        # Review is a visible legacy column status, while the resolver must be
+        # claimable as ready work. Model the dispatcher promotion explicitly.
+        conn.execute(
+            "UPDATE tasks SET status='ready' WHERE id=? AND assignee='default'",
+            (tid,),
+        )
+        conn.commit()
+    resolver = kb.claim_task(conn, tid)
+    assert resolver is not None and resolver.current_run_id is not None
+    return tid, resolver.current_run_id
+
+
+@pytest.mark.parametrize("step", ["test", "review"])
+def test_product_preflight_resolver_validation_precedes_rework(
+    kanban_home, step
+):
+    board = f"resolver-before-rework-{step}"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board, step=step)
+        target = "development"
+        with pytest.raises(ValueError, match="resolver_action"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Trying to bypass resolver",
+                metadata={
+                    "workflow_outcome": {
+                        "verdict": "changes_requested",
+                        "target_step": target,
+                        "findings": ["Workflow finding"],
+                    }
+                },
+                expected_run_id=run_id,
+                board=board,
+            )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.current_step_key == step
+    assert task.status == "running"
+    assert task.rework_count == 0
+    assert task.current_run_id == run_id
+
+
+def test_product_preflight_requires_structured_resolver_action(kanban_home):
+    board = "resolver-required"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        context = kb.build_worker_context(conn, tid)
+        assert "## Required resolver action" in context
+        assert "Original blocker:" in context
+        assert "Attempted resolutions:" in context
+        assert "Board policy:" in context
+        assert "resume, create_fix_task, or escalate" in context
+        with pytest.raises(ValueError, match="resolver_action"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="I think it is fine",
+                expected_run_id=run_id,
+                board=board,
+            )
+
+
+@pytest.mark.parametrize(
+    "resolver_action",
+    [
+        {
+            "action": "resume",
+            "resolution": "Use the configured test token source",
+        },
+        {
+            "action": "resume",
+            "resolution": "Use the configured test token source",
+            "fix_task_id": None,
+            "unexpected": True,
+        },
+        {
+            "action": "resume",
+            "resolution": "Use the configured test token source",
+            "fix_task_id": "t_not_null",
+        },
+    ],
+)
+def test_product_preflight_resolver_action_requires_exact_shape(
+    kanban_home, resolver_action
+):
+    board = "resolver-exact-shape"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        with pytest.raises(ValueError, match="resolver_action"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Invalid resolver shape",
+                metadata={"resolver_action": resolver_action},
+                expected_run_id=run_id,
+                board=board,
+            )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == run_id
+
+
+def test_product_preflight_resume_restores_original_step(kanban_home):
+    board = "resolver-resume"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Resolved",
+            metadata={
+                "resolver_action": {
+                    "action": "resume",
+                    "resolution": "Use the configured test token source",
+                    "fix_task_id": None,
+                }
+            },
+            expected_run_id=run_id,
+            board=board,
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.current_step_key == "development"
+    assert task.assignee == "developer"
+    assert task.status == "ready"
+    assert task.running is False
+    assert task.blocked is False
+
+
+def test_product_preflight_create_fix_task_waits_on_real_child(kanban_home):
+    board = "resolver-fix"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        fix_id = kb.create_task(
+            conn,
+            title="Fix dependency",
+            assignee="developer",
+            created_by="default",
+            parents=[tid],
+            board=board,
+        )
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Created a concrete fix",
+            metadata={
+                "resolver_action": {
+                    "action": "create_fix_task",
+                    "resolution": "Dependency needs a dedicated fix",
+                    "fix_task_id": fix_id,
+                }
+            },
+            expected_run_id=run_id,
+            board=board,
+        )
+        task = kb.get_task(conn, tid)
+        original_parents = kb.parent_ids(conn, tid)
+        fix_parents = kb.parent_ids(conn, fix_id)
+    assert task is not None and task.status == "todo"
+    assert original_parents == [fix_id]
+    assert tid not in fix_parents
+
+
+def test_product_preflight_rejects_unlinked_fix_task(kanban_home):
+    board = "resolver-fix-unlinked"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        fix_id = kb.create_task(
+            conn,
+            title="Unrelated task from the same profile",
+            assignee="developer",
+            created_by="default",
+            board=board,
+        )
+
+        with pytest.raises(ValueError, match="linked"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Tried to reuse an unrelated task",
+                metadata={
+                    "resolver_action": {
+                        "action": "create_fix_task",
+                        "resolution": "Use this existing task",
+                        "fix_task_id": fix_id,
+                    }
+                },
+                expected_run_id=run_id,
+                board=board,
+            )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "running"
+        assert kb.parent_ids(conn, tid) == []
+        assert kb.parent_ids(conn, fix_id) == []
+
+
+def test_product_preflight_revalidates_fix_link_inside_write_transaction(
+    kanban_home, monkeypatch,
+):
+    board = "resolver-fix-concurrent-unlink"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        fix_id = kb.create_task(
+            conn,
+            title="Fix removed during resolver validation",
+            assignee="developer",
+            created_by="default",
+            parents=[tid],
+            board=board,
+        )
+        verify_created_cards = kb._verify_created_cards
+
+        def unlink_after_preflight(*args, **kwargs):
+            verified = verify_created_cards(*args, **kwargs)
+            assert kb.unlink_tasks(conn, tid, fix_id)
+            return verified
+
+        monkeypatch.setattr(kb, "_verify_created_cards", unlink_after_preflight)
+
+        with pytest.raises(ValueError, match="linked"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="The direct fix link was concurrently removed",
+                metadata={
+                    "resolver_action": {
+                        "action": "create_fix_task",
+                        "resolution": "Use the prelinked fix task",
+                        "fix_task_id": fix_id,
+                    }
+                },
+                expected_run_id=run_id,
+                board=board,
+            )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "running"
+        assert task.current_run_id == run_id
+        assert kb.parent_ids(conn, tid) == []
+        assert kb.parent_ids(conn, fix_id) == [tid]
+
+
+def test_product_preflight_fix_cycle_rolls_back_state_and_graph(kanban_home):
+    board = "resolver-fix-cycle"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        middle_id = kb.create_task(
+            conn,
+            title="Intermediate dependency",
+            assignee="developer",
+            created_by="default",
+            parents=[tid],
+            board=board,
+        )
+        fix_id = kb.create_task(
+            conn,
+            title="Fix dependency",
+            assignee="developer",
+            created_by="default",
+            parents=[tid, middle_id],
+            board=board,
+        )
+        before_task = kb.get_task(conn, tid)
+        before_links = conn.execute(
+            "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
+        ).fetchall()
+
+        with pytest.raises(ValueError, match="cycle"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Created a cyclic fix",
+                metadata={
+                    "resolver_action": {
+                        "action": "create_fix_task",
+                        "resolution": "Dependency needs a dedicated fix",
+                        "fix_task_id": fix_id,
+                    }
+                },
+                expected_run_id=run_id,
+                board=board,
+            )
+        after_task = kb.get_task(conn, tid)
+        after_links = conn.execute(
+            "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
+        ).fetchall()
+    assert after_task is not None and before_task is not None
+    assert after_task.status == before_task.status == "running"
+    assert after_task.current_run_id == before_task.current_run_id == run_id
+    assert [tuple(row) for row in after_links] == [tuple(row) for row in before_links]
+
+
+def test_product_preflight_stale_fix_action_does_not_link_child(kanban_home):
+    board = "resolver-fix-stale"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        fix_id = kb.create_task(
+            conn,
+            title="Fix dependency",
+            assignee="developer",
+            created_by="default",
+            board=board,
+        )
+        assert not kb.complete_task(
+            conn,
+            tid,
+            summary="Stale resolver action",
+            metadata={
+                "resolver_action": {
+                    "action": "create_fix_task",
+                    "resolution": "Dependency needs a dedicated fix",
+                    "fix_task_id": fix_id,
+                }
+            },
+            expected_run_id=run_id + 1,
+            board=board,
+        )
+        link = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+            (fix_id, tid),
+        ).fetchone()
+        task = kb.get_task(conn, tid)
+    assert link is None
+    assert task is not None and task.status == "running"
+
+
+def test_product_preflight_escalate_enters_human_block(kanban_home):
+    board = "resolver-escalate"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Cannot resolve safely",
+            metadata={
+                "resolver_action": {
+                    "action": "escalate",
+                    "resolution": "Docs and local config are insufficient",
+                    "fix_task_id": None,
+                }
+            },
+            expected_run_id=run_id,
+            board=board,
+        )
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert task is not None and task.status == "blocked" and task.blocked is True
+    blocked = [event for event in events if event.kind == "blocked"]
+    assert blocked
+    assert blocked[-1].payload["kind"] == "resolver_escalation"
+    assert blocked[-1].payload["resolution"] == "Docs and local config are insufficient"
+
+
+def test_story_title_infers_product_without_role_on_product_board(kanban_home):
+    board = "story-intent"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(conn, title="Story: explicit user intent", board=board)
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.workflow_template_id == "product"
+    assert task.current_step_key == "backlog"
 
 
 def test_set_phase_v2_board_updates_step_and_syncs_status(kanban_home, monkeypatch):
@@ -4132,6 +4969,8 @@ def test_complete_task_v2_with_unresolved_preflight_resumes_instead_of_handoff(
         blocked_card = _card_snapshot(conn, tid)
         assert blocked_card["assignee"] == "default"
         assert blocked_card["current_step_key"] == "development"
+        resolver_run = kb.claim_task(conn, tid)
+        assert resolver_run is not None and resolver_run.current_run_id is not None
 
         # A stray uncommitted diff is present in the worktree -- if the
         # buggy v2 branch fired here, it would wrongly commit it and
@@ -4142,6 +4981,14 @@ def test_complete_task_v2_with_unresolved_preflight_resumes_instead_of_handoff(
             conn,
             tid,
             summary="Found internal test token path",
+            metadata={
+                "resolver_action": {
+                    "action": "resume",
+                    "resolution": "Found internal test token path",
+                    "fix_task_id": None,
+                }
+            },
+            expected_run_id=resolver_run.current_run_id,
             board=board,
         )
 
@@ -4164,10 +5011,7 @@ def test_complete_task_v2_with_unresolved_preflight_resumes_instead_of_handoff(
     assert head != ""
 
 
-def test_complete_task_v2_terminal_release_measure_completes_to_done(kanban_home):
-    """v2 terminal step (release_measure, no transition) still completes to
-    ``done`` via the existing legacy terminal path -- no handoff advance.
-    """
+def test_complete_task_v2_terminal_release_measure_requires_release_evidence(kanban_home):
     board = "v2-complete-task-terminal"
     _v2_product_board(board)
     with kb.connect(board=board) as conn:
@@ -4178,18 +5022,18 @@ def test_complete_task_v2_terminal_release_measure_completes_to_done(kanban_home
             current_step_key="release_measure",
         )
 
-        result = kb.complete_task(
-            conn,
-            tid,
-            summary="Released and measured",
-            board=board,
-        )
+        with pytest.raises(kb.ReleaseEvidenceError):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Released and measured",
+                board=board,
+            )
 
         task = kb.get_task(conn, tid)
         events = kb.list_events(conn, tid)
 
-    assert result is True
-    assert task.status == "done"
+    assert task.status == "ready"
     assert not any(event.kind == "handoff" for event in events)
 
 
@@ -4292,7 +5136,6 @@ def test_complete_task_v2_stale_reclaimed_worker_cannot_advance(kanban_home, tmp
     assert result is False
     assert card["current_step_key"] == "development"
     assert not any(event.kind == "handoff" for event in events)
-
     after_head = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
         check=True, capture_output=True, text=True,
@@ -4304,6 +5147,37 @@ def test_complete_task_v2_stale_reclaimed_worker_cannot_advance(kanban_home, tmp
     ).stdout
     assert status.strip() != ""  # still dirty -- never staged/committed
 
+
+def test_end_run_expected_id_cannot_close_new_owner(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="owned run", assignee="developer")
+        first = kb.claim_task(conn, tid, claimer="old")
+        assert first is not None and first.current_run_id is not None
+        old_run_id = first.current_run_id
+        assert kb.reclaim_task(conn, tid, reason="new owner") is True
+        second = kb.claim_task(conn, tid, claimer="new")
+        assert second is not None and second.current_run_id is not None
+        new_run_id = second.current_run_id
+
+        with kb.write_txn(conn):
+            ended = kb._end_run(
+                conn,
+                tid,
+                outcome="advanced",
+                expected_run_id=old_run_id,
+            )
+        task = kb.get_task(conn, tid)
+        old_run = conn.execute(
+            "SELECT ended_at, outcome FROM task_runs WHERE id=?", (old_run_id,)
+        ).fetchone()
+        new_run = conn.execute(
+            "SELECT ended_at, outcome FROM task_runs WHERE id=?", (new_run_id,)
+        ).fetchone()
+
+    assert ended is None
+    assert task is not None and task.current_run_id == new_run_id
+    assert old_run["ended_at"] is not None and old_run["outcome"] == "reclaimed"
+    assert new_run["ended_at"] is None and new_run["outcome"] is None
 
 def test_complete_task_v2_owning_worker_still_advances_with_expected_run_id(
     kanban_home, tmp_path, monkeypatch,
@@ -5419,10 +6293,20 @@ def test_product_preflight_resolution_returns_card_to_original_assignee(kanban_h
             board="prod",
             human_escalation_assignee="default",
         )
+        resolver_run = kb.claim_task(conn, tid)
+        assert resolver_run is not None and resolver_run.current_run_id is not None
         assert kb.complete_task(
             conn,
             tid,
             summary="Found internal test token path",
+            metadata={
+                "resolver_action": {
+                    "action": "resume",
+                    "resolution": "Found internal test token path",
+                    "fix_task_id": None,
+                }
+            },
+            expected_run_id=resolver_run.current_run_id,
             board="prod",
         )
         task = kb.get_task(conn, tid)
@@ -8540,7 +9424,7 @@ def test_complete_task_v2_terminal_done_sets_phase_and_clears_flags(kanban_home)
             conn,
             title="Story",
             workflow_template_id="product",
-            current_step_key="release_measure",
+            current_step_key="done",
         )
         conn.execute(
             "UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,),
@@ -8565,6 +9449,39 @@ def test_complete_task_v2_terminal_done_sets_phase_and_clears_flags(kanban_home)
     assert row["running"] == 0
     assert row["blocked"] == 0
     assert row["status"] == kb._legacy_status(row, meta)
+
+
+def test_complete_task_release_measure_cannot_bypass_release_orchestration(
+    kanban_home, monkeypatch,
+):
+    board = "v2-release-evidence-gate"
+    kb.ensure_product_board_defaults(board)
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Story: evidence gate",
+            board=board,
+            workflow_template_id="product",
+            current_step_key="release_measure",
+        )
+
+        original_validate = kb._validate_done_evidence
+
+        def validate_in_terminal_transaction(inner_conn, inner_task_id, evidence):
+            assert inner_conn.in_transaction is True
+            return original_validate(inner_conn, inner_task_id, evidence)
+
+        monkeypatch.setattr(
+            kb, "_validate_done_evidence", validate_in_terminal_transaction
+        )
+        with pytest.raises(kb.ReleaseEvidenceError) as exc_info:
+            kb.complete_task(conn, task_id, summary="looks done", board=board)
+
+        assert "integrated_branch" in exc_info.value.missing
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.current_step_key == "release_measure"
 
 
 def test_complete_task_legacy_board_terminal_flags_stay_zero(kanban_home):
@@ -9004,6 +9921,301 @@ def _assert_no_push(calls: list[list[str]]) -> None:
         assert "push" not in cmd, f"git push invoked: {cmd}"
 
 
+def _git_output(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_build_merge_candidate_keeps_checked_out_target_unchanged(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    source_sha = _make_epic_branch(repo, "wt/source")
+    pre_sha = _git_output(repo, "rev-parse", "main")
+
+    candidate = kb._build_verified_merge_candidate(
+        repo,
+        "main",
+        "wt/source",
+        "test candidate",
+        lambda path: (path / "epic_work.txt").read_text() == "epic work\n",
+    )
+
+    assert candidate.pre_sha == pre_sha
+    assert candidate.target_worktree == repo.resolve()
+    assert candidate.candidate_sha != pre_sha
+    assert subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", source_sha, "main"]
+    ).returncode == 1
+    assert kb._fast_forward_target(candidate) is True
+    assert subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", source_sha, "main"]
+    ).returncode == 0
+
+
+def test_build_merge_candidate_rejects_dirty_checked_out_target(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _make_epic_branch(repo, "wt/source")
+    pre_sha = _git_output(repo, "rev-parse", "main")
+    (repo / "tracked.txt").write_text("dirty", encoding="utf-8")
+
+    with pytest.raises(kb.IntegrationCandidateError, match="target worktree is dirty"):
+        kb._build_verified_merge_candidate(
+            repo, "main", "wt/source", "test candidate", lambda _path: True
+        )
+
+    assert _git_output(repo, "rev-parse", "main") == pre_sha
+    assert (repo / "tracked.txt").read_text(encoding="utf-8") == "dirty"
+
+
+def test_build_merge_candidate_updates_unchecked_target_ref(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    source_sha = _make_epic_branch(repo, "wt/source")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", "operator"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate = kb._build_verified_merge_candidate(
+        repo, "main", "wt/source", "test candidate", lambda _path: True
+    )
+    assert candidate.target_worktree is None
+    assert kb._fast_forward_target(candidate) is True
+    assert _git_output(repo, "branch", "--show-current") == "operator"
+    assert subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", source_sha, "main"]
+    ).returncode == 0
+
+
+def test_build_merge_candidate_conflict_preserves_target(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", "wt/source"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _commit_file(repo, "shared.txt", "source\n", "source")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _commit_file(repo, "shared.txt", "main\n", "main")
+    pre_sha = _git_output(repo, "rev-parse", "main")
+    with pytest.raises(kb.IntegrationCandidateError, match="merge conflict"):
+        kb._build_verified_merge_candidate(
+            repo, "main", "wt/source", "test candidate", lambda _path: True
+        )
+    assert _git_output(repo, "rev-parse", "main") == pre_sha
+
+
+def test_build_merge_candidate_verification_failure_preserves_target(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _make_epic_branch(repo, "wt/source")
+    pre_sha = _git_output(repo, "rev-parse", "main")
+    with pytest.raises(kb.IntegrationCandidateError, match="verification failed"):
+        kb._build_verified_merge_candidate(
+            repo, "main", "wt/source", "test candidate", lambda _path: False
+        )
+    assert _git_output(repo, "rev-parse", "main") == pre_sha
+
+
+def test_fast_forward_rejects_target_that_moved_after_candidate(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _make_epic_branch(repo, "wt/source")
+    candidate = kb._build_verified_merge_candidate(
+        repo, "main", "wt/source", "test candidate", lambda _path: True
+    )
+    _commit_file(repo, "operator.txt", "new\n", "operator moved main")
+    moved_sha = _git_output(repo, "rev-parse", "main")
+    assert kb._fast_forward_target(candidate) is False
+    assert _git_output(repo, "rev-parse", "main") == moved_sha
+
+
+def test_fast_forward_rejects_checked_out_target_race_to_candidate_descendant(
+    tmp_path, monkeypatch,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _make_epic_branch(repo, "wt/source")
+    candidate = kb._build_verified_merge_candidate(
+        repo, "main", "wt/source", "test candidate", lambda _path: True
+    )
+    integration_git = kb._integration_git
+    raced: dict[str, str] = {}
+
+    def advance_target_before_merge(cwd, args, *, timeout=120):
+        if args == ["merge", "--ff-only", candidate.candidate_sha] and not raced:
+            subprocess.run(
+                ["git", "-C", str(repo), *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            raced["sha"] = _commit_file(
+                repo,
+                "operator-after-candidate.txt",
+                "unverified\n",
+                "operator advanced past candidate",
+            )
+        return integration_git(cwd, args, timeout=timeout)
+
+    monkeypatch.setattr(kb, "_integration_git", advance_target_before_merge)
+
+    assert kb._fast_forward_target(candidate) is False
+    assert _git_output(repo, "rev-parse", "main") == raced["sha"]
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "show-ref", "--verify", candidate.candidate_ref],
+            capture_output=True,
+            text=True,
+        ).returncode
+        == 0
+    )
+
+
+def test_fast_forward_rejects_target_checked_out_after_candidate(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _make_epic_branch(repo, "wt/source")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", "operator"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    candidate = kb._build_verified_merge_candidate(
+        repo, "main", "wt/source", "test candidate", lambda _path: True
+    )
+    assert candidate.target_worktree is None
+
+    late_checkout = tmp_path / "late-main"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", str(late_checkout), "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    pre_sha = _git_output(repo, "rev-parse", "main")
+
+    assert kb._fast_forward_target(candidate) is False
+    assert _git_output(repo, "rev-parse", "main") == pre_sha
+    assert _git_output(late_checkout, "status", "--porcelain") == ""
+
+
+def test_build_merge_candidate_rejects_reviewed_source_ref_drift(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    approved_sha = _make_epic_branch(repo, "wt/source")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "wt/source"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _commit_file(repo, "after-review.txt", "drift\n", "post-review drift")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    pre_sha = _git_output(repo, "rev-parse", "main")
+
+    with pytest.raises(kb.IntegrationCandidateError, match="source branch moved"):
+        kb._build_verified_merge_candidate(
+            repo,
+            "main",
+            "wt/source",
+            "test candidate",
+            lambda _path: True,
+            expected_source_sha=approved_sha,
+        )
+
+    assert _git_output(repo, "rev-parse", "main") == pre_sha
+
+
+def test_build_merge_candidate_rejects_source_drift_during_verification(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    approved_sha = _make_epic_branch(repo, "wt/source")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", "post-review", "wt/source"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    drift_sha = _commit_file(repo, "after-review.txt", "drift\n", "post-review drift")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    pre_sha = _git_output(repo, "rev-parse", "main")
+
+    def move_source_during_verify(_candidate: Path) -> bool:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "update-ref",
+                "refs/heads/wt/source",
+                drift_sha,
+                approved_sha,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return True
+
+    with pytest.raises(kb.IntegrationCandidateError, match="source branch moved"):
+        kb._build_verified_merge_candidate(
+            repo,
+            "main",
+            "wt/source",
+            "test candidate",
+            move_source_during_verify,
+            expected_source_sha=approved_sha,
+        )
+
+    assert _git_output(repo, "rev-parse", "main") == pre_sha
+
+
+def test_build_merge_candidate_preserves_dirty_scratch_on_cleanup_failure(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _make_epic_branch(repo, "wt/source")
+    pre_sha = _git_output(repo, "rev-parse", "main")
+    scratch: Path | None = None
+
+    def dirty_verify(path: Path) -> bool:
+        nonlocal scratch
+        scratch = path
+        (path / "verification-output.txt").write_text("keep", encoding="utf-8")
+        return True
+
+    with pytest.raises(kb.IntegrationCandidateError, match="scratch worktree is dirty"):
+        kb._build_verified_merge_candidate(
+            repo, "main", "wt/source", "test candidate", dirty_verify
+        )
+    assert _git_output(repo, "rev-parse", "main") == pre_sha
+    assert scratch is not None and (scratch / "verification-output.txt").exists()
+
+
 def test_merge_epic_to_main_happy_path_merges_and_never_pushes(kanban_home, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
@@ -9040,12 +10252,10 @@ def test_merge_epic_to_main_happy_path_merges_and_never_pushes(kanban_home, tmp_
     assert status.stdout.strip() == "", "working tree must be clean after merge"
 
 
-def test_merge_epic_to_main_untracked_sibling_worktree_still_merges(kanban_home, tmp_path, monkeypatch):
-    """Dogfood repro: a story worktree lives at ``<repo>/.worktrees/<story_id>``
-    and is NOT gitignored, so it shows up as ``?? .worktrees/`` in
-    ``git status --porcelain`` on main. That untracked entry must NOT trip
-    the post-merge cleanliness check -- only tracked/conflicted state should.
-    """
+def test_merge_epic_to_main_refuses_unignored_sibling_worktree(
+    kanban_home, tmp_path, monkeypatch
+):
+    """All target dirt, including an unignored worktree, fails closed."""
     repo = tmp_path / "repo"
     _init_git_repo(repo)
     board = "v2-merge-untracked-worktree"
@@ -9084,16 +10294,16 @@ def test_merge_epic_to_main_untracked_sibling_worktree_still_merges(kanban_home,
             conn, epic, board=board, verify_fn=lambda b: True, notify_fn=notify,
         )
 
-    assert result == "merged"
-    notify.assert_not_called()
+    assert result == "verify_failed"
+    notify.assert_called_once()
     _assert_no_push(calls)
-    assert not any("reset" in cmd for cmd in calls), "clean-but-untracked main must not trigger a reset"
+    assert not any("reset" in cmd for cmd in calls)
 
     ancestor = subprocess.run(
         ["git", "-C", str(repo), "merge-base", "--is-ancestor", epic_sha, "main"],
         capture_output=True, text=True,
     )
-    assert ancestor.returncode == 0, "main must contain the epic's commit"
+    assert ancestor.returncode == 1, "dirty main must not contain the epic's commit"
 
 
 def test_merge_epic_to_main_conflict_aborts_blocks_and_never_pushes(kanban_home, tmp_path, monkeypatch):
@@ -9789,7 +10999,7 @@ def test_migrate_cards_to_v2_flags_reconciles_mixed_board(kanban_home, monkeypat
         for status in statuses:
             step_key = "development" if status in ("running", "blocked") else status
             tid = kb.create_task(
-                conn, title=f"card-{status}", workflow_template_id="product",
+                conn, title=f"card-{status}", workflow_template_id="custom",
                 current_step_key=step_key,
             )
             conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
@@ -10220,6 +11430,46 @@ def test_merge_standalone_story_to_main_happy_merges_and_never_pushes(kanban_hom
     assert ancestor.returncode == 0, "main must contain the story's commit"
 
 
+def test_release_reverifies_already_merged_standalone_story(
+    kanban_home, tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-standalone-already-merged-release"
+    _v2_product_board_with_repo(board, repo)
+    story, source_sha = _make_done_standalone_story(board, repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "merge", "--ff-only", "wt/story-1"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    observed: list[str] = []
+
+    def verify(candidate: Path) -> bool:
+        observed.append((candidate / "epic_work.txt").read_text(encoding="utf-8"))
+        return True
+
+    with kb.connect(board=board) as conn:
+        result = kb._merge_standalone_story_to_main(
+            conn,
+            story,
+            board=board,
+            candidate_verify_fn=verify,
+            expected_source_sha=source_sha,
+            allow_release_measure=True,
+        )
+        event = next(
+            event
+            for event in kb.list_events(conn, story)
+            if event.kind == "story_merged_to_main"
+        )
+
+    assert result == "already_merged"
+    assert observed == ["epic work\n"]
+    assert event.payload["source_sha"] == source_sha
+
+
 def test_merge_standalone_story_with_epic_returns_none(kanban_home, tmp_path):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
@@ -10316,13 +11566,22 @@ def test_reconcile_merge_after_green_OFF_does_not_merge(kanban_home, tmp_path, m
 def test_reconcile_merge_after_green_ON_merges_one_standalone_per_pass(kanban_home, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
+    (repo / "scripts").mkdir()
+    test_script = repo / "scripts" / "run_tests.sh"
+    test_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    test_script.chmod(0o755)
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "scripts/run_tests.sh"],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "add test gate"],
+        check=True, capture_output=True, text=True,
+    )
     board = "v2-reconcile-mergeback-on"
     _v2_product_board_with_repo(board, repo)
     _enable_merge_after_green(board)
     story, sha = _make_done_standalone_story(board, repo)
-    # inject a green verify so reconcile's merge passes deterministically
-    monkeypatch.setattr(kb, "_default_epic_verify", lambda b: True)
-
     with kb.connect(board=board) as conn:
         result = kb.reconcile(conn, board=board, spawn_fn=lambda *a, **k: None)
 

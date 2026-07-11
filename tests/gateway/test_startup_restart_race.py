@@ -11,6 +11,11 @@ from gateway.restart import (
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
 )
 
+# The full 24-worker repository run can delay gateway import/startup work for
+# more than five seconds on macOS. Keep a bounded deadlock guard without
+# treating scheduler contention as the restart-race failure under test.
+STARTUP_TEST_TIMEOUT = 15
+
 
 class StartupRaceAdapter(BasePlatformAdapter):
     def __init__(
@@ -89,6 +94,9 @@ def make_startup_runner(tmp_path):
     runner.hooks.emit = AsyncMock()
     runner.session_store = MagicMock()
     runner.session_store.suspend_recently_active.return_value = 0
+    runner._async_session_store = MagicMock()
+    runner._async_session_store._store = runner.session_store
+    runner._async_session_store.suspend_recently_active = AsyncMock(return_value=0)
     runner.delivery_router = MagicMock()
     runner.delivery_router.adapters = {}
 
@@ -136,7 +144,7 @@ async def test_startup_aborts_when_restart_requested_before_start(tmp_path, monk
     runner.request_restart(detached=False, via_service=True)
     runner._create_adapter = MagicMock()
 
-    result = await asyncio.wait_for(runner.start(), timeout=2)
+    result = await asyncio.wait_for(runner.start(), timeout=STARTUP_TEST_TIMEOUT)
 
     assert result is True
     runner._create_adapter.assert_not_called()
@@ -167,7 +175,7 @@ async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_pa
     telegram.disconnect = disconnect_and_release
     runner._create_adapter = MagicMock(side_effect=[telegram, slack])
 
-    result = await asyncio.wait_for(runner.start(), timeout=2)
+    result = await asyncio.wait_for(runner.start(), timeout=STARTUP_TEST_TIMEOUT)
 
     assert result is True
     assert telegram.disconnected is True
@@ -202,7 +210,7 @@ async def test_startup_abort_waits_for_existing_stop_task(tmp_path):
 
     result = await asyncio.wait_for(
         runner._abort_startup_if_shutdown_requested(adapter, Platform.TELEGRAM),
-        timeout=2,
+        timeout=STARTUP_TEST_TIMEOUT,
     )
 
     assert result is True
@@ -227,7 +235,7 @@ async def test_startup_aborts_after_registered_adapter_restart(tmp_path, monkeyp
 
     runner._update_platform_runtime_status = MagicMock(side_effect=update_platform_runtime_status)
 
-    result = await asyncio.wait_for(runner.start(), timeout=2)
+    result = await asyncio.wait_for(runner.start(), timeout=STARTUP_TEST_TIMEOUT)
 
     assert result is True
     assert telegram.connected is True
