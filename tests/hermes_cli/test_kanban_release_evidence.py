@@ -241,6 +241,168 @@ def test_standalone_release_integrates_before_done_and_attaches_terminal_evidenc
         }
 
 
+@pytest.mark.parametrize("stale_state", ["run", "status"])
+def test_stale_release_run_cannot_integrate_record_events_or_deploy(
+    release_home, tmp_path, monkeypatch, stale_state,
+):
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = f"release-stale-{stale_state}-entry"
+    _release_board(board, repo, policy="required")
+    with kb.connect(board=board) as conn:
+        task_id = _release_task(conn, board, repo, branch)
+        _seed_structured_evidence(conn, task_id, branch, source_sha)
+        assert kb.assign_task(conn, task_id, "default")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        expected_run_id = claimed.current_run_id
+        if stale_state == "run":
+            expected_run_id += 1
+        else:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='ready' WHERE id=?",
+                    (task_id,),
+                )
+        before_events = kb.list_events(conn, task_id)
+        before_main = _git(repo, "rev-parse", "main")
+        integrate = Mock(return_value="merged")
+        adapter = _SuccessfulReleaseAdapter()
+        monkeypatch.setattr(kb, "_merge_standalone_story_to_main", integrate)
+
+        result = kb.release_product_task(
+            conn,
+            task_id,
+            board,
+            lambda _path: True,
+            adapter,
+            measurement_note="stale worker must not release",
+            expected_run_id=expected_run_id,
+        )
+
+        assert result == kb.ReleaseResult(False, "completion_conflict")
+        integrate.assert_not_called()
+        assert adapter.calls == []
+        assert kb.list_events(conn, task_id) == before_events
+        assert _git(repo, "rev-parse", "main") == before_main
+
+
+def test_release_rechecks_run_ownership_before_integration_apply(
+    release_home, tmp_path,
+):
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = "release-run-race-before-apply"
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        task_id = _release_task(conn, board, repo, branch)
+        _seed_structured_evidence(conn, task_id, branch, source_sha)
+        assert kb.assign_task(conn, task_id, "default")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        expected_run_id = claimed.current_run_id
+        before_main = _git(repo, "rev-parse", "main")
+
+        def revoke_during_verification(_candidate: Path) -> bool:
+            with kb.write_txn(conn):
+                new_run = conn.execute(
+                    "INSERT INTO task_runs (task_id, profile, status, started_at) "
+                    "VALUES (?, 'default', 'running', 1)",
+                    (task_id,),
+                ).lastrowid
+                conn.execute(
+                    "UPDATE tasks SET status='running', current_run_id=? WHERE id=?",
+                    (new_run, task_id),
+                )
+            return True
+
+        result = kb.release_product_task(
+            conn,
+            task_id,
+            board,
+            revoke_during_verification,
+            None,
+            measurement_note="ownership changed during verification",
+            expected_run_id=expected_run_id,
+        )
+
+        assert result == kb.ReleaseResult(False, "completion_conflict")
+        assert _git(repo, "rev-parse", "main") == before_main
+        assert not any(
+            event.kind in {
+                "story_merged_to_main",
+                "deployment_policy_evaluated",
+                "completed",
+            }
+            for event in kb.list_events(conn, task_id)
+        )
+
+
+def test_release_rechecks_run_ownership_before_deployment(
+    release_home, tmp_path, monkeypatch,
+):
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = "release-run-race-before-deploy"
+    _release_board(board, repo, policy="required")
+    with kb.connect(board=board) as conn:
+        task_id = _release_task(conn, board, repo, branch)
+        _seed_structured_evidence(conn, task_id, branch, source_sha)
+        assert kb.assign_task(conn, task_id, "default")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        expected_run_id = claimed.current_run_id
+        integration_sha = "a" * 40
+
+        def integrate_then_revoke(inner_conn, inner_task_id, **kwargs):
+            assert kwargs["before_apply_fn"]() is True
+            with kb.write_txn(inner_conn):
+                kb._append_event(
+                    inner_conn,
+                    inner_task_id,
+                    "story_merged_to_main",
+                    {
+                        "source_branch": branch,
+                        "source_sha": source_sha,
+                        "target_branch": "main",
+                        "candidate_sha": integration_sha,
+                    },
+                )
+                new_run = inner_conn.execute(
+                    "INSERT INTO task_runs (task_id, profile, status, started_at) "
+                    "VALUES (?, 'default', 'running', 1)",
+                    (inner_task_id,),
+                ).lastrowid
+                inner_conn.execute(
+                    "UPDATE tasks SET status='running', current_run_id=? WHERE id=?",
+                    (new_run, inner_task_id),
+                )
+            return "merged"
+
+        monkeypatch.setattr(
+            kb, "_merge_standalone_story_to_main", integrate_then_revoke
+        )
+        adapter = _SuccessfulReleaseAdapter()
+
+        result = kb.release_product_task(
+            conn,
+            task_id,
+            board,
+            lambda _path: True,
+            adapter,
+            measurement_note="ownership changed before deployment",
+            expected_run_id=expected_run_id,
+        )
+
+        assert result == kb.ReleaseResult(False, "completion_conflict")
+        assert adapter.calls == []
+        assert not any(
+            event.kind in {
+                "deployment_policy_evaluated",
+                "deployment_recorded",
+                "completed",
+            }
+            for event in kb.list_events(conn, task_id)
+        )
+
+
 def test_terminal_done_validation_rechecks_reviewed_integration_source(
     release_home, tmp_path,
 ):

@@ -2005,15 +2005,7 @@ def _complete_product_workflow_step(
         candidate_action = (
             metadata.get("resolver_action") if isinstance(metadata, dict) else None
         )
-        action, resolution, fix_task_id = _validate_resolver_action(candidate_action)
-        if action == "create_fix_task":
-            if fix_task_id not in child_ids(conn, task_id):
-                raise ValueError(
-                    "resolver_action.fix_task_id must name a real linked task"
-                )
-            verified, phantom = _verify_created_cards(conn, task_id, [fix_task_id])
-            if phantom or verified != [fix_task_id]:
-                raise ValueError("resolver_action.fix_task_id must name a real linked task")
+        _validate_resolver_action(candidate_action)
         resolver_action = candidate_action
     else:
         transition = PRODUCT_WORKFLOW_TRANSITIONS.get(str(pre_step or ""))
@@ -2057,6 +2049,25 @@ def _complete_product_workflow_step(
                 )
                 if cur.rowcount != 1:
                     return False
+                # Revalidate both the direct prelink and task provenance while
+                # holding the same write lock as the exact-run CAS. A link
+                # removed after the outer preflight must not be resurrected in
+                # the opposite direction by a stale resolver.
+                if fix_task_id not in child_ids(conn, task_id):
+                    raise ValueError(
+                        "resolver_action.fix_task_id must name a real linked task"
+                    )
+                verified, phantom = _verify_created_cards(
+                    conn, task_id, [fix_task_id]
+                )
+                if phantom or verified != [fix_task_id]:
+                    raise ValueError(
+                        "resolver_action.fix_task_id must name a real linked task"
+                    )
+                if fix_task_id not in child_ids(conn, task_id):
+                    raise ValueError(
+                        "resolver_action.fix_task_id must name a real linked task"
+                    )
                 # A fix task is commonly created as a child of the card that
                 # discovered the blocker. Dependency wait needs the opposite
                 # direction: the original card waits for the fix. Reverse the
@@ -8291,6 +8302,9 @@ def _fast_forward_target(candidate: IntegrationCandidate) -> bool:
         branch = _integration_git(current_target_worktree, ["branch", "--show-current"])
         if branch.returncode != 0 or (branch.stdout or "").strip() != candidate.target_branch:
             return False
+        current = _integration_git(candidate.repo_root, ["rev-parse", target_ref])
+        if current.returncode != 0 or (current.stdout or "").strip() != candidate.pre_sha:
+            return False
         applied = _integration_git(
             current_target_worktree, ["merge", "--ff-only", candidate.candidate_sha]
         )
@@ -8300,6 +8314,12 @@ def _fast_forward_target(candidate: IntegrationCandidate) -> bool:
             ["update-ref", target_ref, candidate.candidate_sha, candidate.pre_sha],
         )
     if applied.returncode != 0:
+        return False
+    applied_ref = _integration_git(candidate.repo_root, ["rev-parse", target_ref])
+    if (
+        applied_ref.returncode != 0
+        or (applied_ref.stdout or "").strip() != candidate.candidate_sha
+    ):
         return False
     _integration_git(
         candidate.repo_root,
@@ -8424,6 +8444,7 @@ def merge_epic_to_main(
     verify_fn: Optional[Callable[[str], bool]] = None,
     candidate_verify_fn: Optional[Callable[[Path], bool]] = None,
     expected_source_sha: Optional[str] = None,
+    before_apply_fn: Optional[Callable[[], bool]] = None,
     notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
 ) -> Optional[str]:
     """Hermes-run merge of ``epic_id``'s integration branch into LOCAL main.
@@ -8485,6 +8506,8 @@ def merge_epic_to_main(
             effective_verify_fn,
             expected_source_sha=expected_source_sha,
         )
+        if before_apply_fn is not None and not before_apply_fn():
+            return "ownership_conflict"
         if not _fast_forward_target(candidate):
             _fail(
                 "target moved or became dirty; candidate retained at "
@@ -8562,6 +8585,7 @@ def integrate_story_to_epic(
     notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
     candidate_verify_fn: Any = _RECONCILE_INTEGRATION_VERIFY_UNSET,
     expected_source_sha: Optional[str] = None,
+    before_apply_fn: Optional[Callable[[], bool]] = None,
 ) -> Optional[str]:
     """Merge a Done story's branch into its epic's integration branch, LOCALLY.
 
@@ -8680,6 +8704,8 @@ def integrate_story_to_epic(
                     effective_verify_fn,
                     expected_source_sha=expected_source_sha,
                 )
+                if before_apply_fn is not None and not before_apply_fn():
+                    return "ownership_conflict"
                 if not _fast_forward_target(candidate):
                     reason = (
                         "epic target moved or became dirty; candidate retained at "
@@ -8770,6 +8796,7 @@ def _merge_standalone_story_to_main(
     verify_fn: Optional[Callable[[str], bool]] = None,
     candidate_verify_fn: Optional[Callable[[Path], bool]] = None,
     expected_source_sha: Optional[str] = None,
+    before_apply_fn: Optional[Callable[[], bool]] = None,
     notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
     allow_release_measure: bool = False,
 ) -> Optional[str]:
@@ -8862,6 +8889,8 @@ def _merge_standalone_story_to_main(
             effective_verify_fn,
             expected_source_sha=expected_source_sha,
         )
+        if before_apply_fn is not None and not before_apply_fn():
+            return "ownership_conflict"
         if not _fast_forward_target(candidate):
             _fail(
                 "target moved or became dirty; candidate retained at "
@@ -9060,6 +9089,25 @@ def _validate_done_evidence(
         raise ReleaseEvidenceError(task_id, missing)
 
 
+def _release_run_is_current(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_run_id: Optional[int],
+) -> bool:
+    """Return whether a worker-owned release still has its exact run lease."""
+    if expected_run_id is None:
+        return True
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    return bool(
+        row is not None
+        and row["status"] == "running"
+        and row["current_run_id"] == int(expected_run_id)
+    )
+
+
 def release_product_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9082,6 +9130,11 @@ def release_product_task(
         or task.current_step_key != "release_measure"
     ):
         raise ReleaseEvidenceError(task_id, ["release_measure_state"])
+    if not _release_run_is_current(conn, task_id, expected_run_id):
+        return ReleaseResult(False, "completion_conflict")
+
+    def before_apply_fn() -> bool:
+        return _release_run_is_current(conn, task_id, expected_run_id)
 
     repo_value = str(meta.get("default_workdir") or task.workspace_path or "").strip()
     repo_root = _git_toplevel(Path(repo_value).expanduser()) if repo_value else None
@@ -9126,6 +9179,7 @@ def release_product_task(
             board=board,
             candidate_verify_fn=candidate_verify_fn,
             expected_source_sha=source_sha,
+            before_apply_fn=before_apply_fn,
         )
         integration_kinds = {"epic_merged"}
     elif parents:
@@ -9135,6 +9189,7 @@ def release_product_task(
             board=board,
             candidate_verify_fn=candidate_verify_fn,
             expected_source_sha=source_sha,
+            before_apply_fn=before_apply_fn,
         )
         integration_kinds = {"story_integrated_to_epic"}
     else:
@@ -9144,10 +9199,13 @@ def release_product_task(
             board=board,
             candidate_verify_fn=candidate_verify_fn,
             expected_source_sha=source_sha,
+            before_apply_fn=before_apply_fn,
             allow_release_measure=True,
         )
         integration_kinds = {"story_merged_to_main"}
 
+    if integration_status == "ownership_conflict":
+        return ReleaseResult(False, "completion_conflict")
     if integration_status not in {
         "merged", "already_merged", "integrated", "already_integrated"
     }:
@@ -9169,6 +9227,8 @@ def release_product_task(
     if policy_name not in {"manual", "not_required", "required"}:
         raise ReleaseEvidenceError(task_id, ["deployment_policy"])
     with write_txn(conn):
+        if not _release_run_is_current(conn, task_id, expected_run_id):
+            return ReleaseResult(False, "completion_conflict")
         _append_event(
             conn,
             task_id,
@@ -9188,6 +9248,8 @@ def release_product_task(
     if policy_name == "required":
         if release_adapter is None:
             with write_txn(conn):
+                if not _release_run_is_current(conn, task_id, expected_run_id):
+                    return ReleaseResult(False, "completion_conflict")
                 _append_event(
                     conn,
                     task_id,
@@ -9202,6 +9264,8 @@ def release_product_task(
                 policy_event.id if policy_event else None,
                 None,
             )
+        if not _release_run_is_current(conn, task_id, expected_run_id):
+            return ReleaseResult(False, "completion_conflict")
         deployment = release_adapter.release(task_id, integration_sha)
         deployment = deployment if isinstance(deployment, dict) else {}
         deployment_missing: list[str] = []

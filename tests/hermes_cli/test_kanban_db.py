@@ -1038,6 +1038,53 @@ def test_product_preflight_rejects_unlinked_fix_task(kanban_home):
         assert kb.parent_ids(conn, fix_id) == []
 
 
+def test_product_preflight_revalidates_fix_link_inside_write_transaction(
+    kanban_home, monkeypatch,
+):
+    board = "resolver-fix-concurrent-unlink"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        fix_id = kb.create_task(
+            conn,
+            title="Fix removed during resolver validation",
+            assignee="developer",
+            created_by="default",
+            parents=[tid],
+            board=board,
+        )
+        verify_created_cards = kb._verify_created_cards
+
+        def unlink_after_preflight(*args, **kwargs):
+            verified = verify_created_cards(*args, **kwargs)
+            assert kb.unlink_tasks(conn, tid, fix_id)
+            return verified
+
+        monkeypatch.setattr(kb, "_verify_created_cards", unlink_after_preflight)
+
+        with pytest.raises(ValueError, match="linked"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="The direct fix link was concurrently removed",
+                metadata={
+                    "resolver_action": {
+                        "action": "create_fix_task",
+                        "resolution": "Use the prelinked fix task",
+                        "fix_task_id": fix_id,
+                    }
+                },
+                expected_run_id=run_id,
+                board=board,
+            )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "running"
+        assert task.current_run_id == run_id
+        assert kb.parent_ids(conn, tid) == []
+        assert kb.parent_ids(conn, fix_id) == [tid]
+
+
 def test_product_preflight_fix_cycle_rolls_back_state_and_graph(kanban_home):
     board = "resolver-fix-cycle"
     _v2_product_board(board)
@@ -9994,6 +10041,48 @@ def test_fast_forward_rejects_target_that_moved_after_candidate(tmp_path):
     moved_sha = _git_output(repo, "rev-parse", "main")
     assert kb._fast_forward_target(candidate) is False
     assert _git_output(repo, "rev-parse", "main") == moved_sha
+
+
+def test_fast_forward_rejects_checked_out_target_race_to_candidate_descendant(
+    tmp_path, monkeypatch,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _make_epic_branch(repo, "wt/source")
+    candidate = kb._build_verified_merge_candidate(
+        repo, "main", "wt/source", "test candidate", lambda _path: True
+    )
+    integration_git = kb._integration_git
+    raced: dict[str, str] = {}
+
+    def advance_target_before_merge(cwd, args, *, timeout=120):
+        if args == ["merge", "--ff-only", candidate.candidate_sha] and not raced:
+            subprocess.run(
+                ["git", "-C", str(repo), *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            raced["sha"] = _commit_file(
+                repo,
+                "operator-after-candidate.txt",
+                "unverified\n",
+                "operator advanced past candidate",
+            )
+        return integration_git(cwd, args, timeout=timeout)
+
+    monkeypatch.setattr(kb, "_integration_git", advance_target_before_merge)
+
+    assert kb._fast_forward_target(candidate) is False
+    assert _git_output(repo, "rev-parse", "main") == raced["sha"]
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "show-ref", "--verify", candidate.candidate_ref],
+            capture_output=True,
+            text=True,
+        ).returncode
+        == 0
+    )
 
 
 def test_fast_forward_rejects_target_checked_out_after_candidate(tmp_path):
