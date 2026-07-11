@@ -24,7 +24,7 @@ from tools.approval import (
 )
 
 
-_FILE_MUTATORS = {"write_file", "patch"}
+_FILE_MUTATORS = {"execute_code", "patch", "write_file"}
 _ALWAYS_READ_ONLY_COMMANDS = {
     "awk",
     "cat",
@@ -91,6 +91,14 @@ _COMMAND_WRAPPERS = {
     "sudo",
     "time",
 }
+_SED_PRINT_ONLY_RE = re.compile(
+    r"\s*(?:(?:\d+|\$)\s*(?:,\s*(?:\d+|\$))?\s*)?p\s*"
+)
+_AWK_PRINT_ONLY_RE = re.compile(r"\s*\{\s*print(?:\s+\$\d+)?\s*\}\s*")
+_INLINE_RIPGREP_CONFIG_RE = re.compile(
+    r"(?<![A-Za-z0-9_])RIPGREP_CONFIG_PATH="
+    r"(?:'(?P<single>[^']*)'|\"(?P<double>[^\"]*)\"|(?P<bare>[^\s;&|]*))"
+)
 
 
 @dataclass(frozen=True)
@@ -246,27 +254,13 @@ def _find_is_read_only(args: list[str]) -> bool:
 
 
 def _awk_is_read_only(args: list[str]) -> bool:
-    program = ""
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg in {"-f", "--file"} or arg.startswith(("-f", "--file=")):
-            return False
-        if arg in {"-v", "--assign"}:
-            index += 2
-            continue
-        if arg.startswith(("-v", "--assign=")) or arg.startswith("-F"):
-            index += 1
-            continue
-        if not arg.startswith("-"):
-            program = arg
-            break
-        index += 1
     return bool(
-        program
-        and ">" not in program
-        and "system(" not in program.replace(" ", "").lower()
-        and "|" not in program
+        len(args) >= 2
+        and _AWK_PRINT_ONLY_RE.fullmatch(args[0])
+        and all(
+            arg and not arg.startswith("-") and "=" not in arg
+            for arg in args[1:]
+        )
     )
 
 
@@ -318,7 +312,7 @@ def _command_requires_explicit_policy(command: str) -> bool:
 
 
 def _rg_is_read_only(args: list[str]) -> bool:
-    return not any(
+    return not os.getenv("RIPGREP_CONFIG_PATH") and not any(
         arg == "--pre" or arg.startswith("--pre=")
         for arg in args
     )
@@ -335,38 +329,43 @@ def _fd_is_read_only(args: list[str]) -> bool:
 
 
 def _sed_is_read_only(args: list[str]) -> bool:
-    programs: list[str] = []
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        option = arg.split("=", 1)[0]
-        if option in {"-i", "--in-place", "-f", "--file"}:
-            return False
-        if arg.startswith("-i") and arg != "-i":
-            return False
-        if option in {"-e", "--expression"}:
-            if "=" in arg:
-                programs.append(arg.split("=", 1)[1])
-                index += 1
-            elif index + 1 < len(args):
-                programs.append(args[index + 1])
-                index += 2
-            else:
-                return False
-            continue
-        if not arg.startswith("-") and not programs:
-            programs.append(arg)
-        index += 1
-    if not programs:
+    return bool(
+        len(args) >= 3
+        and args[0] == "-n"
+        and _SED_PRINT_ONLY_RE.fullmatch(args[1])
+        and all(arg and not arg.startswith("-") for arg in args[2:])
+    )
+
+
+def _command_uses_nonempty_ripgrep_config(
+    command: str, commands: list[list[str]]
+) -> bool:
+    if not any(
+        os.path.basename(argv[0]).lower() == "rg"
+        for argv in commands
+        if argv
+    ):
         return False
-    unsafe_command = re.compile(
-        r"(?:^|[;{}\n])\s*(?:[0-9$,+~]+(?:\s*,\s*[0-9$,+~]+)?\s*)?[eErRwW](?:\s|$)"
-    )
-    return not any(
-        unsafe_command.search(program)
-        or re.search(r"s(?:[^\\\n]|\\.)*/[^/\n]*/[^;\n]*[ew]", program)
-        for program in programs
-    )
+    if os.getenv("RIPGREP_CONFIG_PATH"):
+        return True
+    if "RIPGREP_CONFIG_PATH" not in shell_command_prefix_environment(command):
+        return False
+    for match in _INLINE_RIPGREP_CONFIG_RE.finditer(command):
+        value = next(
+            (
+                group
+                for group in (
+                    match.group("single"),
+                    match.group("double"),
+                    match.group("bare"),
+                )
+                if group is not None
+            ),
+            "",
+        )
+        if value:
+            return True
+    return False
 
 
 def _is_read_only_terminal(command: str, workdir: Path) -> bool:
@@ -378,6 +377,8 @@ def _is_read_only_terminal(command: str, workdir: Path) -> bool:
         return False
     commands = shell_command_argvs(command)
     if not commands:
+        return False
+    if _command_uses_nonempty_ripgrep_config(command, commands):
         return False
     prefix_environment = shell_command_prefix_environment(command)
     if prefix_environment & _COMMAND_EXECUTION_ENV:
@@ -737,9 +738,12 @@ def _terminal_targets(
 ) -> tuple[list[Path], bool]:
     command = str(args.get("command") or "")
     workdir = _terminal_workdir(args, task_context)
+    commands = shell_command_argvs(command)
     raw_targets = shell_command_output_paths(command)
-    ambiguous = _command_requires_explicit_policy(command)
-    for argv in shell_command_argvs(command):
+    ambiguous = _command_requires_explicit_policy(command) or (
+        _command_uses_nonempty_ripgrep_config(command, commands)
+    )
+    for argv in commands:
         policy = _command_policy(argv)
         if policy is None:
             ambiguous = True
@@ -770,6 +774,8 @@ def _effective_targets(
 ) -> tuple[list[Path], bool]:
     if tool_name == "terminal":
         return _terminal_targets(args, task_context)
+    if tool_name == "execute_code":
+        return [_task_path(".", task_context)], False
     if tool_name == "patch" and args.get("mode", "replace") == "patch":
         from tools.file_tools import extract_v4a_patch_paths
 
@@ -909,6 +915,8 @@ def _validate_worker(
         for governance in governances
     ):
         return _block("worker mutation does not match the card project")
+    if tool_name == "execute_code":
+        return _block("workers may not execute arbitrary code")
     if not task.branch_name:
         return _block("worker task has no assigned branch")
     try:

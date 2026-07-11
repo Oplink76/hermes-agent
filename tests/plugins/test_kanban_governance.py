@@ -115,6 +115,86 @@ def test_reads_are_always_allowed(governed_workspace):
     ) is None
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sed -n '   1  ,  3   p   ' README.md",
+        "awk '{   print   $1   }' README.md",
+        "awk '{\n\tprint\t$1\n}' README.md",
+    ],
+)
+def test_tiny_print_only_utility_grammar_remains_read_only(
+    governed_workspace, command
+):
+    mod = _load_plugin()
+
+    assert mod._on_pre_tool_call(
+        "terminal",
+        {"command": command, "workdir": str(governed_workspace["repo"])},
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sed -n '1p; 2p' README.md",
+        "sed -n '1p\n2p' README.md",
+        "sed -e '1,3p' README.md",
+        "sed -n 's/governed/governed/p' README.md",
+        "awk '{print $1; print $2}' README.md",
+        "awk -F, '{print $1}' README.md",
+        "awk 'BEGIN { system\t(\"true\") }' README.md",
+    ],
+)
+def test_nontrivial_sed_and_awk_forms_require_exact_approval(
+    governed_workspace, command
+):
+    mod = _load_plugin()
+
+    decision = mod._on_pre_tool_call(
+        "terminal",
+        {"command": command, "workdir": str(governed_workspace["repo"])},
+    )
+
+    assert decision is not None and decision["action"] == "approve"
+    assert decision["one_shot_override"]
+
+
+@pytest.mark.parametrize("inline", [False, True])
+def test_worker_nonempty_ripgrep_config_requires_approval(
+    governed_workspace, monkeypatch, inline
+):
+    mod = _load_plugin()
+    repo = governed_workspace["repo"]
+    config = repo / ".ripgreprc"
+    config.write_text("--hidden\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+    if inline:
+        command = f"RIPGREP_CONFIG_PATH={config} rg governed README.md"
+        monkeypatch.delenv("RIPGREP_CONFIG_PATH", raising=False)
+    else:
+        command = "rg governed README.md"
+        monkeypatch.setenv("RIPGREP_CONFIG_PATH", str(config))
+
+    decision = mod._on_pre_tool_call(
+        "terminal", {"command": command, "workdir": str(repo)}
+    )
+
+    assert decision is not None and decision["action"] == "block"
+
+
+def test_empty_inline_ripgrep_config_remains_a_plain_read(governed_workspace):
+    mod = _load_plugin()
+
+    assert mod._on_pre_tool_call(
+        "terminal",
+        {
+            "command": "RIPGREP_CONFIG_PATH= rg governed README.md",
+            "workdir": str(governed_workspace["repo"]),
+        },
+    ) is None
+
+
 def test_worker_git_status_with_repo_fsmonitor_cannot_execute_outside(
     governed_workspace, monkeypatch
 ):
@@ -758,6 +838,49 @@ def test_governed_mutation_without_worker_requires_exact_human_approval(
     assert override["project_id"] == governed_workspace["project_id"]
     assert override["operation_hash"] == mod._operation_hash(tool_name, call_args)
     assert override["expires_at"] > override["created_at"]
+
+
+def test_worker_execute_code_never_auto_runs(governed_workspace, monkeypatch):
+    from tools.terminal_tool import clear_task_env_overrides, register_task_env_overrides
+
+    mod = _load_plugin()
+    session_task_id = "governance-execute-code-worker"
+    register_task_env_overrides(
+        session_task_id, {"cwd": str(governed_workspace["repo"])}
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+    try:
+        decision = mod._on_pre_tool_call(
+            "execute_code",
+            {"code": "print('must not run')"},
+            task_id=session_task_id,
+        )
+    finally:
+        clear_task_env_overrides(session_task_id)
+
+    assert decision is not None and decision["action"] == "block"
+
+
+def test_human_execute_code_uses_exact_one_shot_approval(governed_workspace):
+    from tools.terminal_tool import clear_task_env_overrides, register_task_env_overrides
+
+    mod = _load_plugin()
+    session_task_id = "governance-execute-code-human"
+    args = {"code": "print('approved exactly once')"}
+    register_task_env_overrides(
+        session_task_id, {"cwd": str(governed_workspace["repo"])}
+    )
+    try:
+        decision = mod._on_pre_tool_call(
+            "execute_code", args, task_id=session_task_id
+        )
+    finally:
+        clear_task_env_overrides(session_task_id)
+
+    assert decision is not None and decision["action"] == "approve"
+    override = decision["one_shot_override"]
+    assert override["tool_name"] == "execute_code"
+    assert override["operation_hash"] == mod._operation_hash("execute_code", args)
 
 
 def test_valid_worker_write_in_its_workspace_and_branch_is_allowed(
