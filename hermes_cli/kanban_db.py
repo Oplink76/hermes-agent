@@ -9016,6 +9016,40 @@ def _release_run_evidence(
     return {"test_run_id": test_run.id, "review_run_id": review_run.id}
 
 
+def _release_history_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> dict[str, Any]:
+    """Materialize the rejection/rework chain carried into terminal evidence."""
+    events = list_events(conn, task_id)
+    development_handoffs = [
+        {"event_id": event.id, "sha": event.payload.get("sha")}
+        for event in events
+        if event.kind == "handoff"
+        and isinstance(event.payload, dict)
+        and event.payload.get("from_step") == "development"
+    ]
+    failed_test_run_ids = []
+    for run in list_runs(conn, task_id, include_active=False):
+        metadata = run.metadata if isinstance(run.metadata, dict) else {}
+        workflow = metadata.get("workflow_outcome")
+        if (
+            run.step_key == "test"
+            and run.outcome == "rework_requested"
+            and isinstance(workflow, dict)
+            and workflow.get("verdict") == "changes_requested"
+        ):
+            failed_test_run_ids.append(run.id)
+    rework_events = [event for event in events if event.kind == "rework_requested"]
+    task = get_task(conn, task_id)
+    return {
+        "development_handoffs": development_handoffs,
+        "failed_test_run_ids": failed_test_run_ids,
+        "rework_event_ids": [event.id for event in rework_events],
+        "rework_count": int(task.rework_count if task is not None else 0),
+    }
+
+
 def _validate_done_evidence(
     conn: sqlite3.Connection, task_id: str, evidence: dict
 ) -> None:
@@ -9035,6 +9069,27 @@ def _validate_done_evidence(
     except ReleaseEvidenceError as exc:
         missing.extend(exc.missing)
 
+    history = _release_history_evidence(conn, task_id)
+    if (
+        "development_handoffs" not in evidence
+        or evidence.get("development_handoffs")
+        != history["development_handoffs"]
+    ):
+        missing.append("development_history")
+    if (
+        "failed_test_run_ids" not in evidence
+        or evidence.get("failed_test_run_ids")
+        != history["failed_test_run_ids"]
+    ):
+        missing.append("tester_failures")
+    if (
+        "rework_event_ids" not in evidence
+        or evidence.get("rework_event_ids") != history["rework_event_ids"]
+        or "rework_count" not in evidence
+        or evidence.get("rework_count") != history["rework_count"]
+    ):
+        missing.append("rework_history")
+
     integration = _event_by_id(conn, task_id, evidence.get("integration_event_id"))
     if (
         integration is None
@@ -9051,8 +9106,13 @@ def _validate_done_evidence(
     if policy is None or policy.kind != "deployment_policy_evaluated":
         missing.append("deployment_policy")
     policy_payload = policy.payload if policy and isinstance(policy.payload, dict) else {}
-    if policy_payload.get("policy") not in {"manual", "not_required", "required"}:
+    if (
+        policy_payload.get("policy") not in {"manual", "not_required", "required"}
+        or "deployment_policy" not in evidence
+        or evidence.get("deployment_policy") != policy_payload.get("policy")
+    ):
         missing.append("deployment_policy")
+    deployment_payload: dict[str, Any] = {}
     if policy_payload.get("deployment_required") is True:
         deployment = _event_by_id(
             conn, task_id, evidence.get("deployment_record_event_id")
@@ -9077,6 +9137,17 @@ def _validate_done_evidence(
                 deployment_payload.get("runtime_evidence")
             ):
                 missing.append("runtime_evidence")
+    if (
+        "smoke_result" not in evidence
+        or evidence.get("smoke_result") != deployment_payload.get("smoke_result")
+    ):
+        missing.append("smoke_evidence")
+    if (
+        "rollback_target" not in evidence
+        or evidence.get("rollback_target")
+        != deployment_payload.get("rollback_target")
+    ):
+        missing.append("rollback_evidence")
     if not str(evidence.get("measurement_note") or "").strip():
         missing.append("measurement_note")
     board_meta = product_board_metadata(_board_slug_for_connection(conn)) or {}
@@ -9153,6 +9224,7 @@ def release_product_task(
         conn, task_id, branch, source_sha
     )
     evidence.update(source_branch=branch, source_sha=source_sha)
+    evidence.update(_release_history_evidence(conn, task_id))
     note = str(measurement_note or "").strip()
     if not note:
         raise ReleaseEvidenceError(task_id, ["measurement_note"])
@@ -9244,6 +9316,9 @@ def release_product_task(
     )
     evidence["deployment_policy_event_id"] = policy_event.id if policy_event else None
     evidence["deployment_record_event_id"] = None
+    evidence["deployment_policy"] = policy_name
+    evidence["smoke_result"] = None
+    evidence["rollback_target"] = None
 
     if policy_name == "required":
         if release_adapter is None:
@@ -9302,6 +9377,8 @@ def release_product_task(
         evidence["deployment_record_event_id"] = (
             deployment_event.id if deployment_event else None
         )
+        evidence["smoke_result"] = deployment.get("smoke_result")
+        evidence["rollback_target"] = deployment.get("rollback_target")
 
     pr_required = workflow.get("pull_request_required") is True
     pull_request = (

@@ -6,7 +6,6 @@ import importlib.util
 import json
 import subprocess
 import sys
-import types
 from pathlib import Path
 
 import pytest
@@ -15,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import projects_db as pdb
+from hermes_cli.plugins import PluginManager
 
 
 pytestmark = pytest.mark.skipif(
@@ -33,21 +33,10 @@ def _git(repo: Path, *args: str, check: bool = True) -> str:
     return result.stdout.strip()
 
 
-def _load_module(name: str, path: Path, *, package: bool = False):
-    if package and "hermes_plugins" not in sys.modules:
-        namespace = types.ModuleType("hermes_plugins")
-        namespace.__path__ = []
-        sys.modules["hermes_plugins"] = namespace
-    spec = importlib.util.spec_from_file_location(
-        name,
-        path,
-        submodule_search_locations=[str(path.parent)] if package else None,
-    )
+def _load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    if package:
-        module.__package__ = name
-        module.__path__ = [str(path.parent)]
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
@@ -190,17 +179,24 @@ def test_governed_product_story_recovers_through_release_and_done(
     assert stale.status_code == 409, stale.text
     assert stale.json()["current"]["title"].endswith("(API-updated)")
 
-    governance = _load_module(
-        "hermes_plugins.kanban_governance_recovery_fixture",
-        repo_root / "plugins" / "kanban-governance" / "__init__.py",
-        package=True,
+    plugin_manager = PluginManager()
+    plugin_manager.discover_and_load()
+    governance = plugin_manager._plugins["kanban-governance"]
+    assert governance.enabled is True
+    assert (
+        governance.manifest.config_gate
+        == "plugins.kanban-governance.enabled"
     )
+    assert plugin_manager.has_hook("pre_tool_call")
     monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
     monkeypatch.setenv("HERMES_KANBAN_TASK", "not-a-card")
     unauthorized = repo / "non-card-write.txt"
-    decision = governance._on_pre_tool_call(
-        "write_file", {"path": str(unauthorized), "content": "blocked"}
+    decisions = plugin_manager.invoke_hook(
+        "pre_tool_call",
+        tool_name="write_file",
+        args={"path": str(unauthorized), "content": "blocked"},
     )
+    decision = next(item for item in decisions if item.get("action") == "block")
     assert decision is not None and decision["action"] == "block"
     assert "does not exist" in decision["message"]
     assert not unauthorized.exists()
@@ -386,12 +382,13 @@ def test_governed_product_story_recovers_through_release_and_done(
     assert final_task.status == "done" and final_task.current_step_key == "done"
     assert final_task.rework_count == 1
 
-    development_shas = [
-        event.payload["sha"]
+    development_handoffs = [
+        event
         for event in events
         if event.kind == "handoff"
         and event.payload.get("from_step") == "development"
     ]
+    development_shas = [event.payload["sha"] for event in development_handoffs]
     assert development_shas == [first_development_sha, second_development_sha]
     failed_run = next(run for run in runs if run.id == failed_test.current_run_id)
     passed_run = next(run for run in runs if run.id == passed_test.current_run_id)
@@ -410,12 +407,22 @@ def test_governed_product_story_recovers_through_release_and_done(
     smoke = next(event for event in events if event.kind == "deployment_recorded")
     completed = next(event for event in events if event.kind == "completed")
     evidence = completed.payload["release_evidence"]
+    assert evidence["development_handoffs"] == [
+        {"event_id": event.id, "sha": event.payload["sha"]}
+        for event in development_handoffs
+    ]
+    assert evidence["failed_test_run_ids"] == [failed_test.current_run_id]
     assert evidence["test_run_id"] == passed_test.current_run_id
     assert evidence["review_run_id"] == reviewer.current_run_id
+    assert evidence["rework_event_ids"] == [rework[0].id]
+    assert evidence["rework_count"] == 1
     assert evidence["integration_event_id"] == integration.id
     assert evidence["integration_sha"] == integration.payload["candidate_sha"]
     assert evidence["deployment_policy_event_id"] == policy.id
+    assert evidence["deployment_policy"] == "required"
     assert evidence["deployment_record_event_id"] == smoke.id
+    assert evidence["smoke_result"] == smoke.payload["smoke_result"]
+    assert evidence["rollback_target"] == rollback_target
     assert policy.payload == {
         "policy": "required",
         "deployment_required": True,

@@ -442,6 +442,53 @@ def test_terminal_done_validation_rechecks_reviewed_integration_source(
         assert "integrated_branch" in exc_info.value.missing
 
 
+@pytest.mark.parametrize(
+    ("field", "tampered_value", "missing"),
+    [
+        (
+            "development_handoffs",
+            [{"event_id": 999_001, "sha": "f" * 40}],
+            "development_history",
+        ),
+        ("failed_test_run_ids", [999_002], "tester_failures"),
+        ("rework_event_ids", [999_003], "rework_history"),
+        ("rework_count", 1, "rework_history"),
+        ("deployment_policy", "required", "deployment_policy"),
+        ("smoke_result", {"status": "passed"}, "smoke_evidence"),
+        ("rollback_target", "unexpected", "rollback_evidence"),
+    ],
+)
+def test_terminal_done_validation_rechecks_materialized_release_chain(
+    release_home, tmp_path, field, tampered_value, missing,
+):
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = f"release-chain-{field.replace('_', '-')}"
+    _release_board(board, repo, policy="manual")
+    with kb.connect(board=board) as conn:
+        task_id = _release_task(conn, board, repo, branch)
+        _seed_structured_evidence(conn, task_id, branch, source_sha)
+        result = kb.release_product_task(
+            conn,
+            task_id,
+            board,
+            lambda _candidate: True,
+            None,
+            measurement_note="release chain recorded",
+        )
+        assert result.released is True
+        completed = next(
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "completed"
+        )
+        evidence = dict(completed.payload["release_evidence"])
+        evidence[field] = tampered_value
+
+        with pytest.raises(kb.ReleaseEvidenceError) as exc_info:
+            kb._validate_done_evidence(conn, task_id, evidence)
+
+        assert missing in exc_info.value.missing
+
+
 @pytest.mark.parametrize("policy_name", ["manual", "not_required"])
 def test_non_deploy_policy_is_recorded_without_fake_deployment(
     release_home, tmp_path, policy_name,
