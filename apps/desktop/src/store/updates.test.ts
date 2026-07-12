@@ -210,6 +210,35 @@ describe('checkBackendUpdates', () => {
     expect($backendUpdateStatus.get()?.commits?.[0]?.summary).toBe('feat: x')
   })
 
+  it('keeps official upstream sync state separate from installed-versus-fork state', async () => {
+    setRemote(true)
+    checkHermesUpdateSpy.mockResolvedValue({
+      install_method: 'git',
+      current_version: '0.17.0',
+      behind: 0,
+      fork_behind: 0,
+      upstream_behind: 54,
+      sync_state: 'PR_UPDATED',
+      sync_pr_number: 7,
+      sync_required_check: 'All required checks pass',
+      installed_sha: 'a'.repeat(40),
+      update_available: false,
+      can_apply: true,
+      update_command: 'hermes update',
+      message: 'Installed current · 54 official upstream commits syncing'
+    })
+
+    const result = await checkBackendUpdates()
+
+    expect(result?.behind).toBe(0)
+    expect(result?.updateAvailable).toBe(false)
+    expect(result?.upstreamBehind).toBe(54)
+    expect(result?.syncState).toBe('PR_UPDATED')
+    expect(result?.syncPrNumber).toBe(7)
+    expect(result?.syncRequiredCheck).toBe('All required checks pass')
+    expect(result?.installedSha).toBe('a'.repeat(40))
+  })
+
   it('preserves backend update_available when the backend cannot count commits', async () => {
     setRemote(true)
     checkHermesUpdateSpy.mockResolvedValue({

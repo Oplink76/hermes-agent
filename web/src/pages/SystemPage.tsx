@@ -59,6 +59,7 @@ import type {
   PortalStatus,
   DebugShareResponse,
 } from "@/lib/api";
+import { formatHermesSyncSummary } from "./system-update-status";
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -526,7 +527,10 @@ export default function SystemPage() {
               "success",
             );
           } else if (info.behind === 0) {
-            showToast("You're on the latest version", "success");
+            showToast(
+              formatHermesSyncSummary(info) ?? "You're on the latest version",
+              "success",
+            );
           } else if (info.message) {
             showToast(info.message, "error");
           }
@@ -857,6 +861,10 @@ export default function SystemPage() {
                           ? `${updateInfo.behind} behind`
                           : "update available"}
                       </Badge>
+                    ) : formatHermesSyncSummary(updateInfo) ? (
+                      <span className="text-xs text-muted-foreground">
+                        {formatHermesSyncSummary(updateInfo)}
+                      </span>
                     ) : updateInfo.behind === 0 ? (
                       <Badge tone="success">latest</Badge>
                     ) : null)}

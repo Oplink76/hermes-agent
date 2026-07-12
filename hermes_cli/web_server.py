@@ -120,6 +120,7 @@ except ImportError:
 
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
+_UPSTREAM_SYNC_STATUS_PATH = Path.home() / ".hermes" / "recovery" / "sync-status.json"
 
 # Session listing/detail/search endpoints are FastAPI ``async def`` handlers so
 # running synchronous sqlite3 hydration inline freezes the uvicorn event loop.
@@ -3594,6 +3595,51 @@ def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
         return []
 
 
+def _with_upstream_sync_status(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Add fork-sync state without changing the installed-versus-fork contract."""
+    enriched = dict(payload)
+    enriched.update(
+        {
+            "upstream_behind": None,
+            "sync_state": None,
+            "sync_pr_number": None,
+            "sync_required_check": None,
+            "fork_behind": payload.get("behind"),
+            "installed_sha": None,
+        }
+    )
+    try:
+        from ops.cloudadvisor.hermes_ops.sync_status import SyncStatus
+
+        status = SyncStatus.load(_UPSTREAM_SYNC_STATUS_PATH)
+    except FileNotFoundError:
+        return enriched
+    except (OSError, ValueError, json.JSONDecodeError):
+        _log.warning("Ignoring invalid autonomous upstream sync status")
+        return enriched
+
+    enriched.update(
+        {
+            "upstream_behind": status.upstream_behind,
+            "sync_state": status.sync_state,
+            "sync_pr_number": status.sync_pr_number,
+            "sync_required_check": status.required_check,
+            "installed_sha": status.installed_sha,
+        }
+    )
+    if (
+        payload.get("behind") == 0
+        and status.upstream_behind is not None
+        and status.upstream_behind > 0
+    ):
+        count = status.upstream_behind
+        noun = "commit" if count == 1 else "commits"
+        enriched["message"] = (
+            f"Installed current · {count} official upstream {noun} syncing"
+        )
+    return enriched
+
+
 @app.get("/api/hermes/update/check")
 async def check_hermes_update(force: bool = False):
     """Report whether a Hermes update is available, without applying it.
@@ -3621,18 +3667,20 @@ async def check_hermes_update(force: bool = False):
                  changed". Additive: existing consumers ignore it.
     """
     if _dashboard_local_update_managed_externally():
-        return {
-            "install_method": "managed-runtime",
-            "current_version": __version__,
-            "behind": None,
-            "update_available": False,
-            "can_apply": False,
-            "update_command": "managed outside dashboard",
-            "message": (
-                "Hermes updates are managed outside this dashboard in "
-                "containerized environments."
-            ),
-        }
+        return _with_upstream_sync_status(
+            {
+                "install_method": "managed-runtime",
+                "current_version": __version__,
+                "behind": None,
+                "update_available": False,
+                "can_apply": False,
+                "update_command": "managed outside dashboard",
+                "message": (
+                    "Hermes updates are managed outside this dashboard in "
+                    "containerized environments."
+                ),
+            }
+        )
 
     install_method = detect_install_method(PROJECT_ROOT)
     update_command = recommended_update_command_for_method(install_method)
@@ -3649,7 +3697,7 @@ async def check_hermes_update(force: bool = False):
 
     if install_method == "docker":
         payload["message"] = format_docker_update_message()
-        return payload
+        return _with_upstream_sync_status(payload)
 
     # banner.check_for_updates() handles git / pypi / nix-revision paths and
     # caches the result for 6h. ``force`` busts the cache so the "Check now"
@@ -3681,7 +3729,7 @@ async def check_hermes_update(force: bool = False):
         if install_method in ("git", "pip"):
             payload["commits"] = await asyncio.to_thread(_recent_upstream_commits)
 
-    return payload
+    return _with_upstream_sync_status(payload)
 
 
 @app.post("/api/audio/transcribe")

@@ -293,6 +293,11 @@ function mapBackendCheck(res: BackendUpdateCheckResponse): DesktopUpdateStatus {
     behind: behind > 0 ? behind : 0,
     targetSha: res.update_available ? `backend:${res.current_version}` : undefined,
     commits: res.commits,
+    upstreamBehind: res.upstream_behind ?? undefined,
+    syncState: res.sync_state ?? undefined,
+    syncPrNumber: res.sync_pr_number ?? undefined,
+    syncRequiredCheck: res.sync_required_check ?? undefined,
+    installedSha: res.installed_sha ?? undefined,
     fetchedAt: Date.now()
   }
 }

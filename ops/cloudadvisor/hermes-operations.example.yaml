@@ -9,6 +9,8 @@ sync:
   repo_slug: Oplink76/hermes-agent
   lock_path: /Users/cloudadvisor/.hermes/locks/upstream-sync.lock
   receipt_root: /Users/cloudadvisor/.hermes/recovery/sync-receipts
+  status_file: /Users/cloudadvisor/.hermes/recovery/sync-status.json
+  notification_store: /Users/cloudadvisor/.hermes/recovery/sync-notifications.json
   required_check: All required checks pass
   check_timeout_seconds: 2700
   poll_interval_seconds: 15

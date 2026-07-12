@@ -1,8 +1,9 @@
 # CloudAdvisor Hermes operations
 
-This package keeps fork synchronization and installation deployment separate.
-Synchronization can only update `auto-sync/upstream` and a pull request. Deployment
-can only use the reviewed merge SHA from a merged pull request.
+This package keeps fork synchronization and installation deployment as separate
+evidence gates. `sync` can only update `auto-sync/upstream` and its pull request.
+`sync-auto` may continue through the protected merge and deploy only the exact
+attested merge SHA after every required gate is green.
 
 If a merge conflicts, the example resolver runs ephemeral Codex in its
 workspace-write sandbox with user configuration disabled. Arbitrary commands and
@@ -26,6 +27,7 @@ Run from the repository root with its `.venv` active:
 
 ```bash
 python -m ops.cloudadvisor.hermes_ops.cli sync --config /path/to/operations.yaml
+python -m ops.cloudadvisor.hermes_ops.cli sync-auto --config /path/to/operations.yaml
 python -m ops.cloudadvisor.hermes_ops.cli health \
   --config /path/to/operations.yaml --sha APPROVED_SHA
 python -m ops.cloudadvisor.hermes_ops.cli deploy \
@@ -42,6 +44,27 @@ required check, Package 1 receipt, clean checkout, exact `origin/main` SHA, and 
 fresh Git/SQLite snapshot before stopping a service. A failed post-restart health
 matrix automatically switches back to the previous SHA, restores state, restarts
 the same service set, and records rollback health.
+
+## Autonomous schedule and status
+
+The production schedule runs `sync-auto` at 06:00 and 18:00 Europe/Copenhagen.
+A clean sync, an independently reviewed minor conflict, and an already-converged
+run are quiet successes. `PR_UPDATED` is an in-progress state, not success.
+`NEEDS_OLE` emits one decision packet for each escalation fingerprint; later runs
+with the same fingerprint stay quiet. Major or unresolved conflicts, ambiguous
+authority, and failed rollback/revert are the paths that require Ole.
+
+The controller writes the canonical, secret-free status atomically to the
+configured `sync.status_file`. Notification fingerprints are stored separately
+in `sync.notification_store`; neither file contains raw command output. The
+dashboard keeps `behind` (and additive `fork_behind`) as installed-versus-fork,
+while `upstream_behind`, `sync_state`, and `sync_pr_number` report official
+upstream progress independently. Therefore an installed runtime can be current
+with fork `main` while official upstream commits are still syncing.
+
+Task 8 activates the live 06:00/18:00 script only after the bootstrap release is
+deployed. This document describes the intended schedule; this task does not
+change launchd, cron, services, or the production installation.
 
 ## Approval artifact
 
