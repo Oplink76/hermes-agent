@@ -26,8 +26,10 @@ from ops.cloudadvisor.hermes_ops.sync_controller import (
 from ops.cloudadvisor.hermes_ops.sync_github import SyncPullRequestEvidence
 from ops.cloudadvisor.hermes_ops.sync_reconstruction_checkpoint import (
     PendingReconstructionCheckpoint,
+    load_pending_reconstruction,
     write_pending_reconstruction,
 )
+from ops.cloudadvisor.hermes_ops.sync_reconstruction import ReconstructionError
 from ops.cloudadvisor.hermes_ops.sync_review import ConflictReviewReceipt
 
 
@@ -1077,8 +1079,8 @@ def test_post_revert_upstream_advance_returns_pending_without_ordinary_prepare(
         lambda *args, **kwargs: prepared.pop(0),
     )
     monkeypatch.setattr(
-        "ops.cloudadvisor.hermes_ops.sync_controller.reconstruct_failed_candidate",
-        lambda *args, **kwargs: candidate(),
+        "ops.cloudadvisor.hermes_ops.sync_controller.resume_failed_candidate_reconstruction",
+        lambda *args, **kwargs: candidate(changed_files=("upstream.txt",)),
     )
     current = iter((True, False))
     monkeypatch.setattr(
@@ -1131,8 +1133,9 @@ def test_pending_reconstruction_stops_after_durable_retry_budget(
     write_pending_reconstruction(
         cfg.receipt_root,
         PendingReconstructionCheckpoint(
-            schema_version=1,
+            schema_version=2,
             repo_slug=cfg.sync.repo_slug,
+            stage="recovered",
             failed_base_sha=SHA_BASE,
             failed_upstream_sha=SHA_UPSTREAM,
             failed_candidate_sha=SHA_CANDIDATE,
@@ -1141,8 +1144,18 @@ def test_pending_reconstruction_stops_after_durable_retry_budget(
             failed_merge_sha=SHA_MERGE,
             revert_main_sha=SHA_REPAIRED,
             previous_healthy_installed_sha=SHA_BASE,
-            rolling_candidate_sha=SHA_NEW_CANDIDATE,
-            pending_upstream_sha=SHA_NEW_REPAIRED,
+            target_upstream_sha=SHA_NEW_REPAIRED,
+            expected_rolling_candidate_sha=SHA_NEW_CANDIDATE,
+            reconstructed_candidate_sha=None,
+            reconstructed_candidate_tree_sha=None,
+            reconstructed_pr_number=None,
+            reconstructed_changed_files=(),
+            repaired_candidate_sha=None,
+            repaired_candidate_tree_sha=None,
+            repaired_pr_number=None,
+            repair_paths=(),
+            repaired_checks=(),
+            resolution_record_sha256=None,
             reason="upstream advanced during reconstruction",
             resume_attempts=2,
         ),
@@ -1169,6 +1182,186 @@ def test_pending_reconstruction_stops_after_durable_retry_budget(
     assert prepared == []
 
 
+def test_recovery_checkpoint_exists_before_reconstruction_starts(
+    tmp_path: Path, monkeypatch
+):
+    cfg = review_config(tmp_path)
+    prepared = [candidate()]
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: prepared.pop(0),
+    )
+
+    def interrupted(*args, **kwargs):
+        checkpoint = load_pending_reconstruction(
+            cfg.receipt_root, repo_slug=cfg.sync.repo_slug
+        )
+        assert checkpoint is not None
+        assert checkpoint.stage == "recovered"
+        assert checkpoint.target_upstream_sha == SHA_UPSTREAM
+        assert checkpoint.expected_rolling_candidate_sha == SHA_CANDIDATE
+        raise ReconstructionError("simulated process interruption")
+
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.resume_failed_candidate_reconstruction",
+        interrupted,
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
+        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
+        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "merged"})(),
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.finish_or_recover",
+        lambda *args, **kwargs: AutonomousSyncResult(
+            state=AutonomousSyncState.ROLLED_BACK_REVERTED,
+            installed_sha=SHA_BASE,
+            fork_main_sha=SHA_BASE,
+        ),
+    )
+
+    result = run_autonomous_sync(
+        cfg,
+        runner=Runner(),
+        github=GitHub([evidence()]),
+        resolver=None,
+        reviewer=GreenReviewer(),
+        remediator=Remediator(repaired=reviewed_repair(tmp_path)),
+        deploy_fn=lambda *args: deployed_record("rolled_back"),
+        verify_runtime_fn=lambda sha: True,
+    )
+
+    assert result.state is AutonomousSyncState.NEEDS_OLE
+    assert load_pending_reconstruction(
+        cfg.receipt_root, repo_slug=cfg.sync.repo_slug
+    ).stage == "recovered"
+
+
+@pytest.mark.parametrize("conclusion", ["cancelled", "timed_out"])
+def test_repaired_checkpoint_survives_nonterminal_check_and_next_run_deploys(
+    tmp_path: Path, monkeypatch, conclusion: str
+):
+    cfg = review_config(tmp_path)
+    prepared = [candidate()]
+    prepare_calls = 0
+
+    def prepare(*args, **kwargs):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return prepared.pop(0)
+
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate", prepare
+    )
+    interrupted = True
+    resume_calls = 0
+    reconstructed = candidate(
+        candidate_sha=SHA_NEW_CANDIDATE,
+        candidate_tree_sha=SHA_NEW_CANDIDATE_TREE,
+        base_sha=SHA_BASE,
+        upstream_sha=SHA_UPSTREAM,
+        changed_files=("upstream.txt",),
+    )
+
+    def resume(*args, **kwargs):
+        nonlocal interrupted, resume_calls
+        if interrupted:
+            interrupted = False
+            raise ReconstructionError("simulated process interruption")
+        resume_calls += 1
+        return reconstructed
+
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.resume_failed_candidate_reconstruction",
+        resume,
+    )
+    repaired = reviewed_repair(
+        tmp_path,
+        candidate_sha=SHA_NEW_REPAIRED,
+        candidate_tree_sha=SHA_NEW_REPAIRED_TREE,
+        base_sha=SHA_BASE,
+        upstream_sha=SHA_UPSTREAM,
+    )
+    remediator = Remediator(repaired=repaired)
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
+        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
+        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "merged"})(),
+    )
+    outcomes = [
+        AutonomousSyncResult(
+            state=AutonomousSyncState.ROLLED_BACK_REVERTED,
+            installed_sha=SHA_BASE,
+            fork_main_sha=SHA_BASE,
+        ),
+        AutonomousSyncResult(
+            state=AutonomousSyncState.DEPLOYED,
+            deployed_sha=SHA_MERGE,
+        ),
+    ]
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.finish_or_recover",
+        lambda *args, **kwargs: outcomes.pop(0),
+    )
+
+    first = run_autonomous_sync(
+        cfg,
+        runner=Runner(),
+        github=GitHub([evidence()]),
+        resolver=None,
+        reviewer=GreenReviewer(),
+        remediator=remediator,
+        deploy_fn=lambda *args: deployed_record("rolled_back"),
+        verify_runtime_fn=lambda sha: True,
+    )
+    assert first.state is AutonomousSyncState.NEEDS_OLE
+
+    second = run_autonomous_sync(
+        cfg,
+        runner=Runner(),
+        github=GitHub([
+            evidence(head=SHA_NEW_REPAIRED, conclusion=conclusion),
+        ]),
+        resolver=None,
+        reviewer=GreenReviewer(),
+        remediator=remediator,
+        deploy_fn=lambda *args: deployed_record(),
+        verify_runtime_fn=lambda sha: True,
+    )
+    assert second.state is AutonomousSyncState.PENDING_REFRESH
+    checkpoint = load_pending_reconstruction(
+        cfg.receipt_root, repo_slug=cfg.sync.repo_slug
+    )
+    assert checkpoint is not None
+    assert checkpoint.stage == "repaired"
+    assert checkpoint.repaired_candidate_sha == SHA_NEW_REPAIRED
+
+    third = run_autonomous_sync(
+        cfg,
+        runner=Runner(),
+        github=GitHub([evidence(head=SHA_NEW_REPAIRED)]),
+        resolver=None,
+        reviewer=GreenReviewer(),
+        remediator=remediator,
+        deploy_fn=lambda *args: deployed_record(),
+        verify_runtime_fn=lambda sha: True,
+    )
+
+    assert third.state is AutonomousSyncState.DEPLOYED
+    assert prepare_calls == 1
+    assert resume_calls == 1
+    assert len(remediator.repair_calls) == 1
+    assert load_pending_reconstruction(
+        cfg.receipt_root, repo_slug=cfg.sync.repo_slug
+    ) is None
+
+
 def test_healthy_protected_rollback_gets_one_post_rollback_repair(
     tmp_path: Path, monkeypatch
 ):
@@ -1180,11 +1373,11 @@ def test_healthy_protected_rollback_gets_one_post_rollback_repair(
     )
     reconstruction_calls: list[str] = []
     monkeypatch.setattr(
-        "ops.cloudadvisor.hermes_ops.sync_controller.reconstruct_failed_candidate",
+        "ops.cloudadvisor.hermes_ops.sync_controller.resume_failed_candidate_reconstruction",
         lambda *args, **kwargs: reconstruction_calls.append(
             kwargs["revert_main_sha"]
         )
-        or candidate(),
+        or candidate(changed_files=("upstream.txt",)),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
@@ -1246,8 +1439,8 @@ def test_second_deployment_failure_recovers_then_escalates_once(
         lambda *args, **kwargs: prepared.pop(0),
     )
     monkeypatch.setattr(
-        "ops.cloudadvisor.hermes_ops.sync_controller.reconstruct_failed_candidate",
-        lambda *args, **kwargs: candidate(),
+        "ops.cloudadvisor.hermes_ops.sync_controller.resume_failed_candidate_reconstruction",
+        lambda *args, **kwargs: candidate(changed_files=("upstream.txt",)),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",

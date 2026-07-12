@@ -105,10 +105,9 @@ def _reconstruct_failed_candidate(
         or not failed.upstream_sha
     ):
         raise ReconstructionError("candidate reconstruction evidence is incomplete")
-    if current_upstream_sha is not None and (
-        _FULL_SHA.fullmatch(current_upstream_sha) is None
-        or current_upstream_sha == failed.upstream_sha
-    ):
+    if current_upstream_sha is not None and _FULL_SHA.fullmatch(
+        current_upstream_sha
+    ) is None:
         raise ReconstructionError("current upstream reconstruction evidence is invalid")
 
     repo = Path(config.repo)

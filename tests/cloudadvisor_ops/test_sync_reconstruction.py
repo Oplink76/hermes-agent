@@ -489,7 +489,7 @@ def test_controller_persists_then_resumes_complete_tree_across_invocations(
     assert checkpoint.failed_merge_sha == failed_merge
     assert checkpoint.revert_main_sha == revert_main
     assert checkpoint.previous_healthy_installed_sha == base
-    assert checkpoint.pending_upstream_sha == _git(upstream_work, "rev-parse", "HEAD")
+    assert checkpoint.target_upstream_sha == _git(upstream_work, "rev-parse", "HEAD")
 
     second = run_autonomous_sync(
         config,
@@ -715,6 +715,21 @@ def test_real_controller_routes_rollback_through_reconstruction_and_reviewed_rep
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller._upstream_is_current",
         lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller._refresh_current_upstream_sha",
+        lambda *args, **kwargs: "a" * 40,
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.resume_failed_candidate_reconstruction",
+        lambda config, *, failed, failed_merge_sha, revert_main_sha, github, runner, **kwargs: reconstruct_failed_candidate(
+            config,
+            failed=failed,
+            failed_merge_sha=failed_merge_sha,
+            revert_main_sha=revert_main_sha,
+            github=github,
+            runner=runner,
+        ),
     )
     reviews: list[object] = []
     monkeypatch.setattr(

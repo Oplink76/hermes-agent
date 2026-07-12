@@ -11,8 +11,10 @@ import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .sync import CheckResult
 
-SCHEMA_VERSION = 1
+
+SCHEMA_VERSION = 2
 MAX_RESUME_ATTEMPTS = 2
 _FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -20,6 +22,7 @@ _ARTIFACT = re.compile(r"pending-reconstruction-(?P<digest>[0-9a-f]{64})\.json\Z
 _FIELDS = {
     "schema_version",
     "repo_slug",
+    "stage",
     "failed_base_sha",
     "failed_upstream_sha",
     "failed_candidate_sha",
@@ -28,8 +31,18 @@ _FIELDS = {
     "failed_merge_sha",
     "revert_main_sha",
     "previous_healthy_installed_sha",
-    "rolling_candidate_sha",
-    "pending_upstream_sha",
+    "target_upstream_sha",
+    "expected_rolling_candidate_sha",
+    "reconstructed_candidate_sha",
+    "reconstructed_candidate_tree_sha",
+    "reconstructed_pr_number",
+    "reconstructed_changed_files",
+    "repaired_candidate_sha",
+    "repaired_candidate_tree_sha",
+    "repaired_pr_number",
+    "repair_paths",
+    "repaired_checks",
+    "resolution_record_sha256",
     "reason",
     "resume_attempts",
 }
@@ -44,6 +57,7 @@ class ReconstructionCheckpointError(ValueError):
 class PendingReconstructionCheckpoint:
     schema_version: int
     repo_slug: str
+    stage: str
     failed_base_sha: str
     failed_upstream_sha: str
     failed_candidate_sha: str
@@ -52,8 +66,18 @@ class PendingReconstructionCheckpoint:
     failed_merge_sha: str
     revert_main_sha: str
     previous_healthy_installed_sha: str
-    rolling_candidate_sha: str
-    pending_upstream_sha: str
+    target_upstream_sha: str
+    expected_rolling_candidate_sha: str
+    reconstructed_candidate_sha: str | None
+    reconstructed_candidate_tree_sha: str | None
+    reconstructed_pr_number: int | None
+    reconstructed_changed_files: tuple[str, ...]
+    repaired_candidate_sha: str | None
+    repaired_candidate_tree_sha: str | None
+    repaired_pr_number: int | None
+    repair_paths: tuple[str, ...]
+    repaired_checks: tuple[CheckResult, ...]
+    resolution_record_sha256: str | None
     reason: str
     resume_attempts: int
 
@@ -103,13 +127,11 @@ def _validate(checkpoint: PendingReconstructionCheckpoint) -> None:
         checkpoint.failed_merge_sha,
         checkpoint.revert_main_sha,
         checkpoint.previous_healthy_installed_sha,
-        checkpoint.rolling_candidate_sha,
-        checkpoint.pending_upstream_sha,
+        checkpoint.target_upstream_sha,
+        checkpoint.expected_rolling_candidate_sha,
     )
     if not all(isinstance(value, str) and _FULL_SHA.fullmatch(value) for value in shas):
         raise ReconstructionCheckpointError("reconstruction identity is invalid")
-    if checkpoint.pending_upstream_sha == checkpoint.failed_upstream_sha:
-        raise ReconstructionCheckpointError("reconstruction upstream did not advance")
     if type(checkpoint.failed_pr_number) is not int or checkpoint.failed_pr_number < 1:
         raise ReconstructionCheckpointError("reconstruction PR identity is invalid")
     if (
@@ -119,6 +141,117 @@ def _validate(checkpoint: PendingReconstructionCheckpoint) -> None:
         raise ReconstructionCheckpointError("reconstruction retry count is invalid")
     if not isinstance(checkpoint.reason, str) or not checkpoint.reason.strip():
         raise ReconstructionCheckpointError("reconstruction reason is missing")
+    if checkpoint.stage not in {"recovered", "reconstructed", "repaired"}:
+        raise ReconstructionCheckpointError("reconstruction stage is invalid")
+    if not _valid_paths(checkpoint.reconstructed_changed_files) or not _valid_paths(
+        checkpoint.repair_paths
+    ):
+        raise ReconstructionCheckpointError("reconstruction stage paths are invalid")
+    if not isinstance(checkpoint.repaired_checks, tuple) or not all(
+        isinstance(check, CheckResult) for check in checkpoint.repaired_checks
+    ):
+        raise ReconstructionCheckpointError("reconstruction stage checks are invalid")
+    reconstructed_complete = (
+        _is_sha(checkpoint.reconstructed_candidate_sha)
+        and _is_sha(checkpoint.reconstructed_candidate_tree_sha)
+        and type(checkpoint.reconstructed_pr_number) is int
+        and checkpoint.reconstructed_pr_number > 0
+        and bool(checkpoint.reconstructed_changed_files)
+    )
+    repaired_complete = (
+        _is_sha(checkpoint.repaired_candidate_sha)
+        and _is_sha(checkpoint.repaired_candidate_tree_sha)
+        and type(checkpoint.repaired_pr_number) is int
+        and checkpoint.repaired_pr_number > 0
+        and bool(checkpoint.repair_paths)
+        and isinstance(checkpoint.resolution_record_sha256, str)
+        and _DIGEST.fullmatch(checkpoint.resolution_record_sha256) is not None
+        and _valid_repaired_checks(checkpoint.repaired_checks)
+    )
+    if checkpoint.stage == "recovered":
+        if (
+            any(
+                value is not None
+                for value in (
+                    checkpoint.reconstructed_candidate_sha,
+                    checkpoint.reconstructed_candidate_tree_sha,
+                    checkpoint.reconstructed_pr_number,
+                    checkpoint.repaired_candidate_sha,
+                    checkpoint.repaired_candidate_tree_sha,
+                    checkpoint.repaired_pr_number,
+                    checkpoint.resolution_record_sha256,
+                )
+            )
+            or checkpoint.reconstructed_changed_files
+            or checkpoint.repair_paths
+            or checkpoint.repaired_checks
+        ):
+            raise ReconstructionCheckpointError(
+                "reconstruction recovered stage evidence is invalid"
+            )
+    elif checkpoint.stage == "reconstructed":
+        if (
+            not reconstructed_complete
+            or checkpoint.expected_rolling_candidate_sha
+            != checkpoint.reconstructed_candidate_sha
+            or any(
+                value is not None
+                for value in (
+                    checkpoint.repaired_candidate_sha,
+                    checkpoint.repaired_candidate_tree_sha,
+                    checkpoint.repaired_pr_number,
+                    checkpoint.resolution_record_sha256,
+                )
+            )
+            or checkpoint.repair_paths
+            or checkpoint.repaired_checks
+        ):
+            raise ReconstructionCheckpointError(
+                "reconstruction reconstructed stage evidence is invalid"
+            )
+    elif (
+        not reconstructed_complete
+        or not repaired_complete
+        or checkpoint.expected_rolling_candidate_sha
+        != checkpoint.repaired_candidate_sha
+        or checkpoint.repaired_candidate_sha
+        == checkpoint.reconstructed_candidate_sha
+        or checkpoint.repaired_candidate_tree_sha
+        == checkpoint.reconstructed_candidate_tree_sha
+        or checkpoint.repaired_pr_number != checkpoint.reconstructed_pr_number
+    ):
+        raise ReconstructionCheckpointError(
+            "reconstruction repaired stage evidence is invalid"
+        )
+
+
+def _is_sha(value: object) -> bool:
+    return isinstance(value, str) and _FULL_SHA.fullmatch(value) is not None
+
+
+def _valid_paths(value: object) -> bool:
+    return (
+        isinstance(value, tuple)
+        and len(value) == len(set(value))
+        and all(
+            isinstance(path, str)
+            and bool(path)
+            and "\0" not in path
+            and not Path(path).is_absolute()
+            and ".." not in Path(path).parts
+            for path in value
+        )
+    )
+
+
+def _valid_repaired_checks(value: tuple[CheckResult, ...]) -> bool:
+    required = {"diff_check", "unmerged_index", "conflict_markers", "compileall", "tests"}
+    names = [check.name for check in value]
+    return (
+        len(names) == len(set(names))
+        and set(names) == required
+        and all(check.status == "passed" for check in value)
+    )
 
 
 def _root(receipt_root: Path, *, create: bool = False) -> Path:
@@ -239,7 +372,21 @@ def _load_artifact(path: Path) -> PendingReconstructionCheckpoint:
     if _canonical_json(payload) != content:
         raise ReconstructionCheckpointError("reconstruction artifact is not canonical")
     try:
-        checkpoint = PendingReconstructionCheckpoint(**payload)
+        values = dict(payload)
+        values["reconstructed_changed_files"] = tuple(
+            values["reconstructed_changed_files"]
+        )
+        values["repair_paths"] = tuple(values["repair_paths"])
+        raw_checks = values["repaired_checks"]
+        if not isinstance(raw_checks, list) or not all(
+            isinstance(row, dict) and set(row) == {"name", "status", "detail"}
+            for row in raw_checks
+        ):
+            raise ReconstructionCheckpointError(
+                "reconstruction artifact checks are invalid"
+            )
+        values["repaired_checks"] = tuple(CheckResult(**row) for row in raw_checks)
+        checkpoint = PendingReconstructionCheckpoint(**values)
     except TypeError as exc:
         raise ReconstructionCheckpointError("reconstruction artifact is invalid") from exc
     _validate(checkpoint)

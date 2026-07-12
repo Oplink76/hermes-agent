@@ -23,7 +23,6 @@ from .sync import (
 )
 from .sync_reconstruction import (
     ReconstructionError,
-    reconstruct_failed_candidate,
     resume_failed_candidate_reconstruction,
 )
 from .sync_reconstruction_checkpoint import (
@@ -49,7 +48,11 @@ from .sync_poll import (
     poll_exact_head,
 )
 from .sync_remediation import SyncRemediationError, SyncRemediationPort
-from .sync_resolution import ResolutionRecordError, freeze_resolution_record
+from .sync_resolution import (
+    ResolutionRecordArtifact,
+    ResolutionRecordError,
+    freeze_resolution_record,
+)
 from .sync_recovery import (
     ProtectedRevertGitHubPort,
     ProtectedRevertState,
@@ -291,7 +294,29 @@ def _review_candidate(
             )
             if head.returncode != 0 or (head.stdout or "").strip() != candidate.candidate_sha:
                 raise AutonomousSyncError("candidate review worktree head is not exact")
-        resolution_artifact = freeze_resolution_record(config.receipt_root, candidate)
+        if candidate.resolution_evidence_dir is None:
+            try:
+                resolution_artifact = ResolutionRecordArtifact.load(
+                    candidate.resolution_record or Path()
+                )
+            except ResolutionRecordError as exc:
+                raise AutonomousSyncError(
+                    "checkpoint resolution artifact is invalid"
+                ) from exc
+            paths = tuple(row["path"] for row in resolution_artifact.conflicts)
+            if (
+                resolution_artifact.candidate_sha != candidate.candidate_sha
+                or resolution_artifact.strategy != candidate.resolution_strategy
+                or set(paths) != set(candidate.conflicted_files)
+                or len(paths) != len(candidate.conflicted_files)
+            ):
+                raise AutonomousSyncError(
+                    "checkpoint resolution artifact is not exact"
+                )
+        else:
+            resolution_artifact = freeze_resolution_record(
+                config.receipt_root, candidate
+            )
         review_candidate = replace(
             candidate, resolution_record=resolution_artifact.path
         )
@@ -384,6 +409,13 @@ def _upstream_is_current(
     candidate: SyncResult,
     runner: CommandRunner,
 ) -> bool:
+    return _refresh_current_upstream_sha(config, runner) == candidate.upstream_sha
+
+
+def _refresh_current_upstream_sha(
+    config: AutonomousSyncConfig,
+    runner: CommandRunner,
+) -> str:
     fetched = runner.run(
         ["git", "fetch", config.sync.upstream, "main"],
         cwd=config.sync.repo,
@@ -399,7 +431,7 @@ def _upstream_is_current(
     current = (resolved.stdout or "").strip()
     if resolved.returncode != 0 or not current:
         raise AutonomousSyncError("official upstream identity is unavailable")
-    return current == candidate.upstream_sha
+    return current
 
 
 def _current_upstream_sha(
@@ -429,6 +461,130 @@ def _failed_from_checkpoint(
         pr_number=checkpoint.failed_pr_number,
         classification=SyncClassification.CLEAN,
     )
+
+
+def _reconstructed_from_checkpoint(
+    checkpoint: PendingReconstructionCheckpoint,
+) -> SyncResult:
+    if checkpoint.stage not in {"reconstructed", "repaired"}:
+        raise ReconstructionCheckpointError(
+            "checkpoint has no reconstructed candidate"
+        )
+    return SyncResult(
+        state=SyncState.PR_UPDATED,
+        base_sha=checkpoint.revert_main_sha,
+        upstream_sha=checkpoint.target_upstream_sha,
+        candidate_sha=checkpoint.reconstructed_candidate_sha,
+        candidate_tree_sha=checkpoint.reconstructed_candidate_tree_sha,
+        pr_number=checkpoint.reconstructed_pr_number,
+        risk="post_revert_reconstruction",
+        changed_files=checkpoint.reconstructed_changed_files,
+        classification=SyncClassification.MINOR_REVIEW_REQUIRED,
+        conflicted_files=checkpoint.reconstructed_changed_files,
+        resolution_strategy="candidate_repair",
+    )
+
+
+def _repaired_from_checkpoint(
+    config: AutonomousSyncConfig,
+    checkpoint: PendingReconstructionCheckpoint,
+) -> SyncResult:
+    if checkpoint.stage != "repaired" or not checkpoint.resolution_record_sha256:
+        raise ReconstructionCheckpointError("checkpoint has no repaired candidate")
+    resolution_path = (
+        Path(config.receipt_root)
+        / "resolutions"
+        / f"resolution-{checkpoint.resolution_record_sha256}.json"
+    )
+    try:
+        resolution = ResolutionRecordArtifact.load(resolution_path)
+    except ResolutionRecordError as exc:
+        raise ReconstructionCheckpointError(
+            "checkpoint resolution evidence is invalid"
+        ) from exc
+    resolution_paths = tuple(row["path"] for row in resolution.conflicts)
+    if (
+        resolution.sha256 != checkpoint.resolution_record_sha256
+        or resolution.candidate_sha != checkpoint.repaired_candidate_sha
+        or resolution.strategy != "candidate_repair"
+        or set(resolution_paths) != set(checkpoint.repair_paths)
+        or len(resolution_paths) != len(checkpoint.repair_paths)
+    ):
+        raise ReconstructionCheckpointError(
+            "checkpoint repair evidence is not exact"
+        )
+    return SyncResult(
+        state=SyncState.PR_UPDATED,
+        base_sha=checkpoint.revert_main_sha,
+        upstream_sha=checkpoint.target_upstream_sha,
+        candidate_sha=checkpoint.repaired_candidate_sha,
+        candidate_tree_sha=checkpoint.repaired_candidate_tree_sha,
+        pr_number=checkpoint.repaired_pr_number,
+        checks=checkpoint.repaired_checks,
+        risk="post_revert_repair",
+        changed_files=checkpoint.reconstructed_changed_files,
+        classification=SyncClassification.MINOR_REVIEW_REQUIRED,
+        conflicted_files=checkpoint.repair_paths,
+        resolution_record=resolution.path,
+        resolution_strategy="candidate_repair",
+    )
+
+
+def _checkpoint_reconstructed(
+    checkpoint: PendingReconstructionCheckpoint,
+    candidate: SyncResult,
+) -> PendingReconstructionCheckpoint:
+    if (
+        not candidate.candidate_sha
+        or not candidate.candidate_tree_sha
+        or candidate.pr_number is None
+        or not candidate.changed_files
+        or not candidate.upstream_sha
+    ):
+        raise ReconstructionCheckpointError(
+            "reconstructed candidate evidence is incomplete"
+        )
+    return replace(
+        checkpoint,
+        stage="reconstructed",
+        target_upstream_sha=candidate.upstream_sha,
+        expected_rolling_candidate_sha=candidate.candidate_sha,
+        reconstructed_candidate_sha=candidate.candidate_sha,
+        reconstructed_candidate_tree_sha=candidate.candidate_tree_sha,
+        reconstructed_pr_number=candidate.pr_number,
+        reconstructed_changed_files=candidate.changed_files,
+        repaired_candidate_sha=None,
+        repaired_candidate_tree_sha=None,
+        repaired_pr_number=None,
+        repair_paths=(),
+        repaired_checks=(),
+        resolution_record_sha256=None,
+    )
+
+
+def _checkpoint_repaired(
+    config: AutonomousSyncConfig,
+    checkpoint: PendingReconstructionCheckpoint,
+    candidate: SyncResult,
+) -> tuple[PendingReconstructionCheckpoint, SyncResult]:
+    resolution = freeze_resolution_record(config.receipt_root, candidate)
+    repaired = replace(
+        candidate,
+        resolution_record=resolution.path,
+        resolution_evidence_dir=None,
+    )
+    value = replace(
+        checkpoint,
+        stage="repaired",
+        expected_rolling_candidate_sha=candidate.candidate_sha or "",
+        repaired_candidate_sha=candidate.candidate_sha,
+        repaired_candidate_tree_sha=candidate.candidate_tree_sha,
+        repaired_pr_number=candidate.pr_number,
+        repair_paths=candidate.conflicted_files,
+        repaired_checks=candidate.checks,
+        resolution_record_sha256=resolution.sha256,
+    )
+    return value, repaired
 
 
 def attest_candidate(
@@ -535,8 +691,8 @@ def run_autonomous_sync(
         reconstruction_merge_sha: str | None = None
         reconstruction_revert_main_sha: str | None = None
         reconstruction_installed_sha: str | None = None
+        reconstruction_checkpoint: PendingReconstructionCheckpoint | None = None
         reconstruction_checkpoint_sha: str | None = None
-        reconstruction_resume_attempts = 0
         try:
             pending_reconstruction = load_pending_reconstruction(
                 config.receipt_root,
@@ -547,9 +703,16 @@ def run_autonomous_sync(
                     raise AutonomousSyncError(
                         "pending reconstruction retry budget is exhausted"
                     )
-                if remediator is None or verify_runtime_fn is None:
+                if verify_runtime_fn is None:
                     raise AutonomousSyncError(
                         "pending reconstruction dependencies are unavailable"
+                    )
+                if (
+                    pending_reconstruction.stage != "repaired"
+                    and remediator is None
+                ):
+                    raise AutonomousSyncError(
+                        "pending reconstruction remediator is unavailable"
                     )
                 if not verify_runtime_fn(
                     pending_reconstruction.previous_healthy_installed_sha
@@ -564,10 +727,8 @@ def run_autonomous_sync(
                 pending_artifact = write_pending_reconstruction(
                     config.receipt_root, pending_reconstruction
                 )
+                reconstruction_checkpoint = pending_reconstruction
                 reconstruction_checkpoint_sha = pending_artifact.sha256
-                reconstruction_resume_attempts = (
-                    pending_reconstruction.resume_attempts
-                )
                 reconstruction_source = _failed_from_checkpoint(
                     pending_reconstruction
                 )
@@ -578,29 +739,71 @@ def run_autonomous_sync(
                 reconstruction_installed_sha = (
                     pending_reconstruction.previous_healthy_installed_sha
                 )
-                refreshed = resume_failed_candidate_reconstruction(
-                    config.sync,
-                    failed=reconstruction_source,
-                    failed_merge_sha=reconstruction_merge_sha,
-                    revert_main_sha=reconstruction_revert_main_sha,
-                    expected_candidate_sha=(
-                        pending_reconstruction.rolling_candidate_sha
-                    ),
-                    current_upstream_sha=(
-                        pending_reconstruction.pending_upstream_sha
-                    ),
-                    github=github,
-                    runner=runner,
-                )
-                candidate = _valid_repair(
-                    refreshed,
-                    remediator.repair_candidate(
+                if pending_reconstruction.stage == "recovered":
+                    current_upstream = _refresh_current_upstream_sha(config, runner)
+                    if current_upstream != pending_reconstruction.target_upstream_sha:
+                        pending_reconstruction = replace(
+                            pending_reconstruction,
+                            target_upstream_sha=current_upstream,
+                            reason=(
+                                "official upstream advanced while recovery was "
+                                "pending; complete-tree reconstruction refreshed"
+                            ),
+                        )
+                        pending_artifact = write_pending_reconstruction(
+                            config.receipt_root, pending_reconstruction
+                        )
+                        reconstruction_checkpoint = pending_reconstruction
+                        reconstruction_checkpoint_sha = pending_artifact.sha256
+                    refreshed = resume_failed_candidate_reconstruction(
+                        config.sync,
+                        failed=reconstruction_source,
+                        failed_merge_sha=reconstruction_merge_sha,
+                        revert_main_sha=reconstruction_revert_main_sha,
+                        expected_candidate_sha=(
+                            pending_reconstruction.expected_rolling_candidate_sha
+                        ),
+                        current_upstream_sha=(
+                            pending_reconstruction.target_upstream_sha
+                        ),
+                        github=github,
+                        runner=runner,
+                    )
+                    pending_reconstruction = _checkpoint_reconstructed(
+                        pending_reconstruction, refreshed
+                    )
+                    pending_artifact = write_pending_reconstruction(
+                        config.receipt_root, pending_reconstruction
+                    )
+                    reconstruction_checkpoint = pending_reconstruction
+                    reconstruction_checkpoint_sha = pending_artifact.sha256
+                elif pending_reconstruction.stage == "reconstructed":
+                    refreshed = _reconstructed_from_checkpoint(
+                        pending_reconstruction
+                    )
+                else:
+                    candidate = _repaired_from_checkpoint(
+                        config, pending_reconstruction
+                    )
+                    refreshed = None
+                if pending_reconstruction.stage != "repaired":
+                    candidate = _valid_repair(
                         refreshed,
-                        health_evidence=(pending_reconstruction.reason,),
-                    ),
-                    runner=runner,
-                    repo=config.sync.repo,
-                )
+                        remediator.repair_candidate(
+                            refreshed,
+                            health_evidence=(pending_reconstruction.reason,),
+                        ),
+                        runner=runner,
+                        repo=config.sync.repo,
+                    )
+                    pending_reconstruction, candidate = _checkpoint_repaired(
+                        config, pending_reconstruction, candidate
+                    )
+                    pending_artifact = write_pending_reconstruction(
+                        config.receipt_root, pending_reconstruction
+                    )
+                    reconstruction_checkpoint = pending_reconstruction
+                    reconstruction_checkpoint_sha = pending_artifact.sha256
                 candidate_repair_used = True
                 post_rollback_repair = True
             else:
@@ -679,10 +882,8 @@ def run_autonomous_sync(
                 if not _upstream_is_current(config, reviewed, runner):
                     if post_rollback_repair:
                         if (
-                            reconstruction_source is None
-                            or reconstruction_merge_sha is None
-                            or reconstruction_revert_main_sha is None
-                            or reconstruction_installed_sha is None
+                            reconstruction_checkpoint is None
+                            or reviewed.candidate_sha is None
                         ):
                             raise AutonomousSyncError(
                                 "post-revert reconstruction context is incomplete"
@@ -691,31 +892,28 @@ def run_autonomous_sync(
                             "official upstream advanced during post-revert repair; "
                             "complete-tree reconstruction must restart"
                         )
-                        pending = PendingReconstructionCheckpoint(
-                            schema_version=1,
-                            repo_slug=config.sync.repo_slug,
-                            failed_base_sha=reconstruction_source.base_sha or "",
-                            failed_upstream_sha=(
-                                reconstruction_source.upstream_sha or ""
-                            ),
-                            failed_candidate_sha=(
-                                reconstruction_source.candidate_sha or ""
-                            ),
-                            failed_candidate_tree_sha=(
-                                reconstruction_source.candidate_tree_sha or ""
-                            ),
-                            failed_pr_number=reconstruction_source.pr_number or 0,
-                            failed_merge_sha=reconstruction_merge_sha,
-                            revert_main_sha=reconstruction_revert_main_sha,
-                            previous_healthy_installed_sha=(
-                                reconstruction_installed_sha
-                            ),
-                            rolling_candidate_sha=reviewed.candidate_sha or "",
-                            pending_upstream_sha=_current_upstream_sha(config, runner),
+                        pending = replace(
+                            reconstruction_checkpoint,
+                            stage="recovered",
+                            target_upstream_sha=_current_upstream_sha(config, runner),
+                            expected_rolling_candidate_sha=reviewed.candidate_sha,
+                            reconstructed_candidate_sha=None,
+                            reconstructed_candidate_tree_sha=None,
+                            reconstructed_pr_number=None,
+                            reconstructed_changed_files=(),
+                            repaired_candidate_sha=None,
+                            repaired_candidate_tree_sha=None,
+                            repaired_pr_number=None,
+                            repair_paths=(),
+                            repaired_checks=(),
+                            resolution_record_sha256=None,
                             reason=reason,
-                            resume_attempts=reconstruction_resume_attempts,
                         )
-                        write_pending_reconstruction(config.receipt_root, pending)
+                        pending_artifact = write_pending_reconstruction(
+                            config.receipt_root, pending
+                        )
+                        reconstruction_checkpoint = pending
+                        reconstruction_checkpoint_sha = pending_artifact.sha256
                         return AutonomousSyncResult.pending(
                             reviewed,
                             reason=reason,
@@ -772,13 +970,6 @@ def run_autonomous_sync(
                             sha256=reconstruction_checkpoint_sha,
                         )
                     return outcome
-                if candidate_repair_used or remediator is None:
-                    return AutonomousSyncResult.needs_human(
-                        "protected rollback completed; bounded repair is exhausted",
-                        candidate_sha=reviewed.candidate_sha,
-                        merge_sha=merge_sha,
-                        installed_sha=outcome.installed_sha,
-                    )
                 if not outcome.fork_main_sha:
                     raise AutonomousSyncError(
                         "protected rollback did not report reconstructed base"
@@ -791,11 +982,69 @@ def run_autonomous_sync(
                     raise AutonomousSyncError(
                         "protected rollback did not report healthy install identity"
                     )
-                refreshed = reconstruct_failed_candidate(
+                reconstruction_checkpoint = PendingReconstructionCheckpoint(
+                    schema_version=2,
+                    repo_slug=config.sync.repo_slug,
+                    stage="recovered",
+                    failed_base_sha=reviewed.base_sha or "",
+                    failed_upstream_sha=reviewed.upstream_sha or "",
+                    failed_candidate_sha=reviewed.candidate_sha or "",
+                    failed_candidate_tree_sha=reviewed.candidate_tree_sha or "",
+                    failed_pr_number=reviewed.pr_number or 0,
+                    failed_merge_sha=merge_sha,
+                    revert_main_sha=outcome.fork_main_sha,
+                    previous_healthy_installed_sha=reconstruction_installed_sha,
+                    target_upstream_sha=reviewed.upstream_sha or "",
+                    expected_rolling_candidate_sha=reviewed.candidate_sha or "",
+                    reconstructed_candidate_sha=None,
+                    reconstructed_candidate_tree_sha=None,
+                    reconstructed_pr_number=None,
+                    reconstructed_changed_files=(),
+                    repaired_candidate_sha=None,
+                    repaired_candidate_tree_sha=None,
+                    repaired_pr_number=None,
+                    repair_paths=(),
+                    repaired_checks=(),
+                    resolution_record_sha256=None,
+                    reason="healthy rollback and protected revert completed",
+                    resume_attempts=0,
+                )
+                pending_artifact = write_pending_reconstruction(
+                    config.receipt_root, reconstruction_checkpoint
+                )
+                reconstruction_checkpoint_sha = pending_artifact.sha256
+                if candidate_repair_used or remediator is None:
+                    return AutonomousSyncResult.needs_human(
+                        "protected rollback completed; bounded repair is exhausted",
+                        candidate_sha=reviewed.candidate_sha,
+                        merge_sha=merge_sha,
+                        installed_sha=outcome.installed_sha,
+                    )
+                current_upstream = _refresh_current_upstream_sha(config, runner)
+                if current_upstream != reconstruction_checkpoint.target_upstream_sha:
+                    reconstruction_checkpoint = replace(
+                        reconstruction_checkpoint,
+                        target_upstream_sha=current_upstream,
+                        reason=(
+                            "official upstream advanced after protected recovery; "
+                            "complete-tree reconstruction refreshed"
+                        ),
+                    )
+                    pending_artifact = write_pending_reconstruction(
+                        config.receipt_root, reconstruction_checkpoint
+                    )
+                    reconstruction_checkpoint_sha = pending_artifact.sha256
+                refreshed = resume_failed_candidate_reconstruction(
                     config.sync,
                     failed=reviewed,
                     failed_merge_sha=merge_sha,
                     revert_main_sha=outcome.fork_main_sha,
+                    expected_candidate_sha=(
+                        reconstruction_checkpoint.expected_rolling_candidate_sha
+                    ),
+                    current_upstream_sha=(
+                        reconstruction_checkpoint.target_upstream_sha
+                    ),
                     github=github,
                     runner=runner,
                 )
@@ -803,6 +1052,13 @@ def run_autonomous_sync(
                     raise AutonomousSyncError(
                         "post-rollback candidate refresh did not produce a repair target"
                     )
+                reconstruction_checkpoint = _checkpoint_reconstructed(
+                    reconstruction_checkpoint, refreshed
+                )
+                pending_artifact = write_pending_reconstruction(
+                    config.receipt_root, reconstruction_checkpoint
+                )
+                reconstruction_checkpoint_sha = pending_artifact.sha256
                 candidate_repair_used = True
                 health_evidence = tuple(
                     f"{check.name}:{'passed' if check.passed else 'failed'}"
@@ -816,6 +1072,13 @@ def run_autonomous_sync(
                     runner=runner,
                     repo=config.sync.repo,
                 )
+                reconstruction_checkpoint, candidate = _checkpoint_repaired(
+                    config, reconstruction_checkpoint, candidate
+                )
+                pending_artifact = write_pending_reconstruction(
+                    config.receipt_root, reconstruction_checkpoint
+                )
+                reconstruction_checkpoint_sha = pending_artifact.sha256
                 post_rollback_repair = True
         except (
             AutonomousSyncError,
