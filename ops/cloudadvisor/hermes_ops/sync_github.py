@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,7 @@ DEFAULT_REQUIRED_CHECK = "All required checks pass"
 _ALLOWED_PR_COMMANDS = frozenset(
     {"list", "create", "edit", "view", "checks", "merge"}
 )
+_FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
 
 
 class SyncGitHubError(RuntimeError):
@@ -36,6 +38,12 @@ class SyncGitHubPort(Protocol):
     def evidence(self, pr_number: int) -> SyncPullRequestEvidence: ...
 
     def merge_exact(self, pr_number: int, *, expected_head: str) -> str: ...
+
+
+def _full_sha(value: object) -> str:
+    if not isinstance(value, str) or _FULL_SHA.fullmatch(value) is None:
+        raise ValueError
+    return value
 
 
 class GhSyncGitHub:
@@ -162,43 +170,65 @@ class GhSyncGitHub:
         try:
             if not isinstance(payload, dict):
                 raise TypeError
-            checks = payload.get("statusCheckRollup") or []
-            required = next(
-                (
-                    check
-                    for check in checks
-                    if isinstance(check, dict)
-                    and (check.get("name") or check.get("context"))
-                    == self.required_check
-                ),
-                None,
-            )
+            number = payload["number"]
+            state = payload["state"]
+            if type(number) is not int or not isinstance(state, str) or not state:
+                raise TypeError
+            base_sha = _full_sha(payload["baseRefOid"])
+            head_sha = _full_sha(payload["headRefOid"])
+
+            checks = payload["statusCheckRollup"]
+            if not isinstance(checks, list):
+                raise TypeError
+            required_checks = []
+            for check in checks:
+                if not isinstance(check, dict):
+                    raise TypeError
+                name = check.get("name")
+                context = check.get("context")
+                if name is not None and not isinstance(name, str):
+                    raise TypeError
+                if context is not None and not isinstance(context, str):
+                    raise TypeError
+                if self.required_check in {name, context}:
+                    required_checks.append(check)
+            if len(required_checks) > 1:
+                raise SyncGitHubError("required check evidence is ambiguous")
+
             conclusion = "missing"
-            if required is not None:
-                conclusion = str(
+            if required_checks:
+                required = required_checks[0]
+                for field in ("conclusion", "state", "status"):
+                    value = required.get(field)
+                    if value is not None and not isinstance(value, str):
+                        raise TypeError
+                check_state = (
                     required.get("conclusion")
                     or required.get("state")
                     or required.get("status")
                     or "pending"
-                ).lower()
-            merge_commit = payload.get("mergeCommit")
-            merge_sha = (
-                str(merge_commit["oid"])
-                if isinstance(merge_commit, dict) and merge_commit.get("oid")
-                else None
-            )
+                )
+                if not isinstance(check_state, str):
+                    raise TypeError
+                conclusion = check_state.lower()
+
+            merge_commit = payload["mergeCommit"]
+            if merge_commit is None:
+                merge_sha = None
+            else:
+                if not isinstance(merge_commit, dict):
+                    raise TypeError
+                merge_sha = _full_sha(merge_commit.get("oid"))
             evidence = SyncPullRequestEvidence(
-                number=int(payload["number"]),
-                state=str(payload["state"]).lower(),
-                base_sha=str(payload["baseRefOid"]),
-                head_sha=str(payload["headRefOid"]),
+                number=number,
+                state=state.lower(),
+                base_sha=base_sha,
+                head_sha=head_sha,
                 required_check=self.required_check,
                 required_check_conclusion=conclusion,
                 merge_sha=merge_sha,
             )
-            if evidence.number != pr_number or not all(
-                (evidence.state, evidence.base_sha, evidence.head_sha)
-            ):
+            if evidence.number != pr_number:
                 raise ValueError
             return evidence
         except (KeyError, TypeError, ValueError) as exc:
