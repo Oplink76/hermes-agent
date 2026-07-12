@@ -367,6 +367,13 @@ def main(argv: list[str] | None = None) -> int:
         "--inject-health-failure",
         choices=("after_restart",),
     )
+    deploy_sync_parser = subparsers.add_parser(
+        "deploy-sync", help="deploy an attested automated-sync merge SHA"
+    )
+    deploy_sync_parser.add_argument("--config", type=Path, required=True)
+    deploy_sync_parser.add_argument("--sha", required=True)
+    deploy_sync_parser.add_argument("--pr-number", type=int, required=True)
+    deploy_sync_parser.add_argument("--sync-receipt", type=Path, required=True)
     args = parser.parse_args(argv)
 
     if args.command == "sync":
@@ -401,10 +408,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(_health_payload(args.sha, report), indent=2, sort_keys=True))
         return 0 if report.healthy else 3
-    if args.command == "deploy":
+    if args.command in {"deploy", "deploy-sync"}:
         config = load_operations_config(args.config)
         runner = SubprocessCommandRunner()
-        if args.inject_health_failure:
+        inject_health_failure = getattr(args, "inject_health_failure", None)
+        if inject_health_failure:
             current_sha = current_checkout_sha(config.install_root, runner)
             if config.environment != "recovery_canary" and args.sha != current_sha:
                 print(
@@ -424,7 +432,7 @@ def main(argv: list[str] | None = None) -> int:
         services, health = _runtime_adapters(
             config,
             runner,
-            injection=args.inject_health_failure,
+            injection=inject_health_failure,
         )
         snapshots = SnapshotCoordinator(
             install_root=config.install_root,
@@ -439,12 +447,21 @@ def main(argv: list[str] | None = None) -> int:
             runner=runner,
             cwd=config.install_root,
         )
-        request = DeployRequest(
-            sha=args.sha,
-            pr_number=args.pr_number,
-            approval_record=args.approval_record,
-            actor=args.actor,
-        )
+        if args.command == "deploy":
+            request = DeployRequest(
+                sha=args.sha,
+                pr_number=args.pr_number,
+                approval_record=args.approval_record,
+                actor=args.actor,
+            )
+        else:
+            request = DeployRequest(
+                sha=args.sha,
+                pr_number=args.pr_number,
+                actor="hermes-upstream-sync",
+                authority_kind="automated_sync",
+                authority_record=args.sync_receipt,
+            )
         try:
             record = run_deploy(
                 request,

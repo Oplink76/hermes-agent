@@ -13,11 +13,12 @@ import uuid
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Callable, Literal, Protocol
 
 from .command import CommandRunner
 from .health import HealthCheck, HealthReport
 from .locking import try_exclusive_file_lock
+from .sync_receipt import SyncEligibilityReceipt, SyncReceiptError
 from utils import atomic_json_write
 
 
@@ -78,8 +79,10 @@ class ApprovalRecord:
 class DeployRequest:
     sha: str
     pr_number: int
-    approval_record: Path
     actor: str
+    authority_kind: Literal["human", "automated_sync"] = "human"
+    authority_record: Path | None = None
+    approval_record: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -303,7 +306,7 @@ def _run_required(
     return (completed.stdout or "").strip()
 
 
-def _validate_approval(
+def _validate_human_authority(
     request: DeployRequest,
     approval: ApprovalRecord,
     config: DeployConfig,
@@ -376,6 +379,93 @@ def _validate_approval(
         raise PreflightError("required GitHub check did not conclude success")
 
 
+def _validate_sync_authority(
+    request: DeployRequest,
+    receipt: SyncEligibilityReceipt,
+    config: DeployConfig,
+    evidence: ReleaseEvidence,
+) -> None:
+    if not request.actor.strip():
+        raise PreflightError("deployment actor is missing")
+    if receipt.pr_number != request.pr_number or evidence.pr_number != request.pr_number:
+        raise PreflightError("sync authority or GitHub evidence names a different PR")
+    if receipt.merge_sha is None:
+        raise PreflightError("sync authority must be a finalized merged receipt")
+    if receipt.merge_sha != request.sha:
+        raise PreflightError("requested SHA is not the exact merged SHA in sync authority")
+    if evidence.merge_sha != request.sha:
+        raise PreflightError("requested SHA does not equal the PR merge SHA")
+    if not evidence.merged:
+        raise PreflightError("pull request is not merged")
+    if (
+        receipt.required_check != config.required_check
+        or evidence.required_check != config.required_check
+    ):
+        raise PreflightError("required GitHub check identity does not match")
+    if (
+        receipt.required_check_conclusion != "success"
+        or evidence.required_check_conclusion.lower() != "success"
+    ):
+        raise PreflightError("required GitHub check did not conclude success")
+
+
+def _load_authority(
+    request: DeployRequest,
+) -> ApprovalRecord | SyncEligibilityReceipt:
+    if request.authority_kind == "human":
+        if request.authority_record is not None:
+            raise PreflightError("human deployment received a sync authority record")
+        if request.approval_record is None:
+            raise PreflightError("human authority record is missing")
+        try:
+            approval = ApprovalRecord.load(request.approval_record)
+        except PreflightError as exc:
+            raise PreflightError(f"human authority record is invalid: {exc}") from exc
+        return approval
+    if request.authority_kind == "automated_sync":
+        if request.approval_record is not None:
+            raise PreflightError("automated sync received a human authority record")
+        if request.authority_record is None:
+            raise PreflightError("sync authority record is missing")
+        try:
+            return SyncEligibilityReceipt.load(request.authority_record)
+        except SyncReceiptError as exc:
+            raise PreflightError(
+                f"sync authority record is not eligible: {exc}"
+            ) from exc
+    raise PreflightError(f"unsupported deployment authority kind: {request.authority_kind}")
+
+
+def _validate_authority(
+    request: DeployRequest,
+    authority: ApprovalRecord | SyncEligibilityReceipt,
+    config: DeployConfig,
+    evidence: ReleaseEvidence,
+) -> HealthCheck:
+    if request.authority_kind == "human" and isinstance(authority, ApprovalRecord):
+        _validate_human_authority(request, authority, config, evidence)
+        return HealthCheck(
+            "preflight:approval",
+            True,
+            f"approver={authority.approver} "
+            f"pr={request.pr_number} actor={request.actor} "
+            f"approval_artifact={authority.artifact_sha256} "
+            f"packet={authority.decision_packet_sha256}",
+        )
+    if request.authority_kind == "automated_sync" and isinstance(
+        authority, SyncEligibilityReceipt
+    ):
+        _validate_sync_authority(request, authority, config, evidence)
+        return HealthCheck(
+            "preflight:authority",
+            True,
+            f"kind=automated_sync pr={request.pr_number} actor={request.actor} "
+            f"receipt={Path(request.authority_record).name} "
+            f"candidate={authority.candidate_sha} merge={authority.merge_sha}",
+        )
+    raise PreflightError("deployment authority record type does not match authority kind")
+
+
 def _record_id(sha: str) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{timestamp}-{sha[:12]}-{uuid.uuid4().hex[:8]}"
@@ -431,18 +521,11 @@ def _deploy_locked(
     root = Path(config.install_root).expanduser().resolve(strict=True)
     record_store = store or DeploymentStore(config.record_root)
 
-    approval = ApprovalRecord.load(request.approval_record)
+    authority = _load_authority(request)
     evidence = github.verify(request.pr_number)
-    _validate_approval(request, approval, config, evidence)
+    authority_check = _validate_authority(request, authority, config, evidence)
     preflight_checks = [
-        HealthCheck(
-            "preflight:approval",
-            True,
-            f"approver={approval.approver} "
-            f"pr={request.pr_number} actor={request.actor} "
-            f"approval_artifact={approval.artifact_sha256} "
-            f"packet={approval.decision_packet_sha256}",
-        ),
+        authority_check,
         HealthCheck(
             "preflight:github",
             True,

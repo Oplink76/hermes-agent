@@ -325,3 +325,70 @@ def test_deploy_cli_wires_production_adapters_and_prints_record(
     assert captured["snapshots"].kind == "snapshots"
     assert captured["github"].kind == "github"
     assert json.loads(capsys.readouterr().out)["status"] == "deployed"
+
+
+def test_deploy_sync_cli_wires_machine_authority_without_human_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    config_file = _write_operations_config(tmp_path)
+    captured = {}
+    runner = object()
+    monkeypatch.setattr(cli, "SubprocessCommandRunner", lambda: runner)
+    monkeypatch.setattr(
+        cli,
+        "LaunchdServiceController",
+        lambda **kwargs: SimpleNamespace(kind="services", kwargs=kwargs),
+    )
+    monkeypatch.setattr(
+        cli,
+        "RuntimeHealthChecker",
+        lambda **kwargs: SimpleNamespace(kind="health", kwargs=kwargs),
+    )
+    monkeypatch.setattr(
+        cli,
+        "SnapshotCoordinator",
+        lambda **kwargs: SimpleNamespace(kind="snapshots", kwargs=kwargs),
+    )
+    monkeypatch.setattr(
+        cli,
+        "GhReleaseVerifier",
+        lambda **kwargs: SimpleNamespace(kind="github", kwargs=kwargs),
+    )
+
+    def fake_deploy(request, **kwargs):
+        captured["request"] = request
+        captured.update(kwargs)
+        return SimpleNamespace(
+            status="deployed",
+            to_dict=lambda: {"id": "deploy-sync-1", "status": "deployed"},
+        )
+
+    monkeypatch.setattr(cli, "run_deploy", fake_deploy)
+    receipt = tmp_path / "sync-receipt.json"
+
+    exit_code = cli.main([
+        "deploy-sync",
+        "--config",
+        str(config_file),
+        "--sha",
+        "merged-sha",
+        "--pr-number",
+        "7",
+        "--sync-receipt",
+        str(receipt),
+    ])
+
+    assert exit_code == 0
+    assert captured["request"].sha == "merged-sha"
+    assert captured["request"].actor == "hermes-upstream-sync"
+    assert captured["request"].authority_kind == "automated_sync"
+    assert captured["request"].authority_record == receipt
+    assert captured["request"].approval_record is None
+    assert captured["runner"] is runner
+    assert captured["services"].kind == "services"
+    assert captured["health"].kind == "health"
+    assert captured["snapshots"].kind == "snapshots"
+    assert captured["github"].kind == "github"
+    assert json.loads(capsys.readouterr().out)["status"] == "deployed"
