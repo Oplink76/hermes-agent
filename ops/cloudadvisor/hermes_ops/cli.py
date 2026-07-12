@@ -263,8 +263,8 @@ def load_sync_policy_config(path: Path) -> SyncPolicyConfig:
         raise ValueError("sync.required_check must be a non-empty string")
     resolver_backend = backend("resolver_backend")
     reviewer_backend = backend("reviewer_backend")
-    if resolver_backend.casefold() == reviewer_backend.casefold():
-        raise ValueError("sync reviewer backend must be independent")
+    if resolver_backend != "codex" or reviewer_backend != "claude":
+        raise ValueError("sync backends must be canonical codex and claude")
     return SyncPolicyConfig(
         receipt_root=_path(values["receipt_root"], field="sync.receipt_root"),
         required_check=required_check,
@@ -421,6 +421,21 @@ def _sync_deploy_fn(config: OperationsConfig, runner: CommandRunner):
     return deploy_sync
 
 
+def _sync_runtime_verify_fn(config: OperationsConfig, runner: CommandRunner):
+    services, health = _runtime_adapters(config, runner)
+
+    def verify_runtime(expected_sha: str) -> bool:
+        report = health.check(
+            expected_sha=expected_sha,
+            services=services.running_services(),
+            identity_required=True,
+            apply_injection=False,
+        )
+        return report.healthy
+
+    return verify_runtime
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -521,12 +536,14 @@ def main(argv: list[str] | None = None) -> int:
             resolver=resolver,
             reviewer=reviewer,
             deploy_fn=_sync_deploy_fn(operations, runner),
+            verify_runtime_fn=_sync_runtime_verify_fn(operations, runner),
         )
         print(json.dumps(_autonomous_sync_payload(result), indent=2, sort_keys=True))
         if result.state in {
             AutonomousSyncState.NO_CHANGE,
             AutonomousSyncState.DEPLOYED,
             AutonomousSyncState.ROLLED_BACK_REVERTED,
+            AutonomousSyncState.REFRESH_REQUIRED,
         }:
             return 0
         if result.state is AutonomousSyncState.LOCKED:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,6 +32,8 @@ SHA_CANDIDATE_TREE = "5" * 40
 
 class Runner:
     def run(self, argv: list[str], cwd: Path, timeout: int = 300):
+        if argv == ["git", "rev-parse", "upstream/main"]:
+            return subprocess.CompletedProcess(argv, 0, SHA_UPSTREAM + "\n", "")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
 
@@ -61,6 +64,17 @@ class Clock:
         self.value += seconds
 
 
+class AdvancingGitHub(GitHub):
+    def __init__(self, clock: Clock, advance: float):
+        super().__init__([evidence()])
+        self.clock = clock
+        self.advance = advance
+
+    def evidence(self, pr_number: int) -> SyncPullRequestEvidence:
+        self.clock.value += self.advance
+        return super().evidence(pr_number)
+
+
 def checks() -> tuple[CheckResult, ...]:
     return tuple(
         CheckResult(name, "passed")
@@ -80,6 +94,7 @@ def candidate(
     state: SyncState = SyncState.PR_UPDATED,
     conflicted_files: tuple[str, ...] = (),
     resolution_record: Path | None = None,
+    resolution_evidence_dir: Path | None = None,
 ) -> SyncResult:
     return SyncResult(
         state=state,
@@ -92,6 +107,7 @@ def candidate(
         classification=classification,
         conflicted_files=conflicted_files,
         resolution_record=resolution_record,
+        resolution_evidence_dir=resolution_evidence_dir,
     )
 
 
@@ -244,6 +260,59 @@ def test_pending_check_times_out_without_merge(tmp_path: Path, monkeypatch):
     assert github.merge_calls == []
 
 
+def test_green_evidence_returned_after_deadline_is_not_accepted(
+    tmp_path: Path, monkeypatch
+):
+    clock = Clock()
+    github = AdvancingGitHub(clock, advance=11)
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: candidate(),
+    )
+    result = run_autonomous_sync(
+        config(tmp_path, timeout=10, interval=5),
+        runner=Runner(),
+        github=github,
+        resolver=None,
+        reviewer=None,
+        deploy_fn=lambda *args: deployed_record(),
+        clock=clock,
+        sleeper=clock.sleep,
+    )
+    assert result.state is AutonomousSyncState.NEEDS_OLE
+    assert "timed out" in result.reason
+    assert github.merge_calls == []
+
+
+def test_upstream_change_before_merge_is_quiet_refresh(tmp_path: Path, monkeypatch):
+    class ChangedUpstreamRunner(Runner):
+        def run(self, argv: list[str], cwd: Path, timeout: int = 300):
+            if argv == ["git", "rev-parse", "upstream/main"]:
+                return subprocess.CompletedProcess(argv, 0, "9" * 40 + "\n", "")
+            return super().run(argv, cwd, timeout)
+
+    github = GitHub([evidence()])
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: candidate(),
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
+        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+    )
+    result = run_autonomous_sync(
+        config(tmp_path),
+        runner=ChangedUpstreamRunner(),
+        github=github,
+        resolver=None,
+        reviewer=None,
+        deploy_fn=lambda *args: deployed_record(),
+    )
+    assert result.state is AutonomousSyncState.REFRESH_REQUIRED
+    assert result.needs_ole is False
+    assert github.merge_calls == []
+
+
 def test_one_transient_evidence_failure_is_retried(tmp_path: Path, monkeypatch):
     github = GitHub([RuntimeError("temporary"), evidence()])
     monkeypatch.setattr(
@@ -320,8 +389,9 @@ def test_minor_without_review_and_major_candidate_stop(tmp_path: Path, monkeypat
 def test_independently_reviewed_minor_candidate_auto_merges(
     tmp_path: Path, monkeypatch
 ):
-    record = tmp_path / "candidate" / ".hermes-sync-resolution.json"
-    record.parent.mkdir()
+    evidence_dir = tmp_path / ".git" / "hermes-sync-evidence"
+    record = evidence_dir / ".hermes-sync-resolution.json"
+    record.parent.mkdir(parents=True)
     record.write_text(
         '{"conflicts":[{"path":"gateway/run.py",'
         '"decision":"preserve fork behavior"}]}',
@@ -331,6 +401,7 @@ def test_independently_reviewed_minor_candidate_auto_merges(
         classification=SyncClassification.MINOR_REVIEW_REQUIRED,
         conflicted_files=("gateway/run.py",),
         resolution_record=record,
+        resolution_evidence_dir=evidence_dir,
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
@@ -340,6 +411,9 @@ def test_independently_reviewed_minor_candidate_auto_merges(
 
     class Reviewer:
         def review(self, **kwargs):
+            digest = Path(kwargs["resolution_record"]).stem.removeprefix(
+                "resolution-"
+            )
             return ConflictReviewReceipt(
                 candidate_sha=SHA_CANDIDATE,
                 resolver_backend="codex",
@@ -347,6 +421,7 @@ def test_independently_reviewed_minor_candidate_auto_merges(
                 verdict="green",
                 findings=(),
                 reviewed_at="2026-07-12T16:00:00Z",
+                resolution_record_sha256=digest,
             )
 
     def write_receipt(*args, **kwargs):
@@ -395,3 +470,25 @@ def test_lock_contention_returns_locked(tmp_path: Path):
             deploy_fn=lambda *args: deployed_record(),
         )
     assert result.state is AutonomousSyncState.LOCKED
+
+
+def test_unexpected_failure_is_logged_without_secret_terminal_or_log_leak(
+    tmp_path: Path, monkeypatch, caplog
+):
+    secret = "https://token.example.invalid/path?secret=sk-live-value"
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError(secret)),
+    )
+    with caplog.at_level(logging.ERROR):
+        result = run_autonomous_sync(
+            config(tmp_path),
+            runner=Runner(),
+            github=GitHub([evidence()]),
+            resolver=None,
+            reviewer=None,
+            deploy_fn=lambda *args: deployed_record(),
+        )
+    assert result.reason == "unexpected autonomous sync failure"
+    assert secret not in caplog.text
+    assert "sk-live-value" not in caplog.text

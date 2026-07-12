@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import json
+import stat
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -84,6 +85,7 @@ class SyncResult:
     classification: SyncClassification = SyncClassification.MAJOR
     conflicted_files: tuple[str, ...] = ()
     resolution_record: Path | None = None
+    resolution_evidence_dir: Path | None = None
 
 
 class GitHubPullRequests(Protocol):
@@ -113,6 +115,7 @@ class CodexConflictResolver:
     prompt: str
     resolution_record: Path = Path(".hermes-sync-resolution.json")
     _resolved_record: Path | None = field(default=None, init=False, repr=False)
+    _evidence_dir: Path | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.executable.name not in {"codex", "codex.exe"}:
@@ -157,9 +160,32 @@ class CodexConflictResolver:
             or not common_dir_path.is_dir()
         ):
             return False
-        resolution_record = common_dir_path / self.resolution_record
+        evidence_dir = common_dir_path / "hermes-sync-evidence"
+        try:
+            evidence_dir.mkdir(mode=0o700, exist_ok=True)
+            evidence_meta = evidence_dir.lstat()
+        except OSError:
+            return False
+        if stat.S_ISLNK(evidence_meta.st_mode) or not stat.S_ISDIR(
+            evidence_meta.st_mode
+        ):
+            return False
+        resolution_record = evidence_dir / self.resolution_record
         object.__setattr__(self, "_resolved_record", resolution_record)
-        resolution_record.unlink(missing_ok=True)
+        object.__setattr__(self, "_evidence_dir", evidence_dir)
+        try:
+            existing = resolution_record.lstat()
+        except FileNotFoundError:
+            existing = None
+        except OSError:
+            return False
+        if existing is not None:
+            if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+                return False
+            try:
+                resolution_record.unlink()
+            except OSError:
+                return False
         command = list(self.command)
         command[5:5] = ["--add-dir", str(common_dir_path)]
         command[-1] = (
@@ -170,9 +196,12 @@ class CodexConflictResolver:
             "non-empty string fields `path` and `decision`. Do not commit or push."
         )
         completed = runner.run(command, cwd=worktree, timeout=1800)
-        if completed.returncode != 0 or not resolution_record.is_file():
+        if completed.returncode != 0:
             return False
         try:
+            created = resolution_record.lstat()
+            if stat.S_ISLNK(created.st_mode) or not stat.S_ISREG(created.st_mode):
+                return False
             payload = json.loads(resolution_record.read_text(encoding="utf-8"))
             conflicts = payload["conflicts"]
             return bool(
@@ -196,6 +225,12 @@ class CodexConflictResolver:
         if self._resolved_record is None:
             raise ValueError("resolution record is unavailable before resolver execution")
         return self._resolved_record
+
+    def resolution_evidence_directory(self, worktree: Path) -> Path:
+        del worktree
+        if self._evidence_dir is None:
+            raise ValueError("resolution evidence is unavailable before execution")
+        return self._evidence_dir
 
 
 def _run(
@@ -227,6 +262,7 @@ def _result(
     conflicted_files: tuple[str, ...] = (),
     classification: SyncClassification = SyncClassification.MAJOR,
     resolution_record: Path | None = None,
+    resolution_evidence_dir: Path | None = None,
 ) -> SyncResult:
     return SyncResult(
         state=state,
@@ -242,6 +278,7 @@ def _result(
         transitions=tuple(transitions),
         classification=classification,
         resolution_record=resolution_record,
+        resolution_evidence_dir=resolution_evidence_dir,
     )
 
 
@@ -492,6 +529,7 @@ def prepare_candidate(
     )
     conflicted_files: tuple[str, ...] = ()
     resolution_record: Path | None = None
+    resolution_evidence_dir: Path | None = None
     if merged.returncode == 0:
         transitions.append(SyncState.MERGED_CLEAN)
         classification = SyncClassification.CLEAN
@@ -531,6 +569,9 @@ def prepare_candidate(
         record_path = getattr(resolver, "resolution_record_path", None)
         if callable(record_path):
             resolution_record = Path(record_path(config.worktree))
+        evidence_directory = getattr(resolver, "resolution_evidence_directory", None)
+        if callable(evidence_directory):
+            resolution_evidence_dir = Path(evidence_directory(config.worktree))
         unmerged = _run(runner, ["git", "ls-files", "-u"], config.worktree)
         if unmerged.returncode != 0 or _output(unmerged):
             transitions.append(SyncState.NEEDS_DECISION)
@@ -586,6 +627,7 @@ def prepare_candidate(
                 upstream_sha=upstream_sha,
                 conflicted_files=conflicted_files,
                 resolution_record=resolution_record,
+                resolution_evidence_dir=resolution_evidence_dir,
                 risk="resolver_left_dirty_worktree",
             )
         transitions.append(SyncState.AI_RESOLVED)
@@ -692,6 +734,7 @@ def prepare_candidate(
         conflicted_files=conflicted_files,
         classification=classification,
         resolution_record=resolution_record,
+        resolution_evidence_dir=resolution_evidence_dir,
     )
 
 

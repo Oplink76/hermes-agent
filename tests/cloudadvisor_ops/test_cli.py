@@ -72,11 +72,17 @@ def test_sync_auto_returns_terminal_state_exit_codes(tmp_path: Path, monkeypatch
         "_sync_deploy_fn",
         lambda *args, **kwargs: (lambda *deploy_args: object()),
     )
+    monkeypatch.setattr(
+        cli,
+        "_sync_runtime_verify_fn",
+        lambda *args, **kwargs: (lambda sha: True),
+    )
 
     for state, expected in (
         (AutonomousSyncState.DEPLOYED, 0),
         (AutonomousSyncState.ROLLED_BACK_REVERTED, 0),
         (AutonomousSyncState.NO_CHANGE, 0),
+        (AutonomousSyncState.REFRESH_REQUIRED, 0),
         (AutonomousSyncState.LOCKED, 75),
         (AutonomousSyncState.NEEDS_OLE, 2),
     ):
@@ -183,6 +189,31 @@ def test_load_sync_policy_config_reads_exact_authority_settings(tmp_path: Path):
     assert policy.resolver_backend == "codex"
     assert policy.reviewer_backend == "claude"
     assert policy.resolver_backend.casefold() != policy.reviewer_backend.casefold()
+
+
+@pytest.mark.parametrize(
+    ("resolver", "reviewer"),
+    [("Codex", "claude"), ("codex", "Claude"), ("other", "claude")],
+)
+def test_sync_policy_requires_canonical_actual_backend_ids(
+    tmp_path: Path, resolver: str, reviewer: str
+):
+    config_file = tmp_path / "hermes-operations.yaml"
+    config_file.write_text(
+        "\n".join([
+            "sync:",
+            f"  receipt_root: {tmp_path / 'receipts'}",
+            "  required_check: All required checks pass",
+            "  check_timeout_seconds: 2700",
+            "  poll_interval_seconds: 15",
+            f"  resolver_backend: {resolver}",
+            f"  reviewer_backend: {reviewer}",
+        ])
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="codex.*claude"):
+        load_sync_policy_config(config_file)
 
 
 def test_load_operations_config_builds_explicit_runtime_and_deploy_scope(

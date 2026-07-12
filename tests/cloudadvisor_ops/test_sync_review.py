@@ -7,6 +7,11 @@ from pathlib import Path
 import pytest
 
 from ops.cloudadvisor.hermes_ops.sync import SyncClassification
+from ops.cloudadvisor.hermes_ops.sync import SyncResult, SyncState
+from ops.cloudadvisor.hermes_ops.sync_resolution import (
+    ResolutionRecordError,
+    freeze_resolution_record,
+)
 from ops.cloudadvisor.hermes_ops.sync_review import (
     ClaudeConflictReviewer,
     ConflictReviewError,
@@ -25,6 +30,7 @@ def resolution_record(
     paths: tuple[str, ...] = ("gateway/run.py",),
 ) -> Path:
     path = tmp_path / "resolution.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     decision = "preserve fork behavior" if complete else ""
     conflicts = [
         {"path": conflict_path, "decision": decision} for conflict_path in paths
@@ -41,17 +47,43 @@ def receipt(**overrides):
         "verdict": "green",
         "findings": (),
         "reviewed_at": "2026-07-12T16:00:00Z",
+        "resolution_record_sha256": "d" * 64,
     }
     values.update(overrides)
     return ConflictReviewReceipt(**values)
 
 
+def frozen_record(
+    tmp_path: Path,
+    *,
+    complete: bool = True,
+    paths: tuple[str, ...] = ("gateway/run.py",),
+) -> Path:
+    evidence = tmp_path / ".git" / "hermes-sync-evidence"
+    raw = resolution_record(evidence, complete=complete, paths=paths)
+    candidate = SyncResult(
+        state=SyncState.PR_UPDATED,
+        candidate_sha=CANDIDATE_SHA,
+        conflicted_files=paths,
+        resolution_record=raw,
+        resolution_evidence_dir=evidence,
+    )
+    return freeze_resolution_record(tmp_path / "receipts", candidate).path
+
+
 def validate(tmp_path: Path, review):
+    record = frozen_record(tmp_path)
+    review = receipt(
+        **{
+            **review.__dict__,
+            "resolution_record_sha256": record.stem.removeprefix("resolution-"),
+        }
+    )
     return validate_conflict_review(
         review,
         candidate_sha=CANDIDATE_SHA,
         resolver_backend="codex",
-        resolution_record=resolution_record(tmp_path),
+        resolution_record=record,
         conflicted_files=("gateway/run.py",),
     )
 
@@ -88,24 +120,19 @@ def test_backend_id_case_cannot_bypass_independence(tmp_path: Path):
 
 
 def test_review_requires_complete_resolution_record(tmp_path: Path):
-    record = resolution_record(tmp_path, complete=False)
-
-    with pytest.raises(ConflictReviewError, match="resolution record"):
-        validate_conflict_review(
-            receipt(),
-            candidate_sha=CANDIDATE_SHA,
-            resolver_backend="codex",
-            resolution_record=record,
-            conflicted_files=("gateway/run.py",),
-        )
+    with pytest.raises(ResolutionRecordError, match="incomplete"):
+        frozen_record(tmp_path, complete=False)
 
 
 def test_resolution_record_rejects_missing_conflicted_file(tmp_path: Path):
-    record = resolution_record(tmp_path)
+    record = frozen_record(tmp_path)
+    review = receipt(
+        resolution_record_sha256=record.stem.removeprefix("resolution-")
+    )
 
     with pytest.raises(ConflictReviewError, match="conflicted files"):
         validate_conflict_review(
-            receipt(),
+            review,
             candidate_sha=CANDIDATE_SHA,
             resolver_backend="codex",
             resolution_record=record,
@@ -114,14 +141,17 @@ def test_resolution_record_rejects_missing_conflicted_file(tmp_path: Path):
 
 
 def test_resolution_record_rejects_extra_conflicted_file(tmp_path: Path):
-    record = resolution_record(
+    record = frozen_record(
         tmp_path,
         paths=("gateway/run.py", "hermes_cli/kanban.py"),
+    )
+    review = receipt(
+        resolution_record_sha256=record.stem.removeprefix("resolution-")
     )
 
     with pytest.raises(ConflictReviewError, match="conflicted files"):
         validate_conflict_review(
-            receipt(),
+            review,
             candidate_sha=CANDIDATE_SHA,
             resolver_backend="codex",
             resolution_record=record,
@@ -130,18 +160,10 @@ def test_resolution_record_rejects_extra_conflicted_file(tmp_path: Path):
 
 
 def test_resolution_record_rejects_duplicate_conflicted_file(tmp_path: Path):
-    record = resolution_record(
-        tmp_path,
-        paths=("gateway/run.py", "gateway/run.py"),
-    )
-
-    with pytest.raises(ConflictReviewError, match="conflicted files"):
-        validate_conflict_review(
-            receipt(),
-            candidate_sha=CANDIDATE_SHA,
-            resolver_backend="codex",
-            resolution_record=record,
-            conflicted_files=("gateway/run.py",),
+    with pytest.raises(ResolutionRecordError, match="duplicate"):
+        frozen_record(
+            tmp_path,
+            paths=("gateway/run.py", "gateway/run.py"),
         )
 
 
@@ -181,7 +203,7 @@ class ReviewerRunner:
 def test_claude_reviewer_returns_exact_structured_receipt(tmp_path: Path):
     worktree = tmp_path / "candidate"
     worktree.mkdir()
-    record = resolution_record(worktree)
+    record = frozen_record(tmp_path)
     runner = ReviewerRunner({"verdict": "green", "findings": []})
     reviewer = ClaudeConflictReviewer(
         executable=Path("/Users/cloudadvisor/.local/bin/claude"),
@@ -231,5 +253,27 @@ def test_claude_reviewer_rejects_changed_head(tmp_path: Path):
         reviewer.review(
             candidate_sha=CANDIDATE_SHA,
             worktree=worktree,
-            resolution_record=resolution_record(worktree),
+            resolution_record=frozen_record(tmp_path),
         )
+
+
+def test_claude_reviewer_preserves_windows_paths_with_spaces(tmp_path: Path):
+    worktree = tmp_path / "candidate with spaces"
+    worktree.mkdir()
+    record = frozen_record(tmp_path / "evidence with spaces")
+    runner = ReviewerRunner({"verdict": "green", "findings": []})
+    reviewer = ClaudeConflictReviewer(
+        executable=Path("C:/Program Files/Claude/claude.exe"),
+        runner=runner,
+        resolver_backend="codex",
+    )
+    reviewer.review(
+        candidate_sha=CANDIDATE_SHA,
+        worktree=worktree,
+        resolution_record=record,
+    )
+    command = next(
+        call[0] for call in runner.calls if call[0][0].endswith("claude.exe")
+    )
+    assert command[0] == "C:/Program Files/Claude/claude.exe"
+    assert str(record.parent) in command

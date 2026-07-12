@@ -15,6 +15,7 @@ from pathlib import Path
 from .sync import CheckResult, SyncClassification, SyncResult
 from .sync_github import SyncPullRequestEvidence
 from .sync_review import ConflictReviewReceipt
+from .sync_resolution import ResolutionRecordArtifact, ResolutionRecordError
 
 
 SCHEMA_VERSION = 1
@@ -71,6 +72,7 @@ class SyncEligibilityReceipt:
                     "verdict": self.review.verdict,
                     "findings": list(self.review.findings),
                     "reviewed_at": self.review.reviewed_at,
+                    "resolution_record_sha256": self.review.resolution_record_sha256,
                 }
             ),
             "pr_number": self.pr_number,
@@ -157,6 +159,22 @@ class SyncEligibilityReceipt:
             created_at=payload["created_at"],
         )
         _validate_receipt(receipt)
+        if review is not None:
+            resolution_path = (
+                path.parent
+                / "resolutions"
+                / f"resolution-{review.resolution_record_sha256}.json"
+            )
+            try:
+                resolution = ResolutionRecordArtifact.load(resolution_path)
+            except ResolutionRecordError as exc:
+                raise SyncReceiptError(
+                    "sync receipt resolution artifact is invalid"
+                ) from exc
+            if resolution.candidate_sha != receipt.candidate_sha:
+                raise SyncReceiptError(
+                    "sync receipt resolution candidate SHA does not match"
+                )
         return replace(receipt, eligible=True)
 
 
@@ -210,6 +228,7 @@ def _load_review(value: object) -> ConflictReviewReceipt | None:
         "verdict",
         "findings",
         "reviewed_at",
+        "resolution_record_sha256",
     }
     if not isinstance(value, dict) or set(value) != fields:
         raise SyncReceiptError("sync receipt conflict review is invalid")
@@ -228,6 +247,7 @@ def _load_review(value: object) -> ConflictReviewReceipt | None:
         verdict=value["verdict"],
         findings=tuple(findings),
         reviewed_at=value["reviewed_at"],
+        resolution_record_sha256=value["resolution_record_sha256"],
     )
 
 
@@ -252,6 +272,8 @@ def _validate_review(
         raise SyncReceiptError("independent review is not green")
     if not review.reviewed_at:
         raise SyncReceiptError("independent review timestamp is missing")
+    if re.fullmatch(r"[0-9a-f]{64}", review.resolution_record_sha256) is None:
+        raise SyncReceiptError("independent review resolution digest is invalid")
 
 
 def _validate_receipt(receipt: SyncEligibilityReceipt) -> None:

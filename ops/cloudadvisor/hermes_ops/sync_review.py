@@ -11,6 +11,7 @@ from typing import Literal, Protocol
 
 from .command import CommandRunner
 from .sync import SyncClassification
+from .sync_resolution import ResolutionRecordArtifact, ResolutionRecordError
 
 
 class ConflictReviewError(ValueError):
@@ -25,6 +26,7 @@ class ConflictReviewReceipt:
     verdict: Literal["green", "major"]
     findings: tuple[str, ...]
     reviewed_at: str
+    resolution_record_sha256: str
 
 
 class IndependentConflictReviewer(Protocol):
@@ -66,9 +68,10 @@ class ClaudeConflictReviewer:
             or self.resolver_backend != self.resolver_backend.strip()
             or not self.reviewer_backend.strip()
             or self.reviewer_backend != self.reviewer_backend.strip()
-            or self.resolver_backend.casefold() == self.reviewer_backend.casefold()
+            or self.resolver_backend != "codex"
+            or self.reviewer_backend != "claude"
         ):
-            raise ValueError("conflict reviewer backend must be independent")
+            raise ValueError("conflict reviewer backends must be codex and claude")
 
     def _head(self, worktree: Path) -> str:
         completed = self.runner.run(
@@ -98,8 +101,12 @@ class ClaudeConflictReviewer:
     ) -> ConflictReviewReceipt:
         worktree = Path(worktree).resolve(strict=True)
         resolution_record = Path(resolution_record).resolve(strict=True)
-        if resolution_record.is_symlink() or not resolution_record.is_file():
-            raise ConflictReviewError("resolution record is not a regular file")
+        try:
+            resolution = ResolutionRecordArtifact.load(resolution_record)
+        except ResolutionRecordError as exc:
+            raise ConflictReviewError("resolution record artifact is invalid") from exc
+        if resolution.candidate_sha != candidate_sha:
+            raise ConflictReviewError("resolution record candidate SHA is not exact")
         if self._head(worktree) != candidate_sha:
             raise ConflictReviewError("conflict review candidate SHA is not exact")
         status_before = self._status(worktree)
@@ -164,34 +171,16 @@ class ClaudeConflictReviewer:
             reviewed_at=datetime.now(timezone.utc)
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z"),
+            resolution_record_sha256=resolution.sha256,
         )
 
 
 def _resolution_record_paths(path: Path) -> tuple[str, ...]:
     try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, TypeError, json.JSONDecodeError) as exc:
+        artifact = ResolutionRecordArtifact.load(Path(path))
+    except ResolutionRecordError as exc:
         raise ConflictReviewError("resolution record is missing or invalid") from exc
-    if not isinstance(payload, dict):
-        raise ConflictReviewError("resolution record is incomplete")
-    conflicts = payload.get("conflicts")
-    if not isinstance(conflicts, list) or not conflicts:
-        raise ConflictReviewError("resolution record is incomplete")
-    paths: list[str] = []
-    for conflict in conflicts:
-        if not isinstance(conflict, dict):
-            raise ConflictReviewError("resolution record is incomplete")
-        conflict_path = conflict.get("path")
-        decision = conflict.get("decision")
-        if (
-            not isinstance(conflict_path, str)
-            or not conflict_path.strip()
-            or not isinstance(decision, str)
-            or not decision.strip()
-        ):
-            raise ConflictReviewError("resolution record is incomplete")
-        paths.append(conflict_path)
-    return tuple(paths)
+    return tuple(conflict["path"] for conflict in artifact.conflicts)
 
 
 def validate_conflict_review(
@@ -225,6 +214,15 @@ def validate_conflict_review(
         raise ConflictReviewError("conflict review is not independent")
 
     record_paths = _resolution_record_paths(resolution_record)
+    try:
+        artifact = ResolutionRecordArtifact.load(resolution_record)
+    except ResolutionRecordError as exc:
+        raise ConflictReviewError("resolution record is missing or invalid") from exc
+    if (
+        artifact.candidate_sha != candidate_sha
+        or receipt.resolution_record_sha256 != artifact.sha256
+    ):
+        raise ConflictReviewError("resolution record digest is not exact")
     if (
         not isinstance(conflicted_files, tuple)
         or not conflicted_files

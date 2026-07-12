@@ -252,7 +252,9 @@ def test_command_conflict_resolver_runs_only_configured_command_in_worktree(
         executable=Path("/usr/local/bin/codex"),
         prompt="resolve current merge conflicts",
     )
-    resolution_record = git_common_dir / ".hermes-sync-resolution.json"
+    resolution_record = (
+        git_common_dir / "hermes-sync-evidence" / ".hermes-sync-resolution.json"
+    )
     common_dir_command = (
         "git",
         "rev-parse",
@@ -263,6 +265,7 @@ def test_command_conflict_resolver_runs_only_configured_command_in_worktree(
         def run(self, argv: list[str], cwd: Path, timeout: int = 300):
             completed = super().run(argv, cwd, timeout)
             if tuple(argv[:2]) == ("/usr/local/bin/codex", "exec"):
+                resolution_record.parent.mkdir(parents=True, exist_ok=True)
                 resolution_record.write_text(
                     '{"conflicts":[{"path":"gateway/run.py",'
                     '"decision":"preserve fork behavior"}]}',
@@ -314,6 +317,34 @@ def test_command_conflict_resolver_fails_when_record_is_missing(tmp_path: Path):
     })
 
     assert resolver.resolve(worktree, runner) is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges")
+def test_command_conflict_resolver_rejects_stale_evidence_symlink(tmp_path: Path):
+    worktree = tmp_path / "candidate"
+    worktree.mkdir()
+    git_common_dir = tmp_path / "repo" / ".git"
+    evidence_dir = git_common_dir / "hermes-sync-evidence"
+    evidence_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.json"
+    outside.write_text("do not delete", encoding="utf-8")
+    (evidence_dir / ".hermes-sync-resolution.json").symlink_to(outside)
+    resolver = CodexConflictResolver(
+        executable=Path("/usr/local/bin/codex"),
+        prompt="resolve current merge conflicts",
+    )
+    runner = FakeRunner({
+        (
+            "git",
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ): (0, f"{git_common_dir}\n", ""),
+    })
+
+    assert resolver.resolve(worktree, runner) is False
+    assert outside.read_text(encoding="utf-8") == "do not delete"
+    assert len(runner.calls) == 1
 
 
 def test_conflict_resolver_fails_closed_when_git_common_dir_is_unavailable(
@@ -369,6 +400,14 @@ def test_conflict_resolver_rejects_arbitrary_executable():
             executable=Path("/bin/bash"),
             prompt="git push origin HEAD:main",
         )
+
+
+def test_conflict_resolver_preserves_windows_executable_path():
+    resolver = CodexConflictResolver(
+        executable=Path("C:/Program Files/Codex/codex.exe"),
+        prompt="resolve conflicts",
+    )
+    assert resolver.command[0] == "C:/Program Files/Codex/codex.exe"
 
 
 def test_resolved_merge_conflict_runs_gates_before_push(tmp_path: Path):

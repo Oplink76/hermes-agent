@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import tempfile
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -15,16 +16,30 @@ from typing import Callable, Protocol
 from .command import CommandRunner
 from .deploy import DeploymentRecord
 from .sync import SyncResult
-from .sync_github import SyncGitHubPort, SyncPullRequestEvidence
+from .sync_github import SyncGitHubError, SyncGitHubPort, SyncPullRequestEvidence
+from .sync_poll import ExactHeadExpectation, ExactHeadPollError, poll_exact_head
 from utils import atomic_json_write
 
 
 _FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
+logger = logging.getLogger(__name__)
+
+
+def _log_unexpected(error: Exception) -> None:
+    sanitized = RuntimeError("redacted unexpected recovery failure")
+    logger.error(
+        "Protected sync recovery failed unexpectedly",
+        exc_info=(type(sanitized), sanitized, error.__traceback__),
+    )
 
 
 class ProtectedRevertState(str, Enum):
     REVERTED = "REVERTED"
     NEEDS_OLE = "NEEDS_OLE"
+
+
+class ProtectedRevertError(RuntimeError):
+    """Expected protected-recovery evidence failure."""
 
 
 @dataclass(frozen=True)
@@ -108,8 +123,7 @@ def _run_required(
 ) -> str:
     completed = runner.run(argv, cwd=cwd, timeout=timeout)
     if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "").strip()
-        raise RuntimeError(f"recovery command failed ({' '.join(argv)}): {detail}")
+        raise ProtectedRevertError("recovery Git operation failed")
     return (completed.stdout or "").strip()
 
 
@@ -125,29 +139,19 @@ def _wait_for_revert_green(
     timeout_seconds: int,
     poll_interval_seconds: int,
 ) -> SyncPullRequestEvidence:
-    deadline = clock() + timeout_seconds
-    max_polls = timeout_seconds // poll_interval_seconds + 2
-    for poll in range(max_polls):
-        evidence = github.evidence(pr_number)
-        if evidence.number != pr_number:
-            raise RuntimeError("revert PR number changed")
-        if evidence.state != "open":
-            raise RuntimeError("revert PR is not open")
-        if evidence.base_sha != expected_base:
-            raise RuntimeError("revert PR base changed")
-        if evidence.head_sha != expected_head:
-            raise RuntimeError("revert PR head changed")
-        if evidence.required_check != required_check:
-            raise RuntimeError("revert required check identity changed")
-        conclusion = evidence.required_check_conclusion.lower()
-        if conclusion == "success":
-            return evidence
-        if conclusion not in {"pending", "queued", "in_progress"}:
-            raise RuntimeError("revert required check is not green")
-        if clock() >= deadline or poll + 1 == max_polls:
-            raise RuntimeError("revert required check timed out")
-        sleeper(poll_interval_seconds)
-    raise RuntimeError("revert required check timed out")
+    return poll_exact_head(
+        github,
+        ExactHeadExpectation(
+            pr_number,
+            expected_base,
+            expected_head,
+            required_check,
+        ),
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        clock=clock,
+        sleeper=sleeper,
+    )
 
 
 def _bind_expected_base(github: SyncGitHubPort, base_sha: str) -> None:
@@ -172,9 +176,17 @@ def run_protected_revert(
     sleeper: Callable[[float], None],
     timeout_seconds: int,
     poll_interval_seconds: int,
+    verify_runtime_fn: Callable[[str], bool],
 ) -> ProtectedRevertResult:
     """Quarantine a healthy rollback and revert its merge through protection."""
     del repo_slug  # The GitHub port is already scoped to the configured repository.
+    if deployment.requested_sha != merge_sha:
+        return ProtectedRevertResult(
+            state=ProtectedRevertState.NEEDS_OLE,
+            previous_sha=deployment.previous_sha,
+            installed_sha=deployment.previous_sha,
+            reason="deployment record does not match failed merge",
+        )
     if deployment.status != "rolled_back_healthy":
         return ProtectedRevertResult(
             state=ProtectedRevertState.NEEDS_OLE,
@@ -190,7 +202,30 @@ def run_protected_revert(
             runner, ["git", "rev-parse", f"{origin}/main"], cwd=repo
         )
         if current_main != merge_sha:
-            raise RuntimeError("fork main changed before protected revert")
+            raise ProtectedRevertError("fork main changed before protected revert")
+        if not candidate.base_sha or not candidate.candidate_sha:
+            raise ProtectedRevertError("candidate lineage evidence is incomplete")
+        parents = _run_required(
+            runner,
+            ["git", "rev-list", "--parents", "-n", "1", merge_sha],
+            cwd=repo,
+        ).split()
+        if parents != [merge_sha, candidate.base_sha, candidate.candidate_sha]:
+            raise ProtectedRevertError("failed merge parents do not match candidate")
+        previous_tree = _run_required(
+            runner,
+            ["git", "rev-parse", f"{deployment.previous_sha}^{{tree}}"],
+            cwd=repo,
+        )
+        base_tree = _run_required(
+            runner,
+            ["git", "rev-parse", f"{candidate.base_sha}^{{tree}}"],
+            cwd=repo,
+        )
+        if deployment.previous_sha != candidate.base_sha and previous_tree != base_tree:
+            raise ProtectedRevertError(
+                "previous runtime is not equivalent to candidate base"
+            )
 
         branch = f"auto-sync/revert-{merge_sha[:12]}"
         with tempfile.TemporaryDirectory(prefix="hermes-sync-revert-") as temporary:
@@ -205,7 +240,9 @@ def run_protected_revert(
                 added = True
                 _run_required(runner, ["git", "switch", "-c", branch], cwd=worktree)
                 _run_required(
-                    runner, ["git", "revert", "--no-edit", merge_sha], cwd=worktree
+                    runner,
+                    ["git", "revert", "-m", "1", "--no-edit", merge_sha],
+                    cwd=worktree,
                 )
                 _run_required(
                     runner, ["git", "diff", "--check", "HEAD^", "HEAD"], cwd=worktree
@@ -219,7 +256,16 @@ def run_protected_revert(
                     runner, ["git", "rev-parse", "HEAD"], cwd=worktree
                 )
                 if _FULL_SHA.fullmatch(revert_head) is None:
-                    raise RuntimeError("protected revert head SHA is invalid")
+                    raise ProtectedRevertError("protected revert head SHA is invalid")
+                revert_tree = _run_required(
+                    runner,
+                    ["git", "rev-parse", f"{revert_head}^{{tree}}"],
+                    cwd=worktree,
+                )
+                if revert_tree != previous_tree:
+                    raise ProtectedRevertError(
+                        "protected revert did not restore previous tree"
+                    )
                 destination = f"HEAD:refs/heads/{branch}"
                 if destination.endswith("refs/heads/main"):
                     raise RuntimeError("refusing to push recovery directly to main")
@@ -260,7 +306,22 @@ def run_protected_revert(
         _bind_expected_base(github, merge_sha)
         revert_merge_sha = github.merge_exact(pr_number, expected_head=revert_head)
         if _FULL_SHA.fullmatch(revert_merge_sha) is None:
-            raise RuntimeError("protected revert merge SHA is invalid")
+            raise ProtectedRevertError("protected revert merge SHA is invalid")
+        _run_required(runner, ["git", "fetch", origin, "main"], cwd=repo)
+        restored_main = _run_required(
+            runner, ["git", "rev-parse", f"{origin}/main"], cwd=repo
+        )
+        if restored_main != revert_merge_sha:
+            raise ProtectedRevertError("fork main changed after protected revert")
+        restored_tree = _run_required(
+            runner,
+            ["git", "rev-parse", f"{revert_merge_sha}^{{tree}}"],
+            cwd=repo,
+        )
+        if restored_tree != previous_tree:
+            raise ProtectedRevertError("protected revert merge tree is not restored")
+        if not verify_runtime_fn(deployment.previous_sha):
+            raise ProtectedRevertError("installed runtime health is not restored")
         return ProtectedRevertResult(
             state=ProtectedRevertState.REVERTED,
             previous_sha=deployment.previous_sha,
@@ -268,10 +329,32 @@ def run_protected_revert(
             revert_head_sha=revert_head,
             revert_merge_sha=revert_merge_sha,
         )
-    except Exception as exc:
+    except (ExactHeadPollError, ProtectedRevertError) as exc:
         return ProtectedRevertResult(
             state=ProtectedRevertState.NEEDS_OLE,
             previous_sha=deployment.previous_sha,
             installed_sha=deployment.previous_sha,
             reason=str(exc),
+        )
+    except SyncGitHubError:
+        return ProtectedRevertResult(
+            state=ProtectedRevertState.NEEDS_OLE,
+            previous_sha=deployment.previous_sha,
+            installed_sha=deployment.previous_sha,
+            reason="protected GitHub recovery evidence is invalid",
+        )
+    except ValueError:
+        return ProtectedRevertResult(
+            state=ProtectedRevertState.NEEDS_OLE,
+            previous_sha=deployment.previous_sha,
+            installed_sha=deployment.previous_sha,
+            reason="protected recovery evidence is invalid",
+        )
+    except Exception as exc:
+        _log_unexpected(exc)
+        return ProtectedRevertResult(
+            state=ProtectedRevertState.NEEDS_OLE,
+            previous_sha=deployment.previous_sha,
+            installed_sha=deployment.previous_sha,
+            reason="unexpected protected recovery failure",
         )

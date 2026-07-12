@@ -23,6 +23,7 @@ from ops.cloudadvisor.hermes_ops.sync_receipt import (
     write_sync_receipt,
 )
 from ops.cloudadvisor.hermes_ops.sync_review import ConflictReviewReceipt
+from ops.cloudadvisor.hermes_ops.sync_resolution import freeze_resolution_record
 
 
 REPO = "Oplink76/hermes-agent"
@@ -78,6 +79,7 @@ def green_review(**overrides: object) -> ConflictReviewReceipt:
         "verdict": "green",
         "findings": (),
         "reviewed_at": "2026-07-12T16:00:00Z",
+        "resolution_record_sha256": "d" * 64,
     }
     values.update(overrides)
     return ConflictReviewReceipt(**values)
@@ -135,6 +137,41 @@ def test_minor_candidate_requires_exact_green_independent_review():
 
     assert receipt.eligible is True
     assert receipt.review == green_review()
+
+
+def test_minor_receipt_load_requires_bound_immutable_resolution_artifact(
+    tmp_path: Path,
+):
+    evidence_dir = tmp_path / ".git" / "hermes-sync-evidence"
+    evidence_dir.mkdir(parents=True)
+    raw = evidence_dir / "resolution.json"
+    raw.write_text(
+        '{"conflicts":[{"path":"gateway/run.py",'
+        '"decision":"preserve behavior"}]}',
+        encoding="utf-8",
+    )
+    minor = clean_candidate(
+        classification=SyncClassification.MINOR_RESOLVED,
+        conflicted_files=("gateway/run.py",),
+        resolution_record=raw,
+        resolution_evidence_dir=evidence_dir,
+    )
+    resolution = freeze_resolution_record(tmp_path, minor)
+    review = green_review(resolution_record_sha256=resolution.sha256)
+    receipt = write_sync_receipt(
+        tmp_path,
+        minor,
+        green_pr(),
+        repo_slug=REPO,
+        conflict_review=review,
+    )
+    assert SyncEligibilityReceipt.load(receipt.path).review == review
+
+    resolution.path.chmod(0o600)
+    resolution.path.write_text("{}", encoding="utf-8")
+    resolution.path.chmod(0o400)
+    with pytest.raises(SyncReceiptError, match="resolution artifact"):
+        SyncEligibilityReceipt.load(receipt.path)
 
 
 @pytest.mark.parametrize(

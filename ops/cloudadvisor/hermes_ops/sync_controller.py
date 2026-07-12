@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import math
+import logging
 import time
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable
 
 from .command import CommandRunner
-from .deploy import DeployConfig, DeploymentRecord
+from .deploy import DeployConfig, DeploymentRecord, PreflightError
 from .locking import try_exclusive_file_lock
 from .sync import (
     ConflictResolver,
@@ -21,11 +21,15 @@ from .sync import (
     prepare_candidate,
 )
 from .sync_github import SyncGitHubPort, SyncPullRequestEvidence
+from .sync_github import SyncGitHubError
 from .sync_receipt import (
     SyncReceiptArtifact,
+    SyncReceiptError,
     finalize_sync_receipt,
     write_sync_receipt,
 )
+from .sync_poll import ExactHeadExpectation, ExactHeadPollError, poll_exact_head
+from .sync_resolution import ResolutionRecordError, freeze_resolution_record
 from .sync_recovery import (
     ProtectedRevertGitHubPort,
     ProtectedRevertState,
@@ -33,6 +37,7 @@ from .sync_recovery import (
     run_protected_revert,
 )
 from .sync_review import (
+    ConflictReviewError,
     ConflictReviewReceipt,
     IndependentConflictReviewer,
     validate_conflict_review,
@@ -45,6 +50,7 @@ class AutonomousSyncState(str, Enum):
     ROLLED_BACK_REVERTED = "ROLLED_BACK_REVERTED"
     NEEDS_OLE = "NEEDS_OLE"
     LOCKED = "LOCKED"
+    REFRESH_REQUIRED = "REFRESH_REQUIRED"
 
 
 @dataclass(frozen=True)
@@ -87,6 +93,14 @@ class AutonomousSyncResult:
             reason=reason,
         )
 
+    @classmethod
+    def refresh_required(cls, candidate: SyncResult) -> "AutonomousSyncResult":
+        return cls(
+            state=AutonomousSyncState.REFRESH_REQUIRED,
+            candidate_sha=candidate.candidate_sha,
+            reason="official upstream changed; candidate refresh required",
+        )
+
 
 @dataclass(frozen=True)
 class AutonomousSyncConfig:
@@ -121,6 +135,17 @@ class AutonomousSyncConfig:
 
 class AutonomousSyncError(RuntimeError):
     """An exact evidence gate could not authorize further mutation."""
+
+
+logger = logging.getLogger(__name__)
+
+
+def _log_unexpected(message: str, error: Exception) -> None:
+    sanitized = RuntimeError("redacted unexpected failure")
+    logger.error(
+        message,
+        exc_info=(type(sanitized), sanitized, error.__traceback__),
+    )
 
 
 def require_conflict_review(
@@ -172,39 +197,45 @@ def wait_for_green_exact_head(
         raise AutonomousSyncError("candidate PR number is missing")
     if not candidate.base_sha or not candidate.candidate_sha:
         raise AutonomousSyncError("candidate exact SHA evidence is incomplete")
-    deadline = clock() + timeout_seconds
-    max_polls = math.ceil(timeout_seconds / poll_interval_seconds) + 1
-    transient_failures = 0
-    for poll in range(max_polls):
-        try:
-            evidence = github.evidence(candidate.pr_number)
-        except Exception as exc:
-            transient_failures += 1
-            if transient_failures > 1:
-                raise AutonomousSyncError(
-                    f"GitHub evidence failed repeatedly: {exc}"
-                ) from exc
-            sleeper(poll_interval_seconds)
-            continue
-        if evidence.number != candidate.pr_number:
-            raise AutonomousSyncError("pull request number changed")
-        if evidence.state != "open":
-            raise AutonomousSyncError("pull request is not open")
-        if evidence.base_sha != candidate.base_sha:
-            raise AutonomousSyncError("pull request base changed")
-        if evidence.head_sha != candidate.candidate_sha:
-            raise AutonomousSyncError("pull request head changed")
-        if evidence.required_check != required_check:
-            raise AutonomousSyncError("required check identity changed")
-        conclusion = evidence.required_check_conclusion.lower()
-        if conclusion == "success":
-            return evidence
-        if conclusion not in {"pending", "queued", "in_progress"}:
-            raise AutonomousSyncError("required check is not green")
-        if clock() >= deadline or poll + 1 == max_polls:
-            raise AutonomousSyncError("required check timed out")
-        sleeper(poll_interval_seconds)
-    raise AutonomousSyncError("required check timed out")
+    try:
+        return poll_exact_head(
+            github,
+            ExactHeadExpectation(
+                candidate.pr_number,
+                candidate.base_sha,
+                candidate.candidate_sha,
+                required_check,
+            ),
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            clock=clock,
+            sleeper=sleeper,
+        )
+    except ExactHeadPollError as exc:
+        raise AutonomousSyncError(str(exc)) from exc
+
+
+def _upstream_is_current(
+    config: AutonomousSyncConfig,
+    candidate: SyncResult,
+    runner: CommandRunner,
+) -> bool:
+    fetched = runner.run(
+        ["git", "fetch", config.sync.upstream, "main"],
+        cwd=config.sync.repo,
+        timeout=600,
+    )
+    if fetched.returncode != 0:
+        raise AutonomousSyncError("official upstream refresh failed")
+    resolved = runner.run(
+        ["git", "rev-parse", f"{config.sync.upstream}/main"],
+        cwd=config.sync.repo,
+        timeout=300,
+    )
+    current = (resolved.stdout or "").strip()
+    if resolved.returncode != 0 or not current:
+        raise AutonomousSyncError("official upstream identity is unavailable")
+    return current == candidate.upstream_sha
 
 
 def attest_candidate(
@@ -238,6 +269,7 @@ def finish_or_recover(
     github: ProtectedRevertGitHubPort,
     clock: Callable[[], float],
     sleeper: Callable[[float], None],
+    verify_runtime_fn: Callable[[str], bool],
 ) -> AutonomousSyncResult:
     if deployment.status == "deployed":
         if deployment.requested_sha != merge_sha:
@@ -269,6 +301,7 @@ def finish_or_recover(
         sleeper=sleeper,
         timeout_seconds=config.check_timeout_seconds,
         poll_interval_seconds=config.poll_interval_seconds,
+        verify_runtime_fn=verify_runtime_fn,
     )
     if recovery.state is ProtectedRevertState.REVERTED:
         return AutonomousSyncResult(
@@ -295,6 +328,7 @@ def run_autonomous_sync(
     resolver: ConflictResolver | None,
     reviewer: IndependentConflictReviewer | None,
     deploy_fn: Callable[[Path, str, int], DeploymentRecord],
+    verify_runtime_fn: Callable[[str], bool] | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> AutonomousSyncResult:
@@ -319,11 +353,19 @@ def run_autonomous_sync(
                 )
             if is_quarantined(config.quarantine_root, candidate):
                 raise AutonomousSyncError("unchanged failed candidate is quarantined")
+            review_candidate = candidate
+            if candidate.classification is SyncClassification.MINOR_REVIEW_REQUIRED:
+                resolution_artifact = freeze_resolution_record(
+                    config.receipt_root, candidate
+                )
+                review_candidate = replace(
+                    candidate, resolution_record=resolution_artifact.path
+                )
             reviewed, conflict_review = require_conflict_review(
-                candidate,
+                review_candidate,
                 reviewer=reviewer,
                 worktree=config.sync.worktree,
-                resolution_record=candidate.resolution_record
+                resolution_record=review_candidate.resolution_record
                 or config.resolution_record,
                 resolver_backend=config.resolver_backend,
             )
@@ -342,12 +384,18 @@ def run_autonomous_sync(
                 evidence,
                 conflict_review=conflict_review,
             )
+            if not _upstream_is_current(config, reviewed, runner):
+                return AutonomousSyncResult.refresh_required(reviewed)
             _bind_expected_base(github, evidence.base_sha)
             merge_sha = github.merge_exact(
                 evidence.number, expected_head=reviewed.candidate_sha
             )
             final_receipt = finalize_sync_receipt(receipt.path, merge_sha=merge_sha)
             deployment = deploy_fn(final_receipt.path, merge_sha, evidence.number)
+            if deployment.status != "deployed" and verify_runtime_fn is None:
+                raise AutonomousSyncError(
+                    "runtime health verifier is unavailable for recovery"
+                )
             return finish_or_recover(
                 config,
                 reviewed,
@@ -357,10 +405,50 @@ def run_autonomous_sync(
                 github=github,
                 clock=clock,
                 sleeper=sleeper,
+                verify_runtime_fn=verify_runtime_fn or (lambda sha: False),
             )
-        except Exception as exc:
+        except (
+            AutonomousSyncError,
+        ) as exc:
             return AutonomousSyncResult.needs_human(
                 str(exc),
+                candidate_sha=candidate.candidate_sha if candidate else None,
+                merge_sha=merge_sha,
+            )
+        except ConflictReviewError:
+            return AutonomousSyncResult.needs_human(
+                "conflict review evidence is invalid",
+                candidate_sha=candidate.candidate_sha if candidate else None,
+                merge_sha=merge_sha,
+            )
+        except ResolutionRecordError:
+            return AutonomousSyncResult.needs_human(
+                "conflict resolution evidence is invalid",
+                candidate_sha=candidate.candidate_sha if candidate else None,
+                merge_sha=merge_sha,
+            )
+        except SyncReceiptError:
+            return AutonomousSyncResult.needs_human(
+                "sync eligibility evidence is invalid",
+                candidate_sha=candidate.candidate_sha if candidate else None,
+                merge_sha=merge_sha,
+            )
+        except SyncGitHubError:
+            return AutonomousSyncResult.needs_human(
+                "protected GitHub evidence is invalid",
+                candidate_sha=candidate.candidate_sha if candidate else None,
+                merge_sha=merge_sha,
+            )
+        except PreflightError:
+            return AutonomousSyncResult.needs_human(
+                "automated deployment authority failed",
+                candidate_sha=candidate.candidate_sha if candidate else None,
+                merge_sha=merge_sha,
+            )
+        except Exception as exc:
+            _log_unexpected("Autonomous sync failed unexpectedly", exc)
+            return AutonomousSyncResult.needs_human(
+                "unexpected autonomous sync failure",
                 candidate_sha=candidate.candidate_sha if candidate else None,
                 merge_sha=merge_sha,
             )
