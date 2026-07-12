@@ -57,14 +57,15 @@ different fingerprint emits a new decision, and a terminal healthy cycle clears
 the active fingerprint. Major or unresolved conflicts, ambiguous authority, and
 failed rollback/revert are the paths that require Ole.
 
-The `sync-auto` publisher writes the canonical, secret-free status atomically to
-the configured `sync.status_file` after every controller outcome. Active
-escalation fingerprints are stored separately
-in `sync.notification_store`; neither file contains raw command output. The
-dashboard keeps `behind` (and additive `fork_behind`) as installed-versus-fork,
-while `upstream_behind`, `sync_state`, and `sync_pr_number` report official
-upstream progress independently. Therefore an installed runtime can be current
-with fork `main` while official upstream commits are still syncing.
+The `sync-auto` controller writes the canonical, secret-free status atomically
+to the configured `sync.status_file` before releasing its exclusive sync lock.
+It transitions the active escalation fingerprint in `sync.notification_store`
+under the same lock. A contending `LOCKED` run does not write or clear either
+file. Neither file contains raw command output. The dashboard keeps `behind`
+(and additive `fork_behind`) as installed-versus-fork, while `upstream_behind`,
+`sync_state`, and `sync_pr_number` report official upstream progress
+independently. Therefore an installed runtime can be current with fork `main`
+while official upstream commits are still syncing.
 
 Task 8 activates the live 06:00/18:00 script only after the bootstrap release is
 deployed. This document describes the intended schedule; this task does not

@@ -87,6 +87,7 @@ class AutonomousSyncResult:
     fork_main_sha: str | None = None
     installed_sha: str | None = None
     needs_ole: bool = False
+    notify_ole: bool = False
     reason: str | None = None
 
     @classmethod
@@ -179,6 +180,12 @@ class AutonomousSyncConfig:
 
 class AutonomousSyncError(RuntimeError):
     """An exact evidence gate could not authorize further mutation."""
+
+
+class _OutcomePublicationError(RuntimeError):
+    def __init__(self, cause: Exception):
+        super().__init__("autonomous sync outcome publication failed")
+        self.cause = cause
 
 
 logger = logging.getLogger(__name__)
@@ -684,6 +691,7 @@ def run_autonomous_sync(
     remediator: SyncRemediationPort | None = None,
     deploy_fn: Callable[[Path, str, int], DeploymentRecord],
     verify_runtime_fn: Callable[[str], bool] | None = None,
+    publish_outcome: Callable[[AutonomousSyncResult], bool] | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> AutonomousSyncResult:
@@ -691,6 +699,16 @@ def run_autonomous_sync(
     with try_exclusive_file_lock(config.sync.lock_path) as acquired:
         if not acquired:
             return AutonomousSyncResult.locked()
+
+        def finish(result: AutonomousSyncResult) -> AutonomousSyncResult:
+            if publish_outcome is None:
+                return result
+            try:
+                notify_ole = bool(publish_outcome(result))
+            except Exception as exc:
+                raise _OutcomePublicationError(exc) from exc
+            return replace(result, notify_ole=notify_ole)
+
         candidate: SyncResult | None = None
         merge_sha: str | None = None
         infrastructure_retry_used = False
@@ -824,7 +842,7 @@ def run_autonomous_sync(
                     resolver=resolver,
                 )
                 if candidate.state is SyncState.NO_CHANGE:
-                    return AutonomousSyncResult.no_change(candidate)
+                    return finish(AutonomousSyncResult.no_change(candidate))
             while True:
                 if candidate.state is not SyncState.PR_UPDATED:
                     raise AutonomousSyncError(
@@ -854,12 +872,14 @@ def run_autonomous_sync(
                 except RequiredCheckRedError as first_red:
                     conclusion = first_red.evidence.required_check_conclusion
                     if conclusion != "failure":
-                        return AutonomousSyncResult.pending(
-                            reviewed,
-                            reason=(
-                                "exact required check ended "
-                                f"{conclusion}; awaiting a new exact run"
-                            ),
+                        return finish(
+                            AutonomousSyncResult.pending(
+                                reviewed,
+                                reason=(
+                                    "exact required check ended "
+                                    f"{conclusion}; awaiting a new exact run"
+                                ),
+                            )
                         )
                     if remediator is None:
                         raise AutonomousSyncError(str(first_red)) from first_red
@@ -924,12 +944,16 @@ def run_autonomous_sync(
                         )
                         reconstruction_checkpoint = pending
                         reconstruction_checkpoint_sha = pending_artifact.sha256
-                        return AutonomousSyncResult.pending(
-                            reviewed,
-                            reason=reason,
+                        return finish(
+                            AutonomousSyncResult.pending(
+                                reviewed,
+                                reason=reason,
+                            )
                         )
                     if upstream_refreshes >= config.max_upstream_refreshes:
-                        return AutonomousSyncResult.refresh_required(reviewed)
+                        return finish(
+                            AutonomousSyncResult.refresh_required(reviewed)
+                        )
                     upstream_refreshes += 1
                     previous_head = candidate.candidate_sha
                     candidate = prepare_candidate(
@@ -939,7 +963,7 @@ def run_autonomous_sync(
                         resolver=resolver,
                     )
                     if candidate.state is SyncState.NO_CHANGE:
-                        return AutonomousSyncResult.no_change(candidate)
+                        return finish(AutonomousSyncResult.no_change(candidate))
                     if candidate.candidate_sha != previous_head:
                         infrastructure_retry_used = False
                         candidate_repair_used = False
@@ -979,7 +1003,7 @@ def run_autonomous_sync(
                             config.receipt_root,
                             sha256=reconstruction_checkpoint_sha,
                         )
-                    return outcome
+                    return finish(outcome)
                 if not outcome.fork_main_sha:
                     raise AutonomousSyncError(
                         "protected rollback did not report reconstructed base"
@@ -1024,12 +1048,14 @@ def run_autonomous_sync(
                 )
                 reconstruction_checkpoint_sha = pending_artifact.sha256
                 if candidate_repair_used or remediator is None:
-                    return AutonomousSyncResult.needs_human(
-                        "protected rollback completed; bounded repair is exhausted",
-                        candidate_sha=reviewed.candidate_sha,
-                        pr_number=reviewed.pr_number,
-                        merge_sha=merge_sha,
-                        installed_sha=outcome.installed_sha,
+                    return finish(
+                        AutonomousSyncResult.needs_human(
+                            "protected rollback completed; bounded repair is exhausted",
+                            candidate_sha=reviewed.candidate_sha,
+                            pr_number=reviewed.pr_number,
+                            merge_sha=merge_sha,
+                            installed_sha=outcome.installed_sha,
+                        )
                     )
                 current_upstream = _refresh_current_upstream_sha(config, runner)
                 if current_upstream != reconstruction_checkpoint.target_upstream_sha:
@@ -1091,76 +1117,98 @@ def run_autonomous_sync(
                 )
                 reconstruction_checkpoint_sha = pending_artifact.sha256
                 post_rollback_repair = True
+        except _OutcomePublicationError as exc:
+            raise exc.cause
         except (
             AutonomousSyncError,
         ) as exc:
-            return AutonomousSyncResult.needs_human(
-                str(exc),
-                candidate_sha=candidate.candidate_sha if candidate else None,
-                pr_number=candidate.pr_number if candidate else None,
-                merge_sha=merge_sha,
+            return finish(
+                AutonomousSyncResult.needs_human(
+                    str(exc),
+                    candidate_sha=candidate.candidate_sha if candidate else None,
+                    pr_number=candidate.pr_number if candidate else None,
+                    merge_sha=merge_sha,
+                )
             )
         except ConflictReviewError:
-            return AutonomousSyncResult.needs_human(
-                "conflict review evidence is invalid",
-                candidate_sha=candidate.candidate_sha if candidate else None,
-                pr_number=candidate.pr_number if candidate else None,
-                merge_sha=merge_sha,
+            return finish(
+                AutonomousSyncResult.needs_human(
+                    "conflict review evidence is invalid",
+                    candidate_sha=candidate.candidate_sha if candidate else None,
+                    pr_number=candidate.pr_number if candidate else None,
+                    merge_sha=merge_sha,
+                )
             )
         except ResolutionRecordError:
-            return AutonomousSyncResult.needs_human(
-                "conflict resolution evidence is invalid",
-                candidate_sha=candidate.candidate_sha if candidate else None,
-                pr_number=candidate.pr_number if candidate else None,
-                merge_sha=merge_sha,
+            return finish(
+                AutonomousSyncResult.needs_human(
+                    "conflict resolution evidence is invalid",
+                    candidate_sha=candidate.candidate_sha if candidate else None,
+                    pr_number=candidate.pr_number if candidate else None,
+                    merge_sha=merge_sha,
+                )
             )
         except SyncReceiptError:
-            return AutonomousSyncResult.needs_human(
-                "sync eligibility evidence is invalid",
-                candidate_sha=candidate.candidate_sha if candidate else None,
-                pr_number=candidate.pr_number if candidate else None,
-                merge_sha=merge_sha,
+            return finish(
+                AutonomousSyncResult.needs_human(
+                    "sync eligibility evidence is invalid",
+                    candidate_sha=candidate.candidate_sha if candidate else None,
+                    pr_number=candidate.pr_number if candidate else None,
+                    merge_sha=merge_sha,
+                )
             )
         except SyncGitHubError:
-            return AutonomousSyncResult.needs_human(
-                "protected GitHub evidence is invalid",
-                candidate_sha=candidate.candidate_sha if candidate else None,
-                pr_number=candidate.pr_number if candidate else None,
-                merge_sha=merge_sha,
+            return finish(
+                AutonomousSyncResult.needs_human(
+                    "protected GitHub evidence is invalid",
+                    candidate_sha=candidate.candidate_sha if candidate else None,
+                    pr_number=candidate.pr_number if candidate else None,
+                    merge_sha=merge_sha,
+                )
             )
         except PreflightError:
-            return AutonomousSyncResult.needs_human(
-                "automated deployment authority failed",
-                candidate_sha=candidate.candidate_sha if candidate else None,
-                pr_number=candidate.pr_number if candidate else None,
-                merge_sha=merge_sha,
+            return finish(
+                AutonomousSyncResult.needs_human(
+                    "automated deployment authority failed",
+                    candidate_sha=candidate.candidate_sha if candidate else None,
+                    pr_number=candidate.pr_number if candidate else None,
+                    merge_sha=merge_sha,
+                )
             )
         except SyncRemediationError:
-            return AutonomousSyncResult.needs_human(
-                "bounded sync remediation failed",
-                candidate_sha=candidate.candidate_sha if candidate else None,
-                pr_number=candidate.pr_number if candidate else None,
-                merge_sha=merge_sha,
+            return finish(
+                AutonomousSyncResult.needs_human(
+                    "bounded sync remediation failed",
+                    candidate_sha=candidate.candidate_sha if candidate else None,
+                    pr_number=candidate.pr_number if candidate else None,
+                    merge_sha=merge_sha,
+                )
             )
         except ReconstructionError:
-            return AutonomousSyncResult.needs_human(
-                "post-rollback candidate reconstruction failed",
-                candidate_sha=candidate.candidate_sha if candidate else None,
-                pr_number=candidate.pr_number if candidate else None,
-                merge_sha=merge_sha,
+            return finish(
+                AutonomousSyncResult.needs_human(
+                    "post-rollback candidate reconstruction failed",
+                    candidate_sha=candidate.candidate_sha if candidate else None,
+                    pr_number=candidate.pr_number if candidate else None,
+                    merge_sha=merge_sha,
+                )
             )
         except ReconstructionCheckpointError:
-            return AutonomousSyncResult.needs_human(
-                "pending reconstruction evidence is invalid",
-                candidate_sha=candidate.candidate_sha if candidate else None,
-                pr_number=candidate.pr_number if candidate else None,
-                merge_sha=merge_sha,
+            return finish(
+                AutonomousSyncResult.needs_human(
+                    "pending reconstruction evidence is invalid",
+                    candidate_sha=candidate.candidate_sha if candidate else None,
+                    pr_number=candidate.pr_number if candidate else None,
+                    merge_sha=merge_sha,
+                )
             )
         except Exception as exc:
             _log_unexpected("Autonomous sync failed unexpectedly", exc)
-            return AutonomousSyncResult.needs_human(
-                "unexpected autonomous sync failure",
-                candidate_sha=candidate.candidate_sha if candidate else None,
-                pr_number=candidate.pr_number if candidate else None,
-                merge_sha=merge_sha,
+            return finish(
+                AutonomousSyncResult.needs_human(
+                    "unexpected autonomous sync failure",
+                    candidate_sha=candidate.candidate_sha if candidate else None,
+                    pr_number=candidate.pr_number if candidate else None,
+                    merge_sha=merge_sha,
+                )
             )

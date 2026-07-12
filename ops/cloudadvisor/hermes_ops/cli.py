@@ -390,8 +390,7 @@ def _health_payload(expected_sha: str, report) -> dict[str, object]:
 def _autonomous_sync_payload(
     result: AutonomousSyncResult,
     *,
-    status: SyncStatus,
-    notify_ole: bool,
+    status: SyncStatus | None,
 ) -> dict[str, object]:
     return {
         "state": result.state.value,
@@ -399,15 +398,15 @@ def _autonomous_sync_payload(
         "pr_number": result.pr_number,
         "merge_sha": result.merge_sha,
         "deployed_sha": result.deployed_sha,
-        "fork_main_sha": status.fork_main_sha,
-        "installed_sha": status.installed_sha,
+        "fork_main_sha": status.fork_main_sha if status else result.fork_main_sha,
+        "installed_sha": status.installed_sha if status else result.installed_sha,
         "needs_ole": result.needs_ole,
         "reason": result.reason,
-        "checked_at": status.checked_at,
-        "upstream_behind": status.upstream_behind,
-        "fork_behind": status.fork_behind,
-        "sync_required_check": status.required_check,
-        "notify_ole": notify_ole,
+        "checked_at": status.checked_at if status else None,
+        "upstream_behind": status.upstream_behind if status else None,
+        "fork_behind": status.fork_behind if status else None,
+        "sync_required_check": status.required_check if status else None,
+        "notify_ole": result.notify_ole,
     }
 
 
@@ -612,6 +611,19 @@ def main(argv: list[str] | None = None) -> int:
             sync_config.repo,
             required_check=policy.required_check,
         )
+        published_status: SyncStatus | None = None
+
+        def publish_outcome(outcome: AutonomousSyncResult) -> bool:
+            nonlocal published_status
+            published_status, notify_ole = _publish_sync_outcome(
+                outcome,
+                sync_config=sync_config,
+                policy=policy,
+                operations=operations,
+                runner=runner,
+            )
+            return notify_ole
+
         result = run_autonomous_sync(
             AutonomousSyncConfig(
                 sync=sync_config,
@@ -631,20 +643,13 @@ def main(argv: list[str] | None = None) -> int:
             ),
             deploy_fn=_sync_deploy_fn(operations, runner),
             verify_runtime_fn=_sync_runtime_verify_fn(operations, runner),
-        )
-        status, notify_ole = _publish_sync_outcome(
-            result,
-            sync_config=sync_config,
-            policy=policy,
-            operations=operations,
-            runner=runner,
+            publish_outcome=publish_outcome,
         )
         print(
             json.dumps(
                 _autonomous_sync_payload(
                     result,
-                    status=status,
-                    notify_ole=notify_ole,
+                    status=published_status,
                 ),
                 indent=2,
                 sort_keys=True,

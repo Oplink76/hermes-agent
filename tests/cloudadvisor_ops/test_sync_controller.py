@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import logging
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1605,6 +1606,131 @@ def test_lock_contention_returns_locked(tmp_path: Path):
             deploy_fn=lambda *args: deployed_record(),
         )
     assert result.state is AutonomousSyncState.LOCKED
+
+
+def test_outcome_is_published_before_sync_lock_is_released(
+    tmp_path: Path, monkeypatch
+):
+    cfg = config(tmp_path)
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: candidate(state=SyncState.NO_CHANGE),
+    )
+    reacquired: list[bool] = []
+
+    def publish_outcome(result: AutonomousSyncResult) -> bool:
+        with try_exclusive_file_lock(cfg.sync.lock_path) as acquired:
+            reacquired.append(acquired)
+        return True
+
+    result = run_autonomous_sync(
+        cfg,
+        runner=Runner(),
+        github=GitHub([evidence()]),
+        resolver=None,
+        reviewer=None,
+        deploy_fn=lambda *args: deployed_record(),
+        publish_outcome=publish_outcome,
+    )
+
+    assert reacquired == [False]
+    assert result.notify_ole is True
+
+
+def test_outcome_publication_failure_is_not_retried_or_reclassified(
+    tmp_path: Path, monkeypatch
+):
+    cfg = config(tmp_path)
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: candidate(state=SyncState.NO_CHANGE),
+    )
+    publication_calls = 0
+
+    def failed_publication(result: AutonomousSyncResult) -> bool:
+        nonlocal publication_calls
+        publication_calls += 1
+        raise RuntimeError("status publication failed")
+
+    with pytest.raises(RuntimeError, match="status publication failed"):
+        run_autonomous_sync(
+            cfg,
+            runner=Runner(),
+            github=GitHub([evidence()]),
+            resolver=None,
+            reviewer=None,
+            deploy_fn=lambda *args: deployed_record(),
+            publish_outcome=failed_publication,
+        )
+
+    assert publication_calls == 1
+
+
+def test_contending_run_cannot_overtake_blocked_outcome_publication(
+    tmp_path: Path, monkeypatch
+):
+    cfg = config(tmp_path)
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: candidate(state=SyncState.NO_CHANGE),
+    )
+    publisher_entered = threading.Event()
+    release_publisher = threading.Event()
+    publications: list[str] = []
+    first_result: list[AutonomousSyncResult] = []
+
+    def blocked_publisher(result: AutonomousSyncResult) -> bool:
+        publisher_entered.set()
+        assert release_publisher.wait(timeout=5)
+        publications.append("first")
+        return False
+
+    def first_run() -> None:
+        first_result.append(
+            run_autonomous_sync(
+                cfg,
+                runner=Runner(),
+                github=GitHub([evidence()]),
+                resolver=None,
+                reviewer=None,
+                deploy_fn=lambda *args: deployed_record(),
+                publish_outcome=blocked_publisher,
+            )
+        )
+
+    thread = threading.Thread(target=first_run)
+    thread.start()
+    assert publisher_entered.wait(timeout=5)
+
+    second = run_autonomous_sync(
+        cfg,
+        runner=Runner(),
+        github=GitHub([evidence()]),
+        resolver=None,
+        reviewer=None,
+        deploy_fn=lambda *args: deployed_record(),
+        publish_outcome=lambda result: publications.append("second") or False,
+    )
+
+    assert second.state is AutonomousSyncState.LOCKED
+    assert publications == []
+    release_publisher.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert first_result[0].state is AutonomousSyncState.NO_CHANGE
+
+    third = run_autonomous_sync(
+        cfg,
+        runner=Runner(),
+        github=GitHub([evidence()]),
+        resolver=None,
+        reviewer=None,
+        deploy_fn=lambda *args: deployed_record(),
+        publish_outcome=lambda result: publications.append("third") or False,
+    )
+
+    assert third.state is AutonomousSyncState.NO_CHANGE
+    assert publications == ["first", "third"]
 
 
 def test_unexpected_failure_is_logged_without_secret_terminal_or_log_leak(

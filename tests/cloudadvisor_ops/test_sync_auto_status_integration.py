@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -140,9 +141,14 @@ def test_sync_auto_publishes_status_api_and_deduplicated_alert_decision(
     monkeypatch.setattr(cli, "_sync_remediator", lambda *args, **kwargs: object())
     monkeypatch.setattr(cli, "_sync_deploy_fn", lambda *args: lambda *ignored: object())
     monkeypatch.setattr(cli, "_sync_runtime_verify_fn", lambda *args: lambda sha: True)
-    monkeypatch.setattr(
-        cli, "run_autonomous_sync", lambda *args, **kwargs: next(outcomes)
-    )
+    def run_with_publication(*args, **kwargs):
+        result = next(outcomes)
+        if result.state is AutonomousSyncState.LOCKED:
+            return result
+        notify_ole = kwargs["publish_outcome"](result)
+        return replace(result, notify_ole=notify_ole)
+
+    monkeypatch.setattr(cli, "run_autonomous_sync", run_with_publication)
 
     assert cli.main(["sync-auto", "--config", str(config)]) == 2
     first = json.loads(capsys.readouterr().out)
@@ -176,8 +182,14 @@ def test_sync_auto_publishes_status_api_and_deduplicated_alert_decision(
     assert api["sync_state"] == "NEEDS_OLE"
     assert api["message"].endswith("needs attention")
 
+    status_before_locked = (tmp_path / "sync-status.json").read_bytes()
+    notifications_before_locked = (tmp_path / "notifications.json").read_bytes()
     assert cli.main(["sync-auto", "--config", str(config)]) == 75
     assert json.loads(capsys.readouterr().out)["notify_ole"] is False
+    assert (tmp_path / "sync-status.json").read_bytes() == status_before_locked
+    assert (
+        tmp_path / "notifications.json"
+    ).read_bytes() == notifications_before_locked
     assert cli.main(["sync-auto", "--config", str(config)]) == 2
     assert json.loads(capsys.readouterr().out)["notify_ole"] is False
     assert cli.main(["sync-auto", "--config", str(config)]) == 0
