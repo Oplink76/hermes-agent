@@ -30,6 +30,7 @@ def candidate(record: Path, evidence_dir: Path) -> SyncResult:
         conflicted_files=("gateway/run.py",),
         resolution_record=record,
         resolution_evidence_dir=evidence_dir,
+        resolution_strategy="preserve_fork_behavior",
     )
 
 
@@ -44,7 +45,8 @@ def raw_record(evidence_dir: Path) -> Path:
                         "path": "gateway/run.py",
                         "decision": "preserve fork behavior",
                     }
-                ]
+                ],
+                "strategy": "preserve_fork_behavior",
             }
         ),
         encoding="utf-8",

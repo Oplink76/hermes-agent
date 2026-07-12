@@ -147,7 +147,8 @@ def test_minor_receipt_load_requires_bound_immutable_resolution_artifact(
     raw = evidence_dir / "resolution.json"
     raw.write_text(
         '{"conflicts":[{"path":"gateway/run.py",'
-        '"decision":"preserve behavior"}]}',
+        '"decision":"preserve behavior"}],'
+        '"strategy":"preserve_fork_behavior"}',
         encoding="utf-8",
     )
     minor = clean_candidate(
@@ -155,6 +156,7 @@ def test_minor_receipt_load_requires_bound_immutable_resolution_artifact(
         conflicted_files=("gateway/run.py",),
         resolution_record=raw,
         resolution_evidence_dir=evidence_dir,
+        resolution_strategy="preserve_fork_behavior",
     )
     resolution = freeze_resolution_record(tmp_path, minor)
     review = green_review(resolution_record_sha256=resolution.sha256)

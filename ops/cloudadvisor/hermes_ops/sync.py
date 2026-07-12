@@ -43,6 +43,11 @@ class SyncClassification(str, Enum):
     MAJOR = "major"
 
 
+class ConflictResolutionStrategy(str, Enum):
+    PRESERVE_FORK = "preserve_fork_behavior"
+    UPSTREAM_COMPATIBILITY = "upstream_first_compatibility"
+
+
 @dataclass(frozen=True)
 class SyncConfig:
     repo: Path
@@ -86,6 +91,7 @@ class SyncResult:
     conflicted_files: tuple[str, ...] = ()
     resolution_record: Path | None = None
     resolution_evidence_dir: Path | None = None
+    resolution_strategy: str | None = None
 
 
 class GitHubPullRequests(Protocol):
@@ -104,7 +110,13 @@ class GitHubPullRequests(Protocol):
 
 
 class ConflictResolver(Protocol):
-    def resolve(self, worktree: Path, runner: CommandRunner) -> bool: ...
+    def resolve(
+        self,
+        worktree: Path,
+        runner: CommandRunner,
+        *,
+        strategy: ConflictResolutionStrategy,
+    ) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -141,7 +153,13 @@ class CodexConflictResolver:
             self.prompt,
         )
 
-    def resolve(self, worktree: Path, runner: CommandRunner) -> bool:
+    def resolve(
+        self,
+        worktree: Path,
+        runner: CommandRunner,
+        *,
+        strategy: ConflictResolutionStrategy = ConflictResolutionStrategy.PRESERVE_FORK,
+    ) -> bool:
         git_common_dir = runner.run(
             [
                 "git",
@@ -190,10 +208,19 @@ class CodexConflictResolver:
         command[5:5] = ["--add-dir", str(common_dir_path)]
         command[-1] = (
             f"{self.prompt.rstrip()}\n\n"
-            "After resolving, write a JSON object to "
+            f"Resolution strategy: {strategy.value}. "
+            + (
+                "Preserve established fork behavior and safety invariants while "
+                "integrating upstream changes. "
+                if strategy is ConflictResolutionStrategy.PRESERVE_FORK
+                else "Start from upstream semantics and reapply only the minimal "
+                "compatibility required by documented fork safety invariants. "
+            )
+            + "After resolving, write a JSON object to "
             f"{resolution_record}. It must contain a non-empty `conflicts` array "
             "covering every conflicted file exactly once. Each row must contain "
-            "non-empty string fields `path` and `decision`. Do not commit or push."
+            "non-empty string fields `path` and `decision`, and the top-level "
+            f"`strategy` must equal `{strategy.value}`. Do not commit or push."
         )
         completed = runner.run(command, cwd=worktree, timeout=1800)
         if completed.returncode != 0:
@@ -206,6 +233,7 @@ class CodexConflictResolver:
             conflicts = payload["conflicts"]
             return bool(
                 isinstance(payload, dict)
+                and payload.get("strategy") == strategy.value
                 and isinstance(conflicts, list)
                 and conflicts
                 and all(
@@ -263,6 +291,7 @@ def _result(
     classification: SyncClassification = SyncClassification.MAJOR,
     resolution_record: Path | None = None,
     resolution_evidence_dir: Path | None = None,
+    resolution_strategy: str | None = None,
 ) -> SyncResult:
     return SyncResult(
         state=state,
@@ -279,6 +308,7 @@ def _result(
         classification=classification,
         resolution_record=resolution_record,
         resolution_evidence_dir=resolution_evidence_dir,
+        resolution_strategy=resolution_strategy,
     )
 
 
@@ -530,6 +560,7 @@ def prepare_candidate(
     conflicted_files: tuple[str, ...] = ()
     resolution_record: Path | None = None
     resolution_evidence_dir: Path | None = None
+    resolution_strategy: str | None = None
     if merged.returncode == 0:
         transitions.append(SyncState.MERGED_CLEAN)
         classification = SyncClassification.CLEAN
@@ -556,7 +587,7 @@ def prepare_candidate(
                 upstream_sha=upstream_sha,
                 risk="conflicted_files_unavailable",
             )
-        if resolver is None or not resolver.resolve(config.worktree, runner):
+        if resolver is None:
             transitions.append(SyncState.NEEDS_DECISION)
             return _result(
                 SyncState.NEEDS_DECISION,
@@ -564,61 +595,102 @@ def prepare_candidate(
                 base_sha=base_sha,
                 upstream_sha=upstream_sha,
                 conflicted_files=conflicted_files,
-                risk="conflict",
+                risk="conflict_resolver_unavailable",
             )
-        record_path = getattr(resolver, "resolution_record_path", None)
-        if callable(record_path):
-            resolution_record = Path(record_path(config.worktree))
-        evidence_directory = getattr(resolver, "resolution_evidence_directory", None)
-        if callable(evidence_directory):
-            resolution_evidence_dir = Path(evidence_directory(config.worktree))
-        unmerged = _run(runner, ["git", "ls-files", "-u"], config.worktree)
-        if unmerged.returncode != 0 or _output(unmerged):
-            transitions.append(SyncState.NEEDS_DECISION)
-            return _result(
-                SyncState.NEEDS_DECISION,
-                transitions,
-                base_sha=base_sha,
-                upstream_sha=upstream_sha,
-                conflicted_files=conflicted_files,
-                risk="conflict",
-            )
-        merge_head = _run(
-            runner,
-            ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
-            config.worktree,
+        resolved = False
+        strategies = (
+            ConflictResolutionStrategy.PRESERVE_FORK,
+            ConflictResolutionStrategy.UPSTREAM_COMPATIBILITY,
         )
-        if merge_head.returncode != 0 or _output(merge_head) != upstream_sha:
-            transitions.append(SyncState.NEEDS_DECISION)
-            return _result(
-                SyncState.NEEDS_DECISION,
-                transitions,
-                base_sha=base_sha,
-                upstream_sha=upstream_sha,
-                conflicted_files=conflicted_files,
-                risk="resolver_did_not_preserve_merge_state",
+        for attempt, strategy in enumerate(strategies):
+            if attempt:
+                _run(runner, ["git", "merge", "--abort"], config.worktree)
+                reset_attempt = _run(
+                    runner,
+                    ["git", "reset", "--hard", f"{config.origin}/main"],
+                    config.worktree,
+                )
+                clean_attempt = _run(
+                    runner, ["git", "clean", "-fd"], config.worktree
+                )
+                remerge = _run(
+                    runner,
+                    ["git", "merge", "--no-edit", f"{config.upstream}/main"],
+                    config.worktree,
+                    timeout=900,
+                )
+                fresh = _run(
+                    runner,
+                    ["git", "diff", "--name-only", "--diff-filter=U", "-z"],
+                    config.worktree,
+                )
+                fresh_files = tuple(
+                    path for path in (fresh.stdout or "").split("\0") if path
+                )
+                if (
+                    reset_attempt.returncode != 0
+                    or clean_attempt.returncode != 0
+                    or remerge.returncode == 0
+                    or fresh.returncode != 0
+                    or not fresh_files
+                    or len(set(fresh_files)) != len(fresh_files)
+                ):
+                    break
+                conflicted_files = fresh_files
+            if not resolver.resolve(
+                config.worktree, runner, strategy=strategy
+            ):
+                continue
+            record_path = getattr(resolver, "resolution_record_path", None)
+            evidence_directory = getattr(
+                resolver, "resolution_evidence_directory", None
             )
-        committed = _run(
-            runner,
-            ["git", "commit", "--no-edit"],
-            config.worktree,
-        )
-        if committed.returncode != 0:
-            transitions.append(SyncState.NEEDS_DECISION)
-            return _result(
-                SyncState.NEEDS_DECISION,
-                transitions,
-                base_sha=base_sha,
-                upstream_sha=upstream_sha,
-                conflicted_files=conflicted_files,
-                risk="resolved_merge_commit_failed",
+            resolution_record = (
+                Path(record_path(config.worktree))
+                if callable(record_path)
+                else None
             )
-        clean_after_resolver = _run(
-            runner,
-            ["git", "status", "--porcelain", "--untracked-files=all"],
-            config.worktree,
-        )
-        if clean_after_resolver.returncode != 0 or _output(clean_after_resolver):
+            resolution_evidence_dir = (
+                Path(evidence_directory(config.worktree))
+                if callable(evidence_directory)
+                else None
+            )
+            unmerged = _run(runner, ["git", "ls-files", "-u"], config.worktree)
+            merge_head = _run(
+                runner,
+                ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+                config.worktree,
+            )
+            if (
+                unmerged.returncode != 0
+                or _output(unmerged)
+                or merge_head.returncode != 0
+                or _output(merge_head) != upstream_sha
+            ):
+                continue
+            committed = _run(runner, ["git", "commit", "--no-edit"], config.worktree)
+            clean_after_resolver = _run(
+                runner,
+                ["git", "status", "--porcelain", "--untracked-files=all"],
+                config.worktree,
+            )
+            if (
+                committed.returncode != 0
+                or clean_after_resolver.returncode != 0
+                or _output(clean_after_resolver)
+            ):
+                continue
+            resolution_strategy = strategy.value
+            resolved = True
+            break
+        if not resolved:
+            _run(runner, ["git", "merge", "--abort"], config.worktree)
+            _run(
+                runner,
+                ["git", "reset", "--hard", f"{config.origin}/main"],
+                config.worktree,
+            )
+            _run(runner, ["git", "clean", "-fd"], config.worktree)
             transitions.append(SyncState.NEEDS_DECISION)
             return _result(
                 SyncState.NEEDS_DECISION,
@@ -626,9 +698,7 @@ def prepare_candidate(
                 base_sha=base_sha,
                 upstream_sha=upstream_sha,
                 conflicted_files=conflicted_files,
-                resolution_record=resolution_record,
-                resolution_evidence_dir=resolution_evidence_dir,
-                risk="resolver_left_dirty_worktree",
+                risk="conflict_strategies_exhausted",
             )
         transitions.append(SyncState.AI_RESOLVED)
         classification = SyncClassification.MINOR_REVIEW_REQUIRED
@@ -735,6 +805,7 @@ def prepare_candidate(
         classification=classification,
         resolution_record=resolution_record,
         resolution_evidence_dir=resolution_evidence_dir,
+        resolution_strategy=resolution_strategy,
     )
 
 

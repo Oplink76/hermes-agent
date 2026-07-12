@@ -58,6 +58,7 @@ class ResolutionRecordArtifact:
     sha256: str
     candidate_sha: str
     conflicts: tuple[dict[str, str], ...]
+    strategy: str
 
     @classmethod
     def load(cls, path: Path) -> "ResolutionRecordArtifact":
@@ -83,15 +84,20 @@ class ResolutionRecordArtifact:
             raise ResolutionRecordError("resolution artifact JSON is invalid") from exc
         if (
             not isinstance(payload, dict)
-            or set(payload) != {"schema_version", "candidate_sha", "conflicts"}
+            or set(payload)
+            != {"schema_version", "candidate_sha", "conflicts", "strategy"}
             or payload["schema_version"] != SCHEMA_VERSION
             or not isinstance(payload["candidate_sha"], str)
             or not payload["candidate_sha"]
+            or not isinstance(payload["strategy"], str)
+            or not payload["strategy"]
             or _canonical(payload) != content
         ):
             raise ResolutionRecordError("resolution artifact is not canonical")
         conflicts = _conflicts(payload["conflicts"])
-        return cls(path, digest, payload["candidate_sha"], conflicts)
+        return cls(
+            path, digest, payload["candidate_sha"], conflicts, payload["strategy"]
+        )
 
 
 def freeze_resolution_record(
@@ -104,6 +110,7 @@ def freeze_resolution_record(
         or candidate.resolution_record is None
         or candidate.resolution_evidence_dir is None
         or not candidate.conflicted_files
+        or not candidate.resolution_strategy
     ):
         raise ResolutionRecordError("resolution evidence context is incomplete")
     record = Path(candidate.resolution_record)
@@ -123,8 +130,10 @@ def freeze_resolution_record(
         raw = json.loads(record.read_bytes())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ResolutionRecordError("resolution record JSON is invalid") from exc
-    if not isinstance(raw, dict) or set(raw) != {"conflicts"}:
+    if not isinstance(raw, dict) or set(raw) != {"conflicts", "strategy"}:
         raise ResolutionRecordError("resolution record is incomplete")
+    if raw["strategy"] != candidate.resolution_strategy:
+        raise ResolutionRecordError("resolution record strategy does not match")
     conflicts = _conflicts(raw["conflicts"])
     paths = tuple(row["path"] for row in conflicts)
     if set(paths) != set(candidate.conflicted_files) or len(paths) != len(
@@ -135,6 +144,7 @@ def freeze_resolution_record(
         "schema_version": SCHEMA_VERSION,
         "candidate_sha": candidate.candidate_sha,
         "conflicts": list(conflicts),
+        "strategy": candidate.resolution_strategy,
     }
     content = _canonical(payload)
     digest = hashlib.sha256(content).hexdigest()

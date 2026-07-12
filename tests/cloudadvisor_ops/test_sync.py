@@ -64,15 +64,17 @@ class FakeGitHub:
 
 
 class FakeResolver:
-    def __init__(self, resolved: bool):
-        self.resolved = resolved
+    def __init__(self, resolved: bool | list[bool]):
+        self.results = [resolved] if isinstance(resolved, bool) else list(resolved)
         self.calls = 0
+        self.strategies: list[object] = []
         self.last_runner_call: tuple[str, ...] | None = None
 
-    def resolve(self, worktree: Path, runner: FakeRunner) -> bool:
+    def resolve(self, worktree: Path, runner: FakeRunner, *, strategy=None) -> bool:
         self.calls += 1
+        self.strategies.append(strategy)
         self.last_runner_call = runner.calls[-1].argv if runner.calls else None
-        return self.resolved
+        return self.results[min(self.calls - 1, len(self.results) - 1)]
 
 
 def config(tmp_path: Path) -> SyncConfig:
@@ -237,7 +239,7 @@ def test_unresolved_merge_conflict_requires_decision_without_push(tmp_path: Path
 
     assert result.state is SyncState.NEEDS_DECISION
     assert result.conflicted_files == ("gateway/run.py",)
-    assert resolver.calls == 1
+    assert resolver.calls == 2
     assert pushes(runner) == []
 
 
@@ -268,7 +270,8 @@ def test_command_conflict_resolver_runs_only_configured_command_in_worktree(
                 resolution_record.parent.mkdir(parents=True, exist_ok=True)
                 resolution_record.write_text(
                     '{"conflicts":[{"path":"gateway/run.py",'
-                    '"decision":"preserve fork behavior"}]}',
+                    '"decision":"preserve fork behavior"}],'
+                    '"strategy":"preserve_fork_behavior"}',
                     encoding="utf-8",
                 )
             return completed
@@ -470,6 +473,48 @@ def test_resolved_merge_conflict_requires_review(tmp_path: Path):
         "ops/cloudadvisor/hermes_ops/sync.py",
     )
     assert resolver.last_runner_call == capture_command
+
+
+def test_second_materially_different_conflict_strategy_runs_after_isolated_reset(
+    tmp_path: Path,
+):
+    responses = base_responses(merge_returncode=1)
+    responses[("git", "rev-parse", "-q", "--verify", "MERGE_HEAD")] = (
+        0,
+        "upstream-sha\n",
+        "",
+    )
+    resolver = FakeResolver([False, True])
+    runner = FakeRunner(responses)
+
+    result = prepare_candidate(
+        config(tmp_path),
+        runner=runner,
+        github=FakeGitHub(existing_pr=17),
+        resolver=resolver,
+    )
+
+    assert result.state is SyncState.PR_UPDATED
+    assert result.classification is SyncClassification.MINOR_REVIEW_REQUIRED
+    assert resolver.calls == 2
+    assert resolver.strategies[0] != resolver.strategies[1]
+    reset_calls = [call for call in runner.calls if call.argv[:3] == ("git", "reset", "--hard")]
+    assert len(reset_calls) == 2
+    assert any(call.argv == ("git", "clean", "-fd") for call in runner.calls)
+
+
+def test_two_failed_conflict_strategies_exhaust_before_human(tmp_path: Path):
+    resolver = FakeResolver([False, False])
+    result = prepare_candidate(
+        config(tmp_path),
+        runner=FakeRunner(base_responses(merge_returncode=1)),
+        github=FakeGitHub(),
+        resolver=resolver,
+    )
+    assert result.state is SyncState.NEEDS_DECISION
+    assert result.risk == "conflict_strategies_exhausted"
+    assert resolver.calls == 2
+    assert resolver.strategies[0] != resolver.strategies[1]
 
 
 @pytest.mark.parametrize(

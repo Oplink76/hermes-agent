@@ -28,7 +28,13 @@ from .sync_receipt import (
     finalize_sync_receipt,
     write_sync_receipt,
 )
-from .sync_poll import ExactHeadExpectation, ExactHeadPollError, poll_exact_head
+from .sync_poll import (
+    ExactHeadExpectation,
+    ExactHeadPollError,
+    RequiredCheckRedError,
+    poll_exact_head,
+)
+from .sync_remediation import SyncRemediationError, SyncRemediationPort
 from .sync_resolution import ResolutionRecordError, freeze_resolution_record
 from .sync_recovery import (
     ProtectedRevertGitHubPort,
@@ -211,8 +217,50 @@ def wait_for_green_exact_head(
             clock=clock,
             sleeper=sleeper,
         )
+    except RequiredCheckRedError:
+        raise
     except ExactHeadPollError as exc:
         raise AutonomousSyncError(str(exc)) from exc
+
+
+def _review_candidate(
+    config: AutonomousSyncConfig,
+    candidate: SyncResult,
+    reviewer: IndependentConflictReviewer | None,
+) -> tuple[SyncResult, ConflictReviewReceipt | None]:
+    review_candidate = candidate
+    if candidate.classification is SyncClassification.MINOR_REVIEW_REQUIRED:
+        resolution_artifact = freeze_resolution_record(config.receipt_root, candidate)
+        review_candidate = replace(
+            candidate, resolution_record=resolution_artifact.path
+        )
+    return require_conflict_review(
+        review_candidate,
+        reviewer=reviewer,
+        worktree=config.sync.worktree,
+        resolution_record=(
+            review_candidate.resolution_record or config.resolution_record
+        ),
+        resolver_backend=config.resolver_backend,
+    )
+
+
+def _valid_repair(previous: SyncResult, repaired: SyncResult | None) -> SyncResult:
+    if repaired is None:
+        raise AutonomousSyncError("bounded candidate repair did not produce a candidate")
+    if (
+        not previous.candidate_sha
+        or not repaired.candidate_sha
+        or repaired.candidate_sha == previous.candidate_sha
+        or repaired.state is not SyncState.PR_UPDATED
+        or repaired.pr_number != previous.pr_number
+        or repaired.base_sha != previous.base_sha
+        or repaired.upstream_sha != previous.upstream_sha
+        or not repaired.checks
+        or any(check.status != "passed" for check in repaired.checks)
+    ):
+        raise AutonomousSyncError("bounded candidate repair evidence is invalid")
+    return repaired
 
 
 def _upstream_is_current(
@@ -327,6 +375,7 @@ def run_autonomous_sync(
     github: ProtectedRevertGitHubPort,
     resolver: ConflictResolver | None,
     reviewer: IndependentConflictReviewer | None,
+    remediator: SyncRemediationPort | None = None,
     deploy_fn: Callable[[Path, str, int], DeploymentRecord],
     verify_runtime_fn: Callable[[str], bool] | None = None,
     clock: Callable[[], float] = time.monotonic,
@@ -338,6 +387,9 @@ def run_autonomous_sync(
             return AutonomousSyncResult.locked()
         candidate: SyncResult | None = None
         merge_sha: str | None = None
+        infrastructure_retry_used = False
+        candidate_repair_used = False
+        post_rollback_repair = False
         try:
             candidate = prepare_candidate(
                 config.sync,
@@ -347,66 +399,143 @@ def run_autonomous_sync(
             )
             if candidate.state is SyncState.NO_CHANGE:
                 return AutonomousSyncResult.no_change(candidate)
-            if candidate.state is not SyncState.PR_UPDATED:
-                raise AutonomousSyncError(
-                    f"candidate preparation stopped in {candidate.state.value}"
+            while True:
+                if candidate.state is not SyncState.PR_UPDATED:
+                    raise AutonomousSyncError(
+                        f"candidate preparation stopped in {candidate.state.value}"
+                    )
+                if (
+                    not post_rollback_repair
+                    and is_quarantined(config.quarantine_root, candidate)
+                ):
+                    raise AutonomousSyncError(
+                        "unchanged failed candidate is quarantined"
+                    )
+
+                reviewed, conflict_review = _review_candidate(
+                    config, candidate, reviewer
                 )
-            if is_quarantined(config.quarantine_root, candidate):
-                raise AutonomousSyncError("unchanged failed candidate is quarantined")
-            review_candidate = candidate
-            if candidate.classification is SyncClassification.MINOR_REVIEW_REQUIRED:
-                resolution_artifact = freeze_resolution_record(
-                    config.receipt_root, candidate
+                try:
+                    evidence = wait_for_green_exact_head(
+                        github,
+                        reviewed,
+                        required_check=config.required_check,
+                        timeout_seconds=config.check_timeout_seconds,
+                        poll_interval_seconds=config.poll_interval_seconds,
+                        clock=clock,
+                        sleeper=sleeper,
+                    )
+                except RequiredCheckRedError as first_red:
+                    if remediator is None:
+                        raise AutonomousSyncError(str(first_red)) from first_red
+                    retried = False
+                    if not infrastructure_retry_used:
+                        infrastructure_retry_used = True
+                        retried = remediator.retry_infrastructure(reviewed)
+                    if retried:
+                        try:
+                            evidence = wait_for_green_exact_head(
+                                github,
+                                reviewed,
+                                required_check=config.required_check,
+                                timeout_seconds=config.check_timeout_seconds,
+                                poll_interval_seconds=config.poll_interval_seconds,
+                                clock=clock,
+                                sleeper=sleeper,
+                            )
+                        except RequiredCheckRedError:
+                            retried = False
+                    if not retried:
+                        if candidate_repair_used:
+                            raise AutonomousSyncError(
+                                "bounded candidate repair budget is exhausted"
+                            )
+                        candidate_repair_used = True
+                        candidate = _valid_repair(
+                            reviewed,
+                            remediator.repair_candidate(reviewed),
+                        )
+                        reviewed, conflict_review = _review_candidate(
+                            config, candidate, reviewer
+                        )
+                        try:
+                            evidence = wait_for_green_exact_head(
+                                github,
+                                reviewed,
+                                required_check=config.required_check,
+                                timeout_seconds=config.check_timeout_seconds,
+                                poll_interval_seconds=config.poll_interval_seconds,
+                                clock=clock,
+                                sleeper=sleeper,
+                            )
+                        except RequiredCheckRedError as repair_red:
+                            raise AutonomousSyncError(
+                                "bounded candidate repair remained red"
+                            ) from repair_red
+
+                receipt = attest_candidate(
+                    config,
+                    reviewed,
+                    evidence,
+                    conflict_review=conflict_review,
                 )
-                review_candidate = replace(
-                    candidate, resolution_record=resolution_artifact.path
+                if not _upstream_is_current(config, reviewed, runner):
+                    return AutonomousSyncResult.refresh_required(reviewed)
+                _bind_expected_base(github, evidence.base_sha)
+                merge_sha = github.merge_exact(
+                    evidence.number, expected_head=reviewed.candidate_sha
                 )
-            reviewed, conflict_review = require_conflict_review(
-                review_candidate,
-                reviewer=reviewer,
-                worktree=config.sync.worktree,
-                resolution_record=review_candidate.resolution_record
-                or config.resolution_record,
-                resolver_backend=config.resolver_backend,
-            )
-            evidence = wait_for_green_exact_head(
-                github,
-                reviewed,
-                required_check=config.required_check,
-                timeout_seconds=config.check_timeout_seconds,
-                poll_interval_seconds=config.poll_interval_seconds,
-                clock=clock,
-                sleeper=sleeper,
-            )
-            receipt = attest_candidate(
-                config,
-                reviewed,
-                evidence,
-                conflict_review=conflict_review,
-            )
-            if not _upstream_is_current(config, reviewed, runner):
-                return AutonomousSyncResult.refresh_required(reviewed)
-            _bind_expected_base(github, evidence.base_sha)
-            merge_sha = github.merge_exact(
-                evidence.number, expected_head=reviewed.candidate_sha
-            )
-            final_receipt = finalize_sync_receipt(receipt.path, merge_sha=merge_sha)
-            deployment = deploy_fn(final_receipt.path, merge_sha, evidence.number)
-            if deployment.status != "deployed" and verify_runtime_fn is None:
-                raise AutonomousSyncError(
-                    "runtime health verifier is unavailable for recovery"
+                final_receipt = finalize_sync_receipt(
+                    receipt.path, merge_sha=merge_sha
                 )
-            return finish_or_recover(
-                config,
-                reviewed,
-                deployment,
-                merge_sha=merge_sha,
-                runner=runner,
-                github=github,
-                clock=clock,
-                sleeper=sleeper,
-                verify_runtime_fn=verify_runtime_fn or (lambda sha: False),
-            )
+                deployment = deploy_fn(
+                    final_receipt.path, merge_sha, evidence.number
+                )
+                if deployment.status != "deployed" and verify_runtime_fn is None:
+                    raise AutonomousSyncError(
+                        "runtime health verifier is unavailable for recovery"
+                    )
+                outcome = finish_or_recover(
+                    config,
+                    reviewed,
+                    deployment,
+                    merge_sha=merge_sha,
+                    runner=runner,
+                    github=github,
+                    clock=clock,
+                    sleeper=sleeper,
+                    verify_runtime_fn=verify_runtime_fn or (lambda sha: False),
+                )
+                if outcome.state is not AutonomousSyncState.ROLLED_BACK_REVERTED:
+                    return outcome
+                if candidate_repair_used or remediator is None:
+                    return AutonomousSyncResult.needs_human(
+                        "protected rollback completed; bounded repair is exhausted",
+                        candidate_sha=reviewed.candidate_sha,
+                        merge_sha=merge_sha,
+                        installed_sha=outcome.installed_sha,
+                    )
+                refreshed = prepare_candidate(
+                    config.sync,
+                    github=github,
+                    runner=runner,
+                    resolver=resolver,
+                )
+                if refreshed.state is not SyncState.PR_UPDATED:
+                    raise AutonomousSyncError(
+                        "post-rollback candidate refresh did not produce a repair target"
+                    )
+                candidate_repair_used = True
+                health_evidence = tuple(
+                    f"{check.name}:{check.status}" for check in deployment.checks
+                ) or (f"deployment:{deployment.status}",)
+                candidate = _valid_repair(
+                    refreshed,
+                    remediator.repair_candidate(
+                        refreshed, health_evidence=health_evidence
+                    ),
+                )
+                post_rollback_repair = True
         except (
             AutonomousSyncError,
         ) as exc:
@@ -442,6 +571,12 @@ def run_autonomous_sync(
         except PreflightError:
             return AutonomousSyncResult.needs_human(
                 "automated deployment authority failed",
+                candidate_sha=candidate.candidate_sha if candidate else None,
+                merge_sha=merge_sha,
+            )
+        except SyncRemediationError:
+            return AutonomousSyncResult.needs_human(
+                "bounded sync remediation failed",
                 candidate_sha=candidate.candidate_sha if candidate else None,
                 merge_sha=merge_sha,
             )

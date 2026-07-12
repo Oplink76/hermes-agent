@@ -41,6 +41,11 @@ from .sync_controller import (
     run_autonomous_sync,
 )
 from .sync_review import ClaudeConflictReviewer
+from .sync_remediation import (
+    BoundedSyncRemediator,
+    CodexCandidateRemediator,
+    GhActionsRemediator,
+)
 
 
 @dataclass(frozen=True)
@@ -316,6 +321,30 @@ def load_conflict_reviewer(
     )
 
 
+def _sync_remediator(
+    sync_config: SyncConfig,
+    policy: SyncPolicyConfig,
+    resolver: CodexConflictResolver,
+    github: GhSyncGitHub,
+    runner: CommandRunner,
+) -> BoundedSyncRemediator:
+    return BoundedSyncRemediator(
+        actions=GhActionsRemediator(
+            repo_slug=sync_config.repo_slug,
+            required_check=policy.required_check,
+            runner=runner,
+            cwd=sync_config.repo,
+            gh_executable=github.gh_executable,
+        ),
+        candidate=CodexCandidateRemediator(
+            config=sync_config,
+            runner=runner,
+            executable=resolver.executable,
+            prompt=resolver.prompt,
+        ),
+    )
+
+
 def _sync_payload(result: SyncResult) -> dict[str, object]:
     return {
         "state": result.state.value,
@@ -535,6 +564,9 @@ def main(argv: list[str] | None = None) -> int:
             github=github,
             resolver=resolver,
             reviewer=reviewer,
+            remediator=_sync_remediator(
+                sync_config, policy, resolver, github, runner
+            ),
             deploy_fn=_sync_deploy_fn(operations, runner),
             verify_runtime_fn=_sync_runtime_verify_fn(operations, runner),
         )

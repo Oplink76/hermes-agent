@@ -66,6 +66,7 @@ def test_sync_auto_returns_terminal_state_exit_codes(tmp_path: Path, monkeypatch
     monkeypatch.setattr(cli, "load_conflict_resolver", lambda path: object())
     monkeypatch.setattr(cli, "load_conflict_reviewer", lambda path, runner: object())
     monkeypatch.setattr(cli, "GhSyncGitHub", lambda *args, **kwargs: object())
+    monkeypatch.setattr(cli, "_sync_remediator", lambda *args, **kwargs: object())
     monkeypatch.setattr(cli, "SubprocessCommandRunner", lambda: object())
     monkeypatch.setattr(
         cli,

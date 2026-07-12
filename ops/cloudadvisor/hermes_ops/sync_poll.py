@@ -13,6 +13,10 @@ class ExactHeadPollError(RuntimeError):
     """Exact protected-PR evidence did not become green within its budget."""
 
 
+class RequiredCheckRedError(ExactHeadPollError):
+    """The exact required check completed unsuccessfully."""
+
+
 @dataclass(frozen=True)
 class ExactHeadExpectation:
     pr_number: int
@@ -66,7 +70,7 @@ def poll_exact_head(
         if conclusion == "success":
             return evidence
         if conclusion not in {"pending", "queued", "in_progress"}:
-            raise ExactHeadPollError("required check is not green")
+            raise RequiredCheckRedError("required check is not green")
         remaining = deadline - clock()
         if remaining <= 0:
             raise ExactHeadPollError("required check timed out")

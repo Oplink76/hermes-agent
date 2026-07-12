@@ -35,7 +35,15 @@ def resolution_record(
     conflicts = [
         {"path": conflict_path, "decision": decision} for conflict_path in paths
     ]
-    path.write_text(json.dumps({"conflicts": conflicts}), encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            {
+                "conflicts": conflicts,
+                "strategy": "preserve_fork_behavior",
+            }
+        ),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -67,6 +75,7 @@ def frozen_record(
         conflicted_files=paths,
         resolution_record=raw,
         resolution_evidence_dir=evidence,
+        resolution_strategy="preserve_fork_behavior",
     )
     return freeze_resolution_record(tmp_path / "receipts", candidate).path
 
