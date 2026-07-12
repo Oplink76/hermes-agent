@@ -39,9 +39,7 @@ def _python_launcher(tmp_path: Path, name: str, source: str) -> Path:
     driver.write_text(source, encoding="utf-8")
     if os.name == "nt":
         launcher = tmp_path / f"{name}.cmd"
-        launcher.write_bytes(
-            f'@"{sys.executable}" "{driver}" %*\r\n'.encode("utf-8")
-        )
+        launcher.write_bytes(f'@"{sys.executable}" "{driver}" %*\r\n'.encode("utf-8"))
         return launcher
     launcher = tmp_path / name
     launcher.write_text(
@@ -58,7 +56,13 @@ class GateRunner(SubprocessCommandRunner):
         self.local_gate_calls: list[tuple[str, ...]] = []
 
     def run(self, argv: list[str], cwd: Path, timeout: int = 300):
-        if argv[:5] == ["env", "UV_PROJECT_ENVIRONMENT=.venv", "uv", "sync", "--locked"]:
+        if argv[:5] == [
+            "env",
+            "UV_PROJECT_ENVIRONMENT=.venv",
+            "uv",
+            "sync",
+            "--locked",
+        ]:
             return subprocess.CompletedProcess(argv, 0, "synced\n", "")
         if (
             len(argv) >= 3
@@ -204,7 +208,9 @@ class RecordingServices:
     def stop(self, services: tuple[str, ...]) -> None:
         self.stop_count += 1
         self.events.append(("stop", services))
-        self.running = tuple(service for service in self.running if service not in services)
+        self.running = tuple(
+            service for service in self.running if service not in services
+        )
 
     def start(self, services: tuple[str, ...]) -> None:
         self.start_count += 1
@@ -226,9 +232,13 @@ class FailOnceHealth:
         identity_required: bool = True,
         apply_injection: bool = True,
     ) -> HealthReport:
-        self.events.append(
-            ("health", expected_sha, services, identity_required, apply_injection)
-        )
+        self.events.append((
+            "health",
+            expected_sha,
+            services,
+            identity_required,
+            apply_injection,
+        ))
         if expected_sha != self.healthy_sha and not self.failed_candidate:
             self.failed_candidate = True
             return HealthReport((HealthCheck("runtime:default", False),))
@@ -362,9 +372,7 @@ def test_full_real_controller_rollback_revert_reconstruct_review_receipt_deploy(
             raise AssertionError("green checks must not request infrastructure retry")
 
         def repair_candidate(self, candidate, *, health_evidence=()):
-            return repair.repair_candidate(
-                candidate, health_evidence=health_evidence
-            )
+            return repair.repair_candidate(candidate, health_evidence=health_evidence)
 
     deployments: list[tuple[Path, int, DeploymentRecord]] = []
     deploy_events: list[tuple[object, ...]] = []
@@ -434,6 +442,22 @@ def test_full_real_controller_rollback_revert_reconstruct_review_receipt_deploy(
         final_deployment.requested_sha,
     ]
     assert [event[4] for event in health_events] == [True, False, True]
+    failed_pr = github.prs[7]
+    revert_pr = github.prs[8]
+    repaired_pr = github.prs[9]
+    assert failed_pr["merge_sha"] == first_deployment.requested_sha
+    assert repaired_pr["merge_sha"] == result.deployed_sha
+    assert health_events[1][1:] == (
+        healthy_base,
+        ("ai.hermes.gateway",),
+        False,
+        False,
+    )
+    quarantine_artifacts = list(config.quarantine_root.glob("*.json"))
+    assert len(quarantine_artifacts) == 1
+    quarantine = json.loads(quarantine_artifacts[0].read_text(encoding="utf-8"))
+    assert quarantine["candidate_sha"] == failed_pr["head_sha"]
+    assert quarantine["merge_sha"] == first_deployment.requested_sha
     stored_deployments = [
         json.loads(path.read_text(encoding="utf-8"))
         for path in (tmp_path / "deployments").glob("*.json")
@@ -442,17 +466,29 @@ def test_full_real_controller_rollback_revert_reconstruct_review_receipt_deploy(
         "rolled_back_healthy",
         "deployed",
     }
-    assert {record["previous_sha"] for record in stored_deployments} == {
-        healthy_base
-    }
+    assert {record["previous_sha"] for record in stored_deployments} == {healthy_base}
     assert github.created_heads[0] == "auto-sync/upstream"
     assert github.created_heads[1].startswith("auto-sync/revert-")
     assert github.created_heads[2] == "auto-sync/upstream"
+    _git(repo, "fetch", "origin", "main")
+    revert_merge_sha = str(revert_pr["merge_sha"])
+    revert_head_sha = str(revert_pr["head_sha"])
+    assert _git(repo, "rev-list", "--parents", "-n", "1", revert_merge_sha).split() == [
+        revert_merge_sha,
+        first_deployment.requested_sha,
+        revert_head_sha,
+    ]
+    assert _git(repo, "rev-parse", f"{revert_merge_sha}^{{tree}}") == _git(
+        repo, "rev-parse", f"{healthy_base}^{{tree}}"
+    )
     assert SyncEligibilityReceipt.load(deployments[1][0]).review is not None
+    assert not list(tmp_path.rglob("approval*.json"))
     final = tmp_path / "final"
     subprocess.run(
         ["git", "clone", str(origin), str(final)], check=True, capture_output=True
     )
     assert (final / "feature.txt").read_text(encoding="utf-8") == "repaired behavior\n"
+    assert _git(final, "rev-parse", "HEAD") == result.deployed_sha
+    assert _git(install, "rev-parse", "HEAD") == result.deployed_sha
     assert upstream_sha != healthy_base
     assert len(runner.local_gate_calls) >= 4
