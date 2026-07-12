@@ -47,9 +47,57 @@ def reconstruct_failed_candidate(
     runner: CommandRunner,
 ) -> SyncResult:
     """Reintroduce one exact failed tree as a child of verified revert-main."""
+    return _reconstruct_failed_candidate(
+        config,
+        failed=failed,
+        failed_merge_sha=failed_merge_sha,
+        revert_main_sha=revert_main_sha,
+        expected_candidate_sha=failed.candidate_sha,
+        current_upstream_sha=None,
+        github=github,
+        runner=runner,
+    )
+
+
+def resume_failed_candidate_reconstruction(
+    config: SyncConfig,
+    *,
+    failed: SyncResult,
+    failed_merge_sha: str,
+    revert_main_sha: str,
+    expected_candidate_sha: str,
+    current_upstream_sha: str,
+    github: GitHubPullRequests,
+    runner: CommandRunner,
+) -> SyncResult:
+    """Reintroduce the failed tree, then merge the exact current upstream."""
+    return _reconstruct_failed_candidate(
+        config,
+        failed=failed,
+        failed_merge_sha=failed_merge_sha,
+        revert_main_sha=revert_main_sha,
+        expected_candidate_sha=expected_candidate_sha,
+        current_upstream_sha=current_upstream_sha,
+        github=github,
+        runner=runner,
+    )
+
+
+def _reconstruct_failed_candidate(
+    config: SyncConfig,
+    *,
+    failed: SyncResult,
+    failed_merge_sha: str,
+    revert_main_sha: str,
+    expected_candidate_sha: str | None,
+    current_upstream_sha: str | None,
+    github: GitHubPullRequests,
+    runner: CommandRunner,
+) -> SyncResult:
     if (
         _FULL_SHA.fullmatch(failed_merge_sha) is None
         or _FULL_SHA.fullmatch(revert_main_sha) is None
+        or _FULL_SHA.fullmatch(expected_candidate_sha or "") is None
         or not failed.base_sha
         or not failed.candidate_sha
         or not failed.candidate_tree_sha
@@ -57,6 +105,11 @@ def reconstruct_failed_candidate(
         or not failed.upstream_sha
     ):
         raise ReconstructionError("candidate reconstruction evidence is incomplete")
+    if current_upstream_sha is not None and (
+        _FULL_SHA.fullmatch(current_upstream_sha) is None
+        or current_upstream_sha == failed.upstream_sha
+    ):
+        raise ReconstructionError("current upstream reconstruction evidence is invalid")
 
     repo = Path(config.repo)
     _run(runner, ["git", "fetch", config.origin, "main"], repo)
@@ -90,8 +143,16 @@ def reconstruct_failed_candidate(
         repo,
     )
     remote_candidate = _run(runner, ["git", "rev-parse", remote_ref], repo)
-    if remote_candidate != failed.candidate_sha:
+    if remote_candidate != expected_candidate_sha:
         raise ReconstructionError("rolling candidate changed before reconstruction")
+
+    if current_upstream_sha is not None:
+        _run(runner, ["git", "fetch", config.upstream, "main"], repo)
+        fetched_upstream = _run(
+            runner, ["git", "rev-parse", f"{config.upstream}/main"], repo
+        )
+        if fetched_upstream != current_upstream_sha:
+            raise ReconstructionError("official upstream changed before reconstruction")
 
     with tempfile.TemporaryDirectory(
         prefix="hermes-sync-reconstruct-", dir=repo.parent
@@ -131,6 +192,22 @@ def reconstruct_failed_candidate(
             reconstructed_tree = _run(
                 runner, ["git", "rev-parse", "HEAD^{tree}"], worktree
             )
+            if current_upstream_sha is not None:
+                _run(
+                    runner,
+                    [
+                        "git",
+                        "merge",
+                        "--no-ff",
+                        "--no-edit",
+                        current_upstream_sha,
+                    ],
+                    worktree,
+                )
+            candidate_sha = _run(runner, ["git", "rev-parse", "HEAD"], worktree)
+            candidate_tree = _run(
+                runner, ["git", "rev-parse", "HEAD^{tree}"], worktree
+            )
             changed = tuple(
                 line
                 for line in _run(
@@ -144,13 +221,14 @@ def reconstruct_failed_candidate(
                 _FULL_SHA.fullmatch(reconstructed_sha) is None
                 or reconstructed_parent != current_main
                 or reconstructed_tree != failed.candidate_tree_sha
+                or _FULL_SHA.fullmatch(candidate_sha) is None
                 or not changed
             ):
                 raise ReconstructionError("candidate reconstruction identity is invalid")
             destination = f"HEAD:refs/heads/{FIXED_CANDIDATE_BRANCH}"
             lease = (
                 f"--force-with-lease=refs/heads/{FIXED_CANDIDATE_BRANCH}:"
-                f"{failed.candidate_sha}"
+                f"{expected_candidate_sha}"
             )
             _run(
                 runner,
@@ -174,7 +252,13 @@ def reconstruct_failed_candidate(
         "Automated candidate-only reconstruction after protected recovery.\n\n"
         f"- Protected base: `{current_main}`\n"
         f"- Failed merge: `{failed_merge_sha}`\n"
-        f"- Reconstructed head: `{reconstructed_sha}`\n"
+        f"- Reconstructed tree commit: `{reconstructed_sha}`\n"
+        f"- Candidate head: `{candidate_sha}`\n"
+        + (
+            ""
+            if current_upstream_sha is None
+            else f"- Current upstream: `{current_upstream_sha}`\n"
+        )
     )
     pr_number = github.find_open_pull_request(FIXED_CANDIDATE_BRANCH, "main")
     if pr_number is None:
@@ -189,9 +273,9 @@ def reconstruct_failed_candidate(
     return SyncResult(
         state=SyncState.PR_UPDATED,
         base_sha=current_main,
-        upstream_sha=failed.upstream_sha,
-        candidate_sha=reconstructed_sha,
-        candidate_tree_sha=reconstructed_tree,
+        upstream_sha=current_upstream_sha or failed.upstream_sha,
+        candidate_sha=candidate_sha,
+        candidate_tree_sha=candidate_tree,
         pr_number=pr_number,
         risk="post_revert_reconstruction",
         changed_files=changed,

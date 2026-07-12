@@ -24,6 +24,10 @@ from ops.cloudadvisor.hermes_ops.sync_controller import (
     run_autonomous_sync,
 )
 from ops.cloudadvisor.hermes_ops.sync_github import SyncPullRequestEvidence
+from ops.cloudadvisor.hermes_ops.sync_reconstruction_checkpoint import (
+    PendingReconstructionCheckpoint,
+    write_pending_reconstruction,
+)
 from ops.cloudadvisor.hermes_ops.sync_review import ConflictReviewReceipt
 
 
@@ -1082,6 +1086,10 @@ def test_post_revert_upstream_advance_returns_pending_without_ordinary_prepare(
         lambda *args, **kwargs: next(current),
     )
     monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller._current_upstream_sha",
+        lambda *args, **kwargs: SHA_NEW_CANDIDATE,
+    )
+    monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
         lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
     )
@@ -1113,6 +1121,51 @@ def test_post_revert_upstream_advance_returns_pending_without_ordinary_prepare(
 
     assert result.state is AutonomousSyncState.PENDING_REFRESH
     assert result.needs_ole is False
+    assert prepared == []
+
+
+def test_pending_reconstruction_stops_after_durable_retry_budget(
+    tmp_path: Path, monkeypatch
+):
+    cfg = review_config(tmp_path)
+    write_pending_reconstruction(
+        cfg.receipt_root,
+        PendingReconstructionCheckpoint(
+            schema_version=1,
+            repo_slug=cfg.sync.repo_slug,
+            failed_base_sha=SHA_BASE,
+            failed_upstream_sha=SHA_UPSTREAM,
+            failed_candidate_sha=SHA_CANDIDATE,
+            failed_candidate_tree_sha=SHA_CANDIDATE_TREE,
+            failed_pr_number=7,
+            failed_merge_sha=SHA_MERGE,
+            revert_main_sha=SHA_REPAIRED,
+            previous_healthy_installed_sha=SHA_BASE,
+            rolling_candidate_sha=SHA_NEW_CANDIDATE,
+            pending_upstream_sha=SHA_NEW_REPAIRED,
+            reason="upstream advanced during reconstruction",
+            resume_attempts=2,
+        ),
+    )
+    prepared: list[bool] = []
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: prepared.append(True) or candidate(),
+    )
+
+    result = run_autonomous_sync(
+        cfg,
+        runner=Runner(),
+        github=GitHub([]),
+        resolver=None,
+        reviewer=GreenReviewer(),
+        remediator=Remediator(repaired=reviewed_repair(tmp_path)),
+        deploy_fn=lambda *args: deployed_record(),
+        verify_runtime_fn=lambda sha: True,
+    )
+
+    assert result.state is AutonomousSyncState.NEEDS_OLE
+    assert result.reason == "pending reconstruction retry budget is exhausted"
     assert prepared == []
 
 

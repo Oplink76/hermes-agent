@@ -7,8 +7,14 @@ import sys
 from pathlib import Path
 
 from ops.cloudadvisor.hermes_ops.command import SubprocessCommandRunner
-from ops.cloudadvisor.hermes_ops.deploy import DeployConfig, DeploymentRecord
-from ops.cloudadvisor.hermes_ops.health import HealthCheck
+from ops.cloudadvisor.hermes_ops.deploy import (
+    DeployConfig,
+    DeployRequest,
+    DeploymentRecord,
+    ReleaseEvidence,
+    deploy,
+)
+from ops.cloudadvisor.hermes_ops.health import HealthCheck, HealthReport
 from ops.cloudadvisor.hermes_ops.sync import CheckResult, SyncConfig
 from ops.cloudadvisor.hermes_ops.sync_controller import (
     AutonomousSyncConfig,
@@ -39,8 +45,7 @@ def _python_launcher(tmp_path: Path, name: str, source: str) -> Path:
         return launcher
     launcher = tmp_path / name
     launcher.write_text(
-        f"#!{sys.executable}\nexec(compile(open({str(driver)!r}, "
-        "encoding='utf-8').read(), "
+        f"#!{sys.executable}\nexec(compile(open({str(driver)!r}, 'r', encoding='utf-8').read(), "
         f"{str(driver)!r}, 'exec'))\n",
         encoding="utf-8",
     )
@@ -53,6 +58,8 @@ class GateRunner(SubprocessCommandRunner):
         self.local_gate_calls: list[tuple[str, ...]] = []
 
     def run(self, argv: list[str], cwd: Path, timeout: int = 300):
+        if argv[:5] == ["env", "UV_PROJECT_ENVIRONMENT=.venv", "uv", "sync", "--locked"]:
+            return subprocess.CompletedProcess(argv, 0, "synced\n", "")
         if (
             len(argv) >= 3
             and argv[1:3] == ["-m", "compileall"]
@@ -85,6 +92,8 @@ class ProtectedGitHub:
             "head": head,
             "state": "open",
             "merge_sha": None,
+            "head_sha": None,
+            "base_sha": None,
         }
         self.created_heads.append(head)
         return number
@@ -113,7 +122,8 @@ class ProtectedGitHub:
     def merge_exact(self, pr_number: int, *, expected_head: str):
         row = self.prs[pr_number]
         assert row["state"] == "open"
-        assert self.expected_base_sha == self._remote_sha("refs/heads/main")
+        base_sha = self._remote_sha("refs/heads/main")
+        assert self.expected_base_sha == base_sha
         assert expected_head == self._remote_sha(f"refs/heads/{row['head']}")
         admin = self.root.parent / f"admin-{pr_number}"
         subprocess.run(
@@ -131,7 +141,98 @@ class ProtectedGitHub:
         _git(admin, "push", "origin", "main")
         row["state"] = "merged"
         row["merge_sha"] = merge_sha
+        row["head_sha"] = expected_head
+        row["base_sha"] = base_sha
         return merge_sha
+
+    def verify(self, pr_number: int) -> ReleaseEvidence:
+        row = self.prs[pr_number]
+        return ReleaseEvidence(
+            pr_number=pr_number,
+            merged=row["state"] == "merged",
+            merge_sha=str(row["merge_sha"]),
+            repo_slug="Oplink76/hermes-agent",
+            head_sha=str(row["head_sha"]),
+            base_ref_name="main",
+            base_sha=str(row["base_sha"]),
+            required_check="All required checks pass",
+            required_check_conclusion="success",
+        )
+
+
+class RecordingSnapshots:
+    def __init__(self, events: list[tuple[object, ...]]):
+        self.events = events
+        self.restore_count = 0
+
+    def verify_preservation(self) -> bool:
+        self.events.append(("preservation",))
+        return True
+
+    def create(self, previous_sha: str):
+        snapshot = {"previous_sha": previous_sha}
+        self.events.append(("snapshot", previous_sha))
+        return snapshot
+
+    def verify(self, snapshot) -> bool:
+        self.events.append(("snapshot_verified", snapshot["previous_sha"]))
+        return True
+
+    def restore(self, snapshot) -> None:
+        self.restore_count += 1
+        self.events.append(("snapshot_restored", snapshot["previous_sha"]))
+
+
+class RecordingServices:
+    def __init__(self, events: list[tuple[object, ...]]):
+        self.events = events
+        self.running = ("ai.hermes.gateway",)
+        self.start_count = 0
+        self.stop_count = 0
+
+    def loaded_services(self) -> tuple[str, ...]:
+        self.events.append(("loaded", self.running))
+        return self.running
+
+    def running_services(self) -> tuple[str, ...]:
+        self.events.append(("running", self.running))
+        return self.running
+
+    def inventory(self):
+        return {"running": self.running, "starts": self.start_count}
+
+    def stop(self, services: tuple[str, ...]) -> None:
+        self.stop_count += 1
+        self.events.append(("stop", services))
+        self.running = tuple(service for service in self.running if service not in services)
+
+    def start(self, services: tuple[str, ...]) -> None:
+        self.start_count += 1
+        self.events.append(("start", services))
+        self.running = tuple(dict.fromkeys((*self.running, *services)))
+
+
+class FailOnceHealth:
+    def __init__(self, healthy_sha: str, events: list[tuple[object, ...]]):
+        self.healthy_sha = healthy_sha
+        self.events = events
+        self.failed_candidate = False
+
+    def check(
+        self,
+        *,
+        expected_sha: str,
+        services: tuple[str, ...],
+        identity_required: bool = True,
+        apply_injection: bool = True,
+    ) -> HealthReport:
+        self.events.append(
+            ("health", expected_sha, services, identity_required, apply_injection)
+        )
+        if expected_sha != self.healthy_sha and not self.failed_candidate:
+            self.failed_candidate = True
+            return HealthReport((HealthCheck("runtime:default", False),))
+        return HealthReport((HealthCheck("runtime:default", True),))
 
 
 def test_full_real_controller_rollback_revert_reconstruct_review_receipt_deploy(
@@ -151,7 +252,13 @@ def test_full_real_controller_rollback_revert_reconstruct_review_receipt_deploy(
     _git(repo, "config", "user.name", "Hermes E2E")
     _git(repo, "config", "user.email", "hermes@example.invalid")
     (repo / "feature.txt").write_text("healthy\n", encoding="utf-8")
-    _git(repo, "add", "feature.txt")
+    (repo / "pyproject.toml").write_text(
+        "[project]\nname = 'hermes-e2e'\nversion = '0.0.0'\n"
+        "[project.optional-dependencies]\nall = []\n",
+        encoding="utf-8",
+    )
+    (repo / "uv.lock").write_text("version = 1\nrevision = 1\n", encoding="utf-8")
+    _git(repo, "add", "feature.txt", "pyproject.toml", "uv.lock")
     _git(repo, "commit", "-m", "healthy base")
     _git(repo, "push", "-u", "origin", "main")
     healthy_base = _git(repo, "rev-parse", "HEAD")
@@ -185,6 +292,13 @@ def test_full_real_controller_rollback_revert_reconstruct_review_receipt_deploy(
         str(candidate_worktree),
         "main",
     )
+    install = tmp_path / "install"
+    subprocess.run(
+        ["git", "clone", str(origin), str(install)],
+        check=True,
+        capture_output=True,
+    )
+    assert _git(install, "rev-parse", "HEAD") == healthy_base
 
     codex = _python_launcher(
         tmp_path,
@@ -223,11 +337,13 @@ def test_full_real_controller_rollback_revert_reconstruct_review_receipt_deploy(
     config = AutonomousSyncConfig(
         sync=sync,
         deploy=DeployConfig(
-            install_root=tmp_path / "install",
+            install_root=install,
             origin="origin",
             record_root=tmp_path / "deployments",
             repo_slug=sync.repo_slug,
             sync_receipt_root=receipt_root,
+            required_check="All required checks pass",
+            uv_extras=("all",),
         ),
         receipt_root=receipt_root,
         required_check="All required checks pass",
@@ -250,35 +366,32 @@ def test_full_real_controller_rollback_revert_reconstruct_review_receipt_deploy(
                 candidate, health_evidence=health_evidence
             )
 
-    deployments: list[tuple[Path, str, int]] = []
+    deployments: list[tuple[Path, int, DeploymentRecord]] = []
+    deploy_events: list[tuple[object, ...]] = []
+    snapshots = RecordingSnapshots(deploy_events)
+    services = RecordingServices(deploy_events)
+    health = FailOnceHealth(healthy_base, deploy_events)
 
-    def deploy(receipt: Path, sha: str, pr_number: int) -> DeploymentRecord:
+    def deploy_exact(receipt: Path, sha: str, pr_number: int) -> DeploymentRecord:
         loaded = SyncEligibilityReceipt.load(receipt)
         assert loaded.merge_sha == sha
-        deployments.append((receipt, sha, pr_number))
-        if len(deployments) == 1:
-            return DeploymentRecord(
-                id="failed",
-                requested_sha=sha,
-                previous_sha=healthy_base,
-                snapshot={},
-                runtime_before={},
-                runtime_after={},
-                checks=(HealthCheck("runtime:default", False),),
-                status="rolled_back_healthy",
-                rollback={"status": "healthy"},
-            )
-        return DeploymentRecord(
-            id="deployed",
-            requested_sha=sha,
-            previous_sha=healthy_base,
-            snapshot={},
-            runtime_before={},
-            runtime_after={},
-            checks=(HealthCheck("runtime:default", True),),
-            status="deployed",
-            rollback=None,
+        record = deploy(
+            DeployRequest(
+                sha=sha,
+                pr_number=pr_number,
+                actor="hermes-upstream-sync",
+                authority_kind="automated_sync",
+                authority_record=receipt,
+            ),
+            config=config.deploy,
+            runner=runner,
+            github=github,
+            snapshots=snapshots,
+            services=services,
+            health=health,
         )
+        deployments.append((receipt, pr_number, record))
+        return record
 
     result = run_autonomous_sync(
         config,
@@ -292,14 +405,46 @@ def test_full_real_controller_rollback_revert_reconstruct_review_receipt_deploy(
             evidence_dir=receipt_root / "resolutions",
         ),
         remediator=Remediator(),
-        deploy_fn=deploy,
-        verify_runtime_fn=lambda sha: sha == healthy_base,
+        deploy_fn=deploy_exact,
+        verify_runtime_fn=lambda sha: _git(install, "rev-parse", "HEAD") == sha,
         clock=lambda: 0.0,
         sleeper=lambda seconds: None,
     )
 
     assert result.state is AutonomousSyncState.DEPLOYED
     assert len(deployments) == 2
+    first_deployment = deployments[0][2]
+    final_deployment = deployments[1][2]
+    assert first_deployment.status == "rolled_back_healthy"
+    assert first_deployment.previous_sha == healthy_base
+    assert first_deployment.rollback["status"] == "rolled_back_healthy"
+    assert any(not check.passed for check in first_deployment.checks)
+    assert final_deployment.status == "deployed"
+    assert final_deployment.previous_sha == healthy_base
+    assert final_deployment.requested_sha == result.deployed_sha
+    assert _git(install, "rev-parse", "HEAD") == result.deployed_sha
+    assert snapshots.restore_count == 1
+    assert services.stop_count == 3
+    assert services.start_count == 3
+    assert services.running == ("ai.hermes.gateway",)
+    health_events = [event for event in deploy_events if event[0] == "health"]
+    assert [event[1] for event in health_events] == [
+        first_deployment.requested_sha,
+        healthy_base,
+        final_deployment.requested_sha,
+    ]
+    assert [event[4] for event in health_events] == [True, False, True]
+    stored_deployments = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (tmp_path / "deployments").glob("*.json")
+    ]
+    assert {record["status"] for record in stored_deployments} == {
+        "rolled_back_healthy",
+        "deployed",
+    }
+    assert {record["previous_sha"] for record in stored_deployments} == {
+        healthy_base
+    }
     assert github.created_heads[0] == "auto-sync/upstream"
     assert github.created_heads[1].startswith("auto-sync/revert-")
     assert github.created_heads[2] == "auto-sync/upstream"

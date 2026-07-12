@@ -21,7 +21,19 @@ from .sync import (
     SyncState,
     prepare_candidate,
 )
-from .sync_reconstruction import ReconstructionError, reconstruct_failed_candidate
+from .sync_reconstruction import (
+    ReconstructionError,
+    reconstruct_failed_candidate,
+    resume_failed_candidate_reconstruction,
+)
+from .sync_reconstruction_checkpoint import (
+    MAX_RESUME_ATTEMPTS,
+    PendingReconstructionCheckpoint,
+    ReconstructionCheckpointError,
+    clear_pending_reconstruction,
+    load_pending_reconstruction,
+    write_pending_reconstruction,
+)
 from .sync_github import SyncGitHubPort, SyncPullRequestEvidence, bind_expected_base
 from .sync_github import SyncGitHubError
 from .sync_receipt import (
@@ -390,6 +402,35 @@ def _upstream_is_current(
     return current == candidate.upstream_sha
 
 
+def _current_upstream_sha(
+    config: AutonomousSyncConfig,
+    runner: CommandRunner,
+) -> str:
+    resolved = runner.run(
+        ["git", "rev-parse", f"{config.sync.upstream}/main"],
+        cwd=config.sync.repo,
+        timeout=300,
+    )
+    current = (resolved.stdout or "").strip()
+    if resolved.returncode != 0 or len(current) != 40:
+        raise AutonomousSyncError("official upstream identity is unavailable")
+    return current
+
+
+def _failed_from_checkpoint(
+    checkpoint: PendingReconstructionCheckpoint,
+) -> SyncResult:
+    return SyncResult(
+        state=SyncState.PR_UPDATED,
+        base_sha=checkpoint.failed_base_sha,
+        upstream_sha=checkpoint.failed_upstream_sha,
+        candidate_sha=checkpoint.failed_candidate_sha,
+        candidate_tree_sha=checkpoint.failed_candidate_tree_sha,
+        pr_number=checkpoint.failed_pr_number,
+        classification=SyncClassification.CLEAN,
+    )
+
+
 def attest_candidate(
     config: AutonomousSyncConfig,
     candidate: SyncResult,
@@ -490,15 +531,87 @@ def run_autonomous_sync(
         candidate_repair_used = False
         post_rollback_repair = False
         upstream_refreshes = 0
+        reconstruction_source: SyncResult | None = None
+        reconstruction_merge_sha: str | None = None
+        reconstruction_revert_main_sha: str | None = None
+        reconstruction_installed_sha: str | None = None
+        reconstruction_checkpoint_sha: str | None = None
+        reconstruction_resume_attempts = 0
         try:
-            candidate = prepare_candidate(
-                config.sync,
-                github=github,
-                runner=runner,
-                resolver=resolver,
+            pending_reconstruction = load_pending_reconstruction(
+                config.receipt_root,
+                repo_slug=config.sync.repo_slug,
             )
-            if candidate.state is SyncState.NO_CHANGE:
-                return AutonomousSyncResult.no_change(candidate)
+            if pending_reconstruction is not None:
+                if pending_reconstruction.resume_attempts >= MAX_RESUME_ATTEMPTS:
+                    raise AutonomousSyncError(
+                        "pending reconstruction retry budget is exhausted"
+                    )
+                if remediator is None or verify_runtime_fn is None:
+                    raise AutonomousSyncError(
+                        "pending reconstruction dependencies are unavailable"
+                    )
+                if not verify_runtime_fn(
+                    pending_reconstruction.previous_healthy_installed_sha
+                ):
+                    raise AutonomousSyncError(
+                        "pending reconstruction previous install is not healthy"
+                    )
+                pending_reconstruction = replace(
+                    pending_reconstruction,
+                    resume_attempts=pending_reconstruction.resume_attempts + 1,
+                )
+                pending_artifact = write_pending_reconstruction(
+                    config.receipt_root, pending_reconstruction
+                )
+                reconstruction_checkpoint_sha = pending_artifact.sha256
+                reconstruction_resume_attempts = (
+                    pending_reconstruction.resume_attempts
+                )
+                reconstruction_source = _failed_from_checkpoint(
+                    pending_reconstruction
+                )
+                reconstruction_merge_sha = pending_reconstruction.failed_merge_sha
+                reconstruction_revert_main_sha = (
+                    pending_reconstruction.revert_main_sha
+                )
+                reconstruction_installed_sha = (
+                    pending_reconstruction.previous_healthy_installed_sha
+                )
+                refreshed = resume_failed_candidate_reconstruction(
+                    config.sync,
+                    failed=reconstruction_source,
+                    failed_merge_sha=reconstruction_merge_sha,
+                    revert_main_sha=reconstruction_revert_main_sha,
+                    expected_candidate_sha=(
+                        pending_reconstruction.rolling_candidate_sha
+                    ),
+                    current_upstream_sha=(
+                        pending_reconstruction.pending_upstream_sha
+                    ),
+                    github=github,
+                    runner=runner,
+                )
+                candidate = _valid_repair(
+                    refreshed,
+                    remediator.repair_candidate(
+                        refreshed,
+                        health_evidence=(pending_reconstruction.reason,),
+                    ),
+                    runner=runner,
+                    repo=config.sync.repo,
+                )
+                candidate_repair_used = True
+                post_rollback_repair = True
+            else:
+                candidate = prepare_candidate(
+                    config.sync,
+                    github=github,
+                    runner=runner,
+                    resolver=resolver,
+                )
+                if candidate.state is SyncState.NO_CHANGE:
+                    return AutonomousSyncResult.no_change(candidate)
             while True:
                 if candidate.state is not SyncState.PR_UPDATED:
                     raise AutonomousSyncError(
@@ -565,12 +678,47 @@ def run_autonomous_sync(
                 )
                 if not _upstream_is_current(config, reviewed, runner):
                     if post_rollback_repair:
+                        if (
+                            reconstruction_source is None
+                            or reconstruction_merge_sha is None
+                            or reconstruction_revert_main_sha is None
+                            or reconstruction_installed_sha is None
+                        ):
+                            raise AutonomousSyncError(
+                                "post-revert reconstruction context is incomplete"
+                            )
+                        reason = (
+                            "official upstream advanced during post-revert repair; "
+                            "complete-tree reconstruction must restart"
+                        )
+                        pending = PendingReconstructionCheckpoint(
+                            schema_version=1,
+                            repo_slug=config.sync.repo_slug,
+                            failed_base_sha=reconstruction_source.base_sha or "",
+                            failed_upstream_sha=(
+                                reconstruction_source.upstream_sha or ""
+                            ),
+                            failed_candidate_sha=(
+                                reconstruction_source.candidate_sha or ""
+                            ),
+                            failed_candidate_tree_sha=(
+                                reconstruction_source.candidate_tree_sha or ""
+                            ),
+                            failed_pr_number=reconstruction_source.pr_number or 0,
+                            failed_merge_sha=reconstruction_merge_sha,
+                            revert_main_sha=reconstruction_revert_main_sha,
+                            previous_healthy_installed_sha=(
+                                reconstruction_installed_sha
+                            ),
+                            rolling_candidate_sha=reviewed.candidate_sha or "",
+                            pending_upstream_sha=_current_upstream_sha(config, runner),
+                            reason=reason,
+                            resume_attempts=reconstruction_resume_attempts,
+                        )
+                        write_pending_reconstruction(config.receipt_root, pending)
                         return AutonomousSyncResult.pending(
                             reviewed,
-                            reason=(
-                                "official upstream advanced during post-revert repair; "
-                                "complete-tree reconstruction must restart"
-                            ),
+                            reason=reason,
                         )
                     if upstream_refreshes >= config.max_upstream_refreshes:
                         return AutonomousSyncResult.refresh_required(reviewed)
@@ -615,6 +763,14 @@ def run_autonomous_sync(
                     verify_runtime_fn=verify_runtime_fn or (lambda sha: False),
                 )
                 if outcome.state is not AutonomousSyncState.ROLLED_BACK_REVERTED:
+                    if (
+                        outcome.state is AutonomousSyncState.DEPLOYED
+                        and reconstruction_checkpoint_sha is not None
+                    ):
+                        clear_pending_reconstruction(
+                            config.receipt_root,
+                            sha256=reconstruction_checkpoint_sha,
+                        )
                     return outcome
                 if candidate_repair_used or remediator is None:
                     return AutonomousSyncResult.needs_human(
@@ -626,6 +782,14 @@ def run_autonomous_sync(
                 if not outcome.fork_main_sha:
                     raise AutonomousSyncError(
                         "protected rollback did not report reconstructed base"
+                    )
+                reconstruction_source = reviewed
+                reconstruction_merge_sha = merge_sha
+                reconstruction_revert_main_sha = outcome.fork_main_sha
+                reconstruction_installed_sha = outcome.installed_sha
+                if not reconstruction_installed_sha:
+                    raise AutonomousSyncError(
+                        "protected rollback did not report healthy install identity"
                     )
                 refreshed = reconstruct_failed_candidate(
                     config.sync,
@@ -700,6 +864,12 @@ def run_autonomous_sync(
         except ReconstructionError:
             return AutonomousSyncResult.needs_human(
                 "post-rollback candidate reconstruction failed",
+                candidate_sha=candidate.candidate_sha if candidate else None,
+                merge_sha=merge_sha,
+            )
+        except ReconstructionCheckpointError:
+            return AutonomousSyncResult.needs_human(
+                "pending reconstruction evidence is invalid",
                 candidate_sha=candidate.candidate_sha if candidate else None,
                 merge_sha=merge_sha,
             )
