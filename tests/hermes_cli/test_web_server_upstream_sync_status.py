@@ -103,3 +103,53 @@ def test_needs_ole_status_does_not_claim_upstream_is_syncing(
         "Installed current · Official upstream sync needs attention"
     )
     assert "syncing" not in payload["message"]
+    assert payload["update_available"] is False
+    assert payload["can_apply"] is False
+    assert payload["sync_update_blocked"] is True
+
+
+def test_safe_rollback_suppresses_update_action_and_shows_recovery(
+    tmp_path: Path, monkeypatch
+) -> None:
+    status_file = tmp_path / "sync-status.json"
+    _write_status(
+        status_file,
+        upstream_behind=2,
+        sync_state="ROLLED_BACK_REVERTED",
+    )
+    monkeypatch.setattr(web_server, "_upstream_sync_status_path", lambda: status_file)
+    monkeypatch.setattr(
+        web_server, "_dashboard_local_update_managed_externally", lambda: False
+    )
+    monkeypatch.setattr(web_server, "detect_install_method", lambda root: "git")
+    monkeypatch.setattr("hermes_cli.banner.check_for_updates", lambda: 1)
+
+    payload = _client().get("/api/hermes/update/check").json()
+
+    assert payload["update_available"] is False
+    assert payload["can_apply"] is False
+    assert payload["sync_update_blocked"] is True
+    assert "recovery active after safe rollback" in payload["message"]
+
+
+def test_needs_ole_blocks_direct_update_endpoint(
+    tmp_path: Path, monkeypatch
+) -> None:
+    status_file = tmp_path / "sync-status.json"
+    _write_status(status_file, upstream_behind=2, sync_state="NEEDS_OLE")
+    monkeypatch.setattr(web_server, "_upstream_sync_status_path", lambda: status_file)
+    monkeypatch.setattr(
+        web_server, "_dashboard_local_update_managed_externally", lambda: False
+    )
+    spawned: list[object] = []
+    monkeypatch.setattr(
+        web_server,
+        "_spawn_hermes_action",
+        lambda *args, **kwargs: spawned.append((args, kwargs)),
+    )
+
+    payload = _client().post("/api/hermes/update").json()
+
+    assert payload["ok"] is False
+    assert payload["error"] == "upstream_sync_update_blocked"
+    assert spawned == []

@@ -52,7 +52,11 @@ A clean sync, an independently reviewed minor conflict, and an already-converged
 run are quiet successes. `PR_UPDATED` is an in-progress state, not success.
 `NEEDS_OLE` emits one `notify_ole: true` decision for the active escalation
 fingerprint; later runs with the same fingerprint stay quiet. This field requests
-delivery by the Task 8 wrapper and does not claim a notification was sent. A
+delivery by the versioned `cron_wrapper` and does not claim a notification was
+sent. The wrapper accepts only the exact `sync-auto` JSON schema and emits output
+only when `notify_ole` is true and its packet fingerprint, evidence, trusted-root
+path, and content hash agree. Malformed or contradictory output fails closed on
+stderr; it is never reported as `NO_CHANGE`. A
 different fingerprint emits a new decision, and a terminal healthy cycle clears
 the active fingerprint. Major or unresolved conflicts, ambiguous authority, and
 failed rollback/revert are the paths that require Ole.
@@ -67,9 +71,22 @@ file. Neither file contains raw command output. The dashboard keeps `behind`
 independently. Therefore an installed runtime can be current with fork `main`
 while official upstream commits are still syncing.
 
+Each escalation packet is canonical JSON under the configured trusted
+`sync.receipt_root/decision-packets/<fingerprint>/` directory. The filename is
+the SHA-256 of its contents. It contains only the exact PR/commit identities,
+the fixed safe recommendation, and `Approve / Wait / Details`; it never embeds
+free-form command output or controller logs. `NEEDS_OLE` and safe-rollback
+recovery states also suppress dashboard and desktop update actions so a manual
+update cannot bypass the governed sync/recovery path.
+
 Task 8 activates the live 06:00/18:00 script only after the bootstrap release is
 deployed. This document describes the intended schedule; this task does not
 change launchd, cron, services, or the production installation.
+
+The repository-owned wrapper is `ops/cloudadvisor/upstream-sync.sh`. Its default
+action is `sync-auto`; passing `health` preserves the existing attention-only
+gateway health action. Install or activation follows
+`ops/cloudadvisor/AUTONOMOUS_SYNC_ACTIVATION.md`.
 
 ## Approval artifact
 

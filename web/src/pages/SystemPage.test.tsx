@@ -1,7 +1,10 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { formatHermesSyncSummary } from "./system-update-status";
+import {
+  canApplyHermesUpdate,
+  formatHermesSyncSummary,
+} from "./system-update-status";
 
 describe("formatHermesSyncSummary", () => {
   it("renders installed current separately from an official upstream backlog", () => {
@@ -66,5 +69,40 @@ describe("formatHermesSyncSummary", () => {
     });
 
     expect(text).toBe("Installed current · 2 official upstream commits pending");
+  });
+
+  it("suppresses Update now while sync needs attention", () => {
+    const info = {
+      install_method: "git",
+      current_version: "0.17.0",
+      behind: 1,
+      update_available: true,
+      can_apply: true,
+      update_command: "hermes update",
+      message: "Installed current · Official upstream sync needs attention",
+      sync_state: "NEEDS_OLE",
+      sync_update_blocked: true,
+    };
+
+    expect(canApplyHermesUpdate(info)).toBe(false);
+    expect(formatHermesSyncSummary(info)).toContain("needs attention");
+  });
+
+  it("renders safe rollback as recovery, not an update action", () => {
+    const info = {
+      install_method: "git",
+      current_version: "0.17.0",
+      behind: 0,
+      update_available: false,
+      can_apply: false,
+      update_command: "hermes update",
+      message: null,
+      upstream_behind: 2,
+      sync_state: "ROLLED_BACK_REVERTED",
+      sync_update_blocked: true,
+    };
+
+    expect(formatHermesSyncSummary(info)).toContain("safe rollback");
+    expect(canApplyHermesUpdate(info)).toBe(false);
   });
 });

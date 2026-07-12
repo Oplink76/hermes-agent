@@ -239,6 +239,29 @@ describe('checkBackendUpdates', () => {
     expect(result?.installedSha).toBe('a'.repeat(40))
   })
 
+  it('suppresses backend update action when autonomous sync needs attention', async () => {
+    setRemote(true)
+    checkHermesUpdateSpy.mockResolvedValue({
+      install_method: 'git',
+      current_version: '0.17.0',
+      behind: 1,
+      update_available: true,
+      can_apply: true,
+      update_command: 'hermes update',
+      message: 'Installed current · Official upstream sync needs attention',
+      sync_state: 'NEEDS_OLE',
+      sync_update_blocked: true
+    })
+
+    const result = await checkBackendUpdates()
+
+    expect(result?.updateAvailable).toBe(false)
+    expect(result?.supported).toBe(false)
+    expect(result?.targetSha).toBeUndefined()
+    expect(result?.message).toContain('needs attention')
+    expect(result?.syncUpdateBlocked).toBe(true)
+  })
+
   it('preserves backend update_available when the backend cannot count commits', async () => {
     setRemote(true)
     checkHermesUpdateSpy.mockResolvedValue({
@@ -402,6 +425,7 @@ describe('applyBackendUpdate recovery', () => {
     checkHermesUpdateSpy.mockReset()
     updateHermesSpy.mockReset()
     getActionStatusSpy.mockReset()
+    $backendUpdateStatus.set(null)
     $backendUpdateApply.set({
       applying: false,
       stage: 'idle',
@@ -416,6 +440,22 @@ describe('applyBackendUpdate recovery', () => {
 
   afterEach(() => {
     vi.useRealTimers()
+  })
+
+  it('does not call the update API while autonomous sync is blocked', async () => {
+    $backendUpdateStatus.set({
+      supported: false,
+      updateAvailable: false,
+      behind: 1,
+      syncState: 'NEEDS_OLE',
+      syncUpdateBlocked: true,
+      message: 'Official upstream sync needs attention'
+    })
+
+    const result = await applyBackendUpdate()
+
+    expect(result.error).toBe('sync-blocked')
+    expect(updateHermesSpy).not.toHaveBeenCalled()
   })
 
   it('waits for the backend to return after the restart drops the connection, then clears the overlay', async () => {

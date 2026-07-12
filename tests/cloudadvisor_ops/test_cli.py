@@ -93,6 +93,7 @@ def test_sync_auto_returns_terminal_state_exit_codes(tmp_path: Path, monkeypatch
                     installed_sha="a" * 40,
             ),
             False,
+            None,
         ),
     )
 

@@ -59,7 +59,11 @@ import type {
   PortalStatus,
   DebugShareResponse,
 } from "@/lib/api";
-import { formatHermesSyncSummary } from "./system-update-status";
+import {
+  canApplyHermesUpdate,
+  formatHermesSyncSummary,
+  isHermesSyncUpdateBlocked,
+} from "./system-update-status";
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -855,7 +859,8 @@ export default function SystemPage() {
                   <span>v{stats?.hermes_version}</span>
                   {canUpdateHermes &&
                     updateInfo &&
-                    (updateInfo.update_available ? (
+                    (updateInfo.update_available &&
+                    !isHermesSyncUpdateBlocked(updateInfo) ? (
                       <Badge tone="warning">
                         {updateInfo.behind && updateInfo.behind > 0
                           ? `${updateInfo.behind} behind`
@@ -935,7 +940,7 @@ export default function SystemPage() {
                 >
                   Check for updates
                 </Button>
-                {updateInfo?.update_available && updateInfo.can_apply && (
+                {updateInfo && canApplyHermesUpdate(updateInfo) && (
                   <Button
                     size="sm"
                     prefix={<Download className="h-3.5 w-3.5" />}
@@ -946,13 +951,16 @@ export default function SystemPage() {
                 )}
                 {updateInfo &&
                   !updateInfo.can_apply &&
-                  updateInfo.update_available && (
+                  updateInfo.update_available &&
+                  !isHermesSyncUpdateBlocked(updateInfo) && (
                     <span className="text-xs text-muted-foreground">
                       Update with{" "}
                       <span className="font-mono">{updateInfo.update_command}</span>
                     </span>
                   )}
-                {updateInfo?.message && !updateInfo.update_available && (
+                {updateInfo?.message &&
+                  (!updateInfo.update_available ||
+                    isHermesSyncUpdateBlocked(updateInfo)) && (
                   <span className="text-xs text-muted-foreground">
                     {updateInfo.message}
                   </span>

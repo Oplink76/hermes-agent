@@ -3521,6 +3521,30 @@ async def update_hermes():
             "update_command": "managed outside dashboard",
         }
 
+    try:
+        from hermes_cli.upstream_sync_status import SyncStatus
+
+        sync_status = SyncStatus.load(_upstream_sync_status_path())
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+        sync_status = None
+    if sync_status is not None and sync_status.sync_state in {
+        "NEEDS_OLE",
+        "ROLLED_BACK_REVERTED",
+    }:
+        message = (
+            "Hermes update is blocked while autonomous upstream sync needs "
+            "attention or is recovering."
+        )
+        _record_completed_action("hermes-update", message, exit_code=1)
+        return {
+            "ok": False,
+            "pid": None,
+            "name": "hermes-update",
+            "error": "upstream_sync_update_blocked",
+            "message": message,
+            "update_command": "managed by autonomous upstream sync",
+        }
+
     install_method = detect_install_method(PROJECT_ROOT)
     if install_method == "docker":
         message = format_docker_update_message()
@@ -3605,6 +3629,7 @@ def _with_upstream_sync_status(payload: Dict[str, Any]) -> Dict[str, Any]:
             "sync_required_check": None,
             "fork_behind": payload.get("behind"),
             "installed_sha": None,
+            "sync_update_blocked": False,
         }
     )
     try:
@@ -3634,6 +3659,15 @@ def _with_upstream_sync_status(payload: Dict[str, Any]) -> Dict[str, Any]:
             "installed_sha": status.installed_sha,
         }
     )
+    if status.sync_state in {"NEEDS_OLE", "ROLLED_BACK_REVERTED"}:
+        enriched.update(
+            {
+                "update_available": False,
+                "can_apply": False,
+                "commits": [],
+                "sync_update_blocked": True,
+            }
+        )
     message = installed_sync_message(
         installed_current=payload.get("behind") == 0,
         upstream_behind=status.upstream_behind,
@@ -3641,6 +3675,15 @@ def _with_upstream_sync_status(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
     if message is not None:
         enriched["message"] = message
+    elif status.sync_state == "ROLLED_BACK_REVERTED":
+        enriched["message"] = (
+            "Official upstream sync recovery active after safe rollback · "
+            "Update action blocked"
+        )
+    elif status.sync_state == "NEEDS_OLE":
+        enriched["message"] = (
+            "Official upstream sync needs attention · Update action blocked"
+        )
     return enriched
 
 

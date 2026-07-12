@@ -12,6 +12,7 @@ from typing import Any
 import yaml
 
 from .command import CommandRunner, SubprocessCommandRunner
+from .decision_packet import publish_escalation_decision_packet
 from .deploy import (
     DeployConfig,
     DeployRequest,
@@ -391,6 +392,7 @@ def _autonomous_sync_payload(
     result: AutonomousSyncResult,
     *,
     status: SyncStatus | None,
+    decision_packet_path: Path | None,
 ) -> dict[str, object]:
     return {
         "state": result.state.value,
@@ -407,6 +409,12 @@ def _autonomous_sync_payload(
         "fork_behind": status.fork_behind if status else None,
         "sync_required_check": status.required_check if status else None,
         "notify_ole": result.notify_ole,
+        "escalation_fingerprint": (
+            status.escalation_fingerprint if status else None
+        ),
+        "decision_packet_path": (
+            str(decision_packet_path) if decision_packet_path else None
+        ),
     }
 
 
@@ -417,7 +425,7 @@ def _publish_sync_outcome(
     policy: SyncPolicyConfig,
     operations: OperationsConfig,
     runner: CommandRunner,
-) -> tuple[SyncStatus, bool]:
+) -> tuple[SyncStatus, bool, Path | None]:
     status = status_from_result(
         result,
         context=SyncStatusContext(
@@ -430,6 +438,13 @@ def _publish_sync_outcome(
     status.write(policy.status_file)
     notifications = SyncNotificationStore(policy.notification_store)
     notify_ole = notifications.should_emit(result)
+    decision_packet_path = None
+    if status.escalation_fingerprint is not None:
+        decision_packet_path = publish_escalation_decision_packet(
+            result,
+            fingerprint=status.escalation_fingerprint,
+            trusted_root=policy.receipt_root,
+        ).path
     if notify_ole:
         notifications.record_emitted(result)
     elif result.state in {
@@ -438,7 +453,7 @@ def _publish_sync_outcome(
         AutonomousSyncState.ROLLED_BACK_REVERTED,
     }:
         notifications.clear_resolved()
-    return status, notify_ole
+    return status, notify_ole, decision_packet_path
 
 
 def current_checkout_sha(root: Path, runner: CommandRunner) -> str:
@@ -612,10 +627,11 @@ def main(argv: list[str] | None = None) -> int:
             required_check=policy.required_check,
         )
         published_status: SyncStatus | None = None
+        published_packet_path: Path | None = None
 
         def publish_outcome(outcome: AutonomousSyncResult) -> bool:
-            nonlocal published_status
-            published_status, notify_ole = _publish_sync_outcome(
+            nonlocal published_packet_path, published_status
+            published_status, notify_ole, published_packet_path = _publish_sync_outcome(
                 outcome,
                 sync_config=sync_config,
                 policy=policy,
@@ -650,6 +666,7 @@ def main(argv: list[str] | None = None) -> int:
                 _autonomous_sync_payload(
                     result,
                     status=published_status,
+                    decision_packet_path=published_packet_path,
                 ),
                 indent=2,
                 sort_keys=True,

@@ -11,6 +11,9 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 from hermes_cli.upstream_sync_status import SyncStatus
 from ops.cloudadvisor.hermes_ops import cli
+from ops.cloudadvisor.hermes_ops.decision_packet import (
+    load_escalation_decision_packet,
+)
 from ops.cloudadvisor.hermes_ops.sync_controller import (
     AutonomousSyncResult,
     AutonomousSyncState,
@@ -154,6 +157,14 @@ def test_sync_auto_publishes_status_api_and_deduplicated_alert_decision(
     first = json.loads(capsys.readouterr().out)
     assert first["notify_ole"] is True
     assert "ole_notified" not in first
+    assert first["escalation_fingerprint"]
+    assert first["decision_packet_path"]
+    packet = load_escalation_decision_packet(
+        Path(first["decision_packet_path"]),
+        trusted_root=tmp_path / "receipts",
+    )
+    assert packet.escalation_fingerprint == first["escalation_fingerprint"]
+    assert packet.actions == ("Approve", "Wait", "Details")
     status = SyncStatus.load(tmp_path / "sync-status.json")
     assert status.upstream_behind == 1
     assert status.fork_behind == 0
