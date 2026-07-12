@@ -9,11 +9,7 @@ import pytest
 import yaml
 
 from ops.cloudadvisor.hermes_ops import cli
-from ops.cloudadvisor.hermes_ops.cli import (
-    GhGitHub,
-    load_operations_config,
-    load_sync_config,
-)
+from ops.cloudadvisor.hermes_ops.cli import load_operations_config, load_sync_config
 from ops.cloudadvisor.hermes_ops.health import HealthCheck, HealthReport
 from ops.cloudadvisor.hermes_ops.sync import SyncResult, SyncState
 
@@ -123,48 +119,6 @@ def test_load_operations_config_requires_nonempty_uv_extras(tmp_path: Path):
         load_operations_config(config_file)
 
 
-def test_github_query_rejects_duplicate_open_sync_pull_requests(tmp_path: Path):
-    response = subprocess.CompletedProcess(
-        [],
-        0,
-        json.dumps([{"number": 2}, {"number": 7}]),
-        "",
-    )
-    github = GhGitHub("Oplink76/hermes-agent", FakeRunner(response), tmp_path)
-
-    with pytest.raises(RuntimeError, match="more than one open upstream sync PR"):
-        github.find_open_pull_request("auto-sync/upstream", "main")
-
-
-def test_github_create_returns_number_from_created_pull_request_url(tmp_path: Path):
-    response = subprocess.CompletedProcess(
-        [],
-        0,
-        "https://github.com/Oplink76/hermes-agent/pull/41\n",
-        "",
-    )
-    runner = FakeRunner(response)
-    github = GhGitHub("Oplink76/hermes-agent", runner, tmp_path)
-
-    number = github.create_pull_request(
-        head="auto-sync/upstream",
-        base="main",
-        title="sync",
-        body="body",
-    )
-
-    assert number == 41
-    assert runner.calls[0][0][:3] == ("gh", "pr", "create")
-
-
-def test_github_update_surfaces_cli_failure(tmp_path: Path):
-    response = subprocess.CompletedProcess([], 1, "", "permission denied")
-    github = GhGitHub("Oplink76/hermes-agent", FakeRunner(response), tmp_path)
-
-    with pytest.raises(RuntimeError, match="permission denied"):
-        github.update_pull_request(17, title="sync", body="body")
-
-
 def test_sync_cli_prints_machine_readable_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -193,6 +147,13 @@ def test_sync_cli_prints_machine_readable_result(
             transitions=(SyncState.LOCKED, SyncState.FETCHED, SyncState.NO_CHANGE),
         ),
     )
+    constructed = {}
+
+    class FakeGitHub:
+        def __init__(self, repo_slug, runner, cwd):
+            constructed.update(repo_slug=repo_slug, runner=runner, cwd=cwd)
+
+    monkeypatch.setattr(cli, "GhSyncGitHub", FakeGitHub)
 
     exit_code = cli.main(["sync", "--config", str(config_file)])
 
@@ -200,6 +161,8 @@ def test_sync_cli_prints_machine_readable_result(
     payload = json.loads(capsys.readouterr().out)
     assert payload["state"] == "NO_CHANGE"
     assert payload["transitions"] == ["LOCKED", "FETCHED", "NO_CHANGE"]
+    assert constructed["repo_slug"] == "Oplink76/hermes-agent"
+    assert constructed["cwd"] == (tmp_path / "repo").resolve()
 
 
 def test_health_cli_reports_mandatory_matrix_and_exit_status(

@@ -34,6 +34,7 @@ from .sync import (
     SyncState,
     run as run_sync,
 )
+from .sync_github import GhSyncGitHub
 
 
 @dataclass(frozen=True)
@@ -233,83 +234,6 @@ def load_conflict_resolver(path: Path) -> CodexConflictResolver | None:
     )
 
 
-class GhGitHub:
-    def __init__(self, repo_slug: str, runner: CommandRunner, cwd: Path):
-        self.repo_slug = repo_slug
-        self.runner = runner
-        self.cwd = cwd
-
-    def _run(self, argv: list[str]):
-        completed = self.runner.run(argv, cwd=self.cwd, timeout=300)
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "").strip()
-            raise RuntimeError(f"GitHub CLI failed: {detail}")
-        return completed
-
-    def find_open_pull_request(self, head: str, base: str) -> int | None:
-        completed = self._run([
-            "gh",
-            "pr",
-            "list",
-            "--repo",
-            self.repo_slug,
-            "--head",
-            head,
-            "--base",
-            base,
-            "--state",
-            "open",
-            "--json",
-            "number",
-            "--limit",
-            "2",
-        ])
-        rows = json.loads(completed.stdout or "[]")
-        if len(rows) > 1:
-            raise RuntimeError("more than one open upstream sync PR")
-        return int(rows[0]["number"]) if rows else None
-
-    def create_pull_request(
-        self, *, head: str, base: str, title: str, body: str
-    ) -> int:
-        completed = self._run([
-            "gh",
-            "pr",
-            "create",
-            "--repo",
-            self.repo_slug,
-            "--head",
-            head,
-            "--base",
-            base,
-            "--title",
-            title,
-            "--body",
-            body,
-        ])
-        url = (completed.stdout or "").strip().rstrip("/")
-        try:
-            return int(url.rsplit("/", maxsplit=1)[1])
-        except (IndexError, ValueError) as exc:
-            raise RuntimeError(
-                f"could not parse created PR number from {url!r}"
-            ) from exc
-
-    def update_pull_request(self, number: int, *, title: str, body: str) -> None:
-        self._run([
-            "gh",
-            "pr",
-            "edit",
-            str(number),
-            "--repo",
-            self.repo_slug,
-            "--title",
-            title,
-            "--body",
-            body,
-        ])
-
-
 def _sync_payload(result: SyncResult) -> dict[str, object]:
     return {
         "state": result.state.value,
@@ -395,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "sync":
         config = load_sync_config(args.config)
         runner = SubprocessCommandRunner()
-        github = GhGitHub(config.repo_slug, runner, config.repo)
+        github = GhSyncGitHub(config.repo_slug, runner, config.repo)
         resolver = load_conflict_resolver(args.config)
         if resolver is None:
             result = run_sync(config, runner=runner, github=github)
