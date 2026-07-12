@@ -32,6 +32,10 @@ class SyncReceiptError(ValueError):
     """The supplied evidence cannot authorize an automatic sync action."""
 
 
+def _requires_posix_readonly() -> bool:
+    return os.name != "nt"
+
+
 @dataclass(frozen=True)
 class SyncEligibilityReceipt:
     schema_version: int
@@ -46,6 +50,8 @@ class SyncEligibilityReceipt:
     pr_head_sha: str
     required_check: str
     required_check_conclusion: str
+    workflow_run_id: int
+    required_check_run_id: int
     merge_sha: str | None
     eligible: bool
     created_at: str
@@ -79,6 +85,8 @@ class SyncEligibilityReceipt:
             "pr_head_sha": self.pr_head_sha,
             "required_check": self.required_check,
             "required_check_conclusion": self.required_check_conclusion,
+            "workflow_run_id": self.workflow_run_id,
+            "required_check_run_id": self.required_check_run_id,
             "merge_sha": self.merge_sha,
             "eligible": self.eligible,
             "created_at": self.created_at,
@@ -93,7 +101,7 @@ class SyncEligibilityReceipt:
             raise SyncReceiptError("sync receipt is missing") from exc
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise SyncReceiptError("sync receipt must be a regular file")
-        if stat.S_IMODE(metadata.st_mode) != 0o400:
+        if _requires_posix_readonly() and stat.S_IMODE(metadata.st_mode) != 0o400:
             raise SyncReceiptError("sync receipt must be read-only mode 0400")
         name_match = _ARTIFACT_NAME.fullmatch(path.name)
         if name_match is None:
@@ -124,6 +132,8 @@ class SyncEligibilityReceipt:
             "pr_head_sha",
             "required_check",
             "required_check_conclusion",
+            "workflow_run_id",
+            "required_check_run_id",
             "merge_sha",
             "eligible",
             "created_at",
@@ -154,6 +164,8 @@ class SyncEligibilityReceipt:
             pr_head_sha=payload["pr_head_sha"],
             required_check=payload["required_check"],
             required_check_conclusion=payload["required_check_conclusion"],
+            workflow_run_id=payload["workflow_run_id"],
+            required_check_run_id=payload["required_check_run_id"],
             merge_sha=payload["merge_sha"],
             eligible=False,
             created_at=payload["created_at"],
@@ -319,6 +331,13 @@ def _validate_receipt(receipt: SyncEligibilityReceipt) -> None:
         raise SyncReceiptError("sync receipt required check name is invalid")
     if receipt.required_check_conclusion != "success":
         raise SyncReceiptError("sync receipt required check is not green")
+    if type(receipt.workflow_run_id) is not int or receipt.workflow_run_id <= 0:
+        raise SyncReceiptError("sync receipt workflow run identity is invalid")
+    if (
+        type(receipt.required_check_run_id) is not int
+        or receipt.required_check_run_id <= 0
+    ):
+        raise SyncReceiptError("sync receipt check run identity is invalid")
     if receipt.merge_sha is not None and not _is_full_sha(receipt.merge_sha):
         raise SyncReceiptError("sync receipt merge SHA is invalid")
     if not isinstance(receipt.created_at, str) or not receipt.created_at.endswith("Z"):
@@ -362,6 +381,8 @@ def build_sync_receipt(
         pr_head_sha=evidence.head_sha,
         required_check=evidence.required_check,
         required_check_conclusion=evidence.required_check_conclusion,
+        workflow_run_id=evidence.workflow_run_id,
+        required_check_run_id=evidence.required_check_run_id,
         merge_sha=None,
         eligible=False,
         created_at=created_at or _now(),

@@ -22,6 +22,10 @@ class ResolutionRecordError(ValueError):
     """Resolution evidence is mutable, misplaced, or incomplete."""
 
 
+def _requires_posix_readonly() -> bool:
+    return os.name != "nt"
+
+
 def _canonical(payload: dict[str, object]) -> bytes:
     return (
         json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -69,7 +73,7 @@ class ResolutionRecordArtifact:
             raise ResolutionRecordError("resolution artifact is missing") from exc
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise ResolutionRecordError("resolution artifact must be a regular file")
-        if stat.S_IMODE(metadata.st_mode) != 0o400:
+        if _requires_posix_readonly() and stat.S_IMODE(metadata.st_mode) != 0o400:
             raise ResolutionRecordError("resolution artifact must be read-only mode 0400")
         match = _ARTIFACT.fullmatch(path.name)
         if match is None:

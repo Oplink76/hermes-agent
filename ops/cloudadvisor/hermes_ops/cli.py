@@ -318,6 +318,7 @@ def load_conflict_reviewer(
         runner=runner,
         resolver_backend=policy.resolver_backend,
         reviewer_backend=policy.reviewer_backend,
+        evidence_dir=policy.receipt_root / "resolutions",
     )
 
 
@@ -575,10 +576,13 @@ def main(argv: list[str] | None = None) -> int:
             AutonomousSyncState.NO_CHANGE,
             AutonomousSyncState.DEPLOYED,
             AutonomousSyncState.ROLLED_BACK_REVERTED,
-            AutonomousSyncState.REFRESH_REQUIRED,
         }:
             return 0
-        if result.state is AutonomousSyncState.LOCKED:
+        if result.state in {
+            AutonomousSyncState.LOCKED,
+            AutonomousSyncState.REFRESH_REQUIRED,
+            AutonomousSyncState.PENDING_REFRESH,
+        }:
             return 75
         return 2
     if args.command == "health":

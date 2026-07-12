@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,6 +60,7 @@ class ClaudeConflictReviewer:
     executable: Path
     runner: CommandRunner
     resolver_backend: str
+    evidence_dir: Path
     reviewer_backend: str = "claude"
 
     def __post_init__(self) -> None:
@@ -99,8 +102,27 @@ class ClaudeConflictReviewer:
         worktree: Path,
         resolution_record: Path,
     ) -> ConflictReviewReceipt:
+        unresolved_record = Path(os.path.abspath(resolution_record))
+        expected_dir = Path(os.path.abspath(self.evidence_dir))
+        if unresolved_record.parent != expected_dir:
+            raise ConflictReviewError(
+                "resolution record is not in the expected evidence directory"
+            )
+        try:
+            record_meta = unresolved_record.lstat()
+            directory_meta = expected_dir.lstat()
+        except OSError as exc:
+            raise ConflictReviewError("resolution evidence path is unavailable") from exc
+        if stat.S_ISLNK(record_meta.st_mode) or not stat.S_ISREG(record_meta.st_mode):
+            raise ConflictReviewError(
+                "resolution record must be a direct regular file"
+            )
+        if stat.S_ISLNK(directory_meta.st_mode) or not stat.S_ISDIR(
+            directory_meta.st_mode
+        ):
+            raise ConflictReviewError("resolution evidence directory is invalid")
         worktree = Path(worktree).resolve(strict=True)
-        resolution_record = Path(resolution_record).resolve(strict=True)
+        resolution_record = unresolved_record
         try:
             resolution = ResolutionRecordArtifact.load(resolution_record)
         except ResolutionRecordError as exc:

@@ -83,7 +83,8 @@ def test_sync_auto_returns_terminal_state_exit_codes(tmp_path: Path, monkeypatch
         (AutonomousSyncState.DEPLOYED, 0),
         (AutonomousSyncState.ROLLED_BACK_REVERTED, 0),
         (AutonomousSyncState.NO_CHANGE, 0),
-        (AutonomousSyncState.REFRESH_REQUIRED, 0),
+        (AutonomousSyncState.REFRESH_REQUIRED, 75),
+        (AutonomousSyncState.PENDING_REFRESH, 75),
         (AutonomousSyncState.LOCKED, 75),
         (AutonomousSyncState.NEEDS_OLE, 2),
     ):

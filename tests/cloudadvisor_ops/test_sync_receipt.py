@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 from dataclasses import replace
 from pathlib import Path
@@ -66,6 +67,8 @@ def green_pr(**overrides: object) -> SyncPullRequestEvidence:
         "head_sha": CANDIDATE_SHA,
         "required_check": REQUIRED_CHECK,
         "required_check_conclusion": "success",
+        "workflow_run_id": 101,
+        "required_check_run_id": 202,
     }
     values.update(overrides)
     return SyncPullRequestEvidence(**values)
@@ -109,7 +112,8 @@ def test_clean_green_candidate_is_eligible(tmp_path: Path):
 
     assert loaded.eligible is True
     assert loaded.candidate_sha == CANDIDATE_SHA
-    assert stat.S_IMODE(artifact.path.stat().st_mode) == 0o400
+    if os.name != "nt":
+        assert stat.S_IMODE(artifact.path.stat().st_mode) == 0o400
     assert artifact.sha256 in artifact.path.name
 
 
@@ -238,8 +242,26 @@ def test_load_rejects_writable_receipt(tmp_path: Path):
     )
     artifact.path.chmod(0o600)
 
-    with pytest.raises(SyncReceiptError, match="read-only"):
-        SyncEligibilityReceipt.load(artifact.path)
+    if os.name == "nt":
+        assert SyncEligibilityReceipt.load(artifact.path).eligible is True
+    else:
+        with pytest.raises(SyncReceiptError, match="read-only"):
+            SyncEligibilityReceipt.load(artifact.path)
+
+
+def test_windows_receipt_authority_uses_digest_not_posix_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    artifact = write_sync_receipt(
+        tmp_path, clean_candidate(), green_pr(), repo_slug=REPO
+    )
+    artifact.path.chmod(0o600)
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_receipt._requires_posix_readonly",
+        lambda: False,
+    )
+
+    assert SyncEligibilityReceipt.load(artifact.path).eligible is True
 
 
 def test_load_rejects_content_tampering_even_after_mode_is_restored(tmp_path: Path):
@@ -291,7 +313,8 @@ def test_finalize_creates_new_immutable_artifact_without_rewriting_premerge(
     assert premerge.path.read_bytes() == before
     assert SyncEligibilityReceipt.load(premerge.path).merge_sha is None
     assert SyncEligibilityReceipt.load(merged.path).merge_sha == MERGE_SHA
-    assert stat.S_IMODE(merged.path.stat().st_mode) == 0o400
+    if os.name != "nt":
+        assert stat.S_IMODE(merged.path.stat().st_mode) == 0o400
 
 
 def test_receipt_bytes_are_canonical_json(tmp_path: Path):

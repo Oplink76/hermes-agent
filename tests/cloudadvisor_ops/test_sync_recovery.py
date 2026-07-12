@@ -90,6 +90,8 @@ class GitHub:
             head_sha=SHA_REVERT_HEAD,
             required_check="All required checks pass",
             required_check_conclusion=self.conclusion,
+            workflow_run_id=101,
+            required_check_run_id=202,
         )
 
     def merge_exact(self, pr_number: int, *, expected_head: str):
@@ -301,6 +303,8 @@ def test_real_merge_revert_restores_previous_tree_and_runtime(tmp_path: Path):
                 head_sha=self.head,
                 required_check="All required checks pass",
                 required_check_conclusion="success",
+                workflow_run_id=101,
+                required_check_run_id=202,
             )
 
         def merge_exact(self, pr_number: int, *, expected_head: str):

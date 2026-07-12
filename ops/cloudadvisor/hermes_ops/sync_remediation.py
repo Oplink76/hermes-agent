@@ -7,7 +7,7 @@ import os
 import shutil
 import stat
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -20,6 +20,7 @@ from .sync import (
     SyncState,
     _verify,
 )
+from .sync_github import SyncPullRequestEvidence
 
 
 class SyncRemediationError(RuntimeError):
@@ -27,7 +28,9 @@ class SyncRemediationError(RuntimeError):
 
 
 class SyncRemediationPort(Protocol):
-    def retry_infrastructure(self, candidate: SyncResult) -> bool: ...
+    def retry_infrastructure(
+        self, candidate: SyncResult, evidence: SyncPullRequestEvidence
+    ) -> bool: ...
 
     def repair_candidate(
         self,
@@ -90,83 +93,73 @@ class GhActionsRemediator:
                 "GitHub Actions remediation evidence is invalid"
             ) from exc
 
-    def retry_infrastructure(self, candidate: SyncResult) -> bool:
-        if not candidate.candidate_sha or candidate.pr_number is None:
+    def retry_infrastructure(
+        self, candidate: SyncResult, evidence: SyncPullRequestEvidence
+    ) -> bool:
+        if (
+            not candidate.candidate_sha
+            or candidate.pr_number is None
+            or evidence.number != candidate.pr_number
+            or evidence.head_sha != candidate.candidate_sha
+            or evidence.required_check != self.required_check
+            or evidence.required_check_conclusion != "failure"
+            or type(evidence.workflow_run_id) is not int
+            or evidence.workflow_run_id <= 0
+            or type(evidence.required_check_run_id) is not int
+            or evidence.required_check_run_id <= 0
+        ):
             raise SyncRemediationError("candidate remediation identity is incomplete")
         executable = str(self.gh_executable)
-        runs = self._json([
+        run_id = evidence.workflow_run_id
+        detail = self._json([
             executable,
             "run",
-            "list",
+            "view",
+            str(run_id),
             "--repo",
             self.repo_slug,
-            "--commit",
-            candidate.candidate_sha,
             "--json",
-            "databaseId,headSha,status,conclusion,workflowName",
-            "--limit",
-            "10",
+            "databaseId,headSha,status,conclusion,jobs",
         ])
-        if not isinstance(runs, list):
-            raise SyncRemediationError("GitHub Actions run evidence is invalid")
-        matches = [
-            row
-            for row in runs
-            if isinstance(row, dict)
-            and row.get("headSha") == candidate.candidate_sha
-            and row.get("status") == "completed"
-            and row.get("conclusion") == "failure"
-            and type(row.get("databaseId")) is int
+        if (
+            not isinstance(detail, dict)
+            or detail.get("databaseId") != run_id
+            or detail.get("headSha") != candidate.candidate_sha
+            or detail.get("status") != "completed"
+            or detail.get("conclusion") != "failure"
+        ):
+            raise SyncRemediationError("GitHub Actions exact-run evidence changed")
+        jobs = detail.get("jobs")
+        if not isinstance(jobs, list):
+            raise SyncRemediationError("GitHub Actions job evidence is invalid")
+        required_jobs = [
+            job
+            for job in jobs
+            if isinstance(job, dict)
+            and job.get("databaseId") == evidence.required_check_run_id
+            and job.get("name") == self.required_check
+            and job.get("conclusion") == "failure"
         ]
-        infrastructure_runs: list[int] = []
-        for row in matches:
-            run_id = row["databaseId"]
-            detail = self._json([
-                executable,
-                "run",
-                "view",
-                str(run_id),
-                "--repo",
-                self.repo_slug,
-                "--json",
-                "databaseId,headSha,status,conclusion,jobs",
-            ])
-            if not isinstance(detail, dict) or detail.get("headSha") != candidate.candidate_sha:
-                raise SyncRemediationError("GitHub Actions head evidence changed")
-            jobs = detail.get("jobs")
-            if not isinstance(jobs, list):
-                raise SyncRemediationError("GitHub Actions job evidence is invalid")
-            required_jobs = [
-                job
-                for job in jobs
-                if isinstance(job, dict)
-                and job.get("name") == self.required_check
-                and job.get("conclusion") == "failure"
-            ]
-            if len(required_jobs) != 1:
-                continue
-            steps = required_jobs[0].get("steps")
-            if not isinstance(steps, list):
-                continue
-            failed_steps = [
-                step.get("name", "")
-                for step in steps
-                if isinstance(step, dict) and step.get("conclusion") == "failure"
-            ]
-            if len(failed_steps) == 1 and any(
-                str(failed_steps[0]).casefold().startswith(prefix)
-                for prefix in _INFRASTRUCTURE_STEP_PREFIXES
-            ):
-                infrastructure_runs.append(run_id)
-        if not infrastructure_runs:
+        if len(required_jobs) != 1:
+            raise SyncRemediationError("GitHub Actions exact check run is unavailable")
+        steps = required_jobs[0].get("steps")
+        if not isinstance(steps, list):
             return False
-        if len(infrastructure_runs) != 1:
-            raise SyncRemediationError("GitHub infrastructure failure is ambiguous")
+        failed_steps = [
+            step.get("name", "")
+            for step in steps
+            if isinstance(step, dict) and step.get("conclusion") == "failure"
+        ]
+        if len(failed_steps) != 1 or not any(
+            str(failed_steps[0]).casefold().startswith(prefix)
+            for prefix in _INFRASTRUCTURE_STEP_PREFIXES
+        ):
+            return False
         self._run([
             executable,
             "run",
             "rerun",
-            str(infrastructure_runs[0]),
+            str(run_id),
             "--repo",
             self.repo_slug,
             "--failed",
@@ -194,13 +187,18 @@ class CodexCandidateRemediator:
     verify_fn: Callable[[Path, CommandRunner], list[CheckResult]] = _verify
 
     def __post_init__(self) -> None:
-        if self.executable.name not in {"codex", "codex.exe"}:
+        allowed = {"codex", "codex.exe"}
+        if os.name == "nt":
+            allowed.add("codex.cmd")
+        if self.executable.name not in allowed:
             raise ValueError("candidate repair must use the Codex executable")
         if not self.prompt.strip():
             raise ValueError("candidate repair prompt must not be empty")
 
-    def retry_infrastructure(self, candidate: SyncResult) -> bool:
-        del candidate
+    def retry_infrastructure(
+        self, candidate: SyncResult, evidence: SyncPullRequestEvidence
+    ) -> bool:
+        del candidate, evidence
         return False
 
     def _run(
@@ -218,9 +216,6 @@ class CodexCandidateRemediator:
         *,
         new_sha: str,
     ) -> tuple[Path | None, Path | None]:
-        if candidate.classification is SyncClassification.CLEAN:
-            worktree_record.unlink(missing_ok=True)
-            return None, None
         try:
             metadata = worktree_record.lstat()
             payload = json.loads(worktree_record.read_text(encoding="utf-8"))
@@ -300,6 +295,16 @@ class CodexCandidateRemediator:
             or not candidate.upstream_sha
         ):
             raise SyncRemediationError("candidate repair identity is incomplete")
+        review_paths = candidate.conflicted_files or candidate.changed_files
+        if not review_paths or len(review_paths) != len(set(review_paths)):
+            raise SyncRemediationError("candidate repair review paths are incomplete")
+        repair_strategy = "candidate_repair"
+        evidence_candidate = replace(
+            candidate,
+            classification=SyncClassification.MINOR_REVIEW_REQUIRED,
+            conflicted_files=review_paths,
+            resolution_strategy=repair_strategy,
+        )
         with tempfile.TemporaryDirectory(
             prefix="hermes-sync-repair-", dir=self.config.repo.parent
         ) as temporary:
@@ -329,13 +334,12 @@ class CodexCandidateRemediator:
                     "push, change remotes, or access paths outside this worktree. "
                     f"Observed health/check evidence: {json.dumps(health_evidence)}. "
                 )
-                if candidate.classification is not SyncClassification.CLEAN:
-                    prompt += (
-                        "Write .hermes-sync-repair.json with exactly the top-level "
-                        "keys `conflicts` and `strategy`; cover these paths exactly: "
-                        f"{json.dumps(candidate.conflicted_files)}; strategy must be "
-                        f"{json.dumps(candidate.resolution_strategy)}. "
-                    )
+                prompt += (
+                    "Write .hermes-sync-repair.json with exactly the top-level "
+                    "keys `conflicts` and `strategy`, non-empty decisions, and cover "
+                    f"these paths exactly: {json.dumps(review_paths)}; strategy must "
+                    f"be {json.dumps(repair_strategy)}. "
+                )
                 command = [
                     str(self.executable),
                     "exec",
@@ -347,13 +351,11 @@ class CodexCandidateRemediator:
                 ]
                 if self._run(command, worktree, timeout=1800) is None:
                     return None
-                repair_payload: str | None = None
-                if candidate.classification is not SyncClassification.CLEAN:
-                    try:
-                        repair_payload = record.read_text(encoding="utf-8")
-                    except OSError:
-                        return None
-                    record.unlink(missing_ok=True)
+                try:
+                    repair_payload = record.read_text(encoding="utf-8")
+                except OSError:
+                    return None
+                record.unlink(missing_ok=True)
                 status = self._run(
                     ["git", "status", "--porcelain", "--untracked-files=all"],
                     worktree,
@@ -363,13 +365,12 @@ class CodexCandidateRemediator:
                 checks = self.verify_fn(worktree, self.runner)
                 if not checks or any(check.status != "passed" for check in checks):
                     return None
-                if repair_payload is not None:
-                    record.write_text(repair_payload, encoding="utf-8")
+                record.write_text(repair_payload, encoding="utf-8")
                 if self._run(["git", "add", "-A"], worktree) is None:
                     return None
-                if repair_payload is not None:
-                    self._run(["git", "reset", "--", record.name], worktree)
-                    record.unlink(missing_ok=True)
+                if self._run(["git", "reset", "--", record.name], worktree) is None:
+                    return None
+                record.unlink(missing_ok=True)
                 if self._run(
                     ["git", "commit", "-m", "fix(sync): repair exact candidate"],
                     worktree,
@@ -389,17 +390,20 @@ class CodexCandidateRemediator:
                     ],
                     worktree,
                 )
-                if not new_sha or new_sha == candidate.candidate_sha or not tree_sha:
+                if (
+                    not new_sha
+                    or new_sha == candidate.candidate_sha
+                    or not tree_sha
+                    or changed is None
+                    or not changed
+                ):
                     return None
-                resolution_record: Path | None = None
-                evidence_dir: Path | None = None
-                if repair_payload is not None:
-                    record.write_text(repair_payload, encoding="utf-8")
-                    resolution_record, evidence_dir = self._resolution_record(
-                        candidate, record, new_sha=new_sha
-                    )
-                    if resolution_record is None:
-                        return None
+                record.write_text(repair_payload, encoding="utf-8")
+                resolution_record, evidence_dir = self._resolution_record(
+                    evidence_candidate, record, new_sha=new_sha
+                )
+                if resolution_record is None:
+                    return None
                 destination = "HEAD:refs/heads/auto-sync/upstream"
                 lease = (
                     "--force-with-lease=refs/heads/auto-sync/upstream:"
@@ -425,15 +429,11 @@ class CodexCandidateRemediator:
                     ),
                     transitions=candidate.transitions
                     + (SyncState.VERIFIED, SyncState.PUSHED, SyncState.PR_UPDATED),
-                    classification=(
-                        SyncClassification.CLEAN
-                        if candidate.classification is SyncClassification.CLEAN
-                        else SyncClassification.MINOR_REVIEW_REQUIRED
-                    ),
-                    conflicted_files=candidate.conflicted_files,
+                    classification=SyncClassification.MINOR_REVIEW_REQUIRED,
+                    conflicted_files=review_paths,
                     resolution_record=resolution_record,
                     resolution_evidence_dir=evidence_dir,
-                    resolution_strategy=candidate.resolution_strategy,
+                    resolution_strategy=repair_strategy,
                 )
             finally:
                 self.runner.run(
@@ -448,8 +448,10 @@ class BoundedSyncRemediator:
     actions: GhActionsRemediator
     candidate: CodexCandidateRemediator
 
-    def retry_infrastructure(self, value: SyncResult) -> bool:
-        return self.actions.retry_infrastructure(value)
+    def retry_infrastructure(
+        self, value: SyncResult, evidence: SyncPullRequestEvidence
+    ) -> bool:
+        return self.actions.retry_infrastructure(value, evidence)
 
     def repair_candidate(
         self,

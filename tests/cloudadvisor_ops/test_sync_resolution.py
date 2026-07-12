@@ -64,12 +64,30 @@ def test_freeze_writes_canonical_immutable_candidate_bound_artifact(tmp_path: Pa
 
     assert artifact.path.parent == tmp_path / "receipts" / "resolutions"
     assert artifact.path.name == f"resolution-{artifact.sha256}.json"
-    assert stat.S_IMODE(artifact.path.stat().st_mode) == 0o400
+    if os.name != "nt":
+        assert stat.S_IMODE(artifact.path.stat().st_mode) == 0o400
     loaded = ResolutionRecordArtifact.load(artifact.path)
     assert loaded.sha256 == artifact.sha256
     payload = json.loads(artifact.path.read_text(encoding="utf-8"))
     assert payload["candidate_sha"] == CANDIDATE
     assert payload["conflicts"][0]["path"] == "gateway/run.py"
+
+
+def test_windows_authority_uses_digest_not_posix_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    evidence_dir = tmp_path / ".git" / "hermes-sync-evidence"
+    record = raw_record(evidence_dir)
+    artifact = freeze_resolution_record(
+        tmp_path / "receipts", candidate(record, evidence_dir)
+    )
+    artifact.path.chmod(0o600)
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_resolution._requires_posix_readonly",
+        lambda: False,
+    )
+
+    assert ResolutionRecordArtifact.load(artifact.path).sha256 == artifact.sha256
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges")

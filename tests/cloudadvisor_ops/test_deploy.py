@@ -349,6 +349,8 @@ def _sync_receipt(tmp_path: Path) -> Path:
         head_sha=CANDIDATE_SHA,
         required_check="All required checks pass",
         required_check_conclusion="success",
+        workflow_run_id=101,
+        required_check_run_id=202,
     )
     premerge = write_sync_receipt(
         tmp_path / "sync-receipts",

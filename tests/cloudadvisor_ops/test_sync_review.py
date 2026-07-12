@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -215,9 +216,10 @@ def test_claude_reviewer_returns_exact_structured_receipt(tmp_path: Path):
     record = frozen_record(tmp_path)
     runner = ReviewerRunner({"verdict": "green", "findings": []})
     reviewer = ClaudeConflictReviewer(
-        executable=Path("/Users/cloudadvisor/.local/bin/claude"),
+        executable=tmp_path / "bin" / ("claude.exe" if os.name == "nt" else "claude"),
         runner=runner,
         resolver_backend="codex",
+        evidence_dir=record.parent,
     )
 
     review = reviewer.review(
@@ -232,9 +234,9 @@ def test_claude_reviewer_returns_exact_structured_receipt(tmp_path: Path):
     assert review.verdict == "green"
     assert review.findings == ()
     claude_command = next(
-        call[0] for call in runner.calls if call[0][0].endswith("/claude")
+        call[0] for call in runner.calls if Path(call[0][0]).name.startswith("claude")
     )
-    assert claude_command[0] == "/Users/cloudadvisor/.local/bin/claude"
+    assert claude_command[0] == str(reviewer.executable)
     assert "--print" in claude_command
     assert "--json-schema" in claude_command
     assert "--permission-mode" in claude_command
@@ -252,17 +254,19 @@ def test_claude_reviewer_rejects_changed_head(tmp_path: Path):
 
     worktree = tmp_path / "candidate"
     worktree.mkdir()
+    record = frozen_record(tmp_path)
     reviewer = ClaudeConflictReviewer(
-        executable=Path("/Users/cloudadvisor/.local/bin/claude"),
+        executable=tmp_path / "bin" / ("claude.exe" if os.name == "nt" else "claude"),
         runner=ChangedHeadRunner({"verdict": "green", "findings": []}),
         resolver_backend="codex",
+        evidence_dir=record.parent,
     )
 
     with pytest.raises(ConflictReviewError, match="candidate SHA"):
         reviewer.review(
             candidate_sha=CANDIDATE_SHA,
             worktree=worktree,
-            resolution_record=frozen_record(tmp_path),
+            resolution_record=record,
         )
 
 
@@ -275,6 +279,7 @@ def test_claude_reviewer_preserves_windows_paths_with_spaces(tmp_path: Path):
         executable=Path("C:/Program Files/Claude/claude.exe"),
         runner=runner,
         resolver_backend="codex",
+        evidence_dir=record.parent,
     )
     reviewer.review(
         candidate_sha=CANDIDATE_SHA,
@@ -286,3 +291,51 @@ def test_claude_reviewer_preserves_windows_paths_with_spaces(tmp_path: Path):
     )
     assert command[0] == "C:/Program Files/Claude/claude.exe"
     assert str(record.parent) in command
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges")
+def test_claude_reviewer_rejects_original_artifact_symlink_before_resolve(
+    tmp_path: Path,
+):
+    worktree = tmp_path / "candidate"
+    worktree.mkdir()
+    record = frozen_record(tmp_path)
+    link = record.parent / "linked-resolution.json"
+    link.symlink_to(record)
+    runner = ReviewerRunner({"verdict": "green", "findings": []})
+    reviewer = ClaudeConflictReviewer(
+        executable=tmp_path / "bin" / "claude",
+        runner=runner,
+        resolver_backend="codex",
+        evidence_dir=record.parent,
+    )
+
+    with pytest.raises(ConflictReviewError, match="direct regular file"):
+        reviewer.review(
+            candidate_sha=CANDIDATE_SHA,
+            worktree=worktree,
+            resolution_record=link,
+        )
+
+    assert runner.calls == []
+
+
+def test_claude_reviewer_requires_artifact_direct_child_of_expected_dir(
+    tmp_path: Path,
+):
+    worktree = tmp_path / "candidate"
+    worktree.mkdir()
+    record = frozen_record(tmp_path)
+    reviewer = ClaudeConflictReviewer(
+        executable=tmp_path / "bin" / ("claude.exe" if os.name == "nt" else "claude"),
+        runner=ReviewerRunner({"verdict": "green", "findings": []}),
+        resolver_backend="codex",
+        evidence_dir=tmp_path / "different-evidence-dir",
+    )
+
+    with pytest.raises(ConflictReviewError, match="expected evidence directory"):
+        reviewer.review(
+            candidate_sha=CANDIDATE_SHA,
+            worktree=worktree,
+            resolution_record=record,
+        )

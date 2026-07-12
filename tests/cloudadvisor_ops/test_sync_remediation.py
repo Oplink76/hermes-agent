@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 from ops.cloudadvisor.hermes_ops.command import SubprocessCommandRunner
 from ops.cloudadvisor.hermes_ops.sync import (
@@ -16,9 +20,12 @@ from ops.cloudadvisor.hermes_ops.sync_remediation import (
     CodexCandidateRemediator,
     GhActionsRemediator,
 )
+from ops.cloudadvisor.hermes_ops.sync_github import SyncPullRequestEvidence
 
 
 HEAD = "a" * 40
+WORKFLOW_RUN_ID = 99
+CHECK_RUN_ID = 123
 
 
 class Runner:
@@ -29,25 +36,15 @@ class Runner:
     def run(self, argv: list[str], cwd: Path, timeout: int = 300):
         call = tuple(argv)
         self.calls.append(call)
-        if call[1:3] == ("run", "list"):
-            payload = [
-                {
-                    "databaseId": 99,
-                    "headSha": HEAD,
-                    "status": "completed",
-                    "conclusion": "failure",
-                    "workflowName": "CI",
-                }
-            ]
-            return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
         if call[1:3] == ("run", "view"):
             payload = {
-                "databaseId": 99,
+                "databaseId": WORKFLOW_RUN_ID,
                 "headSha": HEAD,
                 "status": "completed",
                 "conclusion": "failure",
                 "jobs": [
                     {
+                        "databaseId": CHECK_RUN_ID,
                         "name": "All required checks pass",
                         "conclusion": "failure",
                         "steps": [
@@ -67,6 +64,19 @@ def candidate() -> SyncResult:
     return SyncResult(state=SyncState.PR_UPDATED, candidate_sha=HEAD, pr_number=7)
 
 
+def failed_evidence() -> SyncPullRequestEvidence:
+    return SyncPullRequestEvidence(
+        number=7,
+        state="open",
+        base_sha="b" * 40,
+        head_sha=HEAD,
+        required_check="All required checks pass",
+        required_check_conclusion="failure",
+        workflow_run_id=WORKFLOW_RUN_ID,
+        required_check_run_id=CHECK_RUN_ID,
+    )
+
+
 def test_exact_infrastructure_failure_is_retried_once(tmp_path: Path):
     runner = Runner(failed_step="Set up job")
     remediator = GhActionsRemediator(
@@ -77,14 +87,15 @@ def test_exact_infrastructure_failure_is_retried_once(tmp_path: Path):
         gh_executable=Path("C:/Program Files/GitHub CLI/gh.exe"),
     )
 
-    assert remediator.retry_infrastructure(candidate()) is True
+    assert remediator.retry_infrastructure(candidate(), failed_evidence()) is True
+    assert not any(call[1:3] == ("run", "list") for call in runner.calls)
     reruns = [call for call in runner.calls if call[1:3] == ("run", "rerun")]
     assert reruns == [
         (
             "C:/Program Files/GitHub CLI/gh.exe",
             "run",
             "rerun",
-            "99",
+            str(WORKFLOW_RUN_ID),
             "--repo",
             "Oplink76/hermes-agent",
             "--failed",
@@ -102,7 +113,7 @@ def test_candidate_failure_is_never_retried_as_infrastructure(tmp_path: Path):
         gh_executable=Path("/usr/local/bin/gh"),
     )
 
-    assert remediator.retry_infrastructure(candidate()) is False
+    assert remediator.retry_infrastructure(candidate(), failed_evidence()) is False
     assert not any(call[1:3] == ("run", "rerun") for call in runner.calls)
 
 
@@ -113,9 +124,7 @@ def _git(cwd: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
-def test_real_candidate_repair_uses_detached_worktree_and_exact_branch_lease(
-    tmp_path: Path,
-):
+def _repair_fixture(tmp_path: Path):
     origin = tmp_path / "origin.git"
     repo = tmp_path / "repo"
     subprocess.run(
@@ -140,12 +149,35 @@ def test_real_candidate_repair_uses_detached_worktree_and_exact_branch_lease(
     old_head = _git(repo, "rev-parse", "HEAD")
     _git(repo, "push", "origin", "auto-sync/upstream")
 
-    codex = tmp_path / "codex"
-    codex.write_text(
-        "#!/bin/sh\nprintf 'repaired\\n' > repaired.txt\n",
+    driver = tmp_path / "fake_codex.py"
+    driver.write_text(
+        "\n".join([
+            "import json",
+            "from pathlib import Path",
+            "Path('repaired.txt').write_text('repaired\\n', encoding='utf-8')",
+            "Path('.hermes-sync-repair.json').write_text(",
+            "    json.dumps({'conflicts': [{'path': 'upstream.txt', "
+            "'decision': 'repair exact candidate'}], "
+            "'strategy': 'candidate_repair'}),",
+            "    encoding='utf-8',",
+            ")",
+        ])
+        + "\n",
         encoding="utf-8",
     )
-    codex.chmod(0o755)
+    if os.name == "nt":
+        codex = tmp_path / "codex.cmd"
+        codex.write_bytes(
+            f'@"{sys.executable}" "{driver}" %*\r\n'.encode("utf-8")
+        )
+    else:
+        codex = tmp_path / "codex"
+        codex.write_text(
+            f"#!{sys.executable}\nexec(compile(open({str(driver)!r}).read(), "
+            f"{str(driver)!r}, 'exec'))\n",
+            encoding="utf-8",
+        )
+        codex.chmod(0o755)
     verify_calls: list[Path] = []
 
     def verify(worktree: Path, runner) -> list[CheckResult]:
@@ -171,6 +203,25 @@ def test_real_candidate_repair_uses_detached_worktree_and_exact_branch_lease(
         repo_slug="Oplink76/hermes-agent",
         lock_path=tmp_path / "sync.lock",
     )
+    value = SyncResult(
+        state=SyncState.PR_UPDATED,
+        base_sha=base_sha,
+        upstream_sha="b" * 40,
+        candidate_sha=old_head,
+        candidate_tree_sha=_git(repo, "rev-parse", "HEAD^{tree}"),
+        pr_number=7,
+        classification=SyncClassification.CLEAN,
+        changed_files=("upstream.txt",),
+    )
+    return repo, base_sha, codex, sync_config, value, verify, verify_calls
+
+
+def test_real_candidate_repair_uses_detached_worktree_and_exact_branch_lease(
+    tmp_path: Path,
+):
+    repo, base_sha, codex, sync_config, value, verify, verify_calls = _repair_fixture(
+        tmp_path
+    )
     remediator = CodexCandidateRemediator(
         config=sync_config,
         runner=SubprocessCommandRunner(),
@@ -178,20 +229,12 @@ def test_real_candidate_repair_uses_detached_worktree_and_exact_branch_lease(
         prompt="Repair the failing exact candidate.",
         verify_fn=verify,
     )
-    result = remediator.repair_candidate(
-        SyncResult(
-            state=SyncState.PR_UPDATED,
-            base_sha=base_sha,
-            upstream_sha="b" * 40,
-            candidate_sha=old_head,
-            candidate_tree_sha=_git(repo, "rev-parse", "HEAD^{tree}"),
-            pr_number=7,
-            classification=SyncClassification.CLEAN,
-        )
-    )
+    result = remediator.repair_candidate(value)
 
     assert result is not None
-    assert result.candidate_sha != old_head
+    assert result.candidate_sha != value.candidate_sha
+    assert result.classification is SyncClassification.MINOR_REVIEW_REQUIRED
+    assert result.resolution_record is not None
     assert result.checks[-1].name == "tests"
     assert len(verify_calls) == 1
     assert (
@@ -200,3 +243,33 @@ def test_real_candidate_repair_uses_detached_worktree_and_exact_branch_lease(
     )
     assert _git(repo, "ls-remote", "origin", "refs/heads/main").split()[0] == base_sha
     assert "hermes-sync-repair-" not in _git(repo, "worktree", "list")
+
+
+@pytest.mark.parametrize(
+    "failed_prefix",
+    [
+        ("git", "reset", "--"),
+        ("git", "diff", "--name-only"),
+    ],
+)
+def test_candidate_repair_fails_closed_when_evidence_git_command_fails(
+    tmp_path: Path, failed_prefix: tuple[str, ...]
+):
+    repo, _, codex, sync_config, value, verify, _ = _repair_fixture(tmp_path)
+
+    class FailingRunner(SubprocessCommandRunner):
+        def run(self, argv: list[str], cwd: Path, timeout: int = 300):
+            if tuple(argv[: len(failed_prefix)]) == failed_prefix:
+                return subprocess.CompletedProcess(argv, 1, "", "injected")
+            return super().run(argv, cwd, timeout)
+
+    result = CodexCandidateRemediator(
+        config=sync_config,
+        runner=FailingRunner(),
+        executable=codex,
+        prompt="Repair the failing exact candidate.",
+        verify_fn=verify,
+    ).repair_candidate(value)
+
+    assert result is None
+    assert _git(repo, "ls-remote", "origin", "refs/heads/auto-sync/upstream").split()[0] == value.candidate_sha

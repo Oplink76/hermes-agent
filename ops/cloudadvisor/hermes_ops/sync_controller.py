@@ -13,6 +13,7 @@ from .command import CommandRunner
 from .deploy import DeployConfig, DeploymentRecord, PreflightError
 from .locking import try_exclusive_file_lock
 from .sync import (
+    FIXED_CANDIDATE_BRANCH,
     ConflictResolver,
     SyncClassification,
     SyncConfig,
@@ -20,6 +21,7 @@ from .sync import (
     SyncState,
     prepare_candidate,
 )
+from .sync_reconstruction import ReconstructionError, reconstruct_failed_candidate
 from .sync_github import SyncGitHubPort, SyncPullRequestEvidence
 from .sync_github import SyncGitHubError
 from .sync_receipt import (
@@ -57,6 +59,7 @@ class AutonomousSyncState(str, Enum):
     NEEDS_OLE = "NEEDS_OLE"
     LOCKED = "LOCKED"
     REFRESH_REQUIRED = "REFRESH_REQUIRED"
+    PENDING_REFRESH = "PENDING_REFRESH"
 
 
 @dataclass(frozen=True)
@@ -102,7 +105,7 @@ class AutonomousSyncResult:
     @classmethod
     def refresh_required(cls, candidate: SyncResult) -> "AutonomousSyncResult":
         return cls(
-            state=AutonomousSyncState.REFRESH_REQUIRED,
+            state=AutonomousSyncState.PENDING_REFRESH,
             candidate_sha=candidate.candidate_sha,
             reason="official upstream changed; candidate refresh required",
         )
@@ -118,10 +121,13 @@ class AutonomousSyncConfig:
     poll_interval_seconds: int = 15
     resolver_backend: str | None = None
     resolution_record: Path | None = None
+    max_upstream_refreshes: int = 2
 
     def __post_init__(self) -> None:
         if self.check_timeout_seconds <= 0 or self.poll_interval_seconds <= 0:
             raise ValueError("sync polling settings must be positive")
+        if self.max_upstream_refreshes < 0:
+            raise ValueError("upstream refresh budget must not be negative")
         if not self.required_check.strip():
             raise ValueError("required check must not be empty")
         if self.deploy.repo_slug and self.deploy.repo_slug != self.sync.repo_slug:
@@ -227,9 +233,41 @@ def _review_candidate(
     config: AutonomousSyncConfig,
     candidate: SyncResult,
     reviewer: IndependentConflictReviewer | None,
+    runner: CommandRunner,
 ) -> tuple[SyncResult, ConflictReviewReceipt | None]:
     review_candidate = candidate
     if candidate.classification is SyncClassification.MINOR_REVIEW_REQUIRED:
+        if candidate.resolution_strategy == "candidate_repair":
+            branch = runner.run(
+                ["git", "branch", "--show-current"],
+                cwd=config.sync.worktree,
+                timeout=300,
+            )
+            status = runner.run(
+                ["git", "status", "--porcelain", "--untracked-files=all"],
+                cwd=config.sync.worktree,
+                timeout=300,
+            )
+            if (
+                branch.returncode != 0
+                or (branch.stdout or "").strip() != FIXED_CANDIDATE_BRANCH
+                or status.returncode != 0
+                or (status.stdout or "").strip()
+            ):
+                raise AutonomousSyncError("candidate review worktree is not disposable")
+            for argv in (
+                ["git", "reset", "--hard", candidate.candidate_sha],
+                ["git", "clean", "-fd"],
+            ):
+                if runner.run(argv, cwd=config.sync.worktree, timeout=300).returncode != 0:
+                    raise AutonomousSyncError("candidate review worktree refresh failed")
+            head = runner.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=config.sync.worktree,
+                timeout=300,
+            )
+            if head.returncode != 0 or (head.stdout or "").strip() != candidate.candidate_sha:
+                raise AutonomousSyncError("candidate review worktree head is not exact")
         resolution_artifact = freeze_resolution_record(config.receipt_root, candidate)
         review_candidate = replace(
             candidate, resolution_record=resolution_artifact.path
@@ -245,21 +283,57 @@ def _review_candidate(
     )
 
 
-def _valid_repair(previous: SyncResult, repaired: SyncResult | None) -> SyncResult:
+def _valid_repair(
+    previous: SyncResult,
+    repaired: SyncResult | None,
+    *,
+    runner: CommandRunner,
+    repo: Path,
+) -> SyncResult:
     if repaired is None:
         raise AutonomousSyncError("bounded candidate repair did not produce a candidate")
     if (
         not previous.candidate_sha
         or not repaired.candidate_sha
         or repaired.candidate_sha == previous.candidate_sha
+        or not previous.candidate_tree_sha
+        or not repaired.candidate_tree_sha
+        or repaired.candidate_tree_sha == previous.candidate_tree_sha
         or repaired.state is not SyncState.PR_UPDATED
         or repaired.pr_number != previous.pr_number
         or repaired.base_sha != previous.base_sha
         or repaired.upstream_sha != previous.upstream_sha
+        or repaired.classification is not SyncClassification.MINOR_REVIEW_REQUIRED
+        or repaired.resolution_strategy != "candidate_repair"
+        or repaired.resolution_record is None
+        or repaired.resolution_evidence_dir is None
+        or not repaired.conflicted_files
         or not repaired.checks
         or any(check.status != "passed" for check in repaired.checks)
     ):
         raise AutonomousSyncError("bounded candidate repair evidence is invalid")
+    ancestry = runner.run(
+        [
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            previous.candidate_sha,
+            repaired.candidate_sha,
+        ],
+        cwd=repo,
+        timeout=300,
+    )
+    parent = runner.run(
+        ["git", "rev-parse", f"{repaired.candidate_sha}^"],
+        cwd=repo,
+        timeout=300,
+    )
+    if (
+        ancestry.returncode != 0
+        or parent.returncode != 0
+        or (parent.stdout or "").strip() != previous.candidate_sha
+    ):
+        raise AutonomousSyncError("bounded candidate repair lineage is invalid")
     return repaired
 
 
@@ -390,6 +464,7 @@ def run_autonomous_sync(
         infrastructure_retry_used = False
         candidate_repair_used = False
         post_rollback_repair = False
+        upstream_refreshes = 0
         try:
             candidate = prepare_candidate(
                 config.sync,
@@ -413,7 +488,7 @@ def run_autonomous_sync(
                     )
 
                 reviewed, conflict_review = _review_candidate(
-                    config, candidate, reviewer
+                    config, candidate, reviewer, runner
                 )
                 try:
                     evidence = wait_for_green_exact_head(
@@ -430,8 +505,11 @@ def run_autonomous_sync(
                         raise AutonomousSyncError(str(first_red)) from first_red
                     retried = False
                     if not infrastructure_retry_used:
-                        infrastructure_retry_used = True
-                        retried = remediator.retry_infrastructure(reviewed)
+                        retried = remediator.retry_infrastructure(
+                            reviewed, first_red.evidence
+                        )
+                        if retried:
+                            infrastructure_retry_used = True
                     if retried:
                         try:
                             evidence = wait_for_green_exact_head(
@@ -454,9 +532,11 @@ def run_autonomous_sync(
                         candidate = _valid_repair(
                             reviewed,
                             remediator.repair_candidate(reviewed),
+                            runner=runner,
+                            repo=config.sync.repo,
                         )
                         reviewed, conflict_review = _review_candidate(
-                            config, candidate, reviewer
+                            config, candidate, reviewer, runner
                         )
                         try:
                             evidence = wait_for_green_exact_head(
@@ -480,7 +560,19 @@ def run_autonomous_sync(
                     conflict_review=conflict_review,
                 )
                 if not _upstream_is_current(config, reviewed, runner):
-                    return AutonomousSyncResult.refresh_required(reviewed)
+                    if upstream_refreshes >= config.max_upstream_refreshes:
+                        return AutonomousSyncResult.refresh_required(reviewed)
+                    upstream_refreshes += 1
+                    candidate = prepare_candidate(
+                        config.sync,
+                        github=github,
+                        runner=runner,
+                        resolver=resolver,
+                    )
+                    if candidate.state is SyncState.NO_CHANGE:
+                        return AutonomousSyncResult.no_change(candidate)
+                    post_rollback_repair = False
+                    continue
                 _bind_expected_base(github, evidence.base_sha)
                 merge_sha = github.merge_exact(
                     evidence.number, expected_head=reviewed.candidate_sha
@@ -515,11 +607,17 @@ def run_autonomous_sync(
                         merge_sha=merge_sha,
                         installed_sha=outcome.installed_sha,
                     )
-                refreshed = prepare_candidate(
+                if not outcome.fork_main_sha:
+                    raise AutonomousSyncError(
+                        "protected rollback did not report reconstructed base"
+                    )
+                refreshed = reconstruct_failed_candidate(
                     config.sync,
+                    failed=reviewed,
+                    failed_merge_sha=merge_sha,
+                    revert_main_sha=outcome.fork_main_sha,
                     github=github,
                     runner=runner,
-                    resolver=resolver,
                 )
                 if refreshed.state is not SyncState.PR_UPDATED:
                     raise AutonomousSyncError(
@@ -527,13 +625,16 @@ def run_autonomous_sync(
                     )
                 candidate_repair_used = True
                 health_evidence = tuple(
-                    f"{check.name}:{check.status}" for check in deployment.checks
+                    f"{check.name}:{'passed' if check.passed else 'failed'}"
+                    for check in deployment.checks
                 ) or (f"deployment:{deployment.status}",)
                 candidate = _valid_repair(
                     refreshed,
                     remediator.repair_candidate(
                         refreshed, health_evidence=health_evidence
                     ),
+                    runner=runner,
+                    repo=config.sync.repo,
                 )
                 post_rollback_repair = True
         except (
@@ -577,6 +678,12 @@ def run_autonomous_sync(
         except SyncRemediationError:
             return AutonomousSyncResult.needs_human(
                 "bounded sync remediation failed",
+                candidate_sha=candidate.candidate_sha if candidate else None,
+                merge_sha=merge_sha,
+            )
+        except ReconstructionError:
+            return AutonomousSyncResult.needs_human(
+                "post-rollback candidate reconstruction failed",
                 candidate_sha=candidate.candidate_sha if candidate else None,
                 merge_sha=merge_sha,
             )

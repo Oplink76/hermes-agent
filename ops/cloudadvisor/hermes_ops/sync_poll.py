@@ -16,6 +16,10 @@ class ExactHeadPollError(RuntimeError):
 class RequiredCheckRedError(ExactHeadPollError):
     """The exact required check completed unsuccessfully."""
 
+    def __init__(self, message: str, evidence: SyncPullRequestEvidence):
+        super().__init__(message)
+        self.evidence = evidence
+
 
 @dataclass(frozen=True)
 class ExactHeadExpectation:
@@ -70,7 +74,7 @@ def poll_exact_head(
         if conclusion == "success":
             return evidence
         if conclusion not in {"pending", "queued", "in_progress"}:
-            raise RequiredCheckRedError("required check is not green")
+            raise RequiredCheckRedError("required check is not green", evidence)
         remaining = deadline - clock()
         if remaining <= 0:
             raise ExactHeadPollError("required check timed out")

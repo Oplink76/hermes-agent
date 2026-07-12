@@ -20,6 +20,8 @@ BASE_SHA = "a" * 40
 HEAD_SHA = "b" * 40
 OTHER_SHA = "c" * 40
 MERGE_SHA = "d" * 40
+WORKFLOW_RUN_ID = 101
+CHECK_RUN_ID = 202
 
 
 @dataclass(frozen=True)
@@ -53,7 +55,16 @@ def _pr(
 ) -> dict[str, object]:
     checks = []
     if conclusion is not None:
-        checks.append({"name": CHECK, "conclusion": conclusion})
+        checks.append(
+            {
+                "name": CHECK,
+                "conclusion": conclusion,
+                "detailsUrl": (
+                    f"https://github.com/{REPO}/actions/runs/{WORKFLOW_RUN_ID}"
+                    f"/job/{CHECK_RUN_ID}"
+                ),
+            }
+        )
     return {
         "number": 7,
         "state": state,
@@ -94,6 +105,8 @@ def test_evidence_reads_exact_pull_request_identity_and_required_check(tmp_path:
     assert evidence.head_sha == HEAD_SHA
     assert evidence.required_check == CHECK
     assert evidence.required_check_conclusion == "success"
+    assert evidence.workflow_run_id == WORKFLOW_RUN_ID
+    assert evidence.required_check_run_id == CHECK_RUN_ID
     assert runner.calls[0].argv[:3] == ("gh", "pr", "view")
 
 
@@ -147,7 +160,7 @@ def test_merge_exact_rejects_non_green_aggregate_check(
 def test_merge_exact_rejects_missing_aggregate_check(tmp_path: Path):
     github, runner = _github(tmp_path, _completed(_pr(conclusion=None)))
 
-    with pytest.raises(SyncGitHubError, match="required check is not green"):
+    with pytest.raises(SyncGitHubError, match="evidence was incomplete"):
         github.merge_exact(7, expected_head=HEAD_SHA)
 
     assert all(call.argv[2] != "merge" for call in runner.calls)
@@ -289,7 +302,15 @@ def test_evidence_rejects_duplicate_configured_aggregate_checks(
     "check",
     [
         {"name": CHECK, "conclusion": 0},
-        {"name": CHECK, "conclusion": "SUCCESS", "state": 0},
+        {
+            "name": CHECK,
+            "conclusion": "SUCCESS",
+            "state": 0,
+            "detailsUrl": (
+                f"https://github.com/{REPO}/actions/runs/{WORKFLOW_RUN_ID}"
+                f"/job/{CHECK_RUN_ID}"
+            ),
+        },
     ],
 )
 def test_evidence_rejects_wrong_configured_check_source_types(
@@ -298,6 +319,21 @@ def test_evidence_rejects_wrong_configured_check_source_types(
 ):
     payload = _pr()
     payload["statusCheckRollup"] = [check]
+    github, _ = _github(tmp_path, _completed(payload))
+
+    with pytest.raises(SyncGitHubError, match="evidence was incomplete"):
+        github.evidence(7)
+
+
+@pytest.mark.parametrize(
+    "details_url",
+    [None, "", "https://github.com/Oplink76/hermes-agent/actions/runs/nope/job/2"],
+)
+def test_evidence_requires_exact_workflow_and_check_run_ids(
+    tmp_path: Path, details_url: object
+):
+    payload = _pr()
+    payload["statusCheckRollup"][0]["detailsUrl"] = details_url
     github, _ = _github(tmp_path, _completed(payload))
 
     with pytest.raises(SyncGitHubError, match="evidence was incomplete"):
