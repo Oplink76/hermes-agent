@@ -12,8 +12,10 @@ if os.name != "nt":
 
 from ops.cloudadvisor.hermes_ops.sync import (
     CodexConflictResolver,
+    SyncClassification,
     SyncConfig,
     SyncState,
+    prepare_candidate,
     run,
 )
 
@@ -160,6 +162,16 @@ def test_clean_merge_updates_exactly_one_existing_pull_request(tmp_path: Path):
         for call in push_calls
         for destination in call.argv
     )
+
+
+def test_clean_merge_classifies_clean(tmp_path: Path):
+    runner = FakeRunner(base_responses())
+
+    result = prepare_candidate(
+        config(tmp_path), runner=runner, github=FakeGitHub(existing_pr=17)
+    )
+
+    assert result.classification is SyncClassification.CLEAN
 
 
 def test_clean_merge_creates_one_pull_request_when_none_exists(tmp_path: Path):
@@ -345,6 +357,37 @@ def test_resolved_merge_conflict_runs_gates_before_push(tmp_path: Path):
     assert len(pushes(runner)) == 1
 
 
+def test_resolved_merge_conflict_requires_review(tmp_path: Path):
+    responses = base_responses(merge_returncode=1)
+    responses[("git", "rev-parse", "-q", "--verify", "MERGE_HEAD")] = (
+        0,
+        "upstream-sha\n",
+        "",
+    )
+
+    result = prepare_candidate(
+        config(tmp_path),
+        runner=FakeRunner(responses),
+        github=FakeGitHub(existing_pr=17),
+        resolver=FakeResolver(True),
+    )
+
+    assert (
+        result.classification is SyncClassification.MINOR_REVIEW_REQUIRED
+    )
+
+
+def test_unresolved_merge_conflict_classifies_major(tmp_path: Path):
+    result = prepare_candidate(
+        config(tmp_path),
+        runner=FakeRunner(base_responses(merge_returncode=1)),
+        github=FakeGitHub(),
+        resolver=FakeResolver(False),
+    )
+
+    assert result.classification is SyncClassification.MAJOR
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Contention fixture uses POSIX flock")
 def test_concurrent_lock_contention_returns_locked_without_git_calls(tmp_path: Path):
     sync_config = config(tmp_path)
@@ -357,6 +400,22 @@ def test_concurrent_lock_contention_returns_locked_without_git_calls(tmp_path: P
 
     assert result.state is SyncState.LOCKED
     assert runner.calls == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Contention fixture uses POSIX flock")
+def test_prepare_candidate_does_not_acquire_file_lock(tmp_path: Path):
+    sync_config = config(tmp_path)
+    sync_config.lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with sync_config.lock_path.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        runner = FakeRunner(base_responses())
+
+        result = prepare_candidate(
+            sync_config, runner=runner, github=FakeGitHub(existing_pr=17)
+        )
+
+    assert result.state is SyncState.PR_UPDATED
+    assert runner.calls
 
 
 def test_resolver_cannot_bypass_missing_merge_head(tmp_path: Path):

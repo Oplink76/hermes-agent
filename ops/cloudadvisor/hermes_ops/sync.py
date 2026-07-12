@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Protocol
@@ -32,6 +32,13 @@ class SyncState(str, Enum):
     VERIFY_FAILED = "VERIFY_FAILED"
     PUSHED = "PUSHED"
     PR_UPDATED = "PR_UPDATED"
+
+
+class SyncClassification(str, Enum):
+    CLEAN = "clean"
+    MINOR_REVIEW_REQUIRED = "minor_review_required"
+    MINOR_RESOLVED = "minor_resolved"
+    MAJOR = "major"
 
 
 @dataclass(frozen=True)
@@ -72,6 +79,7 @@ class SyncResult:
     risk: str = "unknown"
     changed_files: tuple[str, ...] = ()
     transitions: tuple[SyncState, ...] = ()
+    classification: SyncClassification = SyncClassification.MAJOR
 
 
 class GitHubPullRequests(Protocol):
@@ -168,6 +176,7 @@ def _result(
     checks: list[CheckResult] | None = None,
     risk: str = "unknown",
     changed_files: tuple[str, ...] = (),
+    classification: SyncClassification = SyncClassification.MAJOR,
 ) -> SyncResult:
     return SyncResult(
         state=state,
@@ -179,6 +188,7 @@ def _result(
         risk=risk,
         changed_files=changed_files,
         transitions=tuple(transitions),
+        classification=classification,
     )
 
 
@@ -304,6 +314,271 @@ def _push_candidate(
     )
 
 
+def prepare_candidate(
+    config: SyncConfig,
+    *,
+    github: GitHubPullRequests,
+    runner: CommandRunner,
+    resolver: ConflictResolver | None = None,
+) -> SyncResult:
+    """Prepare and push the rolling PR; the caller owns ``config.lock_path``."""
+    transitions: list[SyncState] = []
+
+    for remote in (config.origin, config.upstream):
+        fetched = _run(
+            runner, ["git", "fetch", remote, "main"], config.repo, timeout=600
+        )
+        if fetched.returncode != 0:
+            return _result(SyncState.NEEDS_DECISION, transitions)
+    transitions.append(SyncState.FETCHED)
+
+    base_result = _run(
+        runner, ["git", "rev-parse", f"{config.origin}/main"], config.repo
+    )
+    upstream_result = _run(
+        runner,
+        ["git", "rev-parse", f"{config.upstream}/main"],
+        config.repo,
+    )
+    backlog_result = _run(
+        runner,
+        [
+            "git",
+            "rev-list",
+            "--count",
+            f"{config.origin}/main..{config.upstream}/main",
+        ],
+        config.repo,
+    )
+    if any(
+        result.returncode != 0
+        for result in (base_result, upstream_result, backlog_result)
+    ):
+        return _result(SyncState.NEEDS_DECISION, transitions)
+    base_sha = _output(base_result)
+    upstream_sha = _output(upstream_result)
+    backlog = int(_output(backlog_result))
+    if backlog == 0:
+        transitions.append(SyncState.NO_CHANGE)
+        return _result(
+            SyncState.NO_CHANGE,
+            transitions,
+            base_sha=base_sha,
+            upstream_sha=upstream_sha,
+            risk="none",
+        )
+
+    _run(
+        runner,
+        [
+            "git",
+            "fetch",
+            config.origin,
+            (
+                f"refs/heads/{FIXED_CANDIDATE_BRANCH}:"
+                f"refs/remotes/{config.origin}/{FIXED_CANDIDATE_BRANCH}"
+            ),
+        ],
+        config.repo,
+        timeout=600,
+    )
+    candidate_ref = f"refs/remotes/{config.origin}/{FIXED_CANDIDATE_BRANCH}"
+    previous_result = _run(
+        runner,
+        ["git", "rev-parse", candidate_ref],
+        config.repo,
+    )
+    previous_candidate_sha = (
+        _output(previous_result) if previous_result.returncode == 0 else ""
+    )
+
+    branch_result = _run(
+        runner,
+        ["git", "branch", "--show-current"],
+        config.worktree,
+    )
+    status_result = _run(
+        runner,
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        config.worktree,
+    )
+    if (
+        branch_result.returncode != 0
+        or _output(branch_result) != FIXED_CANDIDATE_BRANCH
+        or status_result.returncode != 0
+        or _output(status_result)
+    ):
+        transitions.append(SyncState.NEEDS_DECISION)
+        return _result(
+            SyncState.NEEDS_DECISION,
+            transitions,
+            base_sha=base_sha,
+            upstream_sha=upstream_sha,
+            risk="candidate_worktree_not_disposable",
+        )
+
+    reset = _run(
+        runner,
+        ["git", "reset", "--hard", f"{config.origin}/main"],
+        config.worktree,
+    )
+    if reset.returncode != 0:
+        return _result(
+            SyncState.NEEDS_DECISION,
+            transitions,
+            base_sha=base_sha,
+            upstream_sha=upstream_sha,
+        )
+    transitions.append(SyncState.CANDIDATE_RESET)
+
+    merged = _run(
+        runner,
+        ["git", "merge", "--no-edit", f"{config.upstream}/main"],
+        config.worktree,
+        timeout=900,
+    )
+    if merged.returncode == 0:
+        transitions.append(SyncState.MERGED_CLEAN)
+        classification = SyncClassification.CLEAN
+    else:
+        transitions.append(SyncState.CONFLICTED)
+        if resolver is None or not resolver.resolve(config.worktree, runner):
+            transitions.append(SyncState.NEEDS_DECISION)
+            return _result(
+                SyncState.NEEDS_DECISION,
+                transitions,
+                base_sha=base_sha,
+                upstream_sha=upstream_sha,
+                risk="conflict",
+            )
+        unmerged = _run(runner, ["git", "ls-files", "-u"], config.worktree)
+        if unmerged.returncode != 0 or _output(unmerged):
+            transitions.append(SyncState.NEEDS_DECISION)
+            return _result(
+                SyncState.NEEDS_DECISION,
+                transitions,
+                base_sha=base_sha,
+                upstream_sha=upstream_sha,
+                risk="conflict",
+            )
+        merge_head = _run(
+            runner,
+            ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+            config.worktree,
+        )
+        if merge_head.returncode != 0 or _output(merge_head) != upstream_sha:
+            transitions.append(SyncState.NEEDS_DECISION)
+            return _result(
+                SyncState.NEEDS_DECISION,
+                transitions,
+                base_sha=base_sha,
+                upstream_sha=upstream_sha,
+                risk="resolver_did_not_preserve_merge_state",
+            )
+        committed = _run(
+            runner,
+            ["git", "commit", "--no-edit"],
+            config.worktree,
+        )
+        if committed.returncode != 0:
+            transitions.append(SyncState.NEEDS_DECISION)
+            return _result(
+                SyncState.NEEDS_DECISION,
+                transitions,
+                base_sha=base_sha,
+                upstream_sha=upstream_sha,
+                risk="resolved_merge_commit_failed",
+            )
+        transitions.append(SyncState.AI_RESOLVED)
+        classification = SyncClassification.MINOR_REVIEW_REQUIRED
+
+    checks = _verify(config.worktree, runner)
+    if any(check.status != "passed" for check in checks):
+        transitions.append(SyncState.VERIFY_FAILED)
+        return _result(
+            SyncState.VERIFY_FAILED,
+            transitions,
+            base_sha=base_sha,
+            upstream_sha=upstream_sha,
+            checks=checks,
+            risk="verification_failed",
+        )
+    transitions.append(SyncState.VERIFIED)
+
+    candidate_result = _run(runner, ["git", "rev-parse", "HEAD"], config.worktree)
+    changed_result = _run(
+        runner,
+        ["git", "diff", "--name-only", f"{config.origin}/main...HEAD"],
+        config.worktree,
+    )
+    if candidate_result.returncode != 0 or changed_result.returncode != 0:
+        transitions.append(SyncState.VERIFY_FAILED)
+        return _result(
+            SyncState.VERIFY_FAILED,
+            transitions,
+            base_sha=base_sha,
+            upstream_sha=upstream_sha,
+            checks=checks,
+        )
+    candidate_sha = _output(candidate_result)
+    changed_files = tuple(
+        line for line in _output(changed_result).splitlines() if line
+    )
+
+    pushed = _push_candidate(config, runner, previous_candidate_sha)
+    if pushed.returncode != 0:
+        transitions.append(SyncState.NEEDS_DECISION)
+        return _result(
+            SyncState.NEEDS_DECISION,
+            transitions,
+            base_sha=base_sha,
+            upstream_sha=upstream_sha,
+            candidate_sha=candidate_sha,
+            checks=checks,
+            changed_files=changed_files,
+            risk="push_failed",
+        )
+    transitions.append(SyncState.PUSHED)
+
+    title = "chore(sync): update fork from upstream"
+    body = (
+        f"Automated PR-only upstream candidate.\n\n"
+        f"- Fork base: `{base_sha}`\n"
+        f"- Upstream: `{upstream_sha}`\n"
+        f"- Candidate: `{candidate_sha}`\n"
+        f"- Upstream commits: {backlog}\n"
+    )
+    pr_number = github.find_open_pull_request(FIXED_CANDIDATE_BRANCH, "main")
+    if pr_number is None:
+        pr_number = github.create_pull_request(
+            head=FIXED_CANDIDATE_BRANCH,
+            base="main",
+            title=title,
+            body=body,
+        )
+    else:
+        github.update_pull_request(pr_number, title=title, body=body)
+    transitions.append(SyncState.PR_UPDATED)
+    custom_prefixes = ("gateway/", "hermes_cli/kanban", "ops/cloudadvisor/")
+    risk = (
+        "fork_customizations_touched"
+        if any(path.startswith(custom_prefixes) for path in changed_files)
+        else "upstream_only"
+    )
+    return _result(
+        SyncState.PR_UPDATED,
+        transitions,
+        base_sha=base_sha,
+        upstream_sha=upstream_sha,
+        candidate_sha=candidate_sha,
+        pr_number=pr_number,
+        checks=checks,
+        risk=risk,
+        changed_files=changed_files,
+        classification=classification,
+    )
+
+
 def run(
     config: SyncConfig,
     *,
@@ -312,259 +587,15 @@ def run(
     resolver: ConflictResolver | None = None,
 ) -> SyncResult:
     runner = runner or SubprocessCommandRunner()
-    transitions = [SyncState.LOCKED]
+    transitions = (SyncState.LOCKED,)
 
     with try_exclusive_file_lock(config.lock_path) as acquired:
         if not acquired:
-            return _result(SyncState.LOCKED, transitions)
-
-        for remote in (config.origin, config.upstream):
-            fetched = _run(
-                runner, ["git", "fetch", remote, "main"], config.repo, timeout=600
-            )
-            if fetched.returncode != 0:
-                return _result(SyncState.NEEDS_DECISION, transitions)
-        transitions.append(SyncState.FETCHED)
-
-        base_result = _run(
-            runner, ["git", "rev-parse", f"{config.origin}/main"], config.repo
+            return _result(SyncState.LOCKED, list(transitions))
+        result = prepare_candidate(
+            config,
+            github=github,
+            runner=runner,
+            resolver=resolver,
         )
-        upstream_result = _run(
-            runner,
-            ["git", "rev-parse", f"{config.upstream}/main"],
-            config.repo,
-        )
-        backlog_result = _run(
-            runner,
-            [
-                "git",
-                "rev-list",
-                "--count",
-                f"{config.origin}/main..{config.upstream}/main",
-            ],
-            config.repo,
-        )
-        if any(
-            result.returncode != 0
-            for result in (base_result, upstream_result, backlog_result)
-        ):
-            return _result(SyncState.NEEDS_DECISION, transitions)
-        base_sha = _output(base_result)
-        upstream_sha = _output(upstream_result)
-        backlog = int(_output(backlog_result))
-        if backlog == 0:
-            transitions.append(SyncState.NO_CHANGE)
-            return _result(
-                SyncState.NO_CHANGE,
-                transitions,
-                base_sha=base_sha,
-                upstream_sha=upstream_sha,
-                risk="none",
-            )
-
-        _run(
-            runner,
-            [
-                "git",
-                "fetch",
-                config.origin,
-                (
-                    f"refs/heads/{FIXED_CANDIDATE_BRANCH}:"
-                    f"refs/remotes/{config.origin}/{FIXED_CANDIDATE_BRANCH}"
-                ),
-            ],
-            config.repo,
-            timeout=600,
-        )
-        candidate_ref = f"refs/remotes/{config.origin}/{FIXED_CANDIDATE_BRANCH}"
-        previous_result = _run(
-            runner,
-            ["git", "rev-parse", candidate_ref],
-            config.repo,
-        )
-        previous_candidate_sha = (
-            _output(previous_result) if previous_result.returncode == 0 else ""
-        )
-
-        branch_result = _run(
-            runner,
-            ["git", "branch", "--show-current"],
-            config.worktree,
-        )
-        status_result = _run(
-            runner,
-            ["git", "status", "--porcelain", "--untracked-files=all"],
-            config.worktree,
-        )
-        if (
-            branch_result.returncode != 0
-            or _output(branch_result) != FIXED_CANDIDATE_BRANCH
-            or status_result.returncode != 0
-            or _output(status_result)
-        ):
-            transitions.append(SyncState.NEEDS_DECISION)
-            return _result(
-                SyncState.NEEDS_DECISION,
-                transitions,
-                base_sha=base_sha,
-                upstream_sha=upstream_sha,
-                risk="candidate_worktree_not_disposable",
-            )
-
-        reset = _run(
-            runner,
-            ["git", "reset", "--hard", f"{config.origin}/main"],
-            config.worktree,
-        )
-        if reset.returncode != 0:
-            return _result(
-                SyncState.NEEDS_DECISION,
-                transitions,
-                base_sha=base_sha,
-                upstream_sha=upstream_sha,
-            )
-        transitions.append(SyncState.CANDIDATE_RESET)
-
-        merged = _run(
-            runner,
-            ["git", "merge", "--no-edit", f"{config.upstream}/main"],
-            config.worktree,
-            timeout=900,
-        )
-        if merged.returncode == 0:
-            transitions.append(SyncState.MERGED_CLEAN)
-        else:
-            transitions.append(SyncState.CONFLICTED)
-            if resolver is None or not resolver.resolve(config.worktree, runner):
-                transitions.append(SyncState.NEEDS_DECISION)
-                return _result(
-                    SyncState.NEEDS_DECISION,
-                    transitions,
-                    base_sha=base_sha,
-                    upstream_sha=upstream_sha,
-                    risk="conflict",
-                )
-            unmerged = _run(runner, ["git", "ls-files", "-u"], config.worktree)
-            if unmerged.returncode != 0 or _output(unmerged):
-                transitions.append(SyncState.NEEDS_DECISION)
-                return _result(
-                    SyncState.NEEDS_DECISION,
-                    transitions,
-                    base_sha=base_sha,
-                    upstream_sha=upstream_sha,
-                    risk="conflict",
-                )
-            merge_head = _run(
-                runner,
-                ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
-                config.worktree,
-            )
-            if merge_head.returncode != 0 or _output(merge_head) != upstream_sha:
-                transitions.append(SyncState.NEEDS_DECISION)
-                return _result(
-                    SyncState.NEEDS_DECISION,
-                    transitions,
-                    base_sha=base_sha,
-                    upstream_sha=upstream_sha,
-                    risk="resolver_did_not_preserve_merge_state",
-                )
-            committed = _run(
-                runner,
-                ["git", "commit", "--no-edit"],
-                config.worktree,
-            )
-            if committed.returncode != 0:
-                transitions.append(SyncState.NEEDS_DECISION)
-                return _result(
-                    SyncState.NEEDS_DECISION,
-                    transitions,
-                    base_sha=base_sha,
-                    upstream_sha=upstream_sha,
-                    risk="resolved_merge_commit_failed",
-                )
-            transitions.append(SyncState.AI_RESOLVED)
-
-        checks = _verify(config.worktree, runner)
-        if any(check.status != "passed" for check in checks):
-            transitions.append(SyncState.VERIFY_FAILED)
-            return _result(
-                SyncState.VERIFY_FAILED,
-                transitions,
-                base_sha=base_sha,
-                upstream_sha=upstream_sha,
-                checks=checks,
-                risk="verification_failed",
-            )
-        transitions.append(SyncState.VERIFIED)
-
-        candidate_result = _run(runner, ["git", "rev-parse", "HEAD"], config.worktree)
-        changed_result = _run(
-            runner,
-            ["git", "diff", "--name-only", f"{config.origin}/main...HEAD"],
-            config.worktree,
-        )
-        if candidate_result.returncode != 0 or changed_result.returncode != 0:
-            transitions.append(SyncState.VERIFY_FAILED)
-            return _result(
-                SyncState.VERIFY_FAILED,
-                transitions,
-                base_sha=base_sha,
-                upstream_sha=upstream_sha,
-                checks=checks,
-            )
-        candidate_sha = _output(candidate_result)
-        changed_files = tuple(
-            line for line in _output(changed_result).splitlines() if line
-        )
-
-        pushed = _push_candidate(config, runner, previous_candidate_sha)
-        if pushed.returncode != 0:
-            transitions.append(SyncState.NEEDS_DECISION)
-            return _result(
-                SyncState.NEEDS_DECISION,
-                transitions,
-                base_sha=base_sha,
-                upstream_sha=upstream_sha,
-                candidate_sha=candidate_sha,
-                checks=checks,
-                changed_files=changed_files,
-                risk="push_failed",
-            )
-        transitions.append(SyncState.PUSHED)
-
-        title = "chore(sync): update fork from upstream"
-        body = (
-            f"Automated PR-only upstream candidate.\n\n"
-            f"- Fork base: `{base_sha}`\n"
-            f"- Upstream: `{upstream_sha}`\n"
-            f"- Candidate: `{candidate_sha}`\n"
-            f"- Upstream commits: {backlog}\n"
-        )
-        pr_number = github.find_open_pull_request(FIXED_CANDIDATE_BRANCH, "main")
-        if pr_number is None:
-            pr_number = github.create_pull_request(
-                head=FIXED_CANDIDATE_BRANCH,
-                base="main",
-                title=title,
-                body=body,
-            )
-        else:
-            github.update_pull_request(pr_number, title=title, body=body)
-        transitions.append(SyncState.PR_UPDATED)
-        custom_prefixes = ("gateway/", "hermes_cli/kanban", "ops/cloudadvisor/")
-        risk = (
-            "fork_customizations_touched"
-            if any(path.startswith(custom_prefixes) for path in changed_files)
-            else "upstream_only"
-        )
-        return _result(
-            SyncState.PR_UPDATED,
-            transitions,
-            base_sha=base_sha,
-            upstream_sha=upstream_sha,
-            candidate_sha=candidate_sha,
-            pr_number=pr_number,
-            checks=checks,
-            risk=risk,
-            changed_files=changed_files,
-        )
+    return replace(result, transitions=transitions + result.transitions)
