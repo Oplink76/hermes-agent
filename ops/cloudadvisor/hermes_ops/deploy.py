@@ -18,6 +18,7 @@ from typing import Callable, Literal, Protocol
 from .command import CommandRunner
 from .health import HealthCheck, HealthReport
 from .locking import try_exclusive_file_lock
+from .sync_github import RequiredCheckEvidenceError, required_check_conclusion
 from .sync_receipt import SyncEligibilityReceipt, SyncReceiptError
 from utils import atomic_json_write
 
@@ -91,6 +92,8 @@ class DeployConfig:
     origin: str
     record_root: Path
     lock_path: Path | None = None
+    repo_slug: str = ""
+    sync_receipt_root: Path | None = None
     required_approver: str = "Ole Ørum-Petersen"
     required_check: str = "All required checks pass"
     uv_extras: tuple[str, ...] = ()
@@ -102,6 +105,10 @@ class ReleaseEvidence:
     pr_number: int
     merged: bool
     merge_sha: str
+    repo_slug: str
+    head_sha: str
+    base_ref_name: str
+    base_sha: str
     required_check: str
     required_check_conclusion: str
 
@@ -152,7 +159,10 @@ class GhReleaseVerifier:
                 "--repo",
                 self.repo_slug,
                 "--json",
-                "number,state,mergedAt,mergeCommit,statusCheckRollup",
+                (
+                    "number,state,mergedAt,mergeCommit,headRefOid,baseRefName,"
+                    "baseRefOid,statusCheckRollup"
+                ),
             ],
             cwd=self.cwd,
             timeout=300,
@@ -163,20 +173,8 @@ class GhReleaseVerifier:
         try:
             payload = json.loads(completed.stdout or "{}")
             merge_commit = payload.get("mergeCommit") or {}
-            checks = payload.get("statusCheckRollup") or []
-            required = next(
-                (
-                    check
-                    for check in checks
-                    if (check.get("name") or check.get("context"))
-                    == self.required_check
-                ),
-                None,
-            )
-            conclusion = (
-                (required.get("conclusion") or required.get("state") or "missing")
-                if isinstance(required, dict)
-                else "missing"
+            conclusion = required_check_conclusion(
+                payload.get("statusCheckRollup"), self.required_check
             )
             return ReleaseEvidence(
                 pr_number=int(payload["number"]),
@@ -184,9 +182,15 @@ class GhReleaseVerifier:
                     payload.get("mergedAt") or payload.get("state") == "MERGED"
                 ),
                 merge_sha=str(merge_commit["oid"]),
+                repo_slug=self.repo_slug,
+                head_sha=str(payload["headRefOid"]),
+                base_ref_name=str(payload["baseRefName"]),
+                base_sha=str(payload["baseRefOid"]),
                 required_check=self.required_check,
-                required_check_conclusion=str(conclusion).lower(),
+                required_check_conclusion=conclusion,
             )
+        except RequiredCheckEvidenceError as exc:
+            raise PreflightError(str(exc)) from exc
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise PreflightError("GitHub release evidence was incomplete") from exc
 
@@ -314,6 +318,10 @@ def _validate_human_authority(
 ) -> None:
     if not request.actor.strip():
         raise PreflightError("deployment actor is missing")
+    if not config.repo_slug or evidence.repo_slug != config.repo_slug:
+        raise PreflightError("GitHub evidence repository does not match configuration")
+    if evidence.base_ref_name != "main":
+        raise PreflightError("GitHub PR base branch is not main")
     if approval.approver != config.required_approver:
         raise PreflightError("approval record does not name the required approver")
     if (
@@ -387,8 +395,18 @@ def _validate_sync_authority(
 ) -> None:
     if not request.actor.strip():
         raise PreflightError("deployment actor is missing")
+    if not config.repo_slug or receipt.repo_slug != config.repo_slug:
+        raise PreflightError("sync authority repository does not match configuration")
+    if evidence.repo_slug != config.repo_slug:
+        raise PreflightError("GitHub evidence repository does not match configuration")
     if receipt.pr_number != request.pr_number or evidence.pr_number != request.pr_number:
         raise PreflightError("sync authority or GitHub evidence names a different PR")
+    if evidence.head_sha != receipt.candidate_sha:
+        raise PreflightError("GitHub PR head does not match sync candidate")
+    if evidence.base_ref_name != "main":
+        raise PreflightError("GitHub PR base branch is not main")
+    if evidence.base_sha != receipt.base_sha:
+        raise PreflightError("GitHub PR base SHA does not match sync authority")
     if receipt.merge_sha is None:
         raise PreflightError("sync authority must be a finalized merged receipt")
     if receipt.merge_sha != request.sha:
@@ -411,6 +429,7 @@ def _validate_sync_authority(
 
 def _load_authority(
     request: DeployRequest,
+    config: DeployConfig,
 ) -> ApprovalRecord | SyncEligibilityReceipt:
     if request.authority_kind == "human":
         if request.authority_record is not None:
@@ -427,8 +446,22 @@ def _load_authority(
             raise PreflightError("automated sync received a human authority record")
         if request.authority_record is None:
             raise PreflightError("sync authority record is missing")
+        if config.sync_receipt_root is None:
+            raise PreflightError("trusted receipt root is not configured")
         try:
+            trusted_root = Path(config.sync_receipt_root).expanduser().resolve(
+                strict=True
+            )
+            artifact = Path(request.authority_record).expanduser().resolve(strict=True)
+            if artifact.parent != trusted_root:
+                raise PreflightError(
+                    "sync authority record is outside the trusted receipt root"
+                )
             return SyncEligibilityReceipt.load(request.authority_record)
+        except PreflightError:
+            raise
+        except OSError as exc:
+            raise PreflightError("trusted receipt root is missing or unreadable") from exc
         except SyncReceiptError as exc:
             raise PreflightError(
                 f"sync authority record is not eligible: {exc}"
@@ -521,7 +554,7 @@ def _deploy_locked(
     root = Path(config.install_root).expanduser().resolve(strict=True)
     record_store = store or DeploymentStore(config.record_root)
 
-    authority = _load_authority(request)
+    authority = _load_authority(request, config)
     evidence = github.verify(request.pr_number)
     authority_check = _validate_authority(request, authority, config, evidence)
     preflight_checks = [
@@ -558,6 +591,27 @@ def _deploy_locked(
     preflight_checks.append(
         HealthCheck("preflight:exact_sha", True, f"origin/main={origin_sha}")
     )
+    if isinstance(authority, SyncEligibilityReceipt):
+        contained = runner.run(
+            [
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                authority.candidate_sha,
+                request.sha,
+            ],
+            cwd=root,
+            timeout=600,
+        )
+        if contained.returncode != 0:
+            raise PreflightError("sync candidate is not contained in merge SHA")
+        preflight_checks.append(
+            HealthCheck(
+                "preflight:sync_ancestry",
+                True,
+                f"candidate={authority.candidate_sha} merge={request.sha}",
+            )
+        )
 
     previous_sha = _run_required(runner, ["git", "rev-parse", "HEAD"], cwd=root)
     _validate_uv_extras_for_revisions(

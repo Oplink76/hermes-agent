@@ -5,8 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from dataclasses import asdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -173,6 +172,7 @@ def load_operations_config(path: Path) -> OperationsConfig:
             if deploy.get("lock_path")
             else None
         ),
+        repo_slug=str(deploy["repo_slug"]),
         required_approver=str(deploy.get("required_approver", "Ole Ørum-Petersen")),
         required_check=str(deploy.get("required_check", "All required checks pass")),
         uv_extras=uv_extras,
@@ -410,6 +410,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if report.healthy else 3
     if args.command in {"deploy", "deploy-sync"}:
         config = load_operations_config(args.config)
+        if args.command == "deploy-sync":
+            sync_policy = load_sync_policy_config(args.config)
+            if sync_policy.required_check != config.deploy_config.required_check:
+                raise ValueError(
+                    "sync and deploy required_check settings must be identical"
+                )
+            config = replace(
+                config,
+                deploy_config=replace(
+                    config.deploy_config,
+                    sync_receipt_root=sync_policy.receipt_root,
+                ),
+            )
         runner = SubprocessCommandRunner()
         inject_health_failure = getattr(args, "inject_health_failure", None)
         if inject_health_failure:

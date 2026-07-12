@@ -37,6 +37,13 @@ def _write_operations_config(
     config_file.write_text(
         "\n".join([
             f"environment: {environment}",
+            "sync:",
+            f"  receipt_root: {tmp_path / 'sync-receipts'}",
+            "  required_check: All required checks pass",
+            "  check_timeout_seconds: 2700",
+            "  poll_interval_seconds: 15",
+            "  resolver_backend: codex",
+            "  reviewer_backend: claude",
             "runtime:",
             f"  install_root: {tmp_path / 'repo'}",
             "  uid: 501",
@@ -386,9 +393,34 @@ def test_deploy_sync_cli_wires_machine_authority_without_human_artifact(
     assert captured["request"].authority_kind == "automated_sync"
     assert captured["request"].authority_record == receipt
     assert captured["request"].approval_record is None
+    assert captured["config"].sync_receipt_root == (
+        tmp_path / "sync-receipts"
+    ).resolve()
     assert captured["runner"] is runner
     assert captured["services"].kind == "services"
     assert captured["health"].kind == "health"
     assert captured["snapshots"].kind == "snapshots"
     assert captured["github"].kind == "github"
     assert json.loads(capsys.readouterr().out)["status"] == "deployed"
+
+
+def test_deploy_sync_cli_rejects_crossed_sync_and_deploy_check_policy(
+    tmp_path: Path,
+):
+    config_file = _write_operations_config(tmp_path)
+    payload = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    payload["sync"]["required_check"] = "Different check"
+    config_file.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="required_check settings must be identical"):
+        cli.main([
+            "deploy-sync",
+            "--config",
+            str(config_file),
+            "--sha",
+            "merged-sha",
+            "--pr-number",
+            "7",
+            "--sync-receipt",
+            str(tmp_path / "receipt.json"),
+        ])

@@ -24,6 +24,52 @@ class SyncGitHubError(RuntimeError):
     """A redacted GitHub sync boundary failure."""
 
 
+class RequiredCheckEvidenceError(ValueError):
+    """Required-check evidence is malformed or ambiguous."""
+
+
+class AmbiguousRequiredCheckEvidenceError(RequiredCheckEvidenceError):
+    """More than one row claims the configured required-check identity."""
+
+
+def required_check_conclusion(checks: object, required_check: str) -> str:
+    """Return one configured check's normalized state, rejecting duplicates."""
+    if not isinstance(checks, list):
+        raise RequiredCheckEvidenceError("required check evidence is invalid")
+    matches: list[dict[str, object]] = []
+    for check in checks:
+        if not isinstance(check, dict):
+            raise RequiredCheckEvidenceError("required check evidence is invalid")
+        name = check.get("name")
+        context = check.get("context")
+        if name is not None and not isinstance(name, str):
+            raise RequiredCheckEvidenceError("required check evidence is invalid")
+        if context is not None and not isinstance(context, str):
+            raise RequiredCheckEvidenceError("required check evidence is invalid")
+        if required_check in {name, context}:
+            matches.append(check)
+    if len(matches) > 1:
+        raise AmbiguousRequiredCheckEvidenceError(
+            "required check evidence is ambiguous"
+        )
+    if not matches:
+        return "missing"
+    required = matches[0]
+    for field in ("conclusion", "state", "status"):
+        value = required.get(field)
+        if value is not None and not isinstance(value, str):
+            raise RequiredCheckEvidenceError("required check evidence is invalid")
+    state = (
+        required.get("conclusion")
+        or required.get("state")
+        or required.get("status")
+        or "pending"
+    )
+    if not isinstance(state, str):
+        raise RequiredCheckEvidenceError("required check evidence is invalid")
+    return state.lower()
+
+
 @dataclass(frozen=True)
 class SyncPullRequestEvidence:
     number: int
@@ -185,40 +231,14 @@ class GhSyncGitHub:
             base_sha = _full_sha(payload["baseRefOid"])
             head_sha = _full_sha(payload["headRefOid"])
 
-            checks = payload["statusCheckRollup"]
-            if not isinstance(checks, list):
-                raise TypeError
-            required_checks = []
-            for check in checks:
-                if not isinstance(check, dict):
-                    raise TypeError
-                name = check.get("name")
-                context = check.get("context")
-                if name is not None and not isinstance(name, str):
-                    raise TypeError
-                if context is not None and not isinstance(context, str):
-                    raise TypeError
-                if self.required_check in {name, context}:
-                    required_checks.append(check)
-            if len(required_checks) > 1:
-                raise SyncGitHubError("required check evidence is ambiguous")
-
-            conclusion = "missing"
-            if required_checks:
-                required = required_checks[0]
-                for field in ("conclusion", "state", "status"):
-                    value = required.get(field)
-                    if value is not None and not isinstance(value, str):
-                        raise TypeError
-                check_state = (
-                    required.get("conclusion")
-                    or required.get("state")
-                    or required.get("status")
-                    or "pending"
+            try:
+                conclusion = required_check_conclusion(
+                    payload["statusCheckRollup"], self.required_check
                 )
-                if not isinstance(check_state, str):
-                    raise TypeError
-                conclusion = check_state.lower()
+            except AmbiguousRequiredCheckEvidenceError as exc:
+                raise SyncGitHubError(str(exc)) from exc
+            except RequiredCheckEvidenceError as exc:
+                raise TypeError from exc
 
             merge_commit = payload["mergeCommit"]
             if merge_commit is None:

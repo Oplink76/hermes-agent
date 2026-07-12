@@ -170,6 +170,10 @@ class ReleaseVerifier:
             pr_number=pr_number,
             merged=True,
             merge_sha=self.sha,
+            repo_slug="Oplink76/hermes-agent",
+            head_sha=self.sha,
+            base_ref_name="main",
+            base_sha="integration-base",
             required_check="All required checks pass",
             required_check_conclusion="success",
         )
@@ -319,6 +323,7 @@ def test_deploy_real_git_and_sqlite_path_restores_previous_state_on_failure(
                 install_root=install_root,
                 origin="origin",
                 record_root=tmp_path / "records",
+                repo_slug="Oplink76/hermes-agent",
                 uv_extras=("dev",),
                 postinstall_commands=(("python", "migrate.py"),),
             ),

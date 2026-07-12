@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import shutil
 import stat
 import subprocess
 from dataclasses import dataclass
@@ -279,6 +280,8 @@ def _config(tmp_path: Path) -> DeployConfig:
         install_root=install_root,
         origin="origin",
         record_root=tmp_path / "records",
+        repo_slug="Oplink76/hermes-agent",
+        sync_receipt_root=tmp_path / "sync-receipts",
         uv_extras=("all", "dev", "slack"),
         postinstall_commands=(
             (".venv/bin/python", "scripts/docker_config_migrate.py"),
@@ -309,14 +312,20 @@ def _responses():
     }
 
 
-def _evidence() -> ReleaseEvidence:
-    return ReleaseEvidence(
-        pr_number=41,
-        merged=True,
-        merge_sha="new-sha",
-        required_check="All required checks pass",
-        required_check_conclusion="success",
-    )
+def _evidence(**updates: object) -> ReleaseEvidence:
+    values: dict[str, object] = {
+        "pr_number": 41,
+        "merged": True,
+        "merge_sha": "new-sha",
+        "repo_slug": "Oplink76/hermes-agent",
+        "head_sha": "new-sha",
+        "base_ref_name": "main",
+        "base_sha": "base-sha",
+        "required_check": "All required checks pass",
+        "required_check_conclusion": "success",
+    }
+    values.update(updates)
+    return ReleaseEvidence(**values)
 
 
 def _green(name: str) -> HealthReport:
@@ -374,6 +383,11 @@ def _sync_responses() -> dict[tuple[str, ...], tuple[int, str, str]]:
         "",
     )
     responses[("git", "switch", "--detach", MERGE_SHA)] = (0, "", "")
+    responses[("git", "merge-base", "--is-ancestor", CANDIDATE_SHA, MERGE_SHA)] = (
+        0,
+        "",
+        "",
+    )
     return responses
 
 
@@ -382,6 +396,10 @@ def _sync_evidence(**updates: object) -> ReleaseEvidence:
         "pr_number": 7,
         "merged": True,
         "merge_sha": MERGE_SHA,
+        "repo_slug": "Oplink76/hermes-agent",
+        "head_sha": CANDIDATE_SHA,
+        "base_ref_name": "main",
+        "base_sha": BASE_SHA,
         "required_check": "All required checks pass",
         "required_check_conclusion": "success",
     }
@@ -429,6 +447,25 @@ def test_human_deploy_still_requires_named_approver(tmp_path: Path):
         deploy(request, **_deploy_dependencies(tmp_path))
 
 
+@pytest.mark.parametrize(
+    ("evidence_update", "message"),
+    [
+        ({"repo_slug": "Other/hermes-agent"}, "repository"),
+        ({"base_ref_name": "release"}, "base branch"),
+    ],
+)
+def test_human_deploy_rejects_crossed_release_repository_or_base(
+    tmp_path: Path,
+    evidence_update: dict[str, object],
+    message: str,
+):
+    dependencies = _deploy_dependencies(tmp_path)
+    dependencies["github"] = FakeGitHub(_evidence(**evidence_update))
+
+    with pytest.raises(PreflightError, match=message):
+        deploy(_request(tmp_path), **dependencies)
+
+
 def test_sync_deploy_accepts_only_exact_merged_receipt(tmp_path: Path):
     events: list[tuple] = []
     receipt = _sync_receipt(tmp_path)
@@ -473,6 +510,56 @@ def test_sync_deploy_rejects_receipt_identity_or_green_state_mismatch(
         deploy(
             _sync_request(receipt), **_deploy_dependencies(tmp_path, sync=True)
         )
+
+
+@pytest.mark.parametrize(
+    ("evidence_update", "message"),
+    [
+        ({"repo_slug": "Other/hermes-agent"}, "repository"),
+        ({"head_sha": "e" * 40}, "PR head"),
+        ({"base_ref_name": "release"}, "base branch"),
+        ({"base_sha": "f" * 40}, "base SHA"),
+    ],
+)
+def test_sync_deploy_rejects_crossed_or_refreshed_github_identity(
+    tmp_path: Path,
+    evidence_update: dict[str, object],
+    message: str,
+):
+    receipt = _sync_receipt(tmp_path)
+    dependencies = _deploy_dependencies(tmp_path, sync=True)
+    dependencies["github"] = FakeGitHub(_sync_evidence(**evidence_update))
+
+    with pytest.raises(PreflightError, match=message):
+        deploy(_sync_request(receipt), **dependencies)
+
+
+def test_sync_deploy_rejects_receipt_outside_configured_issuer_root(tmp_path: Path):
+    receipt = _sync_receipt(tmp_path)
+    outside = tmp_path / "outside" / receipt.name
+    outside.parent.mkdir()
+    shutil.copyfile(receipt, outside)
+    outside.chmod(0o400)
+
+    with pytest.raises(PreflightError, match="trusted receipt root"):
+        deploy(
+            _sync_request(outside), **_deploy_dependencies(tmp_path, sync=True)
+        )
+
+
+def test_sync_deploy_requires_candidate_to_be_contained_in_merge(tmp_path: Path):
+    receipt = _sync_receipt(tmp_path)
+    events: list[tuple] = []
+    dependencies = _deploy_dependencies(tmp_path, sync=True, events=events)
+    runner = dependencies["runner"]
+    assert isinstance(runner, FakeRunner)
+    runner.responses[
+        ("git", "merge-base", "--is-ancestor", CANDIDATE_SHA, MERGE_SHA)
+    ] = (1, "", "not an ancestor")
+
+    with pytest.raises(PreflightError, match="not contained in merge SHA"):
+        deploy(_sync_request(receipt), **dependencies)
+    assert not any(event[0] == "snapshot" for event in events)
 
 
 @pytest.mark.parametrize("artifact_state", ["writable", "tampered"])
@@ -529,7 +616,7 @@ def test_github_verifier_requires_the_named_successful_check(tmp_path: Path):
         "--repo",
         "Oplink76/hermes-agent",
         "--json",
-        "number,state,mergedAt,mergeCommit,statusCheckRollup",
+        "number,state,mergedAt,mergeCommit,headRefOid,baseRefName,baseRefOid,statusCheckRollup",
     )
     runner = FakeRunner({
         command: (
@@ -539,6 +626,9 @@ def test_github_verifier_requires_the_named_successful_check(tmp_path: Path):
                 "state": "MERGED",
                 "mergedAt": "2026-07-10T10:00:00Z",
                 "mergeCommit": {"oid": "new-sha"},
+                "headRefOid": "new-sha",
+                "baseRefName": "main",
+                "baseRefOid": "base-sha",
                 "statusCheckRollup": [
                     {
                         "name": "All required checks pass",
@@ -559,6 +649,41 @@ def test_github_verifier_requires_the_named_successful_check(tmp_path: Path):
     evidence = verifier.verify(41)
 
     assert evidence == _evidence()
+
+
+def test_github_verifier_rejects_duplicate_required_check_context(tmp_path: Path):
+    command = (
+        "gh",
+        "pr",
+        "view",
+        "41",
+        "--repo",
+        "Oplink76/hermes-agent",
+        "--json",
+        "number,state,mergedAt,mergeCommit,headRefOid,baseRefName,baseRefOid,statusCheckRollup",
+    )
+    payload = {
+        "number": 41,
+        "state": "MERGED",
+        "mergedAt": "2026-07-10T10:00:00Z",
+        "mergeCommit": {"oid": "new-sha"},
+        "headRefOid": "new-sha",
+        "baseRefName": "main",
+        "baseRefOid": "base-sha",
+        "statusCheckRollup": [
+            {"name": "All required checks pass", "conclusion": "SUCCESS"},
+            {"context": "All required checks pass", "state": "SUCCESS"},
+        ],
+    }
+    verifier = GhReleaseVerifier(
+        repo_slug="Oplink76/hermes-agent",
+        required_check="All required checks pass",
+        runner=FakeRunner({command: (0, json.dumps(payload), "")}),
+        cwd=tmp_path,
+    )
+
+    with pytest.raises(PreflightError, match="required check evidence is ambiguous"):
+        verifier.verify(41)
 
 
 def test_deployment_store_atomically_replaces_one_private_json_record(tmp_path: Path):
@@ -714,6 +839,7 @@ def test_candidate_service_start_counts_as_state_mutation_for_rollback(tmp_path:
         install_root=config.install_root,
         origin=config.origin,
         record_root=config.record_root,
+        repo_slug=config.repo_slug,
         uv_extras=config.uv_extras,
         postinstall_commands=(),
     )
@@ -870,6 +996,7 @@ def test_preflight_rejects_empty_or_revision_incompatible_uv_extras(
         install_root=empty_base.install_root,
         origin=empty_base.origin,
         record_root=empty_base.record_root,
+        repo_slug=empty_base.repo_slug,
     )
 
     for index, (config, responses, message) in enumerate((
