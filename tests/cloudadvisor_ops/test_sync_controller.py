@@ -8,7 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from ops.cloudadvisor.hermes_ops.deploy import DeployConfig, DeploymentRecord
+from ops.cloudadvisor.hermes_ops.deploy import (
+    DeployConfig,
+    DeploymentRecord,
+    PreflightError,
+)
 from ops.cloudadvisor.hermes_ops.locking import try_exclusive_file_lock
 from ops.cloudadvisor.hermes_ops.health import HealthCheck
 from ops.cloudadvisor.hermes_ops.sync import (
@@ -25,6 +29,9 @@ from ops.cloudadvisor.hermes_ops.sync_controller import (
     run_autonomous_sync,
 )
 from ops.cloudadvisor.hermes_ops.sync_github import SyncPullRequestEvidence
+from ops.cloudadvisor.hermes_ops.sync_deployment_checkpoint import (
+    load_pending_deployment,
+)
 from ops.cloudadvisor.hermes_ops.sync_reconstruction_checkpoint import (
     PendingReconstructionCheckpoint,
     load_pending_reconstruction,
@@ -32,6 +39,7 @@ from ops.cloudadvisor.hermes_ops.sync_reconstruction_checkpoint import (
 )
 from ops.cloudadvisor.hermes_ops.sync_reconstruction import ReconstructionError
 from ops.cloudadvisor.hermes_ops.sync_review import ConflictReviewReceipt
+from ops.cloudadvisor.hermes_ops.sync_receipt import SyncReceiptArtifact
 
 
 SHA_BASE = "1" * 40
@@ -334,6 +342,10 @@ def deployed_record(
     )
 
 
+def receipt_artifact(path: Path) -> SyncReceiptArtifact:
+    return SyncReceiptArtifact(path=path, sha256="e" * 64)
+
+
 def test_clean_candidate_merges_and_deploys_without_human_artifact(
     tmp_path: Path, monkeypatch
 ):
@@ -353,9 +365,7 @@ def test_clean_candidate_merges_and_deploys_without_human_artifact(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
-        lambda *args, **kwargs: type(
-            "Artifact", (), {"path": tmp_path / "merged.json"}
-        )(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "merged.json"),
     )
 
     def deploy_fn(receipt: Path, sha: str, pr_number: int) -> DeploymentRecord:
@@ -379,6 +389,73 @@ def test_clean_candidate_merges_and_deploys_without_human_artifact(
     assert result.needs_ole is False
     assert github.merge_calls == [(7, SHA_CANDIDATE)]
     assert events == ["prepare", "deploy"]
+
+
+def test_preflight_failure_after_merge_resumes_before_ordinary_prepare(
+    tmp_path: Path, monkeypatch
+):
+    cfg = config(tmp_path)
+    prepared: list[str] = []
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: prepared.append("first") or candidate(),
+    )
+
+    first = run_autonomous_sync(
+        cfg,
+        runner=Runner(),
+        github=GitHub([evidence()]),
+        resolver=None,
+        reviewer=None,
+        deploy_fn=lambda *args: (_ for _ in ()).throw(
+            PreflightError("simulated preflight interruption")
+        ),
+    )
+
+    checkpoint = load_pending_deployment(
+        cfg.receipt_root, repo_slug=cfg.sync.repo_slug
+    )
+    assert first.state is AutonomousSyncState.NEEDS_OLE
+    assert checkpoint is not None
+    assert checkpoint.merge_sha == SHA_MERGE
+
+    class ResumeRunner(Runner):
+        def run(self, argv: list[str], cwd: Path, timeout: int = 300):
+            if argv == ["git", "fetch", "--no-tags", "origin", "main"]:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if argv == ["git", "rev-parse", "refs/remotes/origin/main"]:
+                return subprocess.CompletedProcess(argv, 0, SHA_MERGE + "\n", "")
+            return super().run(argv, cwd, timeout)
+
+    merged_evidence = SyncPullRequestEvidence(
+        **{
+            **evidence().__dict__,
+            "state": "merged",
+            "merge_sha": SHA_MERGE,
+        }
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("ordinary prepare must not run while deploy is pending")
+        ),
+    )
+
+    resumed = run_autonomous_sync(
+        cfg,
+        runner=ResumeRunner(),
+        github=GitHub([merged_evidence]),
+        resolver=None,
+        reviewer=None,
+        deploy_fn=lambda *args: deployed_record(),
+    )
+
+    assert resumed.state is AutonomousSyncState.DEPLOYED
+    assert resumed.merge_sha == resumed.deployed_sha == SHA_MERGE
+    assert prepared == ["first"]
+    assert load_pending_deployment(
+        cfg.receipt_root, repo_slug=cfg.sync.repo_slug
+    ) is None
 
 
 def test_changed_pr_head_stops_before_merge(tmp_path: Path, monkeypatch):
@@ -499,9 +576,7 @@ def test_upstream_change_restarts_inside_lock_then_deploys_fresh_candidate(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
-        lambda *args, **kwargs: type(
-            "Artifact", (), {"path": tmp_path / "merged"}
-        )(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "merged"),
     )
 
     result = run_autonomous_sync(
@@ -560,9 +635,7 @@ def test_one_transient_evidence_failure_is_retried(tmp_path: Path, monkeypatch):
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
-        lambda *args, **kwargs: type(
-            "Artifact", (), {"path": tmp_path / "merged"}
-        )(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "merged"),
     )
 
     result = run_autonomous_sync(
@@ -614,9 +687,7 @@ def test_exact_infrastructure_retry_is_used_once_before_merge(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
-        lambda *args, **kwargs: type(
-            "Artifact", (), {"path": tmp_path / "merged"}
-        )(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "merged"),
     )
 
     result = run_autonomous_sync(
@@ -661,9 +732,7 @@ def test_red_candidate_gets_one_changed_locally_green_repair(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
-        lambda *args, **kwargs: type(
-            "Artifact", (), {"path": tmp_path / "merged"}
-        )(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "merged"),
     )
 
     result = run_autonomous_sync(
@@ -734,9 +803,7 @@ def test_formerly_clean_ai_repair_requires_fresh_exact_independent_review(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
-        lambda *args, **kwargs: type(
-            "Artifact", (), {"path": tmp_path / "merged"}
-        )(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "merged"),
     )
     cfg = config(tmp_path)
     cfg = AutonomousSyncConfig(**{**cfg.__dict__, "resolver_backend": "codex"})
@@ -821,9 +888,7 @@ def test_conflict_derived_repair_gets_fresh_independent_review(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
-        lambda *args, **kwargs: type(
-            "Artifact", (), {"path": tmp_path / "merged"}
-        )(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "merged"),
     )
     cfg = config(tmp_path)
     cfg = AutonomousSyncConfig(**{**cfg.__dict__, "resolver_backend": "codex"})
@@ -967,9 +1032,7 @@ def test_code_repair_then_uses_remaining_exact_infrastructure_retry(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
-        lambda *args, **kwargs: type(
-            "Artifact", (), {"path": tmp_path / "merged"}
-        )(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "merged"),
     )
 
     result = run_autonomous_sync(
@@ -1055,9 +1118,7 @@ def test_genuinely_new_upstream_head_resets_candidate_scoped_budgets(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
-        lambda *args, **kwargs: type(
-            "Artifact", (), {"path": tmp_path / "merged"}
-        )(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "merged"),
     )
 
     result = run_autonomous_sync(
@@ -1110,9 +1171,7 @@ def test_post_revert_upstream_advance_returns_pending_without_ordinary_prepare(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
-        lambda *args, **kwargs: type(
-            "Artifact", (), {"path": tmp_path / "merged"}
-        )(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "merged"),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finish_or_recover",
@@ -1225,7 +1284,7 @@ def test_recovery_checkpoint_exists_before_reconstruction_starts(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "merged"})(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "merged"),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finish_or_recover",
@@ -1305,7 +1364,7 @@ def test_repaired_checkpoint_survives_nonterminal_check_and_next_run_deploys(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "merged"})(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "merged"),
     )
     outcomes = [
         AutonomousSyncResult(
@@ -1398,9 +1457,7 @@ def test_healthy_protected_rollback_gets_one_post_rollback_repair(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
-        lambda *args, **kwargs: type(
-            "Artifact", (), {"path": tmp_path / "merged"}
-        )(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "merged"),
     )
     deployments = [
         deployed_record(
@@ -1461,9 +1518,7 @@ def test_second_deployment_failure_recovers_then_escalates_once(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
-        lambda *args, **kwargs: type(
-            "Artifact", (), {"path": tmp_path / "merged"}
-        )(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "merged"),
     )
     recovery_calls: list[str] = []
 
@@ -1571,9 +1626,7 @@ def test_independently_reviewed_minor_candidate_auto_merges(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
-        lambda *args, **kwargs: type(
-            "Artifact", (), {"path": tmp_path / "merged"}
-        )(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "merged"),
     )
     cfg = config(tmp_path)
     cfg = AutonomousSyncConfig(

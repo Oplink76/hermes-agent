@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import re
 import time
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -35,7 +37,16 @@ from .sync_reconstruction_checkpoint import (
 )
 from .sync_github import SyncGitHubPort, SyncPullRequestEvidence, bind_expected_base
 from .sync_github import SyncGitHubError
+from .sync_deployment_checkpoint import (
+    PendingDeploymentCheckpoint,
+    SyncDeploymentCheckpointError,
+    clear_pending_deployment,
+    deployment_checkpoint_sha256,
+    load_pending_deployment,
+    write_pending_deployment,
+)
 from .sync_receipt import (
+    SyncEligibilityReceipt,
     SyncReceiptArtifact,
     SyncReceiptError,
     finalize_sync_receipt,
@@ -189,6 +200,7 @@ class _OutcomePublicationError(RuntimeError):
 
 
 logger = logging.getLogger(__name__)
+_FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
 
 
 def _log_unexpected(message: str, error: Exception) -> None:
@@ -197,6 +209,197 @@ def _log_unexpected(message: str, error: Exception) -> None:
         message,
         exc_info=(type(sanitized), sanitized, error.__traceback__),
     )
+
+
+def _git_sha(
+    runner: CommandRunner,
+    cwd: Path,
+    ref: str,
+) -> str:
+    completed = runner.run(["git", "rev-parse", ref], cwd=cwd, timeout=30)
+    value = (completed.stdout or "").strip()
+    if completed.returncode != 0 or _FULL_SHA.fullmatch(value) is None:
+        raise AutonomousSyncError(f"could not verify exact Git identity for {ref}")
+    return value
+
+
+def _write_pending_deploy(
+    config: AutonomousSyncConfig,
+    *,
+    candidate: SyncResult,
+    evidence: SyncPullRequestEvidence,
+    merge_sha: str,
+    final_receipt: SyncReceiptArtifact,
+    runner: CommandRunner,
+) -> str:
+    if not isinstance(final_receipt.sha256, str) or re.fullmatch(
+        r"[0-9a-f]{64}", final_receipt.sha256
+    ) is None:
+        raise AutonomousSyncError("final sync receipt digest is unavailable")
+    checkpoint = PendingDeploymentCheckpoint(
+        schema_version=1,
+        repo_slug=config.sync.repo_slug,
+        candidate_sha=candidate.candidate_sha or "",
+        pr_number=evidence.number,
+        pr_head_sha=evidence.head_sha,
+        base_sha=evidence.base_sha,
+        upstream_sha=candidate.upstream_sha or "",
+        merge_sha=merge_sha,
+        final_receipt_path=str(Path(final_receipt.path).resolve(strict=False)),
+        final_receipt_sha256=final_receipt.sha256,
+        install_root=str(Path(config.deploy.install_root).resolve(strict=False)),
+        previous_installed_sha=_git_sha(
+            runner, config.deploy.install_root, "HEAD"
+        ),
+    )
+    return write_pending_deployment(config.receipt_root, checkpoint).sha256
+
+
+def _candidate_from_pending_receipt(
+    checkpoint: PendingDeploymentCheckpoint,
+    receipt: SyncEligibilityReceipt,
+) -> SyncResult:
+    try:
+        classification = SyncClassification(receipt.classification)
+    except ValueError as exc:
+        raise AutonomousSyncError(
+            "pending deployment classification is invalid"
+        ) from exc
+    return SyncResult(
+        state=SyncState.PR_UPDATED,
+        base_sha=checkpoint.base_sha,
+        upstream_sha=checkpoint.upstream_sha,
+        candidate_sha=checkpoint.candidate_sha,
+        pr_number=checkpoint.pr_number,
+        checks=receipt.local_checks,
+        classification=classification,
+    )
+
+
+def _validate_pending_deploy(
+    config: AutonomousSyncConfig,
+    checkpoint: PendingDeploymentCheckpoint,
+    *,
+    runner: CommandRunner,
+    github: SyncGitHubPort,
+) -> tuple[SyncResult, Path, str]:
+    expected_install = Path(config.deploy.install_root).resolve(strict=False)
+    if Path(checkpoint.install_root).resolve(strict=False) != expected_install:
+        raise AutonomousSyncError("pending deployment install scope changed")
+    receipt_root = Path(config.receipt_root).resolve(strict=False)
+    receipt_path = Path(checkpoint.final_receipt_path).resolve(strict=True)
+    if not receipt_path.is_relative_to(receipt_root):
+        raise AutonomousSyncError("pending deployment receipt escaped trusted root")
+    content = receipt_path.read_bytes()
+    if hashlib.sha256(content).hexdigest() != checkpoint.final_receipt_sha256:
+        raise AutonomousSyncError("pending deployment receipt digest changed")
+    receipt = SyncEligibilityReceipt.load(receipt_path)
+    exact_receipt = (
+        receipt.repo_slug == checkpoint.repo_slug
+        and receipt.candidate_sha == checkpoint.candidate_sha
+        and receipt.pr_head_sha == checkpoint.pr_head_sha
+        and receipt.pr_number == checkpoint.pr_number
+        and receipt.base_sha == checkpoint.base_sha
+        and receipt.upstream_sha == checkpoint.upstream_sha
+        and receipt.merge_sha == checkpoint.merge_sha
+        and receipt.required_check == config.required_check
+    )
+    if not exact_receipt:
+        raise AutonomousSyncError("pending deployment receipt identity changed")
+
+    fetched = runner.run(
+        ["git", "fetch", "--no-tags", config.sync.origin, "main"],
+        cwd=config.sync.repo,
+        timeout=300,
+    )
+    if fetched.returncode != 0:
+        raise AutonomousSyncError("pending deployment fork main could not be fetched")
+    fork_main = _git_sha(
+        runner,
+        config.sync.repo,
+        f"refs/remotes/{config.sync.origin}/main",
+    )
+    if fork_main != checkpoint.merge_sha:
+        raise AutonomousSyncError("pending deployment fork main identity changed")
+
+    evidence = github.evidence(checkpoint.pr_number)
+    exact_github = (
+        evidence.number == checkpoint.pr_number
+        and evidence.state == "merged"
+        and evidence.base_sha == checkpoint.base_sha
+        and evidence.head_sha == checkpoint.pr_head_sha
+        and evidence.merge_sha == checkpoint.merge_sha
+        and evidence.required_check == receipt.required_check
+        and evidence.required_check_conclusion == "success"
+        and evidence.workflow_run_id == receipt.workflow_run_id
+        and evidence.required_check_run_id == receipt.required_check_run_id
+    )
+    if not exact_github:
+        raise AutonomousSyncError("pending deployment GitHub authority changed")
+    installed_sha = _git_sha(runner, config.deploy.install_root, "HEAD")
+    if installed_sha not in {
+        checkpoint.previous_installed_sha,
+        checkpoint.merge_sha,
+    }:
+        raise AutonomousSyncError("pending deployment install identity changed")
+    return (
+        _candidate_from_pending_receipt(checkpoint, receipt),
+        receipt_path,
+        installed_sha,
+    )
+
+
+def _resume_pending_deploy(
+    config: AutonomousSyncConfig,
+    checkpoint: PendingDeploymentCheckpoint,
+    *,
+    runner: CommandRunner,
+    github: ProtectedRevertGitHubPort,
+    deploy_fn: Callable[[Path, str, int], DeploymentRecord],
+    verify_runtime_fn: Callable[[str], bool] | None,
+    clock: Callable[[], float],
+    sleeper: Callable[[float], None],
+) -> AutonomousSyncResult:
+    candidate, receipt_path, installed_sha = _validate_pending_deploy(
+        config, checkpoint, runner=runner, github=github
+    )
+    checkpoint_sha = deployment_checkpoint_sha256(checkpoint)
+    if installed_sha == checkpoint.merge_sha:
+        if verify_runtime_fn is None or not verify_runtime_fn(checkpoint.merge_sha):
+            raise AutonomousSyncError(
+                "pending deployment installed merge is not verifiably healthy"
+            )
+        clear_pending_deployment(config.receipt_root, sha256=checkpoint_sha)
+        return AutonomousSyncResult(
+            state=AutonomousSyncState.DEPLOYED,
+            candidate_sha=checkpoint.candidate_sha,
+            pr_number=checkpoint.pr_number,
+            merge_sha=checkpoint.merge_sha,
+            deployed_sha=checkpoint.merge_sha,
+            fork_main_sha=checkpoint.merge_sha,
+            installed_sha=checkpoint.merge_sha,
+        )
+    deployment = deploy_fn(
+        receipt_path, checkpoint.merge_sha, checkpoint.pr_number
+    )
+    if deployment.status != "deployed" and verify_runtime_fn is None:
+        raise AutonomousSyncError(
+            "runtime health verifier is unavailable for recovery"
+        )
+    outcome = finish_or_recover(
+        config,
+        candidate,
+        deployment,
+        merge_sha=checkpoint.merge_sha,
+        runner=runner,
+        github=github,
+        clock=clock,
+        sleeper=sleeper,
+        verify_runtime_fn=verify_runtime_fn or (lambda sha: False),
+    )
+    if outcome.state is AutonomousSyncState.DEPLOYED:
+        clear_pending_deployment(config.receipt_root, sha256=checkpoint_sha)
+    return outcome
 
 
 def require_conflict_review(
@@ -722,6 +925,27 @@ def run_autonomous_sync(
         reconstruction_checkpoint: PendingReconstructionCheckpoint | None = None
         reconstruction_checkpoint_sha: str | None = None
         try:
+            pending_reconstruction_probe = load_pending_reconstruction(
+                config.receipt_root,
+                repo_slug=config.sync.repo_slug,
+            )
+            pending_deployment = load_pending_deployment(
+                config.receipt_root,
+                repo_slug=config.sync.repo_slug,
+            )
+            if pending_deployment is not None and pending_reconstruction_probe is None:
+                return finish(
+                    _resume_pending_deploy(
+                        config,
+                        pending_deployment,
+                        runner=runner,
+                        github=github,
+                        deploy_fn=deploy_fn,
+                        verify_runtime_fn=verify_runtime_fn,
+                        clock=clock,
+                        sleeper=sleeper,
+                    )
+                )
             pending_reconstruction = load_pending_reconstruction(
                 config.receipt_root,
                 repo_slug=config.sync.repo_slug,
@@ -976,6 +1200,14 @@ def run_autonomous_sync(
                 final_receipt = finalize_sync_receipt(
                     receipt.path, merge_sha=merge_sha
                 )
+                deployment_checkpoint_sha = _write_pending_deploy(
+                    config,
+                    candidate=reviewed,
+                    evidence=evidence,
+                    merge_sha=merge_sha,
+                    final_receipt=final_receipt,
+                    runner=runner,
+                )
                 deployment = deploy_fn(
                     final_receipt.path, merge_sha, evidence.number
                 )
@@ -1002,6 +1234,11 @@ def run_autonomous_sync(
                         clear_pending_reconstruction(
                             config.receipt_root,
                             sha256=reconstruction_checkpoint_sha,
+                        )
+                    if outcome.state is AutonomousSyncState.DEPLOYED:
+                        clear_pending_deployment(
+                            config.receipt_root,
+                            sha256=deployment_checkpoint_sha,
                         )
                     return finish(outcome)
                 if not outcome.fork_main_sha:
@@ -1197,6 +1434,15 @@ def run_autonomous_sync(
             return finish(
                 AutonomousSyncResult.needs_human(
                     "pending reconstruction evidence is invalid",
+                    candidate_sha=candidate.candidate_sha if candidate else None,
+                    pr_number=candidate.pr_number if candidate else None,
+                    merge_sha=merge_sha,
+                )
+            )
+        except SyncDeploymentCheckpointError:
+            return finish(
+                AutonomousSyncResult.needs_human(
+                    "pending deployment evidence is invalid",
                     candidate_sha=candidate.candidate_sha if candidate else None,
                     pr_number=candidate.pr_number if candidate else None,
                     merge_sha=merge_sha,
