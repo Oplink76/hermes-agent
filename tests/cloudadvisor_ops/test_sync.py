@@ -113,6 +113,7 @@ def base_responses(*, backlog: int = 3, merge_returncode: int = 0):
             "conflict",
         ),
         ("git", "rev-parse", "HEAD"): (0, "candidate-sha\n", ""),
+        ("git", "rev-parse", "HEAD^{tree}"): (0, "candidate-tree-sha\n", ""),
         ("git", "diff", "--name-only", "origin/main...HEAD"): (
             0,
             "gateway/run.py\n",
@@ -251,7 +252,34 @@ def test_command_conflict_resolver_runs_only_configured_command_in_worktree(
         executable=Path("/usr/local/bin/codex"),
         prompt="resolve current merge conflicts",
     )
-    command = (
+    resolution_record = git_common_dir / ".hermes-sync-resolution.json"
+    common_dir_command = (
+        "git",
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    )
+    class ResolutionRunner(FakeRunner):
+        def run(self, argv: list[str], cwd: Path, timeout: int = 300):
+            completed = super().run(argv, cwd, timeout)
+            if tuple(argv[:2]) == ("/usr/local/bin/codex", "exec"):
+                resolution_record.write_text(
+                    '{"conflicts":[{"path":"gateway/run.py",'
+                    '"decision":"preserve fork behavior"}]}',
+                    encoding="utf-8",
+                )
+            return completed
+
+    runner = ResolutionRunner({
+        common_dir_command: (0, f"{git_common_dir}\n", ""),
+    })
+
+    resolved = resolver.resolve(worktree, runner)
+
+    assert resolved is True
+    assert runner.calls[0] == Call(common_dir_command, worktree, 300)
+    command = runner.calls[1]
+    assert command.argv[:7] == (
         "/usr/local/bin/codex",
         "exec",
         "--ignore-user-config",
@@ -259,27 +287,33 @@ def test_command_conflict_resolver_runs_only_configured_command_in_worktree(
         "workspace-write",
         "--add-dir",
         str(git_common_dir),
-        "--ephemeral",
-        "resolve current merge conflicts",
     )
-    common_dir_command = (
-        "git",
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-common-dir",
+    assert command.argv[-2] == "--ephemeral"
+    assert str(resolution_record) in command.argv[-1]
+    assert "every conflicted file" in command.argv[-1]
+    assert command.cwd == worktree
+    assert resolver.resolution_record_path(worktree) == resolution_record
+
+
+def test_command_conflict_resolver_fails_when_record_is_missing(tmp_path: Path):
+    worktree = tmp_path / "candidate"
+    worktree.mkdir()
+    git_common_dir = tmp_path / "repo" / ".git"
+    git_common_dir.mkdir(parents=True)
+    resolver = CodexConflictResolver(
+        executable=Path("/usr/local/bin/codex"),
+        prompt="resolve current merge conflicts",
     )
     runner = FakeRunner({
-        common_dir_command: (0, f"{git_common_dir}\n", ""),
-        command: (0, "resolved", ""),
+        (
+            "git",
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ): (0, f"{git_common_dir}\n", ""),
     })
 
-    resolved = resolver.resolve(worktree, runner)
-
-    assert resolved is True
-    assert runner.calls == [
-        Call(common_dir_command, worktree, 300),
-        Call(command, worktree, 1800),
-    ]
+    assert resolver.resolve(worktree, runner) is False
 
 
 def test_conflict_resolver_fails_closed_when_git_common_dir_is_unavailable(

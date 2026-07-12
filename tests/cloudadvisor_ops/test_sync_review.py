@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from ops.cloudadvisor.hermes_ops.sync import SyncClassification
 from ops.cloudadvisor.hermes_ops.sync_review import (
+    ClaudeConflictReviewer,
     ConflictReviewError,
     ConflictReviewReceipt,
     validate_conflict_review,
@@ -155,3 +157,79 @@ def test_major_review_fails_closed(tmp_path: Path):
     )
 
     assert result is SyncClassification.MAJOR
+
+
+class ReviewerRunner:
+    def __init__(self, payload: dict[str, object]):
+        self.payload = payload
+        self.calls: list[tuple[tuple[str, ...], Path, int]] = []
+
+    def run(self, argv: list[str], cwd: Path, timeout: int = 300):
+        self.calls.append((tuple(argv), Path(cwd), timeout))
+        if argv[:3] == ["git", "rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(argv, 0, CANDIDATE_SHA + "\n", "")
+        if argv[:2] == ["git", "status"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            json.dumps({"structured_output": self.payload}),
+            "",
+        )
+
+
+def test_claude_reviewer_returns_exact_structured_receipt(tmp_path: Path):
+    worktree = tmp_path / "candidate"
+    worktree.mkdir()
+    record = resolution_record(worktree)
+    runner = ReviewerRunner({"verdict": "green", "findings": []})
+    reviewer = ClaudeConflictReviewer(
+        executable=Path("/Users/cloudadvisor/.local/bin/claude"),
+        runner=runner,
+        resolver_backend="codex",
+    )
+
+    review = reviewer.review(
+        candidate_sha=CANDIDATE_SHA,
+        worktree=worktree,
+        resolution_record=record,
+    )
+
+    assert review.candidate_sha == CANDIDATE_SHA
+    assert review.resolver_backend == "codex"
+    assert review.reviewer_backend == "claude"
+    assert review.verdict == "green"
+    assert review.findings == ()
+    claude_command = next(
+        call[0] for call in runner.calls if call[0][0].endswith("/claude")
+    )
+    assert claude_command[0] == "/Users/cloudadvisor/.local/bin/claude"
+    assert "--print" in claude_command
+    assert "--json-schema" in claude_command
+    assert "--permission-mode" in claude_command
+    assert "plan" in claude_command
+    assert CANDIDATE_SHA in claude_command[-1]
+
+
+def test_claude_reviewer_rejects_changed_head(tmp_path: Path):
+    class ChangedHeadRunner(ReviewerRunner):
+        def run(self, argv: list[str], cwd: Path, timeout: int = 300):
+            completed = super().run(argv, cwd, timeout)
+            if argv[:3] == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(argv, 0, "b" * 40 + "\n", "")
+            return completed
+
+    worktree = tmp_path / "candidate"
+    worktree.mkdir()
+    reviewer = ClaudeConflictReviewer(
+        executable=Path("/Users/cloudadvisor/.local/bin/claude"),
+        runner=ChangedHeadRunner({"verdict": "green", "findings": []}),
+        resolver_backend="codex",
+    )
+
+    with pytest.raises(ConflictReviewError, match="candidate SHA"):
+        reviewer.review(
+            candidate_sha=CANDIDATE_SHA,
+            worktree=worktree,
+            resolution_record=resolution_record(worktree),
+        )

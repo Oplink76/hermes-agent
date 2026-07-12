@@ -34,6 +34,13 @@ from .sync import (
     run as run_sync,
 )
 from .sync_github import GhSyncGitHub
+from .sync_controller import (
+    AutonomousSyncConfig,
+    AutonomousSyncResult,
+    AutonomousSyncState,
+    run_autonomous_sync,
+)
+from .sync_review import ClaudeConflictReviewer
 
 
 @dataclass(frozen=True)
@@ -287,6 +294,28 @@ def load_conflict_resolver(path: Path) -> CodexConflictResolver | None:
     )
 
 
+def load_conflict_reviewer(
+    path: Path,
+    runner: CommandRunner,
+) -> ClaudeConflictReviewer:
+    values = _mapping(_load_yaml(path), "sync")
+    reviewer = values.get("conflict_reviewer")
+    if not isinstance(reviewer, dict):
+        raise ValueError("sync.conflict_reviewer must be a mapping")
+    policy = load_sync_policy_config(path)
+    if policy.reviewer_backend.casefold() != "claude":
+        raise ValueError("the configured conflict reviewer backend is not Claude")
+    return ClaudeConflictReviewer(
+        executable=_path(
+            reviewer.get("claude_executable"),
+            field="sync.conflict_reviewer.claude_executable",
+        ),
+        runner=runner,
+        resolver_backend=policy.resolver_backend,
+        reviewer_backend=policy.reviewer_backend,
+    )
+
+
 def _sync_payload(result: SyncResult) -> dict[str, object]:
     return {
         "state": result.state.value,
@@ -306,6 +335,19 @@ def _health_payload(expected_sha: str, report) -> dict[str, object]:
         "expected_sha": expected_sha,
         "healthy": report.healthy,
         "checks": [asdict(check) for check in report.checks],
+    }
+
+
+def _autonomous_sync_payload(result: AutonomousSyncResult) -> dict[str, object]:
+    return {
+        "state": result.state.value,
+        "candidate_sha": result.candidate_sha,
+        "merge_sha": result.merge_sha,
+        "deployed_sha": result.deployed_sha,
+        "fork_main_sha": result.fork_main_sha,
+        "installed_sha": result.installed_sha,
+        "needs_ole": result.needs_ole,
+        "reason": result.reason,
     }
 
 
@@ -343,6 +385,42 @@ def _runtime_adapters(
     return controller, health
 
 
+def _sync_deploy_fn(config: OperationsConfig, runner: CommandRunner):
+    services, health = _runtime_adapters(config, runner)
+    snapshots = SnapshotCoordinator(
+        install_root=config.install_root,
+        hermes_homes=config.hermes_homes,
+        snapshot_root=config.snapshot_root,
+        preservation_command=config.preservation_command,
+        runner=runner,
+    )
+    release = GhReleaseVerifier(
+        repo_slug=config.repo_slug,
+        required_check=config.deploy_config.required_check,
+        runner=runner,
+        cwd=config.install_root,
+    )
+
+    def deploy_sync(receipt: Path, sha: str, pr_number: int):
+        return run_deploy(
+            DeployRequest(
+                sha=sha,
+                pr_number=pr_number,
+                actor="hermes-upstream-sync",
+                authority_kind="automated_sync",
+                authority_record=receipt,
+            ),
+            config=config.deploy_config,
+            runner=runner,
+            github=release,
+            snapshots=snapshots,
+            services=services,
+            health=health,
+        )
+
+    return deploy_sync
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -350,6 +428,10 @@ def main(argv: list[str] | None = None) -> int:
         "sync", help="prepare or update the upstream PR"
     )
     sync_parser.add_argument("--config", type=Path, required=True)
+    sync_auto_parser = subparsers.add_parser(
+        "sync-auto", help="converge upstream through protected merge and deployment"
+    )
+    sync_auto_parser.add_argument("--config", type=Path, required=True)
     health_parser = subparsers.add_parser(
         "health", help="check configured services against an approved SHA"
     )
@@ -397,6 +479,58 @@ def main(argv: list[str] | None = None) -> int:
             return 75
         if result.state is SyncState.VERIFY_FAILED:
             return 3
+        return 2
+    if args.command == "sync-auto":
+        sync_config = load_sync_config(args.config)
+        policy = load_sync_policy_config(args.config)
+        operations = load_operations_config(args.config)
+        if policy.required_check != operations.deploy_config.required_check:
+            raise ValueError(
+                "sync and deploy required_check settings must be identical"
+            )
+        operations = replace(
+            operations,
+            deploy_config=replace(
+                operations.deploy_config,
+                sync_receipt_root=policy.receipt_root,
+            ),
+        )
+        runner = SubprocessCommandRunner()
+        resolver = load_conflict_resolver(args.config)
+        if resolver is None:
+            raise ValueError("sync-auto requires the configured conflict resolver")
+        reviewer = load_conflict_reviewer(args.config, runner)
+        github = GhSyncGitHub(
+            sync_config.repo_slug,
+            runner,
+            sync_config.repo,
+            required_check=policy.required_check,
+        )
+        result = run_autonomous_sync(
+            AutonomousSyncConfig(
+                sync=sync_config,
+                deploy=operations.deploy_config,
+                receipt_root=policy.receipt_root,
+                required_check=policy.required_check,
+                check_timeout_seconds=policy.check_timeout_seconds,
+                poll_interval_seconds=policy.poll_interval_seconds,
+                resolver_backend=policy.resolver_backend,
+            ),
+            runner=runner,
+            github=github,
+            resolver=resolver,
+            reviewer=reviewer,
+            deploy_fn=_sync_deploy_fn(operations, runner),
+        )
+        print(json.dumps(_autonomous_sync_payload(result), indent=2, sort_keys=True))
+        if result.state in {
+            AutonomousSyncState.NO_CHANGE,
+            AutonomousSyncState.DEPLOYED,
+            AutonomousSyncState.ROLLED_BACK_REVERTED,
+        }:
+            return 0
+        if result.state is AutonomousSyncState.LOCKED:
+            return 75
         return 2
     if args.command == "health":
         config = load_operations_config(args.config)

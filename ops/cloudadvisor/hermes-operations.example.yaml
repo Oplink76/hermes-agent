@@ -17,6 +17,8 @@ sync:
   conflict_resolver:
     codex_executable: /Users/cloudadvisor/.local/bin/codex
     prompt: Resolve only the current Git merge conflicts. Do not commit, push, or change remotes.
+  conflict_reviewer:
+    claude_executable: /Users/cloudadvisor/.local/bin/claude
 
 runtime:
   install_root: /Users/cloudadvisor/.hermes/hermes-agent

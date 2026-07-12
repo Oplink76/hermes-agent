@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+import json
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -74,6 +75,7 @@ class SyncResult:
     base_sha: str | None = None
     upstream_sha: str | None = None
     candidate_sha: str | None = None
+    candidate_tree_sha: str | None = None
     pr_number: int | None = None
     checks: tuple[CheckResult, ...] = ()
     risk: str = "unknown"
@@ -81,6 +83,7 @@ class SyncResult:
     transitions: tuple[SyncState, ...] = ()
     classification: SyncClassification = SyncClassification.MAJOR
     conflicted_files: tuple[str, ...] = ()
+    resolution_record: Path | None = None
 
 
 class GitHubPullRequests(Protocol):
@@ -108,12 +111,20 @@ class CodexConflictResolver:
 
     executable: Path
     prompt: str
+    resolution_record: Path = Path(".hermes-sync-resolution.json")
+    _resolved_record: Path | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.executable.name not in {"codex", "codex.exe"}:
             raise ValueError("conflict resolver must use the Codex executable")
         if not self.prompt.strip():
             raise ValueError("conflict resolver prompt must not be empty")
+        if (
+            self.resolution_record.is_absolute()
+            or ".." in self.resolution_record.parts
+            or self.resolution_record.name != str(self.resolution_record)
+        ):
+            raise ValueError("resolution record must be one worktree-local filename")
 
     @property
     def command(self) -> tuple[str, ...]:
@@ -146,10 +157,45 @@ class CodexConflictResolver:
             or not common_dir_path.is_dir()
         ):
             return False
+        resolution_record = common_dir_path / self.resolution_record
+        object.__setattr__(self, "_resolved_record", resolution_record)
+        resolution_record.unlink(missing_ok=True)
         command = list(self.command)
         command[5:5] = ["--add-dir", str(common_dir_path)]
+        command[-1] = (
+            f"{self.prompt.rstrip()}\n\n"
+            "After resolving, write a JSON object to "
+            f"{resolution_record}. It must contain a non-empty `conflicts` array "
+            "covering every conflicted file exactly once. Each row must contain "
+            "non-empty string fields `path` and `decision`. Do not commit or push."
+        )
         completed = runner.run(command, cwd=worktree, timeout=1800)
-        return completed.returncode == 0
+        if completed.returncode != 0 or not resolution_record.is_file():
+            return False
+        try:
+            payload = json.loads(resolution_record.read_text(encoding="utf-8"))
+            conflicts = payload["conflicts"]
+            return bool(
+                isinstance(payload, dict)
+                and isinstance(conflicts, list)
+                and conflicts
+                and all(
+                    isinstance(row, dict)
+                    and isinstance(row.get("path"), str)
+                    and bool(row["path"].strip())
+                    and isinstance(row.get("decision"), str)
+                    and bool(row["decision"].strip())
+                    for row in conflicts
+                )
+            )
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            return False
+
+    def resolution_record_path(self, worktree: Path) -> Path:
+        del worktree
+        if self._resolved_record is None:
+            raise ValueError("resolution record is unavailable before resolver execution")
+        return self._resolved_record
 
 
 def _run(
@@ -173,18 +219,21 @@ def _result(
     base_sha: str | None = None,
     upstream_sha: str | None = None,
     candidate_sha: str | None = None,
+    candidate_tree_sha: str | None = None,
     pr_number: int | None = None,
     checks: list[CheckResult] | None = None,
     risk: str = "unknown",
     changed_files: tuple[str, ...] = (),
     conflicted_files: tuple[str, ...] = (),
     classification: SyncClassification = SyncClassification.MAJOR,
+    resolution_record: Path | None = None,
 ) -> SyncResult:
     return SyncResult(
         state=state,
         base_sha=base_sha,
         upstream_sha=upstream_sha,
         candidate_sha=candidate_sha,
+        candidate_tree_sha=candidate_tree_sha,
         pr_number=pr_number,
         checks=tuple(checks or ()),
         risk=risk,
@@ -192,6 +241,7 @@ def _result(
         conflicted_files=conflicted_files,
         transitions=tuple(transitions),
         classification=classification,
+        resolution_record=resolution_record,
     )
 
 
@@ -441,6 +491,7 @@ def prepare_candidate(
         timeout=900,
     )
     conflicted_files: tuple[str, ...] = ()
+    resolution_record: Path | None = None
     if merged.returncode == 0:
         transitions.append(SyncState.MERGED_CLEAN)
         classification = SyncClassification.CLEAN
@@ -477,6 +528,9 @@ def prepare_candidate(
                 conflicted_files=conflicted_files,
                 risk="conflict",
             )
+        record_path = getattr(resolver, "resolution_record_path", None)
+        if callable(record_path):
+            resolution_record = Path(record_path(config.worktree))
         unmerged = _run(runner, ["git", "ls-files", "-u"], config.worktree)
         if unmerged.returncode != 0 or _output(unmerged):
             transitions.append(SyncState.NEEDS_DECISION)
@@ -518,6 +572,22 @@ def prepare_candidate(
                 conflicted_files=conflicted_files,
                 risk="resolved_merge_commit_failed",
             )
+        clean_after_resolver = _run(
+            runner,
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            config.worktree,
+        )
+        if clean_after_resolver.returncode != 0 or _output(clean_after_resolver):
+            transitions.append(SyncState.NEEDS_DECISION)
+            return _result(
+                SyncState.NEEDS_DECISION,
+                transitions,
+                base_sha=base_sha,
+                upstream_sha=upstream_sha,
+                conflicted_files=conflicted_files,
+                resolution_record=resolution_record,
+                risk="resolver_left_dirty_worktree",
+            )
         transitions.append(SyncState.AI_RESOLVED)
         classification = SyncClassification.MINOR_REVIEW_REQUIRED
 
@@ -536,12 +606,21 @@ def prepare_candidate(
     transitions.append(SyncState.VERIFIED)
 
     candidate_result = _run(runner, ["git", "rev-parse", "HEAD"], config.worktree)
+    candidate_tree_result = _run(
+        runner, ["git", "rev-parse", "HEAD^{tree}"], config.worktree
+    )
     changed_result = _run(
         runner,
         ["git", "diff", "--name-only", f"{config.origin}/main...HEAD"],
         config.worktree,
     )
-    if candidate_result.returncode != 0 or changed_result.returncode != 0:
+    if (
+        candidate_result.returncode != 0
+        or not _output(candidate_result)
+        or candidate_tree_result.returncode != 0
+        or not _output(candidate_tree_result)
+        or changed_result.returncode != 0
+    ):
         transitions.append(SyncState.VERIFY_FAILED)
         return _result(
             SyncState.VERIFY_FAILED,
@@ -552,6 +631,7 @@ def prepare_candidate(
             conflicted_files=conflicted_files,
         )
     candidate_sha = _output(candidate_result)
+    candidate_tree_sha = _output(candidate_tree_result)
     changed_files = tuple(
         line for line in _output(changed_result).splitlines() if line
     )
@@ -565,6 +645,7 @@ def prepare_candidate(
             base_sha=base_sha,
             upstream_sha=upstream_sha,
             candidate_sha=candidate_sha,
+            candidate_tree_sha=candidate_tree_sha,
             checks=checks,
             changed_files=changed_files,
             conflicted_files=conflicted_files,
@@ -603,12 +684,14 @@ def prepare_candidate(
         base_sha=base_sha,
         upstream_sha=upstream_sha,
         candidate_sha=candidate_sha,
+        candidate_tree_sha=candidate_tree_sha,
         pr_number=pr_number,
         checks=checks,
         risk=risk,
         changed_files=changed_files,
         conflicted_files=conflicted_files,
         classification=classification,
+        resolution_record=resolution_record,
     )
 
 

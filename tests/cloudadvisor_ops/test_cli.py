@@ -16,6 +16,10 @@ from ops.cloudadvisor.hermes_ops.cli import (
 )
 from ops.cloudadvisor.hermes_ops.health import HealthCheck, HealthReport
 from ops.cloudadvisor.hermes_ops.sync import SyncResult, SyncState
+from ops.cloudadvisor.hermes_ops.sync_controller import (
+    AutonomousSyncResult,
+    AutonomousSyncState,
+)
 
 
 class FakeRunner:
@@ -26,6 +30,65 @@ class FakeRunner:
     def run(self, argv: list[str], cwd: Path, timeout: int = 300):
         self.calls.append((tuple(argv), Path(cwd)))
         return self.response
+
+
+def test_sync_auto_returns_terminal_state_exit_codes(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "ops.yaml"
+    config_path.write_text("sync: {}\n", encoding="utf-8")
+    sync_config = SimpleNamespace(repo_slug="Oplink76/hermes-agent", repo=tmp_path)
+    policy = SimpleNamespace(
+        receipt_root=tmp_path / "receipts",
+        required_check="All required checks pass",
+        check_timeout_seconds=10,
+        poll_interval_seconds=1,
+        resolver_backend="codex",
+    )
+    operations = cli.OperationsConfig(
+        environment="production",
+        install_root=tmp_path,
+        uid=501,
+        services=(),
+        gateway_targets=(),
+        deploy_config=cli.DeployConfig(
+            install_root=tmp_path,
+            origin="origin",
+            record_root=tmp_path / "records",
+            required_check="All required checks pass",
+        ),
+        repo_slug="Oplink76/hermes-agent",
+        snapshot_root=tmp_path / "snapshots",
+        hermes_homes=(),
+        preservation_command=("false",),
+    )
+    monkeypatch.setattr(cli, "load_sync_config", lambda path: sync_config)
+    monkeypatch.setattr(cli, "load_sync_policy_config", lambda path: policy)
+    monkeypatch.setattr(cli, "load_operations_config", lambda path: operations)
+    monkeypatch.setattr(cli, "load_conflict_resolver", lambda path: object())
+    monkeypatch.setattr(cli, "load_conflict_reviewer", lambda path, runner: object())
+    monkeypatch.setattr(cli, "GhSyncGitHub", lambda *args, **kwargs: object())
+    monkeypatch.setattr(cli, "SubprocessCommandRunner", lambda: object())
+    monkeypatch.setattr(
+        cli,
+        "_sync_deploy_fn",
+        lambda *args, **kwargs: (lambda *deploy_args: object()),
+    )
+
+    for state, expected in (
+        (AutonomousSyncState.DEPLOYED, 0),
+        (AutonomousSyncState.ROLLED_BACK_REVERTED, 0),
+        (AutonomousSyncState.NO_CHANGE, 0),
+        (AutonomousSyncState.LOCKED, 75),
+        (AutonomousSyncState.NEEDS_OLE, 2),
+    ):
+        monkeypatch.setattr(
+            cli,
+            "run_autonomous_sync",
+            lambda *args, _state=state, **kwargs: AutonomousSyncResult(
+                state=_state,
+                needs_ole=_state is AutonomousSyncState.NEEDS_OLE,
+            ),
+        )
+        assert cli.main(["sync-auto", "--config", str(config_path)]) == expected
 
 
 def _write_operations_config(

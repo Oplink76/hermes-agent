@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Protocol
 
+from .command import CommandRunner
 from .sync import SyncClassification
 
 
@@ -32,6 +35,136 @@ class IndependentConflictReviewer(Protocol):
         worktree: Path,
         resolution_record: Path,
     ) -> ConflictReviewReceipt: ...
+
+
+_FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
+_REVIEW_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "verdict": {"type": "string", "enum": ["green", "major"]},
+        "findings": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["verdict", "findings"],
+}
+
+
+@dataclass(frozen=True)
+class ClaudeConflictReviewer:
+    """Run an independent, non-mutating exact-head Claude review."""
+
+    executable: Path
+    runner: CommandRunner
+    resolver_backend: str
+    reviewer_backend: str = "claude"
+
+    def __post_init__(self) -> None:
+        if self.executable.name not in {"claude", "claude.exe"}:
+            raise ValueError("conflict reviewer must use the Claude executable")
+        if (
+            not self.resolver_backend.strip()
+            or self.resolver_backend != self.resolver_backend.strip()
+            or not self.reviewer_backend.strip()
+            or self.reviewer_backend != self.reviewer_backend.strip()
+            or self.resolver_backend.casefold() == self.reviewer_backend.casefold()
+        ):
+            raise ValueError("conflict reviewer backend must be independent")
+
+    def _head(self, worktree: Path) -> str:
+        completed = self.runner.run(
+            ["git", "rev-parse", "HEAD"], cwd=worktree, timeout=300
+        )
+        head = (completed.stdout or "").strip()
+        if completed.returncode != 0 or _FULL_SHA.fullmatch(head) is None:
+            raise ConflictReviewError("conflict review candidate SHA is unavailable")
+        return head
+
+    def _status(self, worktree: Path) -> str:
+        completed = self.runner.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=worktree,
+            timeout=300,
+        )
+        if completed.returncode != 0:
+            raise ConflictReviewError("conflict review worktree status is unavailable")
+        return completed.stdout or ""
+
+    def review(
+        self,
+        *,
+        candidate_sha: str,
+        worktree: Path,
+        resolution_record: Path,
+    ) -> ConflictReviewReceipt:
+        worktree = Path(worktree).resolve(strict=True)
+        resolution_record = Path(resolution_record).resolve(strict=True)
+        if resolution_record.is_symlink() or not resolution_record.is_file():
+            raise ConflictReviewError("resolution record is not a regular file")
+        if self._head(worktree) != candidate_sha:
+            raise ConflictReviewError("conflict review candidate SHA is not exact")
+        status_before = self._status(worktree)
+        prompt = (
+            "Independently review this resolved upstream-sync merge at exact HEAD "
+            f"{candidate_sha}. Read {resolution_record}, inspect the Git diff and "
+            "verify every recorded decision preserves fork behavior, branch protection, "
+            "exact-SHA deployment/rollback, credentials/auth, Kanban governance, database "
+            "preservation, Trading research-only dormancy, profile isolation, and Second "
+            "Brain raw-source immutability. Do not modify files, commit, or push. Return "
+            "green only when the resolution is mechanically safe with zero findings; "
+            "otherwise return major and concise findings."
+        )
+        command = [
+            str(self.executable),
+            "--print",
+            "--output-format",
+            "json",
+            "--json-schema",
+            json.dumps(_REVIEW_SCHEMA, sort_keys=True, separators=(",", ":")),
+            "--permission-mode",
+            "plan",
+            "--no-session-persistence",
+            "--safe-mode",
+            "--add-dir",
+            str(resolution_record.parent),
+            prompt,
+        ]
+        completed = self.runner.run(command, cwd=worktree, timeout=1800)
+        if completed.returncode != 0:
+            raise ConflictReviewError("independent Claude review failed")
+        try:
+            envelope = json.loads(completed.stdout or "")
+            payload = envelope["structured_output"]
+            if not isinstance(payload, dict) or set(payload) != {
+                "verdict",
+                "findings",
+            }:
+                raise TypeError
+            verdict = payload["verdict"]
+            findings = payload["findings"]
+            if verdict not in {"green", "major"} or not isinstance(findings, list):
+                raise TypeError
+            if not all(isinstance(finding, str) and finding.strip() for finding in findings):
+                raise TypeError
+            if verdict == "green" and findings:
+                raise TypeError
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise ConflictReviewError(
+                "independent Claude review returned invalid structured output"
+            ) from exc
+        if self._head(worktree) != candidate_sha:
+            raise ConflictReviewError("conflict review candidate SHA changed")
+        if self._status(worktree) != status_before:
+            raise ConflictReviewError("independent review modified the worktree")
+        return ConflictReviewReceipt(
+            candidate_sha=candidate_sha,
+            resolver_backend=self.resolver_backend,
+            reviewer_backend=self.reviewer_backend,
+            verdict=verdict,
+            findings=tuple(findings),
+            reviewed_at=datetime.now(timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"),
+        )
 
 
 def _resolution_record_paths(path: Path) -> tuple[str, ...]:
