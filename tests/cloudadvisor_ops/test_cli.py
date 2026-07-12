@@ -38,6 +38,8 @@ def test_sync_auto_returns_terminal_state_exit_codes(tmp_path: Path, monkeypatch
     sync_config = SimpleNamespace(repo_slug="Oplink76/hermes-agent", repo=tmp_path)
     policy = SimpleNamespace(
         receipt_root=tmp_path / "receipts",
+        status_file=tmp_path / "sync-status.json",
+        notification_store=tmp_path / "notifications.json",
         required_check="All required checks pass",
         check_timeout_seconds=10,
         poll_interval_seconds=1,
@@ -78,6 +80,21 @@ def test_sync_auto_returns_terminal_state_exit_codes(tmp_path: Path, monkeypatch
         "_sync_runtime_verify_fn",
         lambda *args, **kwargs: (lambda sha: True),
     )
+    monkeypatch.setattr(
+        cli,
+        "_publish_sync_outcome",
+        lambda *args, **kwargs: (
+            SimpleNamespace(
+                checked_at="2026-07-13T00:00:00+00:00",
+                    upstream_behind=0,
+                    fork_behind=0,
+                    required_check="All required checks pass",
+                    fork_main_sha="a" * 40,
+                    installed_sha="a" * 40,
+            ),
+            False,
+        ),
+    )
 
     for state, expected in (
         (AutonomousSyncState.DEPLOYED, 0),
@@ -110,6 +127,8 @@ def _write_operations_config(
             f"environment: {environment}",
             "sync:",
             f"  receipt_root: {tmp_path / 'sync-receipts'}",
+            f"  status_file: {tmp_path / 'sync-status.json'}",
+            f"  notification_store: {tmp_path / 'sync-notifications.json'}",
             "  required_check: All required checks pass",
             "  check_timeout_seconds: 2700",
             "  poll_interval_seconds: 15",
@@ -172,6 +191,8 @@ def test_load_sync_policy_config_reads_exact_authority_settings(tmp_path: Path):
         "\n".join([
             "sync:",
             f"  receipt_root: {tmp_path / 'receipts'}",
+            f"  status_file: {tmp_path / 'sync-status.json'}",
+            f"  notification_store: {tmp_path / 'sync-notifications.json'}",
             "  required_check: All required checks pass",
             "  check_timeout_seconds: 2700",
             "  poll_interval_seconds: 15",
@@ -185,6 +206,10 @@ def test_load_sync_policy_config_reads_exact_authority_settings(tmp_path: Path):
     policy = load_sync_policy_config(config_file)
 
     assert policy.receipt_root == (tmp_path / "receipts").resolve()
+    assert policy.status_file == (tmp_path / "sync-status.json").resolve()
+    assert policy.notification_store == (
+        tmp_path / "sync-notifications.json"
+    ).resolve()
     assert policy.required_check == "All required checks pass"
     assert policy.check_timeout_seconds == 2700
     assert policy.poll_interval_seconds == 15
@@ -205,6 +230,8 @@ def test_sync_policy_requires_canonical_actual_backend_ids(
         "\n".join([
             "sync:",
             f"  receipt_root: {tmp_path / 'receipts'}",
+            f"  status_file: {tmp_path / 'sync-status.json'}",
+            f"  notification_store: {tmp_path / 'sync-notifications.json'}",
             "  required_check: All required checks pass",
             "  check_timeout_seconds: 2700",
             "  poll_interval_seconds: 15",
@@ -215,6 +242,33 @@ def test_sync_policy_requires_canonical_actual_backend_ids(
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="codex.*claude"):
+        load_sync_policy_config(config_file)
+
+
+def test_sync_policy_requires_distinct_status_and_notification_files(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "hermes-operations.yaml"
+    same = tmp_path / "state.json"
+    config_file.write_text(
+        "\n".join(
+            [
+                "sync:",
+                f"  receipt_root: {tmp_path / 'receipts'}",
+                f"  status_file: {same}",
+                f"  notification_store: {same}",
+                "  required_check: All required checks pass",
+                "  check_timeout_seconds: 2700",
+                "  poll_interval_seconds: 15",
+                "  resolver_backend: codex",
+                "  reviewer_backend: claude",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="status_file.*notification_store"):
         load_sync_policy_config(config_file)
 
 

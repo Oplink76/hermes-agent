@@ -50,12 +50,16 @@ the same service set, and records rollback health.
 The production schedule runs `sync-auto` at 06:00 and 18:00 Europe/Copenhagen.
 A clean sync, an independently reviewed minor conflict, and an already-converged
 run are quiet successes. `PR_UPDATED` is an in-progress state, not success.
-`NEEDS_OLE` emits one decision packet for each escalation fingerprint; later runs
-with the same fingerprint stay quiet. Major or unresolved conflicts, ambiguous
-authority, and failed rollback/revert are the paths that require Ole.
+`NEEDS_OLE` emits one `notify_ole: true` decision for the active escalation
+fingerprint; later runs with the same fingerprint stay quiet. This field requests
+delivery by the Task 8 wrapper and does not claim a notification was sent. A
+different fingerprint emits a new decision, and a terminal healthy cycle clears
+the active fingerprint. Major or unresolved conflicts, ambiguous authority, and
+failed rollback/revert are the paths that require Ole.
 
-The controller writes the canonical, secret-free status atomically to the
-configured `sync.status_file`. Notification fingerprints are stored separately
+The `sync-auto` publisher writes the canonical, secret-free status atomically to
+the configured `sync.status_file` after every controller outcome. Active
+escalation fingerprints are stored separately
 in `sync.notification_store`; neither file contains raw command output. The
 dashboard keeps `behind` (and additive `fork_behind`) as installed-versus-fork,
 while `upstream_behind`, `sync_state`, and `sync_pr_number` report official

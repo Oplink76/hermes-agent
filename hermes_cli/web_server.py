@@ -120,7 +120,6 @@ except ImportError:
 
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
-_UPSTREAM_SYNC_STATUS_PATH = Path.home() / ".hermes" / "recovery" / "sync-status.json"
 
 # Session listing/detail/search endpoints are FastAPI ``async def`` handlers so
 # running synchronous sqlite3 hydration inline freezes the uvicorn event loop.
@@ -3609,9 +3608,12 @@ def _with_upstream_sync_status(payload: Dict[str, Any]) -> Dict[str, Any]:
         }
     )
     try:
-        from ops.cloudadvisor.hermes_ops.sync_status import SyncStatus
+        from hermes_cli.upstream_sync_status import (
+            SyncStatus,
+            installed_sync_message,
+        )
 
-        status = SyncStatus.load(_UPSTREAM_SYNC_STATUS_PATH)
+        status = SyncStatus.load(_upstream_sync_status_path())
     except FileNotFoundError:
         return enriched
     except (OSError, ValueError, json.JSONDecodeError):
@@ -3624,20 +3626,28 @@ def _with_upstream_sync_status(payload: Dict[str, Any]) -> Dict[str, Any]:
             "sync_state": status.sync_state,
             "sync_pr_number": status.sync_pr_number,
             "sync_required_check": status.required_check,
+            "fork_behind": (
+                status.fork_behind
+                if status.fork_behind is not None
+                else payload.get("behind")
+            ),
             "installed_sha": status.installed_sha,
         }
     )
-    if (
-        payload.get("behind") == 0
-        and status.upstream_behind is not None
-        and status.upstream_behind > 0
-    ):
-        count = status.upstream_behind
-        noun = "commit" if count == 1 else "commits"
-        enriched["message"] = (
-            f"Installed current · {count} official upstream {noun} syncing"
-        )
+    message = installed_sync_message(
+        installed_current=payload.get("behind") == 0,
+        upstream_behind=status.upstream_behind,
+        sync_state=status.sync_state,
+    )
+    if message is not None:
+        enriched["message"] = message
     return enriched
+
+
+def _upstream_sync_status_path() -> Path:
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root() / "recovery" / "sync-status.json"
 
 
 @app.get("/api/hermes/update/check")

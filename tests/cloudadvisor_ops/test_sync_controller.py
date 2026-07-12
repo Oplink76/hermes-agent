@@ -46,6 +46,18 @@ SHA_NEW_REPAIRED = "a" * 40
 SHA_NEW_REPAIRED_TREE = "b" * 40
 
 
+def test_controller_result_helpers_preserve_candidate_pr_number() -> None:
+    candidate = SyncResult(
+        state=SyncState.PR_UPDATED,
+        candidate_sha=SHA_CANDIDATE,
+        pr_number=7,
+    )
+
+    assert AutonomousSyncResult.no_change(candidate).pr_number == 7
+    assert AutonomousSyncResult.pending(candidate, reason="waiting").pr_number == 7
+    assert AutonomousSyncResult.refresh_required(candidate).pr_number == 7
+
+
 class Runner:
     def __init__(self, repair_paths: tuple[str, ...] = ("upstream.txt",)):
         self.review_head = SHA_CANDIDATE

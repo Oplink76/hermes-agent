@@ -46,6 +46,12 @@ from .sync_remediation import (
     CodexCandidateRemediator,
     GhActionsRemediator,
 )
+from .sync_status import (
+    SyncNotificationStore,
+    SyncStatus,
+    SyncStatusContext,
+    status_from_result,
+)
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,8 @@ class OperationsConfig:
 @dataclass(frozen=True)
 class SyncPolicyConfig:
     receipt_root: Path
+    status_file: Path
+    notification_store: Path
     required_check: str
     check_timeout_seconds: int
     poll_interval_seconds: int
@@ -241,6 +249,8 @@ def load_sync_policy_config(path: Path) -> SyncPolicyConfig:
     values = _mapping(_load_yaml(path), "sync")
     required = {
         "receipt_root",
+        "status_file",
+        "notification_store",
         "required_check",
         "check_timeout_seconds",
         "poll_interval_seconds",
@@ -270,8 +280,17 @@ def load_sync_policy_config(path: Path) -> SyncPolicyConfig:
     reviewer_backend = backend("reviewer_backend")
     if resolver_backend != "codex" or reviewer_backend != "claude":
         raise ValueError("sync backends must be canonical codex and claude")
+    receipt_root = _path(values["receipt_root"], field="sync.receipt_root")
+    status_file = _path(values["status_file"], field="sync.status_file")
+    notification_store = _path(
+        values["notification_store"], field="sync.notification_store"
+    )
+    if status_file == notification_store:
+        raise ValueError("sync.status_file and sync.notification_store must differ")
     return SyncPolicyConfig(
-        receipt_root=_path(values["receipt_root"], field="sync.receipt_root"),
+        receipt_root=receipt_root,
+        status_file=status_file,
+        notification_store=notification_store,
         required_check=required_check,
         check_timeout_seconds=positive_integer("check_timeout_seconds"),
         poll_interval_seconds=positive_integer("poll_interval_seconds"),
@@ -368,17 +387,59 @@ def _health_payload(expected_sha: str, report) -> dict[str, object]:
     }
 
 
-def _autonomous_sync_payload(result: AutonomousSyncResult) -> dict[str, object]:
+def _autonomous_sync_payload(
+    result: AutonomousSyncResult,
+    *,
+    status: SyncStatus,
+    notify_ole: bool,
+) -> dict[str, object]:
     return {
         "state": result.state.value,
         "candidate_sha": result.candidate_sha,
+        "pr_number": result.pr_number,
         "merge_sha": result.merge_sha,
         "deployed_sha": result.deployed_sha,
-        "fork_main_sha": result.fork_main_sha,
-        "installed_sha": result.installed_sha,
+        "fork_main_sha": status.fork_main_sha,
+        "installed_sha": status.installed_sha,
         "needs_ole": result.needs_ole,
         "reason": result.reason,
+        "checked_at": status.checked_at,
+        "upstream_behind": status.upstream_behind,
+        "fork_behind": status.fork_behind,
+        "sync_required_check": status.required_check,
+        "notify_ole": notify_ole,
     }
+
+
+def _publish_sync_outcome(
+    result: AutonomousSyncResult,
+    *,
+    sync_config: SyncConfig,
+    policy: SyncPolicyConfig,
+    operations: OperationsConfig,
+    runner: CommandRunner,
+) -> tuple[SyncStatus, bool]:
+    status = status_from_result(
+        result,
+        context=SyncStatusContext(
+            sync=sync_config,
+            install_root=operations.install_root,
+            required_check=policy.required_check,
+        ),
+        runner=runner,
+    )
+    status.write(policy.status_file)
+    notifications = SyncNotificationStore(policy.notification_store)
+    notify_ole = notifications.should_emit(result)
+    if notify_ole:
+        notifications.record_emitted(result)
+    elif result.state in {
+        AutonomousSyncState.NO_CHANGE,
+        AutonomousSyncState.DEPLOYED,
+        AutonomousSyncState.ROLLED_BACK_REVERTED,
+    }:
+        notifications.clear_resolved()
+    return status, notify_ole
 
 
 def current_checkout_sha(root: Path, runner: CommandRunner) -> str:
@@ -571,7 +632,24 @@ def main(argv: list[str] | None = None) -> int:
             deploy_fn=_sync_deploy_fn(operations, runner),
             verify_runtime_fn=_sync_runtime_verify_fn(operations, runner),
         )
-        print(json.dumps(_autonomous_sync_payload(result), indent=2, sort_keys=True))
+        status, notify_ole = _publish_sync_outcome(
+            result,
+            sync_config=sync_config,
+            policy=policy,
+            operations=operations,
+            runner=runner,
+        )
+        print(
+            json.dumps(
+                _autonomous_sync_payload(
+                    result,
+                    status=status,
+                    notify_ole=notify_ole,
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+        )
         if result.state in {
             AutonomousSyncState.NO_CHANGE,
             AutonomousSyncState.DEPLOYED,
