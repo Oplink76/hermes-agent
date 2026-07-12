@@ -68,7 +68,9 @@ def _pr(
     return {
         "number": 7,
         "state": state,
+        "mergedAt": "2026-07-12T20:00:00Z" if state == "MERGED" else None,
         "baseRefOid": base,
+        "baseRefName": "main",
         "headRefOid": head,
         "mergeCommit": {"oid": merge_sha} if merge_sha else None,
         "statusCheckRollup": checks,

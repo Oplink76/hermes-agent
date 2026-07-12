@@ -17,8 +17,12 @@ from typing import Callable, Literal, Protocol
 
 from .command import CommandRunner
 from .health import HealthCheck, HealthReport
+from .github_authority import (
+    AmbiguousRequiredCheckEvidenceError,
+    GitHubAuthorityError,
+    GitHubAuthorityReader,
+)
 from .locking import try_exclusive_file_lock
-from .sync_github import RequiredCheckEvidenceError, required_check_conclusion
 from .sync_receipt import SyncEligibilityReceipt, SyncReceiptError
 from utils import atomic_json_write
 
@@ -143,55 +147,40 @@ class GhReleaseVerifier:
         required_check: str,
         runner: CommandRunner,
         cwd: Path,
+        gh_executable: str | Path | None = None,
     ):
         self.repo_slug = repo_slug
         self.required_check = required_check
         self.runner = runner
         self.cwd = Path(cwd)
+        try:
+            self._authority = GitHubAuthorityReader(
+                repo_slug=repo_slug,
+                required_check=required_check,
+                runner=runner,
+                cwd=cwd,
+                gh_executable=gh_executable,
+            )
+        except GitHubAuthorityError as exc:
+            raise PreflightError(str(exc)) from exc
 
     def verify(self, pr_number: int) -> ReleaseEvidence:
-        completed = self.runner.run(
-            [
-                "gh",
-                "pr",
-                "view",
-                str(pr_number),
-                "--repo",
-                self.repo_slug,
-                "--json",
-                (
-                    "number,state,mergedAt,mergeCommit,headRefOid,baseRefName,"
-                    "baseRefOid,statusCheckRollup"
-                ),
-            ],
-            cwd=self.cwd,
-            timeout=300,
-        )
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "").strip()
-            raise PreflightError(f"could not verify GitHub release evidence: {detail}")
         try:
-            payload = json.loads(completed.stdout or "{}")
-            merge_commit = payload.get("mergeCommit") or {}
-            conclusion = required_check_conclusion(
-                payload.get("statusCheckRollup"), self.required_check
-            )
+            authority = self._authority.read(pr_number)
             return ReleaseEvidence(
-                pr_number=int(payload["number"]),
-                merged=bool(
-                    payload.get("mergedAt") or payload.get("state") == "MERGED"
-                ),
-                merge_sha=str(merge_commit["oid"]),
+                pr_number=authority.number,
+                merged=authority.merged,
+                merge_sha=authority.merge_sha or "",
                 repo_slug=self.repo_slug,
-                head_sha=str(payload["headRefOid"]),
-                base_ref_name=str(payload["baseRefName"]),
-                base_sha=str(payload["baseRefOid"]),
+                head_sha=authority.head_sha,
+                base_ref_name=authority.base_ref_name,
+                base_sha=authority.base_sha,
                 required_check=self.required_check,
-                required_check_conclusion=conclusion,
+                required_check_conclusion=authority.required_check_conclusion,
             )
-        except RequiredCheckEvidenceError as exc:
+        except AmbiguousRequiredCheckEvidenceError as exc:
             raise PreflightError(str(exc)) from exc
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        except GitHubAuthorityError as exc:
             raise PreflightError("GitHub release evidence was incomplete") from exc
 
 

@@ -627,14 +627,18 @@ def test_github_verifier_requires_the_named_successful_check(tmp_path: Path):
                 "number": 41,
                 "state": "MERGED",
                 "mergedAt": "2026-07-10T10:00:00Z",
-                "mergeCommit": {"oid": "new-sha"},
-                "headRefOid": "new-sha",
+                "mergeCommit": {"oid": "d" * 40},
+                "headRefOid": "a" * 40,
                 "baseRefName": "main",
-                "baseRefOid": "base-sha",
+                "baseRefOid": "b" * 40,
                 "statusCheckRollup": [
                     {
                         "name": "All required checks pass",
                         "conclusion": "SUCCESS",
+                        "detailsUrl": (
+                            "https://github.com/Oplink76/hermes-agent/"
+                            "actions/runs/101/job/202"
+                        ),
                     }
                 ],
             }),
@@ -646,11 +650,16 @@ def test_github_verifier_requires_the_named_successful_check(tmp_path: Path):
         required_check="All required checks pass",
         runner=runner,
         cwd=tmp_path,
+        gh_executable="gh",
     )
 
     evidence = verifier.verify(41)
 
-    assert evidence == _evidence()
+    assert evidence == _evidence(
+        merge_sha="d" * 40,
+        head_sha="a" * 40,
+        base_sha="b" * 40,
+    )
 
 
 def test_github_verifier_rejects_duplicate_required_check_context(tmp_path: Path):
@@ -668,10 +677,10 @@ def test_github_verifier_rejects_duplicate_required_check_context(tmp_path: Path
         "number": 41,
         "state": "MERGED",
         "mergedAt": "2026-07-10T10:00:00Z",
-        "mergeCommit": {"oid": "new-sha"},
-        "headRefOid": "new-sha",
+        "mergeCommit": {"oid": "d" * 40},
+        "headRefOid": "a" * 40,
         "baseRefName": "main",
-        "baseRefOid": "base-sha",
+        "baseRefOid": "b" * 40,
         "statusCheckRollup": [
             {"name": "All required checks pass", "conclusion": "SUCCESS"},
             {"context": "All required checks pass", "state": "SUCCESS"},
@@ -682,10 +691,59 @@ def test_github_verifier_rejects_duplicate_required_check_context(tmp_path: Path
         required_check="All required checks pass",
         runner=FakeRunner({command: (0, json.dumps(payload), "")}),
         cwd=tmp_path,
+        gh_executable="gh",
     )
 
     with pytest.raises(PreflightError, match="required check evidence is ambiguous"):
         verifier.verify(41)
+
+
+def test_github_verifier_uses_explicit_windows_cli_and_full_authority_ids(
+    tmp_path: Path,
+):
+    executable = tmp_path / "bin" / "gh.cmd"
+    command = (
+        str(executable),
+        "pr",
+        "view",
+        "41",
+        "--repo",
+        "Oplink76/hermes-agent",
+        "--json",
+        "number,state,mergedAt,mergeCommit,headRefOid,baseRefName,baseRefOid,statusCheckRollup",
+    )
+    payload = {
+        "number": 41,
+        "state": "MERGED",
+        "mergedAt": "2026-07-10T10:00:00Z",
+        "mergeCommit": {"oid": "d" * 40},
+        "headRefOid": "a" * 40,
+        "baseRefName": "main",
+        "baseRefOid": "b" * 40,
+        "statusCheckRollup": [
+            {
+                "name": "All required checks pass",
+                "conclusion": "SUCCESS",
+                "detailsUrl": (
+                    "https://github.com/Oplink76/hermes-agent/"
+                    "actions/runs/101/job/202"
+                ),
+            }
+        ],
+    }
+    verifier = GhReleaseVerifier(
+        repo_slug="Oplink76/hermes-agent",
+        required_check="All required checks pass",
+        runner=FakeRunner({command: (0, json.dumps(payload), "")}),
+        cwd=tmp_path,
+        gh_executable=executable,
+    )
+
+    evidence = verifier.verify(41)
+
+    assert evidence.merge_sha == "d" * 40
+    assert evidence.head_sha == "a" * 40
+    assert evidence.base_sha == "b" * 40
 
 
 def test_deployment_store_atomically_replaces_one_private_json_record(tmp_path: Path):
