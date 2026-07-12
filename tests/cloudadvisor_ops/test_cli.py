@@ -9,7 +9,11 @@ import pytest
 import yaml
 
 from ops.cloudadvisor.hermes_ops import cli
-from ops.cloudadvisor.hermes_ops.cli import load_operations_config, load_sync_config
+from ops.cloudadvisor.hermes_ops.cli import (
+    load_operations_config,
+    load_sync_config,
+    load_sync_policy_config,
+)
 from ops.cloudadvisor.hermes_ops.health import HealthCheck, HealthReport
 from ops.cloudadvisor.hermes_ops.sync import SyncResult, SyncState
 
@@ -82,6 +86,33 @@ def test_load_sync_config_resolves_paths_and_fixed_candidate(tmp_path: Path):
     assert config.repo == (tmp_path / "repo").resolve()
     assert config.worktree == (tmp_path / "candidate").resolve()
     assert config.candidate_branch == "auto-sync/upstream"
+
+
+def test_load_sync_policy_config_reads_exact_authority_settings(tmp_path: Path):
+    config_file = tmp_path / "hermes-operations.yaml"
+    config_file.write_text(
+        "\n".join([
+            "sync:",
+            f"  receipt_root: {tmp_path / 'receipts'}",
+            "  required_check: All required checks pass",
+            "  check_timeout_seconds: 2700",
+            "  poll_interval_seconds: 15",
+            "  resolver_backend: codex",
+            "  reviewer_backend: claude",
+        ])
+        + "\n",
+        encoding="utf-8",
+    )
+
+    policy = load_sync_policy_config(config_file)
+
+    assert policy.receipt_root == (tmp_path / "receipts").resolve()
+    assert policy.required_check == "All required checks pass"
+    assert policy.check_timeout_seconds == 2700
+    assert policy.poll_interval_seconds == 15
+    assert policy.resolver_backend == "codex"
+    assert policy.reviewer_backend == "claude"
+    assert policy.resolver_backend.casefold() != policy.reviewer_backend.casefold()
 
 
 def test_load_operations_config_builds_explicit_runtime_and_deploy_scope(

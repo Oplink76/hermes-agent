@@ -51,6 +51,16 @@ class OperationsConfig:
     preservation_command: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class SyncPolicyConfig:
+    receipt_root: Path
+    required_check: str
+    check_timeout_seconds: int
+    poll_interval_seconds: int
+    resolver_backend: str
+    reviewer_backend: str
+
+
 def _load_yaml(path: Path) -> dict[str, Any]:
     payload = yaml.safe_load(path.expanduser().read_text(encoding="utf-8-sig")) or {}
     if not isinstance(payload, dict):
@@ -213,6 +223,49 @@ def load_sync_config(path: Path) -> SyncConfig:
     if lock_path is not None:
         kwargs["lock_path"] = Path(lock_path).expanduser().resolve(strict=False)
     return SyncConfig(**kwargs)
+
+
+def load_sync_policy_config(path: Path) -> SyncPolicyConfig:
+    values = _mapping(_load_yaml(path), "sync")
+    required = {
+        "receipt_root",
+        "required_check",
+        "check_timeout_seconds",
+        "poll_interval_seconds",
+        "resolver_backend",
+        "reviewer_backend",
+    }
+    missing = sorted(required - set(values))
+    if missing:
+        raise ValueError(f"sync policy config is missing required fields: {missing}")
+
+    def positive_integer(name: str) -> int:
+        value = values[name]
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"sync.{name} must be a positive integer")
+        return value
+
+    def backend(name: str) -> str:
+        value = values[name]
+        if not isinstance(value, str) or not value.strip() or value != value.strip():
+            raise ValueError(f"sync.{name} must be a normalized backend id")
+        return value
+
+    required_check = values["required_check"]
+    if not isinstance(required_check, str) or not required_check.strip():
+        raise ValueError("sync.required_check must be a non-empty string")
+    resolver_backend = backend("resolver_backend")
+    reviewer_backend = backend("reviewer_backend")
+    if resolver_backend.casefold() == reviewer_backend.casefold():
+        raise ValueError("sync reviewer backend must be independent")
+    return SyncPolicyConfig(
+        receipt_root=_path(values["receipt_root"], field="sync.receipt_root"),
+        required_check=required_check,
+        check_timeout_seconds=positive_integer("check_timeout_seconds"),
+        poll_interval_seconds=positive_integer("poll_interval_seconds"),
+        resolver_backend=resolver_backend,
+        reviewer_backend=reviewer_backend,
+    )
 
 
 def load_conflict_resolver(path: Path) -> CodexConflictResolver | None:

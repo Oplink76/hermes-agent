@@ -8,6 +8,12 @@ sync:
   candidate_branch: auto-sync/upstream
   repo_slug: Oplink76/hermes-agent
   lock_path: /Users/cloudadvisor/.hermes/locks/upstream-sync.lock
+  receipt_root: /Users/cloudadvisor/.hermes/recovery/sync-receipts
+  required_check: All required checks pass
+  check_timeout_seconds: 2700
+  poll_interval_seconds: 15
+  resolver_backend: codex
+  reviewer_backend: claude
   conflict_resolver:
     codex_executable: /Users/cloudadvisor/.local/bin/codex
     prompt: Resolve only the current Git merge conflicts. Do not commit, push, or change remotes.
