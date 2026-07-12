@@ -20,6 +20,7 @@ _FIELDS = {
     "schema_version",
     "repo_slug",
     "candidate_sha",
+    "candidate_tree_sha",
     "pr_number",
     "pr_head_sha",
     "base_sha",
@@ -42,6 +43,7 @@ class PendingDeploymentCheckpoint:
     schema_version: int
     repo_slug: str
     candidate_sha: str
+    candidate_tree_sha: str
     pr_number: int
     pr_head_sha: str
     base_sha: str
@@ -88,6 +90,7 @@ def _validate(checkpoint: PendingDeploymentCheckpoint) -> None:
         raise SyncDeploymentCheckpointError("deployment repository is invalid")
     shas = (
         checkpoint.candidate_sha,
+        checkpoint.candidate_tree_sha,
         checkpoint.pr_head_sha,
         checkpoint.base_sha,
         checkpoint.upstream_sha,

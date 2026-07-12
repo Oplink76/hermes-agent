@@ -305,6 +305,7 @@ def _write_pending_deploy(
         schema_version=1,
         repo_slug=config.sync.repo_slug,
         candidate_sha=candidate.candidate_sha or "",
+        candidate_tree_sha=candidate.candidate_tree_sha or "",
         pr_number=evidence.number,
         pr_head_sha=evidence.head_sha,
         base_sha=evidence.base_sha,
@@ -335,6 +336,7 @@ def _candidate_from_pending_receipt(
         base_sha=checkpoint.base_sha,
         upstream_sha=checkpoint.upstream_sha,
         candidate_sha=checkpoint.candidate_sha,
+        candidate_tree_sha=checkpoint.candidate_tree_sha,
         pr_number=checkpoint.pr_number,
         checks=receipt.local_checks,
         classification=classification,
@@ -464,6 +466,41 @@ def _resume_pending_deploy(
     )
     if outcome.state is AutonomousSyncState.DEPLOYED:
         clear_pending_deployment(config.receipt_root, sha256=checkpoint_sha)
+    elif outcome.state is AutonomousSyncState.ROLLED_BACK_REVERTED:
+        if not outcome.fork_main_sha or not outcome.installed_sha:
+            raise AutonomousSyncError(
+                "resumed deployment recovery identity is incomplete"
+            )
+        write_pending_reconstruction(
+            config.receipt_root,
+            PendingReconstructionCheckpoint(
+                schema_version=2,
+                repo_slug=config.sync.repo_slug,
+                stage="recovered",
+                failed_base_sha=checkpoint.base_sha,
+                failed_upstream_sha=checkpoint.upstream_sha,
+                failed_candidate_sha=checkpoint.candidate_sha,
+                failed_candidate_tree_sha=checkpoint.candidate_tree_sha,
+                failed_pr_number=checkpoint.pr_number,
+                failed_merge_sha=checkpoint.merge_sha,
+                revert_main_sha=outcome.fork_main_sha,
+                previous_healthy_installed_sha=outcome.installed_sha,
+                target_upstream_sha=checkpoint.upstream_sha,
+                expected_rolling_candidate_sha=checkpoint.candidate_sha,
+                reconstructed_candidate_sha=None,
+                reconstructed_candidate_tree_sha=None,
+                reconstructed_pr_number=None,
+                reconstructed_changed_files=(),
+                repaired_candidate_sha=None,
+                repaired_candidate_tree_sha=None,
+                repaired_pr_number=None,
+                repair_paths=(),
+                repaired_checks=(),
+                resolution_record_sha256=None,
+                reason="resumed deployment rolled back and protected revert completed",
+                resume_attempts=0,
+            ),
+        )
     return outcome
 
 

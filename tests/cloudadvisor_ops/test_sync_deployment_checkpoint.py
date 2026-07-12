@@ -25,6 +25,7 @@ def _checkpoint(**updates: object) -> PendingDeploymentCheckpoint:
         "schema_version": 1,
         "repo_slug": REPO,
         "candidate_sha": "a" * 40,
+        "candidate_tree_sha": "9" * 40,
         "pr_number": 7,
         "pr_head_sha": "a" * 40,
         "base_sha": "b" * 40,
