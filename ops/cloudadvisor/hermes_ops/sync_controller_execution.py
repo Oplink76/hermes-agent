@@ -265,6 +265,7 @@ class ControllerExecution:
         self.state = ControllerRunState(
             stage=ControllerStage.CANDIDATE,
             candidate=candidate,
+            merge_sha=context.failed_merge_sha,
             candidate_repair_used=True,
             reconstruction=context,
         )

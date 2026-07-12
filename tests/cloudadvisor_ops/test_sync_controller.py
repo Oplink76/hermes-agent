@@ -79,6 +79,16 @@ def test_controller_run_state_rejects_stage_without_required_evidence() -> None:
             candidate=candidate(),
         )
 
+    with pytest.raises(ValueError, match="initial"):
+        ControllerRunState(candidate=candidate())
+
+    with pytest.raises(ValueError, match="checkpoint"):
+        ControllerRunState(
+            stage=ControllerStage.MERGED,
+            candidate=candidate(),
+            merge_sha=SHA_MERGE,
+        )
+
 
 class Runner:
     def __init__(self, repair_paths: tuple[str, ...] = ("upstream.txt",)):

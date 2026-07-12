@@ -117,6 +117,18 @@ class ControllerRunState:
     deployment_checkpoint_sha256: str | None = None
 
     def __post_init__(self) -> None:
+        if self.stage is ControllerStage.INITIAL and any(
+            (
+                self.candidate is not None,
+                self.merge_sha is not None,
+                self.infrastructure_retry_used,
+                self.candidate_repair_used,
+                self.upstream_refreshes,
+                self.reconstruction is not None,
+                self.deployment_checkpoint_sha256 is not None,
+            )
+        ):
+            raise ValueError("controller initial stage contains operation evidence")
         if self.stage is not ControllerStage.INITIAL and self.candidate is None:
             raise ValueError("controller candidate evidence is required")
         if self.stage in {ControllerStage.MERGED, ControllerStage.RECOVERY} and (
@@ -125,6 +137,14 @@ class ControllerRunState:
             raise ValueError("controller merge evidence is required")
         if self.stage is ControllerStage.RECOVERY and self.reconstruction is None:
             raise ValueError("controller recovery evidence is required")
+        if self.stage is ControllerStage.MERGED and (
+            self.deployment_checkpoint_sha256 is None
+        ):
+            raise ValueError("controller deployment checkpoint is required")
+        if self.stage is ControllerStage.CANDIDATE and (
+            (self.reconstruction is None) != (self.merge_sha is None)
+        ):
+            raise ValueError("controller candidate recovery evidence is crossed")
         if self.upstream_refreshes < 0:
             raise ValueError("controller refresh count is invalid")
 
