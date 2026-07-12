@@ -16,7 +16,12 @@ from typing import Callable, Protocol
 from .command import CommandRunner
 from .deploy import DeploymentRecord
 from .sync import SyncResult
-from .sync_github import SyncGitHubError, SyncGitHubPort, SyncPullRequestEvidence
+from .sync_github import (
+    SyncGitHubError,
+    SyncGitHubPort,
+    SyncPullRequestEvidence,
+    bind_expected_base,
+)
 from .sync_poll import ExactHeadExpectation, ExactHeadPollError, poll_exact_head
 from utils import atomic_json_write
 
@@ -152,12 +157,6 @@ def _wait_for_revert_green(
         clock=clock,
         sleeper=sleeper,
     )
-
-
-def _bind_expected_base(github: SyncGitHubPort, base_sha: str) -> None:
-    """Bind the concrete gh adapter while leaving strict test ports generic."""
-    if hasattr(github, "expected_base_sha"):
-        setattr(github, "expected_base_sha", base_sha)
 
 
 def run_protected_revert(
@@ -303,7 +302,7 @@ def run_protected_revert(
             timeout_seconds=timeout_seconds,
             poll_interval_seconds=poll_interval_seconds,
         )
-        _bind_expected_base(github, merge_sha)
+        bind_expected_base(github, merge_sha)
         revert_merge_sha = github.merge_exact(pr_number, expected_head=revert_head)
         if _FULL_SHA.fullmatch(revert_merge_sha) is None:
             raise ProtectedRevertError("protected revert merge SHA is invalid")

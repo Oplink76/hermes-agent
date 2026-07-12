@@ -21,6 +21,11 @@ from .locking import try_exclusive_file_lock
 FIXED_CANDIDATE_BRANCH = "auto-sync/upstream"
 
 
+def is_canonical_backend_executable(path: Path, backend: str) -> bool:
+    """Accept only one canonical backend binary or its Windows launch shims."""
+    return Path(path).name in {backend, f"{backend}.exe", f"{backend}.cmd"}
+
+
 class SyncState(str, Enum):
     LOCKED = "LOCKED"
     FETCHED = "FETCHED"
@@ -130,7 +135,7 @@ class CodexConflictResolver:
     _evidence_dir: Path | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.executable.name not in {"codex", "codex.exe"}:
+        if not is_canonical_backend_executable(self.executable, "codex"):
             raise ValueError("conflict resolver must use the Codex executable")
         if not self.prompt.strip():
             raise ValueError("conflict resolver prompt must not be empty")

@@ -79,12 +79,15 @@ def failed_evidence() -> SyncPullRequestEvidence:
 
 def test_exact_infrastructure_failure_is_retried_once(tmp_path: Path):
     runner = Runner(failed_step="Set up job")
+    executable = tmp_path / "Program Files" / "GitHub CLI" / (
+        "gh.exe" if os.name == "nt" else "gh"
+    )
     remediator = GhActionsRemediator(
         repo_slug="Oplink76/hermes-agent",
         required_check="All required checks pass",
         runner=runner,
         cwd=tmp_path,
-        gh_executable=Path("C:/Program Files/GitHub CLI/gh.exe"),
+        gh_executable=executable,
     )
 
     assert remediator.retry_infrastructure(candidate(), failed_evidence()) is True
@@ -92,7 +95,7 @@ def test_exact_infrastructure_failure_is_retried_once(tmp_path: Path):
     reruns = [call for call in runner.calls if call[1:3] == ("run", "rerun")]
     assert reruns == [
         (
-            "C:/Program Files/GitHub CLI/gh.exe",
+            str(executable),
             "run",
             "rerun",
             str(WORKFLOW_RUN_ID),
@@ -105,16 +108,40 @@ def test_exact_infrastructure_failure_is_retried_once(tmp_path: Path):
 
 def test_candidate_failure_is_never_retried_as_infrastructure(tmp_path: Path):
     runner = Runner(failed_step="Run tests")
+    executable = tmp_path / "bin" / ("gh.exe" if os.name == "nt" else "gh")
     remediator = GhActionsRemediator(
         repo_slug="Oplink76/hermes-agent",
         required_check="All required checks pass",
         runner=runner,
         cwd=tmp_path,
-        gh_executable=Path("/usr/local/bin/gh"),
+        gh_executable=executable,
     )
 
     assert remediator.retry_infrastructure(candidate(), failed_evidence()) is False
     assert not any(call[1:3] == ("run", "rerun") for call in runner.calls)
+
+
+@pytest.mark.parametrize("name", ["codex", "codex.exe", "codex.cmd"])
+def test_candidate_remediator_accepts_canonical_executable_names(
+    tmp_path: Path, name: str
+):
+    config = SyncConfig(
+        repo=tmp_path / "repo",
+        worktree=tmp_path / "candidate",
+        origin="origin",
+        upstream="upstream",
+        candidate_branch="auto-sync/upstream",
+        repo_slug="Oplink76/hermes-agent",
+        lock_path=tmp_path / "sync.lock",
+    )
+    remediator = CodexCandidateRemediator(
+        config=config,
+        runner=SubprocessCommandRunner(),
+        executable=tmp_path / "Program Files" / "Codex" / name,
+        prompt="repair",
+    )
+
+    assert remediator.executable.name == name
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -124,7 +151,9 @@ def _git(cwd: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
-def _repair_fixture(tmp_path: Path):
+def _repair_fixture(
+    tmp_path: Path, *, record_paths: tuple[str, ...] = ("repaired.txt",)
+):
     origin = tmp_path / "origin.git"
     repo = tmp_path / "repo"
     subprocess.run(
@@ -150,17 +179,21 @@ def _repair_fixture(tmp_path: Path):
     _git(repo, "push", "origin", "auto-sync/upstream")
 
     driver = tmp_path / "fake_codex.py"
+    repair_payload = json.dumps(
+        {
+            "conflicts": [
+                {"path": path, "decision": "repair exact candidate"}
+                for path in record_paths
+            ],
+            "strategy": "candidate_repair",
+        }
+    )
     driver.write_text(
         "\n".join([
-            "import json",
             "from pathlib import Path",
             "Path('repaired.txt').write_text('repaired\\n', encoding='utf-8')",
-            "Path('.hermes-sync-repair.json').write_text(",
-            "    json.dumps({'conflicts': [{'path': 'upstream.txt', "
-            "'decision': 'repair exact candidate'}], "
-            "'strategy': 'candidate_repair'}),",
-            "    encoding='utf-8',",
-            ")",
+            "Path('.hermes-sync-repair.json').write_text("
+            f"{repair_payload!r}, encoding='utf-8')",
         ])
         + "\n",
         encoding="utf-8",
@@ -173,7 +206,7 @@ def _repair_fixture(tmp_path: Path):
     else:
         codex = tmp_path / "codex"
         codex.write_text(
-            f"#!{sys.executable}\nexec(compile(open({str(driver)!r}).read(), "
+            f"#!{sys.executable}\nexec(compile(open({str(driver)!r}, encoding='utf-8').read(), "
             f"{str(driver)!r}, 'exec'))\n",
             encoding="utf-8",
         )
@@ -235,6 +268,7 @@ def test_real_candidate_repair_uses_detached_worktree_and_exact_branch_lease(
     assert result.candidate_sha != value.candidate_sha
     assert result.classification is SyncClassification.MINOR_REVIEW_REQUIRED
     assert result.resolution_record is not None
+    assert result.conflicted_files == ("repaired.txt",)
     assert result.checks[-1].name == "tests"
     assert len(verify_calls) == 1
     assert (
@@ -243,6 +277,35 @@ def test_real_candidate_repair_uses_detached_worktree_and_exact_branch_lease(
     )
     assert _git(repo, "ls-remote", "origin", "refs/heads/main").split()[0] == base_sha
     assert "hermes-sync-repair-" not in _git(repo, "worktree", "list")
+
+
+@pytest.mark.parametrize(
+    "record_paths",
+    [
+        ("upstream.txt",),
+        ("repaired.txt", "upstream.txt"),
+        ("repaired.txt", "repaired.txt"),
+    ],
+)
+def test_candidate_repair_rejects_nonexact_actual_diff_evidence(
+    tmp_path: Path, record_paths: tuple[str, ...]
+):
+    repo, _, codex, sync_config, value, verify, _ = _repair_fixture(
+        tmp_path, record_paths=record_paths
+    )
+    result = CodexCandidateRemediator(
+        config=sync_config,
+        runner=SubprocessCommandRunner(),
+        executable=codex,
+        prompt="Repair the failing exact candidate.",
+        verify_fn=verify,
+    ).repair_candidate(value)
+
+    assert result is None
+    assert (
+        _git(repo, "ls-remote", "origin", "refs/heads/auto-sync/upstream").split()[0]
+        == value.candidate_sha
+    )
 
 
 @pytest.mark.parametrize(

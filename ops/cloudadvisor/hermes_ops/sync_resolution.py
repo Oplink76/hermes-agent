@@ -165,7 +165,8 @@ def freeze_resolution_record(
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
-            temporary.chmod(0o400)
+            if _requires_posix_readonly():
+                temporary.chmod(0o400)
             try:
                 os.link(temporary, target)
             except FileExistsError:

@@ -5,6 +5,8 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from ops.cloudadvisor.hermes_ops.deploy import DeployConfig, DeploymentRecord
 from ops.cloudadvisor.hermes_ops.locking import try_exclusive_file_lock
 from ops.cloudadvisor.hermes_ops.health import HealthCheck
@@ -32,19 +34,45 @@ SHA_MERGE = "4" * 40
 SHA_CANDIDATE_TREE = "5" * 40
 SHA_REPAIRED = "6" * 40
 SHA_REPAIRED_TREE = "7" * 40
+SHA_NEW_CANDIDATE = "8" * 40
+SHA_NEW_CANDIDATE_TREE = "9" * 40
+SHA_NEW_REPAIRED = "a" * 40
+SHA_NEW_REPAIRED_TREE = "b" * 40
 
 
 class Runner:
-    def __init__(self):
+    def __init__(self, repair_paths: tuple[str, ...] = ("upstream.txt",)):
         self.review_head = SHA_CANDIDATE
+        self.repair_paths = repair_paths
 
     def run(self, argv: list[str], cwd: Path, timeout: int = 300):
         if argv == ["git", "rev-parse", "upstream/main"]:
             return subprocess.CompletedProcess(argv, 0, SHA_UPSTREAM + "\n", "")
         if argv == ["git", "merge-base", "--is-ancestor", SHA_CANDIDATE, SHA_REPAIRED]:
             return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv == [
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            SHA_NEW_CANDIDATE,
+            SHA_NEW_REPAIRED,
+        ]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
         if argv == ["git", "rev-parse", f"{SHA_REPAIRED}^"]:
             return subprocess.CompletedProcess(argv, 0, SHA_CANDIDATE + "\n", "")
+        if argv == ["git", "rev-parse", f"{SHA_NEW_REPAIRED}^"]:
+            return subprocess.CompletedProcess(
+                argv, 0, SHA_NEW_CANDIDATE + "\n", ""
+            )
+        if len(argv) == 5 and argv[:4] == [
+            "git", "diff", "--name-only", "-z"
+        ] and argv[4] in {
+            f"{SHA_CANDIDATE}..{SHA_REPAIRED}",
+            f"{SHA_NEW_CANDIDATE}..{SHA_NEW_REPAIRED}",
+        }:
+            return subprocess.CompletedProcess(
+                argv, 0, "\0".join(self.repair_paths) + "\0", ""
+            )
         if argv == ["git", "branch", "--show-current"]:
             return subprocess.CompletedProcess(
                 argv, 0, "auto-sync/upstream\n", ""
@@ -121,11 +149,13 @@ def candidate(
     candidate_sha: str = SHA_CANDIDATE,
     candidate_tree_sha: str = SHA_CANDIDATE_TREE,
     changed_files: tuple[str, ...] = (),
+    base_sha: str = SHA_BASE,
+    upstream_sha: str = SHA_UPSTREAM,
 ) -> SyncResult:
     return SyncResult(
         state=state,
-        base_sha=SHA_BASE,
-        upstream_sha=SHA_UPSTREAM,
+        base_sha=base_sha,
+        upstream_sha=upstream_sha,
         candidate_sha=candidate_sha,
         candidate_tree_sha=candidate_tree_sha,
         pr_number=7,
@@ -143,11 +173,12 @@ def evidence(
     *,
     head: str = SHA_CANDIDATE,
     conclusion: str = "success",
+    base: str = SHA_BASE,
 ) -> SyncPullRequestEvidence:
     return SyncPullRequestEvidence(
         number=7,
         state="open",
-        base_sha=SHA_BASE,
+        base_sha=base,
         head_sha=head,
         required_check="All required checks pass",
         required_check_conclusion=conclusion,
@@ -157,7 +188,12 @@ def evidence(
 
 
 class Remediator:
-    def __init__(self, *, retry: bool = False, repaired: SyncResult | None = None):
+    def __init__(
+        self,
+        *,
+        retry: bool | list[bool] = False,
+        repaired: SyncResult | list[SyncResult] | None = None,
+    ):
         self.retry = retry
         self.repaired = repaired
         self.retry_calls = 0
@@ -165,12 +201,16 @@ class Remediator:
 
     def retry_infrastructure(self, value: SyncResult, evidence) -> bool:
         self.retry_calls += 1
+        if isinstance(self.retry, list):
+            return self.retry.pop(0)
         return self.retry
 
     def repair_candidate(
         self, value: SyncResult, *, health_evidence: tuple[str, ...] = ()
     ) -> SyncResult | None:
         self.repair_calls.append(health_evidence)
+        if isinstance(self.repaired, list):
+            return self.repaired.pop(0)
         return self.repaired
 
 
@@ -188,25 +228,35 @@ class GreenReviewer:
         )
 
 
-def reviewed_repair(tmp_path: Path) -> SyncResult:
+def reviewed_repair(
+    tmp_path: Path,
+    *,
+    candidate_sha: str = SHA_REPAIRED,
+    candidate_tree_sha: str = SHA_REPAIRED_TREE,
+    path: str = "upstream.txt",
+    base_sha: str = SHA_BASE,
+    upstream_sha: str = SHA_UPSTREAM,
+) -> SyncResult:
     evidence_dir = tmp_path / ".git" / "hermes-sync-evidence"
     evidence_dir.mkdir(parents=True, exist_ok=True)
-    raw = evidence_dir / "repair.json"
+    raw = evidence_dir / f"repair-{candidate_sha}.json"
     raw.write_text(
-        '{"conflicts":[{"path":"upstream.txt",'
-        '"decision":"repair exact candidate"}],'
+        '{"conflicts":[{"path":'
+        f'"{path}","decision":"repair exact candidate"}}],'
         '"strategy":"candidate_repair"}',
         encoding="utf-8",
     )
     return candidate(
         classification=SyncClassification.MINOR_REVIEW_REQUIRED,
-        conflicted_files=("upstream.txt",),
+        conflicted_files=(path,),
         resolution_record=raw,
         resolution_evidence_dir=evidence_dir,
         resolution_strategy="candidate_repair",
-        candidate_sha=SHA_REPAIRED,
-        candidate_tree_sha=SHA_REPAIRED_TREE,
-        changed_files=("upstream.txt",),
+        candidate_sha=candidate_sha,
+        candidate_tree_sha=candidate_tree_sha,
+        changed_files=(path,),
+        base_sha=base_sha,
+        upstream_sha=upstream_sha,
     )
 
 
@@ -761,7 +811,7 @@ def test_conflict_derived_repair_gets_fresh_independent_review(
 
     result = run_autonomous_sync(
         cfg,
-        runner=Runner(),
+        runner=Runner(repair_paths=("gateway/run.py",)),
         github=GitHub(
             [
                 evidence(conclusion="failure"),
@@ -823,6 +873,39 @@ def test_changed_repair_commit_with_unchanged_tree_is_rejected(
     assert "repair evidence" in result.reason
 
 
+@pytest.mark.parametrize(
+    "reported_paths",
+    [(), ("upstream.txt", "extra.py"), ("upstream.txt", "upstream.txt")],
+)
+def test_nonexact_repair_diff_paths_are_rejected_before_claude(
+    tmp_path: Path, monkeypatch, reported_paths: tuple[str, ...]
+):
+    repaired = reviewed_repair(tmp_path)
+    repaired = repaired.__class__(
+        **{**repaired.__dict__, "conflicted_files": reported_paths}
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: candidate(),
+    )
+
+    class Reviewer:
+        def review(self, **kwargs):
+            raise AssertionError("Claude must not see invalid repair evidence")
+
+    result = run_autonomous_sync(
+        review_config(tmp_path),
+        runner=Runner(),
+        github=GitHub([evidence(conclusion="failure")]),
+        resolver=None,
+        reviewer=Reviewer(),
+        remediator=Remediator(repaired=repaired),
+        deploy_fn=lambda *args: deployed_record(),
+    )
+
+    assert result.state is AutonomousSyncState.NEEDS_OLE
+
+
 def test_repaired_candidate_red_does_not_get_a_second_repair(
     tmp_path: Path, monkeypatch
 ):
@@ -847,6 +930,190 @@ def test_repaired_candidate_red_does_not_get_a_second_repair(
     )
     assert result.state is AutonomousSyncState.NEEDS_OLE
     assert len(remediator.repair_calls) == 1
+
+
+def test_code_repair_then_uses_remaining_exact_infrastructure_retry(
+    tmp_path: Path, monkeypatch
+):
+    remediator = Remediator(
+        retry=[False, True], repaired=reviewed_repair(tmp_path)
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: candidate(),
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
+        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
+        lambda *args, **kwargs: type(
+            "Artifact", (), {"path": tmp_path / "merged"}
+        )(),
+    )
+
+    result = run_autonomous_sync(
+        review_config(tmp_path),
+        runner=Runner(),
+        github=GitHub(
+            [
+                evidence(conclusion="failure"),
+                evidence(head=SHA_REPAIRED, conclusion="failure"),
+                evidence(head=SHA_REPAIRED),
+            ]
+        ),
+        resolver=None,
+        reviewer=GreenReviewer(),
+        remediator=remediator,
+        deploy_fn=lambda *args: deployed_record(),
+    )
+
+    assert result.state is AutonomousSyncState.DEPLOYED
+    assert remediator.retry_calls == 2
+    assert len(remediator.repair_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "conclusion", ["cancelled", "timed_out", "action_required", "neutral"]
+)
+def test_exact_nonfailure_red_conclusion_is_nonalerting_pending(
+    tmp_path: Path, monkeypatch, conclusion: str
+):
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: candidate(),
+    )
+    result = run_autonomous_sync(
+        config(tmp_path),
+        runner=Runner(),
+        github=GitHub([evidence(conclusion=conclusion)]),
+        resolver=None,
+        reviewer=None,
+        remediator=Remediator(),
+        deploy_fn=lambda *args: deployed_record(),
+    )
+
+    assert result.state is AutonomousSyncState.PENDING_REFRESH
+    assert result.needs_ole is False
+    assert conclusion in result.reason
+
+
+def test_genuinely_new_upstream_head_resets_candidate_scoped_budgets(
+    tmp_path: Path, monkeypatch
+):
+    new_upstream = "c" * 40
+    first = candidate()
+    second = candidate(
+        candidate_sha=SHA_NEW_CANDIDATE,
+        candidate_tree_sha=SHA_NEW_CANDIDATE_TREE,
+        upstream_sha=new_upstream,
+        changed_files=("upstream.txt",),
+    )
+    first_repair = reviewed_repair(tmp_path)
+    second_repair = reviewed_repair(
+        tmp_path,
+        candidate_sha=SHA_NEW_REPAIRED,
+        candidate_tree_sha=SHA_NEW_REPAIRED_TREE,
+        upstream_sha=new_upstream,
+    )
+    prepared = [first, second]
+    remediator = Remediator(
+        retry=[False, False], repaired=[first_repair, second_repair]
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: prepared.pop(0),
+    )
+    current = iter((False, True))
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller._upstream_is_current",
+        lambda *args, **kwargs: next(current),
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
+        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
+        lambda *args, **kwargs: type(
+            "Artifact", (), {"path": tmp_path / "merged"}
+        )(),
+    )
+
+    result = run_autonomous_sync(
+        review_config(tmp_path),
+        runner=Runner(),
+        github=GitHub(
+            [
+                evidence(conclusion="failure"),
+                evidence(head=SHA_REPAIRED),
+                evidence(head=SHA_NEW_CANDIDATE, conclusion="failure"),
+                evidence(head=SHA_NEW_REPAIRED),
+            ]
+        ),
+        resolver=None,
+        reviewer=GreenReviewer(),
+        remediator=remediator,
+        deploy_fn=lambda *args: deployed_record(),
+    )
+
+    assert result.state is AutonomousSyncState.DEPLOYED
+    assert len(remediator.repair_calls) == 2
+    assert prepared == []
+
+
+def test_post_revert_upstream_advance_returns_pending_without_ordinary_prepare(
+    tmp_path: Path, monkeypatch
+):
+    prepared = [candidate()]
+    remediator = Remediator(repaired=reviewed_repair(tmp_path))
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: prepared.pop(0),
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.reconstruct_failed_candidate",
+        lambda *args, **kwargs: candidate(),
+    )
+    current = iter((True, False))
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller._upstream_is_current",
+        lambda *args, **kwargs: next(current),
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
+        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
+        lambda *args, **kwargs: type(
+            "Artifact", (), {"path": tmp_path / "merged"}
+        )(),
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.finish_or_recover",
+        lambda *args, **kwargs: AutonomousSyncResult(
+            state=AutonomousSyncState.ROLLED_BACK_REVERTED,
+            installed_sha=SHA_BASE,
+            fork_main_sha=SHA_BASE,
+        ),
+    )
+
+    result = run_autonomous_sync(
+        review_config(tmp_path),
+        runner=Runner(),
+        github=GitHub([evidence(), evidence(head=SHA_REPAIRED)]),
+        resolver=None,
+        reviewer=GreenReviewer(),
+        remediator=remediator,
+        deploy_fn=lambda *args: deployed_record("rolled_back"),
+        verify_runtime_fn=lambda sha: True,
+    )
+
+    assert result.state is AutonomousSyncState.PENDING_REFRESH
+    assert result.needs_ole is False
+    assert prepared == []
 
 
 def test_healthy_protected_rollback_gets_one_post_rollback_repair(

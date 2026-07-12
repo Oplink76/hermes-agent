@@ -270,13 +270,17 @@ def test_claude_reviewer_rejects_changed_head(tmp_path: Path):
         )
 
 
-def test_claude_reviewer_preserves_windows_paths_with_spaces(tmp_path: Path):
+@pytest.mark.parametrize("name", ["claude", "claude.exe", "claude.cmd"])
+def test_claude_reviewer_preserves_platform_paths_with_spaces(
+    tmp_path: Path, name: str
+):
     worktree = tmp_path / "candidate with spaces"
     worktree.mkdir()
     record = frozen_record(tmp_path / "evidence with spaces")
     runner = ReviewerRunner({"verdict": "green", "findings": []})
+    executable = tmp_path / "Program Files" / "Claude" / name
     reviewer = ClaudeConflictReviewer(
-        executable=Path("C:/Program Files/Claude/claude.exe"),
+        executable=executable,
         runner=runner,
         resolver_backend="codex",
         evidence_dir=record.parent,
@@ -287,10 +291,11 @@ def test_claude_reviewer_preserves_windows_paths_with_spaces(tmp_path: Path):
         resolution_record=record,
     )
     command = next(
-        call[0] for call in runner.calls if call[0][0].endswith("claude.exe")
+        call[0] for call in runner.calls if Path(call[0][0]).name == name
     )
-    assert command[0] == "C:/Program Files/Claude/claude.exe"
-    assert str(record.parent) in command
+    assert Path(command[0]) == executable
+    add_dir = command.index("--add-dir")
+    assert Path(command[add_dir + 1]) == record.parent
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges")

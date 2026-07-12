@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 from .command import CommandRunner
-from .sync import SyncClassification
+from .sync import SyncClassification, is_canonical_backend_executable
 from .sync_resolution import ResolutionRecordArtifact, ResolutionRecordError
 
 
@@ -64,7 +64,7 @@ class ClaudeConflictReviewer:
     reviewer_backend: str = "claude"
 
     def __post_init__(self) -> None:
-        if self.executable.name not in {"claude", "claude.exe"}:
+        if not is_canonical_backend_executable(self.executable, "claude"):
             raise ValueError("conflict reviewer must use the Claude executable")
         if (
             not self.resolver_backend.strip()

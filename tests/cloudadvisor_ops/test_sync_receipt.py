@@ -264,6 +264,30 @@ def test_windows_receipt_authority_uses_digest_not_posix_mode(
     assert SyncEligibilityReceipt.load(artifact.path).eligible is True
 
 
+def test_windows_receipt_write_and_finalize_never_chmod_and_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_receipt._requires_posix_readonly",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        Path,
+        "chmod",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("chmod must not run for Windows artifacts")
+        ),
+    )
+
+    premerge = write_sync_receipt(
+        tmp_path, clean_candidate(), green_pr(), repo_slug=REPO
+    )
+    merged = finalize_sync_receipt(premerge.path, merge_sha=MERGE_SHA)
+
+    assert SyncEligibilityReceipt.load(merged.path).merge_sha == MERGE_SHA
+    assert not tuple(tmp_path.glob(".sync-receipt-*.tmp"))
+
+
 def test_load_rejects_content_tampering_even_after_mode_is_restored(tmp_path: Path):
     artifact = write_sync_receipt(
         tmp_path, clean_candidate(), green_pr(), repo_slug=REPO

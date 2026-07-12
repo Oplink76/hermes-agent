@@ -90,6 +90,31 @@ def test_windows_authority_uses_digest_not_posix_mode(
     assert ResolutionRecordArtifact.load(artifact.path).sha256 == artifact.sha256
 
 
+def test_windows_freeze_never_chmods_artifact_and_cleanup_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    evidence_dir = tmp_path / ".git" / "hermes-sync-evidence"
+    record = raw_record(evidence_dir)
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_resolution._requires_posix_readonly",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        Path,
+        "chmod",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("chmod must not run for Windows artifacts")
+        ),
+    )
+
+    artifact = freeze_resolution_record(
+        tmp_path / "receipts", candidate(record, evidence_dir)
+    )
+
+    assert ResolutionRecordArtifact.load(artifact.path).sha256 == artifact.sha256
+    assert not tuple(artifact.path.parent.glob(".resolution-*.tmp"))
+
+
 @pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges")
 def test_freeze_rejects_original_record_symlink(tmp_path: Path):
     evidence_dir = tmp_path / ".git" / "hermes-sync-evidence"

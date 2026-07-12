@@ -19,6 +19,7 @@ from .sync import (
     SyncResult,
     SyncState,
     _verify,
+    is_canonical_backend_executable,
 )
 from .sync_github import SyncPullRequestEvidence
 
@@ -187,10 +188,7 @@ class CodexCandidateRemediator:
     verify_fn: Callable[[Path, CommandRunner], list[CheckResult]] = _verify
 
     def __post_init__(self) -> None:
-        allowed = {"codex", "codex.exe"}
-        if os.name == "nt":
-            allowed.add("codex.cmd")
-        if self.executable.name not in allowed:
+        if not is_canonical_backend_executable(self.executable, "codex"):
             raise ValueError("candidate repair must use the Codex executable")
         if not self.prompt.strip():
             raise ValueError("candidate repair prompt must not be empty")
@@ -234,6 +232,8 @@ class CodexCandidateRemediator:
         paths = [row.get("path") for row in rows if isinstance(row, dict)]
         if (
             len(paths) != len(rows)
+            or len(paths) != len(candidate.conflicted_files)
+            or len(paths) != len(set(paths))
             or set(paths) != set(candidate.conflicted_files)
             or any(
                 set(row) != {"path", "decision"}
@@ -295,16 +295,7 @@ class CodexCandidateRemediator:
             or not candidate.upstream_sha
         ):
             raise SyncRemediationError("candidate repair identity is incomplete")
-        review_paths = candidate.conflicted_files or candidate.changed_files
-        if not review_paths or len(review_paths) != len(set(review_paths)):
-            raise SyncRemediationError("candidate repair review paths are incomplete")
         repair_strategy = "candidate_repair"
-        evidence_candidate = replace(
-            candidate,
-            classification=SyncClassification.MINOR_REVIEW_REQUIRED,
-            conflicted_files=review_paths,
-            resolution_strategy=repair_strategy,
-        )
         with tempfile.TemporaryDirectory(
             prefix="hermes-sync-repair-", dir=self.config.repo.parent
         ) as temporary:
@@ -336,9 +327,10 @@ class CodexCandidateRemediator:
                 )
                 prompt += (
                     "Write .hermes-sync-repair.json with exactly the top-level "
-                    "keys `conflicts` and `strategy`, non-empty decisions, and cover "
-                    f"these paths exactly: {json.dumps(review_paths)}; strategy must "
-                    f"be {json.dumps(repair_strategy)}. "
+                    "keys `conflicts` and `strategy` and non-empty decisions. Run "
+                    "`git diff --name-only HEAD` after editing and cover that exact "
+                    "file set once each, with no missing, extra, or duplicate paths. "
+                    f"Strategy must be {json.dumps(repair_strategy)}. "
                 )
                 command = [
                     str(self.executable),
@@ -398,6 +390,33 @@ class CodexCandidateRemediator:
                     or not changed
                 ):
                     return None
+                repair_delta_raw = self._run(
+                    [
+                        "git",
+                        "diff",
+                        "--name-only",
+                        "-z",
+                        f"{candidate.candidate_sha}..{new_sha}",
+                    ],
+                    worktree,
+                )
+                repair_paths = tuple(
+                    path for path in (repair_delta_raw or "").split("\0") if path
+                )
+                if (
+                    repair_delta_raw is None
+                    or not repair_paths
+                    or len(repair_paths) != len(set(repair_paths))
+                ):
+                    return None
+                evidence_candidate = replace(
+                    candidate,
+                    candidate_sha=new_sha,
+                    candidate_tree_sha=tree_sha,
+                    classification=SyncClassification.MINOR_REVIEW_REQUIRED,
+                    conflicted_files=repair_paths,
+                    resolution_strategy=repair_strategy,
+                )
                 record.write_text(repair_payload, encoding="utf-8")
                 resolution_record, evidence_dir = self._resolution_record(
                     evidence_candidate, record, new_sha=new_sha
@@ -430,7 +449,7 @@ class CodexCandidateRemediator:
                     transitions=candidate.transitions
                     + (SyncState.VERIFIED, SyncState.PUSHED, SyncState.PR_UPDATED),
                     classification=SyncClassification.MINOR_REVIEW_REQUIRED,
-                    conflicted_files=review_paths,
+                    conflicted_files=repair_paths,
                     resolution_record=resolution_record,
                     resolution_evidence_dir=evidence_dir,
                     resolution_strategy=repair_strategy,

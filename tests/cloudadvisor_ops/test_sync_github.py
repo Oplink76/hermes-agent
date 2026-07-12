@@ -365,7 +365,7 @@ def test_evidence_crosses_real_subprocess_runner_boundary(
     else:
         launcher = bin_dir / "gh"
         launcher.write_text(
-            f"#!{sys.executable}\nexec(compile(open({str(driver)!r}).read(), "
+            f"#!{sys.executable}\nexec(compile(open({str(driver)!r}, encoding='utf-8').read(), "
             f"{str(driver)!r}, 'exec'))\n",
             encoding="utf-8",
         )

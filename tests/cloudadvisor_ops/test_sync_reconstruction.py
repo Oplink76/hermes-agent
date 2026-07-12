@@ -181,7 +181,7 @@ def test_real_controller_routes_rollback_through_reconstruction_and_reviewed_rep
     else:
         codex = tmp_path / "codex"
         codex.write_text(
-            f"#!{sys.executable}\nexec(compile(open({str(driver)!r}).read(), "
+            f"#!{sys.executable}\nexec(compile(open({str(driver)!r}, encoding='utf-8').read(), "
             f"{str(driver)!r}, 'exec'))\n",
             encoding="utf-8",
         )

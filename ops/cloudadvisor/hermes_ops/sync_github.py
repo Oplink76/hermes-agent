@@ -98,6 +98,12 @@ class SyncGitHubPort(Protocol):
     def merge_exact(self, pr_number: int, *, expected_head: str) -> str: ...
 
 
+def bind_expected_base(github: SyncGitHubPort, base_sha: str) -> None:
+    """Bind concrete GitHub adapters while keeping strict test ports generic."""
+    if hasattr(github, "expected_base_sha"):
+        setattr(github, "expected_base_sha", base_sha)
+
+
 def _full_sha(value: object) -> str:
     if not isinstance(value, str) or _FULL_SHA.fullmatch(value) is None:
         raise ValueError

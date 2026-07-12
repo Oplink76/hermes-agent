@@ -22,7 +22,7 @@ from .sync import (
     prepare_candidate,
 )
 from .sync_reconstruction import ReconstructionError, reconstruct_failed_candidate
-from .sync_github import SyncGitHubPort, SyncPullRequestEvidence
+from .sync_github import SyncGitHubPort, SyncPullRequestEvidence, bind_expected_base
 from .sync_github import SyncGitHubError
 from .sync_receipt import (
     SyncReceiptArtifact,
@@ -108,6 +108,17 @@ class AutonomousSyncResult:
             state=AutonomousSyncState.PENDING_REFRESH,
             candidate_sha=candidate.candidate_sha,
             reason="official upstream changed; candidate refresh required",
+        )
+
+    @classmethod
+    def pending(
+        cls, candidate: SyncResult, *, reason: str
+    ) -> "AutonomousSyncResult":
+        return cls(
+            state=AutonomousSyncState.PENDING_REFRESH,
+            candidate_sha=candidate.candidate_sha,
+            needs_ole=False,
+            reason=reason,
         )
 
 
@@ -328,10 +339,29 @@ def _valid_repair(
         cwd=repo,
         timeout=300,
     )
+    repair_diff = runner.run(
+        [
+            "git",
+            "diff",
+            "--name-only",
+            "-z",
+            f"{previous.candidate_sha}..{repaired.candidate_sha}",
+        ],
+        cwd=repo,
+        timeout=300,
+    )
+    actual_repair_paths = tuple(
+        path for path in (repair_diff.stdout or "").split("\0") if path
+    )
     if (
         ancestry.returncode != 0
         or parent.returncode != 0
         or (parent.stdout or "").strip() != previous.candidate_sha
+        or repair_diff.returncode != 0
+        or not actual_repair_paths
+        or len(actual_repair_paths) != len(set(actual_repair_paths))
+        or len(repaired.conflicted_files) != len(set(repaired.conflicted_files))
+        or set(actual_repair_paths) != set(repaired.conflicted_files)
     ):
         raise AutonomousSyncError("bounded candidate repair lineage is invalid")
     return repaired
@@ -374,11 +404,6 @@ def attest_candidate(
         repo_slug=config.sync.repo_slug,
         conflict_review=conflict_review,
     )
-
-
-def _bind_expected_base(github: SyncGitHubPort, base_sha: str) -> None:
-    if hasattr(github, "expected_base_sha"):
-        setattr(github, "expected_base_sha", base_sha)
 
 
 def finish_or_recover(
@@ -501,57 +526,36 @@ def run_autonomous_sync(
                         sleeper=sleeper,
                     )
                 except RequiredCheckRedError as first_red:
+                    conclusion = first_red.evidence.required_check_conclusion
+                    if conclusion != "failure":
+                        return AutonomousSyncResult.pending(
+                            reviewed,
+                            reason=(
+                                "exact required check ended "
+                                f"{conclusion}; awaiting a new exact run"
+                            ),
+                        )
                     if remediator is None:
                         raise AutonomousSyncError(str(first_red)) from first_red
-                    retried = False
                     if not infrastructure_retry_used:
                         retried = remediator.retry_infrastructure(
                             reviewed, first_red.evidence
                         )
                         if retried:
                             infrastructure_retry_used = True
-                    if retried:
-                        try:
-                            evidence = wait_for_green_exact_head(
-                                github,
-                                reviewed,
-                                required_check=config.required_check,
-                                timeout_seconds=config.check_timeout_seconds,
-                                poll_interval_seconds=config.poll_interval_seconds,
-                                clock=clock,
-                                sleeper=sleeper,
-                            )
-                        except RequiredCheckRedError:
-                            retried = False
-                    if not retried:
-                        if candidate_repair_used:
-                            raise AutonomousSyncError(
-                                "bounded candidate repair budget is exhausted"
-                            )
-                        candidate_repair_used = True
-                        candidate = _valid_repair(
-                            reviewed,
-                            remediator.repair_candidate(reviewed),
-                            runner=runner,
-                            repo=config.sync.repo,
+                            continue
+                    if candidate_repair_used:
+                        raise AutonomousSyncError(
+                            "bounded candidate repair budget is exhausted"
                         )
-                        reviewed, conflict_review = _review_candidate(
-                            config, candidate, reviewer, runner
-                        )
-                        try:
-                            evidence = wait_for_green_exact_head(
-                                github,
-                                reviewed,
-                                required_check=config.required_check,
-                                timeout_seconds=config.check_timeout_seconds,
-                                poll_interval_seconds=config.poll_interval_seconds,
-                                clock=clock,
-                                sleeper=sleeper,
-                            )
-                        except RequiredCheckRedError as repair_red:
-                            raise AutonomousSyncError(
-                                "bounded candidate repair remained red"
-                            ) from repair_red
+                    candidate_repair_used = True
+                    candidate = _valid_repair(
+                        reviewed,
+                        remediator.repair_candidate(reviewed),
+                        runner=runner,
+                        repo=config.sync.repo,
+                    )
+                    continue
 
                 receipt = attest_candidate(
                     config,
@@ -560,9 +564,18 @@ def run_autonomous_sync(
                     conflict_review=conflict_review,
                 )
                 if not _upstream_is_current(config, reviewed, runner):
+                    if post_rollback_repair:
+                        return AutonomousSyncResult.pending(
+                            reviewed,
+                            reason=(
+                                "official upstream advanced during post-revert repair; "
+                                "complete-tree reconstruction must restart"
+                            ),
+                        )
                     if upstream_refreshes >= config.max_upstream_refreshes:
                         return AutonomousSyncResult.refresh_required(reviewed)
                     upstream_refreshes += 1
+                    previous_head = candidate.candidate_sha
                     candidate = prepare_candidate(
                         config.sync,
                         github=github,
@@ -571,9 +584,12 @@ def run_autonomous_sync(
                     )
                     if candidate.state is SyncState.NO_CHANGE:
                         return AutonomousSyncResult.no_change(candidate)
+                    if candidate.candidate_sha != previous_head:
+                        infrastructure_retry_used = False
+                        candidate_repair_used = False
                     post_rollback_repair = False
                     continue
-                _bind_expected_base(github, evidence.base_sha)
+                bind_expected_base(github, evidence.base_sha)
                 merge_sha = github.merge_exact(
                     evidence.number, expected_head=reviewed.candidate_sha
                 )

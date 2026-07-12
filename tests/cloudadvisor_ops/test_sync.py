@@ -250,8 +250,9 @@ def test_command_conflict_resolver_runs_only_configured_command_in_worktree(
     worktree.mkdir()
     git_common_dir = tmp_path / "repo" / ".git"
     git_common_dir.mkdir(parents=True)
+    executable = tmp_path / "bin" / ("codex.cmd" if os.name == "nt" else "codex")
     resolver = CodexConflictResolver(
-        executable=Path("/usr/local/bin/codex"),
+        executable=executable,
         prompt="resolve current merge conflicts",
     )
     resolution_record = (
@@ -266,7 +267,7 @@ def test_command_conflict_resolver_runs_only_configured_command_in_worktree(
     class ResolutionRunner(FakeRunner):
         def run(self, argv: list[str], cwd: Path, timeout: int = 300):
             completed = super().run(argv, cwd, timeout)
-            if tuple(argv[:2]) == ("/usr/local/bin/codex", "exec"):
+            if Path(argv[0]) == executable and argv[1] == "exec":
                 resolution_record.parent.mkdir(parents=True, exist_ok=True)
                 resolution_record.write_text(
                     '{"conflicts":[{"path":"gateway/run.py",'
@@ -286,7 +287,7 @@ def test_command_conflict_resolver_runs_only_configured_command_in_worktree(
     assert runner.calls[0] == Call(common_dir_command, worktree, 300)
     command = runner.calls[1]
     assert command.argv[:7] == (
-        "/usr/local/bin/codex",
+        str(executable),
         "exec",
         "--ignore-user-config",
         "--sandbox",
@@ -307,7 +308,7 @@ def test_command_conflict_resolver_fails_when_record_is_missing(tmp_path: Path):
     git_common_dir = tmp_path / "repo" / ".git"
     git_common_dir.mkdir(parents=True)
     resolver = CodexConflictResolver(
-        executable=Path("/usr/local/bin/codex"),
+        executable=tmp_path / "bin" / ("codex.cmd" if os.name == "nt" else "codex"),
         prompt="resolve current merge conflicts",
     )
     runner = FakeRunner({
@@ -333,7 +334,7 @@ def test_command_conflict_resolver_rejects_stale_evidence_symlink(tmp_path: Path
     outside.write_text("do not delete", encoding="utf-8")
     (evidence_dir / ".hermes-sync-resolution.json").symlink_to(outside)
     resolver = CodexConflictResolver(
-        executable=Path("/usr/local/bin/codex"),
+        executable=tmp_path / "bin" / ("codex.cmd" if os.name == "nt" else "codex"),
         prompt="resolve current merge conflicts",
     )
     runner = FakeRunner({
@@ -356,7 +357,7 @@ def test_conflict_resolver_fails_closed_when_git_common_dir_is_unavailable(
     worktree = tmp_path / "candidate"
     worktree.mkdir()
     resolver = CodexConflictResolver(
-        executable=Path("/usr/local/bin/codex"),
+        executable=tmp_path / "bin" / ("codex.cmd" if os.name == "nt" else "codex"),
         prompt="resolve current merge conflicts",
     )
     common_dir_command = (
@@ -380,7 +381,7 @@ def test_conflict_resolver_fails_closed_when_git_common_dir_does_not_exist(
     worktree.mkdir()
     missing_common_dir = tmp_path / "missing" / ".git"
     resolver = CodexConflictResolver(
-        executable=Path("/usr/local/bin/codex"),
+        executable=tmp_path / "bin" / ("codex.cmd" if os.name == "nt" else "codex"),
         prompt="resolve current merge conflicts",
     )
     common_dir_command = (
@@ -405,12 +406,16 @@ def test_conflict_resolver_rejects_arbitrary_executable():
         )
 
 
-def test_conflict_resolver_preserves_windows_executable_path():
+@pytest.mark.parametrize("name", ["codex", "codex.exe", "codex.cmd"])
+def test_conflict_resolver_accepts_canonical_executable_names(
+    tmp_path: Path, name: str
+):
+    executable = tmp_path / "Program Files" / "Codex" / name
     resolver = CodexConflictResolver(
-        executable=Path("C:/Program Files/Codex/codex.exe"),
+        executable=executable,
         prompt="resolve conflicts",
     )
-    assert resolver.command[0] == "C:/Program Files/Codex/codex.exe"
+    assert Path(resolver.command[0]) == executable
 
 
 def test_resolved_merge_conflict_runs_gates_before_push(tmp_path: Path):
