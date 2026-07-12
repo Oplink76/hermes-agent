@@ -218,11 +218,10 @@ class RecordingServices:
         self.running = tuple(dict.fromkeys((*self.running, *services)))
 
 
-class FailOnceHealth:
-    def __init__(self, healthy_sha: str, events: list[tuple[object, ...]]):
-        self.healthy_sha = healthy_sha
+class FailSecondCandidateHealth:
+    def __init__(self, events: list[tuple[object, ...]]):
         self.events = events
-        self.failed_candidate = False
+        self.candidate_checks = 0
 
     def check(
         self,
@@ -239,13 +238,14 @@ class FailOnceHealth:
             identity_required,
             apply_injection,
         ))
-        if expected_sha != self.healthy_sha and not self.failed_candidate:
-            self.failed_candidate = True
+        if apply_injection:
+            self.candidate_checks += 1
+        if apply_injection and self.candidate_checks == 2:
             return HealthReport((HealthCheck("runtime:default", False),))
         return HealthReport((HealthCheck("runtime:default", True),))
 
 
-def test_full_real_controller_rollback_revert_reconstruct_review_receipt_deploy(
+def test_real_controller_clean_deploy_then_rollback_revert_repair_and_redeploy(
     tmp_path: Path,
 ):
     origin = tmp_path / "origin.git"
@@ -286,11 +286,11 @@ def test_full_real_controller_rollback_revert_reconstruct_review_receipt_deploy(
     _git(upstream_work, "config", "user.name", "Official Upstream")
     _git(upstream_work, "config", "user.email", "upstream@example.invalid")
     (upstream_work / "feature.txt").write_text(
-        "failed upstream behavior\n", encoding="utf-8"
+        "clean upstream behavior\n", encoding="utf-8"
     )
-    _git(upstream_work, "commit", "-am", "upstream change")
+    _git(upstream_work, "commit", "-am", "clean upstream change")
     _git(upstream_work, "push", "origin", "main")
-    upstream_sha = _git(upstream_work, "rev-parse", "HEAD")
+    clean_upstream_sha = _git(upstream_work, "rev-parse", "HEAD")
     _git(repo, "remote", "add", "upstream", str(upstream))
     candidate_worktree = tmp_path / "candidate"
     _git(
@@ -378,7 +378,7 @@ def test_full_real_controller_rollback_revert_reconstruct_review_receipt_deploy(
     deploy_events: list[tuple[object, ...]] = []
     snapshots = RecordingSnapshots(deploy_events)
     services = RecordingServices(deploy_events)
-    health = FailOnceHealth(healthy_base, deploy_events)
+    health = FailSecondCandidateHealth(deploy_events)
 
     def deploy_exact(receipt: Path, sha: str, pr_number: int) -> DeploymentRecord:
         loaded = SyncEligibilityReceipt.load(receipt)
@@ -401,17 +401,43 @@ def test_full_real_controller_rollback_revert_reconstruct_review_receipt_deploy(
         deployments.append((receipt, pr_number, record))
         return record
 
+    reviewer = ClaudeConflictReviewer(
+        executable=claude,
+        runner=runner,
+        resolver_backend="codex",
+        evidence_dir=receipt_root / "resolutions",
+    )
+    clean_result = run_autonomous_sync(
+        config,
+        runner=runner,
+        github=github,
+        resolver=None,
+        reviewer=reviewer,
+        remediator=Remediator(),
+        deploy_fn=deploy_exact,
+        verify_runtime_fn=lambda sha: _git(install, "rev-parse", "HEAD") == sha,
+        clock=lambda: 0.0,
+        sleeper=lambda seconds: None,
+    )
+    assert clean_result.state is AutonomousSyncState.DEPLOYED
+    assert clean_result.merge_sha == clean_result.deployed_sha
+    assert _git(install, "rev-parse", "HEAD") == clean_result.deployed_sha
+    assert github.prs[7]["head_sha"] == clean_result.candidate_sha
+    assert github.prs[7]["merge_sha"] == clean_result.deployed_sha
+    assert not list(tmp_path.rglob("approval*.json"))
+
+    (upstream_work / "feature.txt").write_text(
+        "failed upstream behavior\n", encoding="utf-8"
+    )
+    _git(upstream_work, "commit", "-am", "failing upstream change")
+    _git(upstream_work, "push", "origin", "main")
+    upstream_sha = _git(upstream_work, "rev-parse", "HEAD")
     result = run_autonomous_sync(
         config,
         runner=runner,
         github=github,
         resolver=None,
-        reviewer=ClaudeConflictReviewer(
-            executable=claude,
-            runner=runner,
-            resolver_backend="codex",
-            evidence_dir=receipt_root / "resolutions",
-        ),
+        reviewer=reviewer,
         remediator=Remediator(),
         deploy_fn=deploy_exact,
         verify_runtime_fn=lambda sha: _git(install, "rev-parse", "HEAD") == sha,
@@ -420,35 +446,39 @@ def test_full_real_controller_rollback_revert_reconstruct_review_receipt_deploy(
     )
 
     assert result.state is AutonomousSyncState.DEPLOYED
-    assert len(deployments) == 2
-    first_deployment = deployments[0][2]
-    final_deployment = deployments[1][2]
-    assert first_deployment.status == "rolled_back_healthy"
-    assert first_deployment.previous_sha == healthy_base
-    assert first_deployment.rollback["status"] == "rolled_back_healthy"
-    assert any(not check.passed for check in first_deployment.checks)
+    assert len(deployments) == 3
+    clean_deployment = deployments[0][2]
+    failed_deployment = deployments[1][2]
+    final_deployment = deployments[2][2]
+    assert clean_deployment.status == "deployed"
+    assert clean_deployment.previous_sha == healthy_base
+    assert failed_deployment.status == "rolled_back_healthy"
+    assert failed_deployment.previous_sha == clean_result.deployed_sha
+    assert failed_deployment.rollback["status"] == "rolled_back_healthy"
+    assert any(not check.passed for check in failed_deployment.checks)
     assert final_deployment.status == "deployed"
-    assert final_deployment.previous_sha == healthy_base
+    assert final_deployment.previous_sha == clean_result.deployed_sha
     assert final_deployment.requested_sha == result.deployed_sha
     assert _git(install, "rev-parse", "HEAD") == result.deployed_sha
     assert snapshots.restore_count == 1
-    assert services.stop_count == 3
-    assert services.start_count == 3
+    assert services.stop_count == 4
+    assert services.start_count == 4
     assert services.running == ("ai.hermes.gateway",)
     health_events = [event for event in deploy_events if event[0] == "health"]
     assert [event[1] for event in health_events] == [
-        first_deployment.requested_sha,
-        healthy_base,
+        clean_deployment.requested_sha,
+        failed_deployment.requested_sha,
+        clean_result.deployed_sha,
         final_deployment.requested_sha,
     ]
-    assert [event[4] for event in health_events] == [True, False, True]
-    failed_pr = github.prs[7]
-    revert_pr = github.prs[8]
-    repaired_pr = github.prs[9]
-    assert failed_pr["merge_sha"] == first_deployment.requested_sha
+    assert [event[4] for event in health_events] == [True, True, False, True]
+    failed_pr = github.prs[8]
+    revert_pr = github.prs[9]
+    repaired_pr = github.prs[10]
+    assert failed_pr["merge_sha"] == failed_deployment.requested_sha
     assert repaired_pr["merge_sha"] == result.deployed_sha
-    assert health_events[1][1:] == (
-        healthy_base,
+    assert health_events[2][1:] == (
+        clean_result.deployed_sha,
         ("ai.hermes.gateway",),
         False,
         False,
@@ -457,7 +487,7 @@ def test_full_real_controller_rollback_revert_reconstruct_review_receipt_deploy(
     assert len(quarantine_artifacts) == 1
     quarantine = json.loads(quarantine_artifacts[0].read_text(encoding="utf-8"))
     assert quarantine["candidate_sha"] == failed_pr["head_sha"]
-    assert quarantine["merge_sha"] == first_deployment.requested_sha
+    assert quarantine["merge_sha"] == failed_deployment.requested_sha
     stored_deployments = [
         json.loads(path.read_text(encoding="utf-8"))
         for path in (tmp_path / "deployments").glob("*.json")
@@ -466,22 +496,25 @@ def test_full_real_controller_rollback_revert_reconstruct_review_receipt_deploy(
         "rolled_back_healthy",
         "deployed",
     }
-    assert {record["previous_sha"] for record in stored_deployments} == {healthy_base}
-    assert github.created_heads[0] == "auto-sync/upstream"
-    assert github.created_heads[1].startswith("auto-sync/revert-")
-    assert github.created_heads[2] == "auto-sync/upstream"
+    assert {record["previous_sha"] for record in stored_deployments} == {
+        healthy_base,
+        clean_result.deployed_sha,
+    }
+    assert github.created_heads[0:2] == ["auto-sync/upstream"] * 2
+    assert github.created_heads[2].startswith("auto-sync/revert-")
+    assert github.created_heads[3] == "auto-sync/upstream"
     _git(repo, "fetch", "origin", "main")
     revert_merge_sha = str(revert_pr["merge_sha"])
     revert_head_sha = str(revert_pr["head_sha"])
     assert _git(repo, "rev-list", "--parents", "-n", "1", revert_merge_sha).split() == [
         revert_merge_sha,
-        first_deployment.requested_sha,
+        failed_deployment.requested_sha,
         revert_head_sha,
     ]
     assert _git(repo, "rev-parse", f"{revert_merge_sha}^{{tree}}") == _git(
-        repo, "rev-parse", f"{healthy_base}^{{tree}}"
+        repo, "rev-parse", f"{clean_result.deployed_sha}^{{tree}}"
     )
-    assert SyncEligibilityReceipt.load(deployments[1][0]).review is not None
+    assert SyncEligibilityReceipt.load(deployments[2][0]).review is not None
     assert not list(tmp_path.rglob("approval*.json"))
     final = tmp_path / "final"
     subprocess.run(
@@ -490,5 +523,6 @@ def test_full_real_controller_rollback_revert_reconstruct_review_receipt_deploy(
     assert (final / "feature.txt").read_text(encoding="utf-8") == "repaired behavior\n"
     assert _git(final, "rev-parse", "HEAD") == result.deployed_sha
     assert _git(install, "rev-parse", "HEAD") == result.deployed_sha
+    assert clean_upstream_sha != healthy_base
     assert upstream_sha != healthy_base
-    assert len(runner.local_gate_calls) >= 4
+    assert len(runner.local_gate_calls) >= 6
