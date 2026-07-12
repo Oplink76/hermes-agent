@@ -26,6 +26,8 @@ from ops.cloudadvisor.hermes_ops.sync_controller import (
     AutonomousSyncConfig,
     AutonomousSyncResult,
     AutonomousSyncState,
+    ControllerRunState,
+    ControllerStage,
     run_autonomous_sync,
 )
 from ops.cloudadvisor.hermes_ops.sync_github import SyncPullRequestEvidence
@@ -65,6 +67,17 @@ def test_controller_result_helpers_preserve_candidate_pr_number() -> None:
     assert AutonomousSyncResult.no_change(candidate).pr_number == 7
     assert AutonomousSyncResult.pending(candidate, reason="waiting").pr_number == 7
     assert AutonomousSyncResult.refresh_required(candidate).pr_number == 7
+
+
+def test_controller_run_state_rejects_stage_without_required_evidence() -> None:
+    with pytest.raises(ValueError, match="candidate"):
+        ControllerRunState(stage=ControllerStage.CANDIDATE)
+
+    with pytest.raises(ValueError, match="merge"):
+        ControllerRunState(
+            stage=ControllerStage.MERGED,
+            candidate=candidate(),
+        )
 
 
 class Runner:
