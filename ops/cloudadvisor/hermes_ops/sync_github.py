@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,17 +58,24 @@ class GhSyncGitHub:
         *,
         required_check: str = DEFAULT_REQUIRED_CHECK,
         expected_base_sha: str | None = None,
+        gh_executable: str | Path | None = None,
     ):
+        resolved_gh = (
+            shutil.which("gh") if gh_executable is None else str(gh_executable)
+        )
+        if not resolved_gh:
+            raise SyncGitHubError("GitHub CLI executable was not found")
         self.repo_slug = repo_slug
         self.required_check = required_check
         self.expected_base_sha = expected_base_sha
         self.runner = runner
         self.cwd = Path(cwd)
+        self.gh_executable = resolved_gh
 
     def _run(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
         if (
             len(argv) < 3
-            or argv[:2] != ["gh", "pr"]
+            or argv[:2] != [self.gh_executable, "pr"]
             or argv[2] not in _ALLOWED_PR_COMMANDS
         ):
             raise SyncGitHubError("refusing non-normalized GitHub CLI command")
@@ -85,7 +93,7 @@ class GhSyncGitHub:
 
     def find_open_pull_request(self, head: str, base: str) -> int | None:
         payload = self._json([
-            "gh",
+            self.gh_executable,
             "pr",
             "list",
             "--repo",
@@ -122,7 +130,7 @@ class GhSyncGitHub:
         body: str,
     ) -> int:
         completed = self._run([
-            "gh",
+            self.gh_executable,
             "pr",
             "create",
             "--repo",
@@ -144,7 +152,7 @@ class GhSyncGitHub:
 
     def update_pull_request(self, number: int, *, title: str, body: str) -> None:
         self._run([
-            "gh",
+            self.gh_executable,
             "pr",
             "edit",
             str(number),
@@ -158,7 +166,7 @@ class GhSyncGitHub:
 
     def evidence(self, pr_number: int) -> SyncPullRequestEvidence:
         payload = self._json([
-            "gh",
+            self.gh_executable,
             "pr",
             "view",
             str(pr_number),
@@ -248,7 +256,7 @@ class GhSyncGitHub:
             raise SyncGitHubError("required check is not green")
 
         self._run([
-            "gh",
+            self.gh_executable,
             "pr",
             "merge",
             str(pr_number),

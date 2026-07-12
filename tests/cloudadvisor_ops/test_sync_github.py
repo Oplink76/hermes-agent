@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -76,6 +77,7 @@ def _github(
             expected_base_sha=expected_base,
             runner=runner,
             cwd=tmp_path,
+            gh_executable="gh",
         ),
         runner,
     )
@@ -304,7 +306,6 @@ def test_evidence_rejects_wrong_configured_check_source_types(
 
 def test_evidence_crosses_real_subprocess_runner_boundary(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -322,9 +323,8 @@ def test_evidence_crosses_real_subprocess_runner_boundary(
     )
     if os.name == "nt":
         launcher = bin_dir / "gh.cmd"
-        launcher.write_text(
-            f'@"{sys.executable}" "{driver}" %*\r\n',
-            encoding="utf-8",
+        launcher.write_bytes(
+            f'@"{sys.executable}" "{driver}" %*\r\n'.encode("utf-8")
         )
     else:
         launcher = bin_dir / "gh"
@@ -334,19 +334,55 @@ def test_evidence_crosses_real_subprocess_runner_boundary(
             encoding="utf-8",
         )
         launcher.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     github = GhSyncGitHub(
         repo_slug=REPO,
         required_check=CHECK,
         expected_base_sha=BASE_SHA,
         runner=SubprocessCommandRunner(),
         cwd=tmp_path,
+        gh_executable=launcher,
     )
 
     evidence = github.evidence(7)
 
     assert evidence.base_sha == BASE_SHA
     assert evidence.head_sha == HEAD_SHA
+
+
+def test_default_gh_executable_uses_resolved_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    resolved = tmp_path / "bin" / "gh.cmd"
+    monkeypatch.setattr(shutil, "which", lambda executable: str(resolved))
+    runner = ScriptedRunner([_completed(_pr())])
+    github = GhSyncGitHub(
+        repo_slug=REPO,
+        required_check=CHECK,
+        expected_base_sha=BASE_SHA,
+        runner=runner,
+        cwd=tmp_path,
+    )
+
+    github.evidence(7)
+
+    assert runner.calls[0].argv[:3] == (str(resolved), "pr", "view")
+
+
+def test_missing_default_gh_executable_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(shutil, "which", lambda executable: None)
+
+    with pytest.raises(SyncGitHubError, match="GitHub CLI executable was not found"):
+        GhSyncGitHub(
+            repo_slug=REPO,
+            required_check=CHECK,
+            expected_base_sha=BASE_SHA,
+            runner=ScriptedRunner([]),
+            cwd=tmp_path,
+        )
 
 
 def test_find_open_pull_request_rejects_duplicates(tmp_path: Path):
