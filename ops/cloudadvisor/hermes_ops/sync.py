@@ -80,6 +80,7 @@ class SyncResult:
     changed_files: tuple[str, ...] = ()
     transitions: tuple[SyncState, ...] = ()
     classification: SyncClassification = SyncClassification.MAJOR
+    conflicted_files: tuple[str, ...] = ()
 
 
 class GitHubPullRequests(Protocol):
@@ -176,6 +177,7 @@ def _result(
     checks: list[CheckResult] | None = None,
     risk: str = "unknown",
     changed_files: tuple[str, ...] = (),
+    conflicted_files: tuple[str, ...] = (),
     classification: SyncClassification = SyncClassification.MAJOR,
 ) -> SyncResult:
     return SyncResult(
@@ -187,6 +189,7 @@ def _result(
         checks=tuple(checks or ()),
         risk=risk,
         changed_files=changed_files,
+        conflicted_files=conflicted_files,
         transitions=tuple(transitions),
         classification=classification,
     )
@@ -437,11 +440,33 @@ def prepare_candidate(
         config.worktree,
         timeout=900,
     )
+    conflicted_files: tuple[str, ...] = ()
     if merged.returncode == 0:
         transitions.append(SyncState.MERGED_CLEAN)
         classification = SyncClassification.CLEAN
     else:
         transitions.append(SyncState.CONFLICTED)
+        conflicted = _run(
+            runner,
+            ["git", "diff", "--name-only", "--diff-filter=U", "-z"],
+            config.worktree,
+        )
+        conflicted_files = tuple(
+            path for path in (conflicted.stdout or "").split("\0") if path
+        )
+        if (
+            conflicted.returncode != 0
+            or not conflicted_files
+            or len(set(conflicted_files)) != len(conflicted_files)
+        ):
+            transitions.append(SyncState.NEEDS_DECISION)
+            return _result(
+                SyncState.NEEDS_DECISION,
+                transitions,
+                base_sha=base_sha,
+                upstream_sha=upstream_sha,
+                risk="conflicted_files_unavailable",
+            )
         if resolver is None or not resolver.resolve(config.worktree, runner):
             transitions.append(SyncState.NEEDS_DECISION)
             return _result(
@@ -449,6 +474,7 @@ def prepare_candidate(
                 transitions,
                 base_sha=base_sha,
                 upstream_sha=upstream_sha,
+                conflicted_files=conflicted_files,
                 risk="conflict",
             )
         unmerged = _run(runner, ["git", "ls-files", "-u"], config.worktree)
@@ -459,6 +485,7 @@ def prepare_candidate(
                 transitions,
                 base_sha=base_sha,
                 upstream_sha=upstream_sha,
+                conflicted_files=conflicted_files,
                 risk="conflict",
             )
         merge_head = _run(
@@ -473,6 +500,7 @@ def prepare_candidate(
                 transitions,
                 base_sha=base_sha,
                 upstream_sha=upstream_sha,
+                conflicted_files=conflicted_files,
                 risk="resolver_did_not_preserve_merge_state",
             )
         committed = _run(
@@ -487,6 +515,7 @@ def prepare_candidate(
                 transitions,
                 base_sha=base_sha,
                 upstream_sha=upstream_sha,
+                conflicted_files=conflicted_files,
                 risk="resolved_merge_commit_failed",
             )
         transitions.append(SyncState.AI_RESOLVED)
@@ -501,6 +530,7 @@ def prepare_candidate(
             base_sha=base_sha,
             upstream_sha=upstream_sha,
             checks=checks,
+            conflicted_files=conflicted_files,
             risk="verification_failed",
         )
     transitions.append(SyncState.VERIFIED)
@@ -519,6 +549,7 @@ def prepare_candidate(
             base_sha=base_sha,
             upstream_sha=upstream_sha,
             checks=checks,
+            conflicted_files=conflicted_files,
         )
     candidate_sha = _output(candidate_result)
     changed_files = tuple(
@@ -536,6 +567,7 @@ def prepare_candidate(
             candidate_sha=candidate_sha,
             checks=checks,
             changed_files=changed_files,
+            conflicted_files=conflicted_files,
             risk="push_failed",
         )
     transitions.append(SyncState.PUSHED)
@@ -575,6 +607,7 @@ def prepare_candidate(
         checks=checks,
         risk=risk,
         changed_files=changed_files,
+        conflicted_files=conflicted_files,
         classification=classification,
     )
 

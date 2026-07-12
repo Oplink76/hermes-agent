@@ -34,7 +34,7 @@ class IndependentConflictReviewer(Protocol):
     ) -> ConflictReviewReceipt: ...
 
 
-def _validate_resolution_record(path: Path) -> None:
+def _resolution_record_paths(path: Path) -> tuple[str, ...]:
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, TypeError, json.JSONDecodeError) as exc:
@@ -44,6 +44,7 @@ def _validate_resolution_record(path: Path) -> None:
     conflicts = payload.get("conflicts")
     if not isinstance(conflicts, list) or not conflicts:
         raise ConflictReviewError("resolution record is incomplete")
+    paths: list[str] = []
     for conflict in conflicts:
         if not isinstance(conflict, dict):
             raise ConflictReviewError("resolution record is incomplete")
@@ -56,6 +57,8 @@ def _validate_resolution_record(path: Path) -> None:
             or not decision.strip()
         ):
             raise ConflictReviewError("resolution record is incomplete")
+        paths.append(conflict_path)
+    return tuple(paths)
 
 
 def validate_conflict_review(
@@ -64,6 +67,7 @@ def validate_conflict_review(
     candidate_sha: str,
     resolver_backend: str,
     resolution_record: Path,
+    conflicted_files: tuple[str, ...],
 ) -> SyncClassification:
     """Return the reviewed classification or reject incomplete/stale evidence."""
     if (
@@ -83,11 +87,22 @@ def validate_conflict_review(
         not isinstance(receipt.reviewer_backend, str)
         or not receipt.reviewer_backend.strip()
         or receipt.reviewer_backend != receipt.reviewer_backend.strip()
-        or receipt.reviewer_backend == resolver_backend
+        or receipt.reviewer_backend.casefold() == resolver_backend.casefold()
     ):
         raise ConflictReviewError("conflict review is not independent")
 
-    _validate_resolution_record(resolution_record)
+    record_paths = _resolution_record_paths(resolution_record)
+    if (
+        not isinstance(conflicted_files, tuple)
+        or not conflicted_files
+        or not all(isinstance(path, str) and path for path in conflicted_files)
+        or len(set(conflicted_files)) != len(conflicted_files)
+        or len(set(record_paths)) != len(record_paths)
+        or set(record_paths) != set(conflicted_files)
+    ):
+        raise ConflictReviewError(
+            "resolution record paths do not match conflicted files"
+        )
 
     if receipt.verdict == "major":
         return SyncClassification.MAJOR

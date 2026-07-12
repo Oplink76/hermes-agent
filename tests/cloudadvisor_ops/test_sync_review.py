@@ -16,13 +16,17 @@ from ops.cloudadvisor.hermes_ops.sync_review import (
 CANDIDATE_SHA = "a" * 40
 
 
-def resolution_record(tmp_path: Path, *, complete: bool = True) -> Path:
+def resolution_record(
+    tmp_path: Path,
+    *,
+    complete: bool = True,
+    paths: tuple[str, ...] = ("gateway/run.py",),
+) -> Path:
     path = tmp_path / "resolution.json"
-    conflicts = (
-        [{"path": "gateway/run.py", "decision": "preserve fork access guard"}]
-        if complete
-        else [{"path": "gateway/run.py", "decision": ""}]
-    )
+    decision = "preserve fork behavior" if complete else ""
+    conflicts = [
+        {"path": conflict_path, "decision": decision} for conflict_path in paths
+    ]
     path.write_text(json.dumps({"conflicts": conflicts}), encoding="utf-8")
     return path
 
@@ -46,6 +50,7 @@ def validate(tmp_path: Path, review):
         candidate_sha=CANDIDATE_SHA,
         resolver_backend="codex",
         resolution_record=resolution_record(tmp_path),
+        conflicted_files=("gateway/run.py",),
     )
 
 
@@ -75,6 +80,11 @@ def test_backend_id_whitespace_cannot_bypass_independence(tmp_path: Path):
         validate(tmp_path, receipt(reviewer_backend=" codex "))
 
 
+def test_backend_id_case_cannot_bypass_independence(tmp_path: Path):
+    with pytest.raises(ConflictReviewError, match="independent"):
+        validate(tmp_path, receipt(reviewer_backend="Codex"))
+
+
 def test_review_requires_complete_resolution_record(tmp_path: Path):
     record = resolution_record(tmp_path, complete=False)
 
@@ -84,6 +94,52 @@ def test_review_requires_complete_resolution_record(tmp_path: Path):
             candidate_sha=CANDIDATE_SHA,
             resolver_backend="codex",
             resolution_record=record,
+            conflicted_files=("gateway/run.py",),
+        )
+
+
+def test_resolution_record_rejects_missing_conflicted_file(tmp_path: Path):
+    record = resolution_record(tmp_path)
+
+    with pytest.raises(ConflictReviewError, match="conflicted files"):
+        validate_conflict_review(
+            receipt(),
+            candidate_sha=CANDIDATE_SHA,
+            resolver_backend="codex",
+            resolution_record=record,
+            conflicted_files=("gateway/run.py", "hermes_cli/kanban.py"),
+        )
+
+
+def test_resolution_record_rejects_extra_conflicted_file(tmp_path: Path):
+    record = resolution_record(
+        tmp_path,
+        paths=("gateway/run.py", "hermes_cli/kanban.py"),
+    )
+
+    with pytest.raises(ConflictReviewError, match="conflicted files"):
+        validate_conflict_review(
+            receipt(),
+            candidate_sha=CANDIDATE_SHA,
+            resolver_backend="codex",
+            resolution_record=record,
+            conflicted_files=("gateway/run.py",),
+        )
+
+
+def test_resolution_record_rejects_duplicate_conflicted_file(tmp_path: Path):
+    record = resolution_record(
+        tmp_path,
+        paths=("gateway/run.py", "gateway/run.py"),
+    )
+
+    with pytest.raises(ConflictReviewError, match="conflicted files"):
+        validate_conflict_review(
+            receipt(),
+            candidate_sha=CANDIDATE_SHA,
+            resolver_backend="codex",
+            resolution_record=record,
+            conflicted_files=("gateway/run.py",),
         )
 
 

@@ -67,9 +67,11 @@ class FakeResolver:
     def __init__(self, resolved: bool):
         self.resolved = resolved
         self.calls = 0
+        self.last_runner_call: tuple[str, ...] | None = None
 
     def resolve(self, worktree: Path, runner: FakeRunner) -> bool:
         self.calls += 1
+        self.last_runner_call = runner.calls[-1].argv if runner.calls else None
         return self.resolved
 
 
@@ -90,7 +92,7 @@ def config(tmp_path: Path) -> SyncConfig:
 
 
 def base_responses(*, backlog: int = 3, merge_returncode: int = 0):
-    return {
+    responses = {
         ("git", "rev-parse", "origin/main"): (0, "base-sha\n", ""),
         ("git", "rev-parse", "upstream/main"): (0, "upstream-sha\n", ""),
         ("git", "rev-list", "--count", "origin/main..upstream/main"): (
@@ -122,6 +124,13 @@ def base_responses(*, backlog: int = 3, merge_returncode: int = 0):
             "",
         ),
     }
+    if merge_returncode != 0:
+        responses[("git", "diff", "--name-only", "--diff-filter=U", "-z")] = (
+            0,
+            "gateway/run.py\0",
+            "",
+        )
+    return responses
 
 
 def pushes(runner: FakeRunner) -> list[Call]:
@@ -226,6 +235,7 @@ def test_unresolved_merge_conflict_requires_decision_without_push(tmp_path: Path
     result = run(config(tmp_path), runner=runner, github=github, resolver=resolver)
 
     assert result.state is SyncState.NEEDS_DECISION
+    assert result.conflicted_files == ("gateway/run.py",)
     assert resolver.calls == 1
     assert pushes(runner) == []
 
@@ -359,22 +369,65 @@ def test_resolved_merge_conflict_runs_gates_before_push(tmp_path: Path):
 
 def test_resolved_merge_conflict_requires_review(tmp_path: Path):
     responses = base_responses(merge_returncode=1)
+    capture_command = ("git", "diff", "--name-only", "--diff-filter=U", "-z")
+    responses[capture_command] = (
+        0,
+        "gateway/run.py\0ops/cloudadvisor/hermes_ops/sync.py\0",
+        "",
+    )
     responses[("git", "rev-parse", "-q", "--verify", "MERGE_HEAD")] = (
         0,
         "upstream-sha\n",
         "",
     )
+    resolver = FakeResolver(True)
 
     result = prepare_candidate(
         config(tmp_path),
         runner=FakeRunner(responses),
         github=FakeGitHub(existing_pr=17),
-        resolver=FakeResolver(True),
+        resolver=resolver,
     )
 
     assert (
         result.classification is SyncClassification.MINOR_REVIEW_REQUIRED
     )
+    assert result.conflicted_files == (
+        "gateway/run.py",
+        "ops/cloudadvisor/hermes_ops/sync.py",
+    )
+    assert resolver.last_runner_call == capture_command
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout"),
+    [(1, ""), (0, "")],
+    ids=["command-failed", "empty-conflict-set"],
+)
+def test_conflicted_file_capture_fails_closed_before_resolver(
+    tmp_path: Path,
+    returncode: int,
+    stdout: str,
+):
+    responses = base_responses(merge_returncode=1)
+    responses[("git", "diff", "--name-only", "--diff-filter=U", "-z")] = (
+        returncode,
+        stdout,
+        "capture failed",
+    )
+    resolver = FakeResolver(True)
+
+    result = prepare_candidate(
+        config(tmp_path),
+        runner=FakeRunner(responses),
+        github=FakeGitHub(),
+        resolver=resolver,
+    )
+
+    assert result.state is SyncState.NEEDS_DECISION
+    assert result.classification is SyncClassification.MAJOR
+    assert result.risk == "conflicted_files_unavailable"
+    assert resolver.calls == 0
 
 
 def test_unresolved_merge_conflict_classifies_major(tmp_path: Path):
