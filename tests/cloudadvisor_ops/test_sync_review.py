@@ -19,6 +19,10 @@ from ops.cloudadvisor.hermes_ops.sync_review import (
     ConflictReviewReceipt,
     validate_conflict_review,
 )
+from ops.cloudadvisor.hermes_ops.sync_review_evidence import (
+    ConflictReviewAttemptArtifact,
+    ConflictReviewEvidenceError,
+)
 
 
 CANDIDATE_SHA = "a" * 40
@@ -210,6 +214,45 @@ class ReviewerRunner:
         )
 
 
+class SequenceReviewerRunner(ReviewerRunner):
+    def __init__(self, responses: list[object]):
+        super().__init__({})
+        self.responses = iter(responses)
+
+    def run(self, argv: list[str], cwd: Path, timeout: int = 300):
+        if Path(argv[0]).name.startswith("claude"):
+            self.calls.append((tuple(argv), Path(cwd), timeout))
+            response = next(self.responses)
+            if isinstance(response, subprocess.CompletedProcess):
+                return response
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({"structured_output": response}),
+                "",
+            )
+        return super().run(argv, cwd, timeout)
+
+
+def reviewer_fixture(tmp_path: Path, runner: ReviewerRunner):
+    worktree = tmp_path / "candidate"
+    worktree.mkdir()
+    record = frozen_record(tmp_path)
+    reviewer = ClaudeConflictReviewer(
+        executable=tmp_path / "bin" / ("claude.exe" if os.name == "nt" else "claude"),
+        runner=runner,
+        resolver_backend="codex",
+        evidence_dir=record.parent,
+    )
+    return reviewer, worktree, record
+
+
+def claude_calls(runner: ReviewerRunner):
+    return [
+        call for call in runner.calls if Path(call[0][0]).name.startswith("claude")
+    ]
+
+
 def test_claude_reviewer_returns_exact_structured_receipt(tmp_path: Path):
     worktree = tmp_path / "candidate"
     worktree.mkdir()
@@ -233,6 +276,13 @@ def test_claude_reviewer_returns_exact_structured_receipt(tmp_path: Path):
     assert review.reviewer_backend == "claude"
     assert review.verdict == "green"
     assert review.findings == ()
+    assert review.evidence_artifact is not None
+    assert len(claude_calls(runner)) == 1
+    artifact = ConflictReviewAttemptArtifact.load(
+        record.parent.parent / review.evidence_artifact
+    )
+    assert artifact.attempt == 1
+    assert artifact.verdict == "green"
     claude_command = next(
         call[0] for call in runner.calls if Path(call[0][0]).name.startswith("claude")
     )
@@ -243,6 +293,219 @@ def test_claude_reviewer_returns_exact_structured_receipt(tmp_path: Path):
     assert "plan" in claude_command
     assert claude_command[-2] == "--"
     assert CANDIDATE_SHA in claude_command[-1]
+
+
+def test_initial_major_confirmation_green_continues(tmp_path: Path):
+    runner = SequenceReviewerRunner(
+        [
+            {"verdict": "major", "findings": ["possible kanban regression"]},
+            {"verdict": "green", "findings": []},
+        ]
+    )
+    reviewer, worktree, record = reviewer_fixture(tmp_path, runner)
+
+    review = reviewer.review(
+        candidate_sha=CANDIDATE_SHA,
+        worktree=worktree,
+        resolution_record=record,
+    )
+
+    assert review.verdict == "green"
+    assert review.findings == ()
+    assert review.evidence_artifact is not None
+    assert len(claude_calls(runner)) == 2
+    final_artifact = ConflictReviewAttemptArtifact.load(
+        record.parent.parent / review.evidence_artifact
+    )
+    assert final_artifact.attempt == 2
+    assert final_artifact.verdict == "green"
+    initial_artifact = ConflictReviewAttemptArtifact.load(
+        final_artifact.path.parent
+        / f"review-{final_artifact.prior_artifact_sha256}.json"
+    )
+    assert initial_artifact.verdict == "major"
+    assert initial_artifact.findings == ("possible kanban regression",)
+
+
+def test_initial_major_confirmation_major_stays_major(tmp_path: Path):
+    runner = SequenceReviewerRunner(
+        [
+            {"verdict": "major", "findings": ["kanban gate removed"]},
+            {
+                "verdict": "major",
+                "findings": ["kanban gate is absent at exact HEAD"],
+            },
+        ]
+    )
+    reviewer, worktree, record = reviewer_fixture(tmp_path, runner)
+
+    review = reviewer.review(
+        candidate_sha=CANDIDATE_SHA,
+        worktree=worktree,
+        resolution_record=record,
+    )
+
+    assert review.verdict == "major"
+    assert review.findings == ("kanban gate is absent at exact HEAD",)
+    assert review.evidence_artifact is not None
+    assert len(claude_calls(runner)) == 2
+    artifact = ConflictReviewAttemptArtifact.load(
+        record.parent.parent / review.evidence_artifact
+    )
+    assert artifact.attempt == 2
+    assert artifact.verdict == "major"
+
+
+def test_initial_major_requires_findings(tmp_path: Path):
+    runner = SequenceReviewerRunner([{"verdict": "major", "findings": []}])
+    reviewer, worktree, record = reviewer_fixture(tmp_path, runner)
+
+    with pytest.raises(ConflictReviewError, match="structured output"):
+        reviewer.review(
+            candidate_sha=CANDIDATE_SHA,
+            worktree=worktree,
+            resolution_record=record,
+        )
+
+    assert len(claude_calls(runner)) == 1
+
+
+def test_confirmation_major_requires_findings_and_links_initial_attempt(tmp_path: Path):
+    runner = SequenceReviewerRunner(
+        [
+            {"verdict": "major", "findings": ["possible kanban regression"]},
+            {"verdict": "major", "findings": []},
+        ]
+    )
+    reviewer, worktree, record = reviewer_fixture(tmp_path, runner)
+
+    with pytest.raises(ConflictReviewError, match="structured output") as failure:
+        reviewer.review(
+            candidate_sha=CANDIDATE_SHA,
+            worktree=worktree,
+            resolution_record=record,
+        )
+
+    assert failure.value.details_artifact is not None
+    initial = ConflictReviewAttemptArtifact.load(
+        record.parent.parent / failure.value.details_artifact
+    )
+    assert initial.verdict == "major"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        subprocess.CompletedProcess(["claude"], 1, "", "failed"),
+        subprocess.CompletedProcess(["claude"], 0, "not-json", ""),
+    ],
+)
+def test_confirmation_execution_failure_links_initial_attempt(
+    tmp_path: Path, response: subprocess.CompletedProcess
+):
+    runner = SequenceReviewerRunner(
+        [
+            {"verdict": "major", "findings": ["possible kanban regression"]},
+            response,
+        ]
+    )
+    reviewer, worktree, record = reviewer_fixture(tmp_path, runner)
+
+    with pytest.raises(ConflictReviewError) as failure:
+        reviewer.review(
+            candidate_sha=CANDIDATE_SHA,
+            worktree=worktree,
+            resolution_record=record,
+        )
+
+    assert failure.value.details_artifact is not None
+    assert (record.parent.parent / failure.value.details_artifact).is_file()
+
+
+def test_head_change_after_confirmation_fails_closed_with_initial_attempt(tmp_path: Path):
+    class ConfirmationHeadChangeRunner(SequenceReviewerRunner):
+        def __init__(self):
+            super().__init__(
+                [
+                    {"verdict": "major", "findings": ["possible regression"]},
+                    {"verdict": "green", "findings": []},
+                ]
+            )
+            self.head_calls = 0
+
+        def run(self, argv: list[str], cwd: Path, timeout: int = 300):
+            if argv[:3] == ["git", "rev-parse", "HEAD"]:
+                self.head_calls += 1
+                self.calls.append((tuple(argv), Path(cwd), timeout))
+                head = CANDIDATE_SHA if self.head_calls < 3 else "b" * 40
+                return subprocess.CompletedProcess(argv, 0, head + "\n", "")
+            return super().run(argv, cwd, timeout)
+
+    runner = ConfirmationHeadChangeRunner()
+    reviewer, worktree, record = reviewer_fixture(tmp_path, runner)
+
+    with pytest.raises(ConflictReviewError, match="candidate SHA changed") as failure:
+        reviewer.review(
+            candidate_sha=CANDIDATE_SHA,
+            worktree=worktree,
+            resolution_record=record,
+        )
+
+    assert failure.value.details_artifact is not None
+
+
+def test_worktree_mutation_after_confirmation_fails_closed_with_initial_attempt(
+    tmp_path: Path,
+):
+    class ConfirmationMutationRunner(SequenceReviewerRunner):
+        def __init__(self):
+            super().__init__(
+                [
+                    {"verdict": "major", "findings": ["possible regression"]},
+                    {"verdict": "green", "findings": []},
+                ]
+            )
+            self.status_calls = 0
+
+        def run(self, argv: list[str], cwd: Path, timeout: int = 300):
+            if argv[:2] == ["git", "status"]:
+                self.status_calls += 1
+                self.calls.append((tuple(argv), Path(cwd), timeout))
+                status = "" if self.status_calls < 3 else " M gateway/run.py\n"
+                return subprocess.CompletedProcess(argv, 0, status, "")
+            return super().run(argv, cwd, timeout)
+
+    runner = ConfirmationMutationRunner()
+    reviewer, worktree, record = reviewer_fixture(tmp_path, runner)
+
+    with pytest.raises(ConflictReviewError, match="modified the worktree") as failure:
+        reviewer.review(
+            candidate_sha=CANDIDATE_SHA,
+            worktree=worktree,
+            resolution_record=record,
+        )
+
+    assert failure.value.details_artifact is not None
+
+
+def test_evidence_publication_failure_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    runner = SequenceReviewerRunner([{"verdict": "green", "findings": []}])
+    reviewer, worktree, record = reviewer_fixture(tmp_path, runner)
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_review.write_conflict_review_attempt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ConflictReviewEvidenceError("disk unavailable")
+        ),
+    )
+
+    with pytest.raises(ConflictReviewError, match="evidence"):
+        reviewer.review(
+            candidate_sha=CANDIDATE_SHA,
+            worktree=worktree,
+            resolution_record=record,
+        )
 
 
 def test_claude_reviewer_rejects_changed_head(tmp_path: Path):
