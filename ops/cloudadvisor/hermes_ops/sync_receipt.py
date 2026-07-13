@@ -79,6 +79,7 @@ class SyncEligibilityReceipt:
                     "findings": list(self.review.findings),
                     "reviewed_at": self.review.reviewed_at,
                     "resolution_record_sha256": self.review.resolution_record_sha256,
+                    "evidence_artifacts": list(self.review.evidence_artifacts),
                 }
             ),
             "pr_number": self.pr_number,
@@ -242,11 +243,19 @@ def _load_review(value: object) -> ConflictReviewReceipt | None:
         "reviewed_at",
         "resolution_record_sha256",
     }
-    if not isinstance(value, dict) or set(value) != fields:
+    if not isinstance(value, dict):
+        raise SyncReceiptError("sync receipt conflict review is invalid")
+    field_names = set(value)
+    if field_names != fields and field_names != fields | {"evidence_artifacts"}:
         raise SyncReceiptError("sync receipt conflict review is invalid")
     findings = value["findings"]
     if not isinstance(findings, list) or not all(
         isinstance(finding, str) for finding in findings
+    ):
+        raise SyncReceiptError("sync receipt conflict review is invalid")
+    evidence_artifacts = value.get("evidence_artifacts", [])
+    if not isinstance(evidence_artifacts, list) or not all(
+        isinstance(reference, str) for reference in evidence_artifacts
     ):
         raise SyncReceiptError("sync receipt conflict review is invalid")
     string_fields = fields - {"findings"}
@@ -260,6 +269,7 @@ def _load_review(value: object) -> ConflictReviewReceipt | None:
         findings=tuple(findings),
         reviewed_at=value["reviewed_at"],
         resolution_record_sha256=value["resolution_record_sha256"],
+        evidence_artifacts=tuple(evidence_artifacts),
     )
 
 
@@ -286,6 +296,18 @@ def _validate_review(
         raise SyncReceiptError("independent review timestamp is missing")
     if re.fullmatch(r"[0-9a-f]{64}", review.resolution_record_sha256) is None:
         raise SyncReceiptError("independent review resolution digest is invalid")
+    if (
+        not isinstance(review.evidence_artifacts, tuple)
+        or len(set(review.evidence_artifacts)) != len(review.evidence_artifacts)
+        or not all(
+            re.fullmatch(
+                r"conflict-reviews/review-[0-9a-f]{64}\.json",
+                reference,
+            )
+            for reference in review.evidence_artifacts
+        )
+    ):
+        raise SyncReceiptError("independent review evidence references are invalid")
 
 
 def _validate_receipt(receipt: SyncEligibilityReceipt) -> None:

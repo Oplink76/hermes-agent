@@ -162,6 +162,37 @@ def test_writer_rejects_symlink_review_directory(tmp_path: Path):
         write_attempt(tmp_path)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges")
+def test_writer_rejects_symlink_receipt_root(tmp_path: Path):
+    actual = tmp_path / "actual-receipts"
+    actual.mkdir()
+    linked = tmp_path / "linked-receipts"
+    linked.symlink_to(actual, target_is_directory=True)
+
+    with pytest.raises(ConflictReviewEvidenceError, match="receipt root"):
+        write_attempt(linked)
+
+
+def test_loader_rejects_artifact_outside_configured_receipt_root(tmp_path: Path):
+    artifact = write_attempt(tmp_path / "actual")
+
+    with pytest.raises(ConflictReviewEvidenceError, match="receipt root"):
+        ConflictReviewAttemptArtifact.load(
+            artifact.path,
+            receipt_root=tmp_path / "different",
+        )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes are not authoritative")
+def test_writer_rejects_broad_review_directory_mode(tmp_path: Path):
+    directory = tmp_path / "conflict-reviews"
+    directory.mkdir(mode=0o755)
+
+    with pytest.raises(ConflictReviewEvidenceError, match="0700"):
+        write_attempt(tmp_path)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes are not authoritative")
 def test_existing_artifact_must_remain_valid(tmp_path: Path):
     artifact = write_attempt(tmp_path)
     artifact.path.chmod(0o600)

@@ -66,7 +66,7 @@ def _validate_timestamp(value: object) -> str:
 def _validate_payload(payload: object) -> dict[str, object]:
     if not isinstance(payload, dict) or set(payload) != _FIELDS:
         raise ConflictReviewEvidenceError("review artifact schema is invalid")
-    if payload["schema_version"] != SCHEMA_VERSION:
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != SCHEMA_VERSION:
         raise ConflictReviewEvidenceError("review artifact schema is invalid")
     candidate_sha = payload["candidate_sha"]
     if not isinstance(candidate_sha, str) or _FULL_SHA.fullmatch(candidate_sha) is None:
@@ -149,8 +149,13 @@ class ConflictReviewAttemptArtifact:
         return f"conflict-reviews/{self.path.name}"
 
     @classmethod
-    def load(cls, path: Path) -> "ConflictReviewAttemptArtifact":
-        path = Path(path)
+    def load(
+        cls,
+        path: Path,
+        *,
+        receipt_root: Path | None = None,
+    ) -> "ConflictReviewAttemptArtifact":
+        path = Path(os.path.abspath(path))
         try:
             parent_metadata = path.parent.lstat()
             metadata = path.lstat()
@@ -164,6 +169,28 @@ class ConflictReviewAttemptArtifact:
             raise ConflictReviewEvidenceError(
                 "review artifact must be in a direct conflict-reviews directory"
             )
+        if _requires_posix_readonly() and stat.S_IMODE(parent_metadata.st_mode) != 0o700:
+            raise ConflictReviewEvidenceError(
+                "review evidence directory must be private mode 0700"
+            )
+        if receipt_root is not None:
+            root = Path(os.path.abspath(receipt_root))
+            try:
+                root_metadata = root.lstat()
+                resolved_root = root.resolve(strict=True)
+                resolved_parent = path.parent.resolve(strict=True)
+            except OSError as exc:
+                raise ConflictReviewEvidenceError(
+                    "review artifact receipt root is invalid"
+                ) from exc
+            if (
+                stat.S_ISLNK(root_metadata.st_mode)
+                or not stat.S_ISDIR(root_metadata.st_mode)
+                or resolved_parent != resolved_root / "conflict-reviews"
+            ):
+                raise ConflictReviewEvidenceError(
+                    "review artifact is outside the configured receipt root"
+                )
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise ConflictReviewEvidenceError(
                 "review artifact must be a regular file"
@@ -236,22 +263,36 @@ def write_conflict_review_attempt(
     _validate_payload(payload)
     content = _canonical(payload)
     digest = hashlib.sha256(content).hexdigest()
-    directory = Path(receipt_root) / "conflict-reviews"
+    root = Path(os.path.abspath(receipt_root))
     try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        root_metadata = root.lstat()
+        if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(
+            root_metadata.st_mode
+        ):
+            raise ConflictReviewEvidenceError("review evidence receipt root is invalid")
+        root = root.resolve(strict=True)
+        directory = root / "conflict-reviews"
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         directory_metadata = directory.lstat()
+    except ConflictReviewEvidenceError:
+        raise
     except OSError as exc:
         raise ConflictReviewEvidenceError(
-            "review evidence directory is invalid"
+            "review evidence receipt root is invalid"
         ) from exc
     if stat.S_ISLNK(directory_metadata.st_mode) or not stat.S_ISDIR(
         directory_metadata.st_mode
     ):
         raise ConflictReviewEvidenceError("review evidence directory is invalid")
+    if _requires_posix_readonly() and stat.S_IMODE(directory_metadata.st_mode) != 0o700:
+        raise ConflictReviewEvidenceError(
+            "review evidence directory must be private mode 0700"
+        )
 
     target = directory / f"review-{digest}.json"
     if target.exists() or target.is_symlink():
-        return ConflictReviewAttemptArtifact.load(target)
+        return ConflictReviewAttemptArtifact.load(target, receipt_root=root)
 
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".review-", suffix=".tmp", dir=directory
@@ -270,4 +311,4 @@ def write_conflict_review_attempt(
             pass
     finally:
         temporary.unlink(missing_ok=True)
-    return ConflictReviewAttemptArtifact.load(target)
+    return ConflictReviewAttemptArtifact.load(target, receipt_root=root)

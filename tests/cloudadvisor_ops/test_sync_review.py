@@ -22,6 +22,7 @@ from ops.cloudadvisor.hermes_ops.sync_review import (
 from ops.cloudadvisor.hermes_ops.sync_review_evidence import (
     ConflictReviewAttemptArtifact,
     ConflictReviewEvidenceError,
+    write_conflict_review_attempt,
 )
 
 
@@ -61,6 +62,7 @@ def receipt(**overrides):
         "findings": (),
         "reviewed_at": "2026-07-12T16:00:00Z",
         "resolution_record_sha256": "d" * 64,
+        "evidence_artifacts": (),
     }
     values.update(overrides)
     return ConflictReviewReceipt(**values)
@@ -187,12 +189,74 @@ def test_green_review_requires_zero_findings(tmp_path: Path):
 
 
 def test_major_review_fails_closed(tmp_path: Path):
-    result = validate(
-        tmp_path,
-        receipt(verdict="major", findings=("product judgment required",)),
+    record = frozen_record(tmp_path)
+    resolution_digest = record.stem.removeprefix("resolution-")
+    root = record.parent.parent
+    initial = write_conflict_review_attempt(
+        root,
+        candidate_sha=CANDIDATE_SHA,
+        resolution_record_sha256=resolution_digest,
+        resolver_backend="codex",
+        reviewer_backend="claude",
+        attempt=1,
+        review_kind="initial",
+        verdict="major",
+        findings=("product judgment required",),
+        reviewed_at="2026-07-12T15:59:00Z",
+    )
+    confirmation = write_conflict_review_attempt(
+        root,
+        candidate_sha=CANDIDATE_SHA,
+        resolution_record_sha256=resolution_digest,
+        resolver_backend="codex",
+        reviewer_backend="claude",
+        attempt=2,
+        review_kind="major_confirmation",
+        verdict="major",
+        findings=("product judgment required",),
+        reviewed_at="2026-07-12T16:00:00Z",
+        prior_artifact_sha256=initial.sha256,
+    )
+    review = receipt(
+        verdict="major",
+        findings=("product judgment required",),
+        resolution_record_sha256=resolution_digest,
+        evidence_artifacts=(initial.relative_path, confirmation.relative_path),
+    )
+
+    result = validate_conflict_review(
+        review,
+        candidate_sha=CANDIDATE_SHA,
+        resolver_backend="codex",
+        resolution_record=record,
+        conflicted_files=("gateway/run.py",),
     )
 
     assert result is SyncClassification.MAJOR
+
+
+def test_major_review_requires_findings_at_protocol_boundary(tmp_path: Path):
+    with pytest.raises(ConflictReviewError, match="findings"):
+        validate(tmp_path, receipt(verdict="major", findings=()))
+
+
+@pytest.mark.parametrize(
+    "evidence_artifacts",
+    [(), ("../review.json", "conflict-reviews/review-" + "e" * 64 + ".json")],
+)
+def test_major_review_requires_two_safe_evidence_artifacts(
+    tmp_path: Path,
+    evidence_artifacts: tuple[str, ...],
+):
+    with pytest.raises(ConflictReviewError, match="evidence"):
+        validate(
+            tmp_path,
+            receipt(
+                verdict="major",
+                findings=("product judgment required",),
+                evidence_artifacts=evidence_artifacts,
+            ),
+        )
 
 
 class ReviewerRunner:
@@ -276,7 +340,8 @@ def test_claude_reviewer_returns_exact_structured_receipt(tmp_path: Path):
     assert review.reviewer_backend == "claude"
     assert review.verdict == "green"
     assert review.findings == ()
-    assert review.evidence_artifact is not None
+    assert len(review.evidence_artifacts) == 1
+    assert review.evidence_artifact == review.evidence_artifacts[-1]
     assert len(claude_calls(runner)) == 1
     artifact = ConflictReviewAttemptArtifact.load(
         record.parent.parent / review.evidence_artifact
@@ -312,7 +377,8 @@ def test_initial_major_confirmation_green_continues(tmp_path: Path):
 
     assert review.verdict == "green"
     assert review.findings == ()
-    assert review.evidence_artifact is not None
+    assert len(review.evidence_artifacts) == 2
+    assert review.evidence_artifact == review.evidence_artifacts[-1]
     assert len(claude_calls(runner)) == 2
     final_artifact = ConflictReviewAttemptArtifact.load(
         record.parent.parent / review.evidence_artifact
@@ -320,9 +386,9 @@ def test_initial_major_confirmation_green_continues(tmp_path: Path):
     assert final_artifact.attempt == 2
     assert final_artifact.verdict == "green"
     initial_artifact = ConflictReviewAttemptArtifact.load(
-        final_artifact.path.parent
-        / f"review-{final_artifact.prior_artifact_sha256}.json"
+        record.parent.parent / review.evidence_artifacts[0]
     )
+    assert initial_artifact.sha256 == final_artifact.prior_artifact_sha256
     assert initial_artifact.verdict == "major"
     assert initial_artifact.findings == ("possible kanban regression",)
 
@@ -347,7 +413,8 @@ def test_initial_major_confirmation_major_stays_major(tmp_path: Path):
 
     assert review.verdict == "major"
     assert review.findings == ("kanban gate is absent at exact HEAD",)
-    assert review.evidence_artifact is not None
+    assert len(review.evidence_artifacts) == 2
+    assert review.evidence_artifact == review.evidence_artifacts[-1]
     assert len(claude_calls(runner)) == 2
     artifact = ConflictReviewAttemptArtifact.load(
         record.parent.parent / review.evidence_artifact

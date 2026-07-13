@@ -15,6 +15,7 @@ from .command import CommandRunner
 from .sync import SyncClassification, is_canonical_backend_executable
 from .sync_resolution import ResolutionRecordArtifact, ResolutionRecordError
 from .sync_review_evidence import (
+    ConflictReviewAttemptArtifact,
     ConflictReviewEvidenceError,
     write_conflict_review_attempt,
 )
@@ -41,7 +42,11 @@ class ConflictReviewReceipt:
     findings: tuple[str, ...]
     reviewed_at: str
     resolution_record_sha256: str
-    evidence_artifact: str | None = None
+    evidence_artifacts: tuple[str, ...] = ()
+
+    @property
+    def evidence_artifact(self) -> str | None:
+        return self.evidence_artifacts[-1] if self.evidence_artifacts else None
 
 
 class IndependentConflictReviewer(Protocol):
@@ -55,6 +60,9 @@ class IndependentConflictReviewer(Protocol):
 
 
 _FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
+_REVIEW_REFERENCE = re.compile(
+    r"conflict-reviews/review-[0-9a-f]{64}\.json\Z"
+)
 _REVIEW_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -252,7 +260,7 @@ class ClaudeConflictReviewer:
             ) from exc
         if initial.verdict == "green":
             return replace(
-                initial, evidence_artifact=initial_artifact.relative_path
+                initial, evidence_artifacts=(initial_artifact.relative_path,)
             )
 
         confirmation_prompt = (
@@ -289,7 +297,11 @@ class ClaudeConflictReviewer:
                 str(exc), details_artifact=initial_artifact.relative_path
             ) from exc
         return replace(
-            confirmation, evidence_artifact=confirmation_artifact.relative_path
+            confirmation,
+            evidence_artifacts=(
+                initial_artifact.relative_path,
+                confirmation_artifact.relative_path,
+            ),
         )
 
 
@@ -354,6 +366,79 @@ def validate_conflict_review(
         )
 
     if receipt.verdict == "major":
+        if (
+            not isinstance(receipt.findings, tuple)
+            or not receipt.findings
+            or not all(
+                isinstance(finding, str)
+                and finding
+                and finding == finding.strip()
+                for finding in receipt.findings
+            )
+        ):
+            raise ConflictReviewError(
+                "major conflict review must contain non-empty findings"
+            )
+        if (
+            not isinstance(receipt.evidence_artifacts, tuple)
+            or len(receipt.evidence_artifacts) != 2
+            or len(set(receipt.evidence_artifacts)) != 2
+            or not all(
+                isinstance(reference, str)
+                and _REVIEW_REFERENCE.fullmatch(reference) is not None
+                for reference in receipt.evidence_artifacts
+            )
+        ):
+            raise ConflictReviewError(
+                "confirmed major review evidence is missing or invalid"
+            )
+        receipt_root = Path(resolution_record).parent.parent
+        try:
+            initial, confirmation = (
+                ConflictReviewAttemptArtifact.load(
+                    receipt_root / reference,
+                    receipt_root=receipt_root,
+                )
+                for reference in receipt.evidence_artifacts
+            )
+        except ConflictReviewEvidenceError as exc:
+            raise ConflictReviewError(
+                "confirmed major review evidence is missing or invalid"
+            ) from exc
+        common_identity = (
+            receipt.candidate_sha,
+            receipt.resolution_record_sha256,
+            receipt.resolver_backend,
+            receipt.reviewer_backend,
+        )
+        if (
+            (
+                initial.candidate_sha,
+                initial.resolution_record_sha256,
+                initial.resolver_backend,
+                initial.reviewer_backend,
+            )
+            != common_identity
+            or (
+                confirmation.candidate_sha,
+                confirmation.resolution_record_sha256,
+                confirmation.resolver_backend,
+                confirmation.reviewer_backend,
+            )
+            != common_identity
+            or initial.attempt != 1
+            or initial.review_kind != "initial"
+            or initial.verdict != "major"
+            or confirmation.attempt != 2
+            or confirmation.review_kind != "major_confirmation"
+            or confirmation.verdict != "major"
+            or confirmation.prior_artifact_sha256 != initial.sha256
+            or confirmation.findings != receipt.findings
+            or confirmation.reviewed_at != receipt.reviewed_at
+        ):
+            raise ConflictReviewError(
+                "confirmed major review evidence is not exact"
+            )
         return SyncClassification.MAJOR
     if receipt.verdict != "green":
         raise ConflictReviewError("conflict review verdict is invalid")

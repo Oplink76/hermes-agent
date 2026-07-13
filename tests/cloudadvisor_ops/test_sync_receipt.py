@@ -83,6 +83,7 @@ def green_review(**overrides: object) -> ConflictReviewReceipt:
         "findings": (),
         "reviewed_at": "2026-07-12T16:00:00Z",
         "resolution_record_sha256": "d" * 64,
+        "evidence_artifacts": (),
     }
     values.update(overrides)
     return ConflictReviewReceipt(**values)
@@ -163,7 +164,14 @@ def test_minor_receipt_load_requires_bound_immutable_resolution_artifact(
         resolution_strategy="preserve_fork_behavior",
     )
     resolution = freeze_resolution_record(tmp_path, minor)
-    review = green_review(resolution_record_sha256=resolution.sha256)
+    evidence_artifacts = (
+        f"conflict-reviews/review-{'e' * 64}.json",
+        f"conflict-reviews/review-{'f' * 64}.json",
+    )
+    review = green_review(
+        resolution_record_sha256=resolution.sha256,
+        evidence_artifacts=evidence_artifacts,
+    )
     receipt = write_sync_receipt(
         tmp_path,
         minor,
@@ -171,7 +179,11 @@ def test_minor_receipt_load_requires_bound_immutable_resolution_artifact(
         repo_slug=REPO,
         conflict_review=review,
     )
-    assert SyncEligibilityReceipt.load(receipt.path).review == review
+    loaded = SyncEligibilityReceipt.load(receipt.path)
+    assert loaded.review == review
+    assert loaded.to_dict()["review"]["evidence_artifacts"] == list(
+        evidence_artifacts
+    )
 
     resolution.path.chmod(0o600)
     resolution.path.write_text("{}", encoding="utf-8")
