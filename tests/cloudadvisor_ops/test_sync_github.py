@@ -433,6 +433,16 @@ def test_find_open_pull_request_rejects_duplicates(tmp_path: Path):
         github.find_open_pull_request("auto-sync/upstream", "main")
 
 
+@pytest.mark.parametrize("number", ["7", True, 7.0, 0, -1])
+def test_find_open_pull_request_rejects_coerced_or_nonpositive_number(
+    tmp_path: Path, number: object
+):
+    github, _ = _github(tmp_path, _completed([{"number": number}]))
+
+    with pytest.raises(SyncGitHubError, match="list was incomplete"):
+        github.find_open_pull_request("auto-sync/upstream", "main")
+
+
 def test_create_pull_request_returns_number_from_url(tmp_path: Path):
     created = subprocess.CompletedProcess(
         [],

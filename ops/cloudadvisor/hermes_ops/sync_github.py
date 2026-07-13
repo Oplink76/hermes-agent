@@ -128,7 +128,12 @@ class GhSyncGitHub:
             rows = payload
             if len(rows) > 1:
                 raise SyncGitHubError("more than one open upstream sync PR")
-            return int(rows[0]["number"]) if rows else None
+            if not rows:
+                return None
+            number = rows[0]["number"]
+            if type(number) is not int or number < 1:
+                raise TypeError
+            return number
         except SyncGitHubError:
             raise
         except (KeyError, TypeError, ValueError) as exc:
