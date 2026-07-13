@@ -111,6 +111,27 @@ def test_controller_run_state_rejects_stage_without_required_evidence() -> None:
             merge_sha=SHA_MERGE,
         )
 
+    with pytest.raises(ValueError, match="intent"):
+        ControllerRunState(
+            stage=ControllerStage.MERGE_INTENT,
+            candidate=candidate(),
+        )
+
+    with pytest.raises(ValueError, match="intent"):
+        ControllerRunState(
+            stage=ControllerStage.MERGE_INTENT,
+            candidate=candidate(),
+            merge_sha=SHA_MERGE,
+            deployment_checkpoint_sha256="e" * 64,
+        )
+
+    with pytest.raises(ValueError, match="recovery"):
+        ControllerRunState(
+            stage=ControllerStage.CANDIDATE,
+            candidate=candidate(),
+            deployment_checkpoint_sha256="e" * 64,
+        )
+
 
 class Runner:
     def __init__(self, repair_paths: tuple[str, ...] = ("upstream.txt",)):
@@ -404,9 +425,7 @@ def test_clean_candidate_merges_and_deploys_without_human_artifact(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
-        lambda *args, **kwargs: type(
-            "Artifact", (), {"path": tmp_path / "pre.json"}
-        )(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "pre.json"),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
@@ -503,6 +522,165 @@ def test_preflight_failure_after_merge_resumes_before_ordinary_prepare(
     ) is None
 
 
+def test_lost_merge_response_resumes_exact_intent_without_preparing_again(
+    tmp_path: Path, monkeypatch
+):
+    cfg = config(tmp_path)
+
+    class ResumeRunner(Runner):
+        def run(self, argv: list[str], cwd: Path, timeout: int = 300):
+            if argv == ["git", "fetch", "--no-tags", "origin", "main"]:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if argv == ["git", "rev-parse", "refs/remotes/origin/main"]:
+                return subprocess.CompletedProcess(argv, 0, SHA_MERGE + "\n", "")
+            return super().run(argv, cwd, timeout)
+
+    class LostResponseGitHub:
+        def __init__(self):
+            self.merged = False
+            self.merge_calls = 0
+
+        def evidence(self, pr_number: int) -> SyncPullRequestEvidence:
+            value = evidence()
+            if not self.merged:
+                return value
+            return SyncPullRequestEvidence(
+                **{
+                    **value.__dict__,
+                    "state": "merged",
+                    "merge_sha": SHA_MERGE,
+                }
+            )
+
+        def merge_exact(self, pr_number: int, *, expected_head: str) -> str:
+            self.merge_calls += 1
+            self.merged = True
+            raise RuntimeError("simulated lost merge response")
+
+    github = LostResponseGitHub()
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: candidate(),
+    )
+
+    interrupted = run_autonomous_sync(
+        cfg,
+        runner=ResumeRunner(),
+        github=github,
+        resolver=None,
+        reviewer=None,
+        deploy_fn=lambda *args: (_ for _ in ()).throw(
+            AssertionError("deploy cannot start without recorded merge identity")
+        ),
+    )
+
+    intent = load_pending_deployment(cfg.receipt_root, repo_slug=cfg.sync.repo_slug)
+    assert interrupted.state is AutonomousSyncState.NEEDS_OLE
+    assert intent is not None
+    assert intent.stage == "merge_intent"
+    assert intent.merge_sha is None
+
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("ordinary prepare must not run while merge intent is pending")
+        ),
+    )
+    resumed = run_autonomous_sync(
+        cfg,
+        runner=ResumeRunner(),
+        github=github,
+        resolver=None,
+        reviewer=None,
+        deploy_fn=lambda *args: deployed_record(),
+    )
+
+    assert resumed.state is AutonomousSyncState.DEPLOYED
+    assert resumed.merge_sha == resumed.deployed_sha == SHA_MERGE
+    assert github.merge_calls == 1
+    assert load_pending_deployment(
+        cfg.receipt_root, repo_slug=cfg.sync.repo_slug
+    ) is None
+
+
+def test_failed_recovery_is_terminal_and_never_redeploys_on_next_run(
+    tmp_path: Path, monkeypatch
+):
+    cfg = config(tmp_path)
+    github = GitHub([evidence()])
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: candidate(changed_files=("danger.py",)),
+    )
+    failure = AutonomousSyncResult.needs_human(
+        "protected revert failed",
+        candidate_sha=SHA_CANDIDATE,
+        pr_number=7,
+        merge_sha=SHA_MERGE,
+        reason_code="AUTOMATIC_RECOVERY_FAILED",
+        failed_gate="protected_recovery",
+        affected_files=("danger.py",),
+        rollback_state="rolled_back_healthy",
+        rollback_sha=SHA_BASE,
+        revert_state="NEEDS_OLE",
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.finish_or_recover",
+        lambda *args, **kwargs: failure,
+    )
+
+    first = run_autonomous_sync(
+        cfg,
+        runner=Runner(),
+        github=github,
+        resolver=None,
+        reviewer=None,
+        deploy_fn=lambda *args: deployed_record(status="rolled_back_healthy"),
+        verify_runtime_fn=lambda sha: True,
+    )
+
+    terminal = load_pending_deployment(
+        cfg.receipt_root, repo_slug=cfg.sync.repo_slug
+    )
+    assert first.state is AutonomousSyncState.NEEDS_OLE
+    assert terminal is not None
+    assert terminal.stage == "failed_terminal"
+    assert terminal.terminal_reason_code == "AUTOMATIC_RECOVERY_FAILED"
+
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("ordinary prepare must not run after terminal recovery")
+        ),
+    )
+    deploy_calls = 0
+
+    def reject_deploy(*args) -> DeploymentRecord:
+        nonlocal deploy_calls
+        deploy_calls += 1
+        raise AssertionError("terminal recovery must not deploy again")
+
+    second = run_autonomous_sync(
+        cfg,
+        runner=Runner(),
+        github=GitHub([]),
+        resolver=None,
+        reviewer=None,
+        deploy_fn=reject_deploy,
+        verify_runtime_fn=lambda sha: True,
+    )
+
+    assert second.state is AutonomousSyncState.NEEDS_OLE
+    assert second.reason == first.reason
+    assert second.reason_code == first.reason_code
+    assert second.failed_gate == first.failed_gate
+    assert second.rollback_state == first.rollback_state
+    assert second.rollback_sha == first.rollback_sha
+    assert second.revert_state == first.revert_state
+    assert second.details_artifact == first.details_artifact
+    assert deploy_calls == 0
+
+
 def test_changed_pr_head_stops_before_merge(tmp_path: Path, monkeypatch):
     github = GitHub([evidence(head="9" * 40)])
     monkeypatch.setattr(
@@ -587,7 +765,7 @@ def test_upstream_change_before_merge_is_quiet_refresh(tmp_path: Path, monkeypat
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "pre"),
     )
     result = run_autonomous_sync(
         config(tmp_path, max_upstream_refreshes=0),
@@ -617,7 +795,7 @@ def test_upstream_change_restarts_inside_lock_then_deploys_fresh_candidate(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "pre"),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
@@ -651,7 +829,7 @@ def test_upstream_churn_exhaustion_is_pending_without_ole(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "pre"),
     )
 
     result = run_autonomous_sync(
@@ -676,7 +854,7 @@ def test_one_transient_evidence_failure_is_retried(tmp_path: Path, monkeypatch):
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "pre"),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
@@ -728,7 +906,7 @@ def test_exact_infrastructure_retry_is_used_once_before_merge(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "pre"),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
@@ -769,7 +947,7 @@ def test_red_candidate_gets_one_changed_locally_green_repair(
 
     def write_receipt(*args, **kwargs):
         captured["candidate"] = args[1]
-        return type("Artifact", (), {"path": tmp_path / "pre"})()
+        return receipt_artifact(tmp_path / "pre")
 
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
@@ -844,7 +1022,7 @@ def test_formerly_clean_ai_repair_requires_fresh_exact_independent_review(
 
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "pre"),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
@@ -929,7 +1107,7 @@ def test_conflict_derived_repair_gets_fresh_independent_review(
 
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "pre"),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
@@ -1073,7 +1251,7 @@ def test_code_repair_then_uses_remaining_exact_infrastructure_retry(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "pre"),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
@@ -1159,7 +1337,7 @@ def test_genuinely_new_upstream_head_resets_candidate_scoped_budgets(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "pre"),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
@@ -1212,7 +1390,7 @@ def test_post_revert_upstream_advance_returns_pending_without_ordinary_prepare(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "pre"),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
@@ -1325,7 +1503,7 @@ def test_recovery_checkpoint_exists_before_reconstruction_starts(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "pre"),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
@@ -1405,7 +1583,7 @@ def test_repaired_checkpoint_survives_nonterminal_check_and_next_run_deploys(
     remediator = Remediator(repaired=repaired)
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "pre"),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
@@ -1498,7 +1676,7 @@ def test_healthy_protected_rollback_gets_one_post_rollback_repair(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "pre"),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
@@ -1559,7 +1737,7 @@ def test_second_deployment_failure_recovers_then_escalates_once(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "pre"),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
@@ -1663,7 +1841,7 @@ def test_independently_reviewed_minor_candidate_auto_merges(
     def write_receipt(*args, **kwargs):
         captured["candidate"] = args[1]
         captured["review"] = kwargs["conflict_review"]
-        return type("Artifact", (), {"path": tmp_path / "pre"})()
+        return receipt_artifact(tmp_path / "pre")
 
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",

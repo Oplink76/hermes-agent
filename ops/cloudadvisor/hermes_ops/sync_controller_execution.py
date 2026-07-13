@@ -41,6 +41,7 @@ from .sync_controller import (
 from .sync_deployment_checkpoint import (
     clear_pending_deployment,
     load_pending_deployment,
+    terminalize_pending_deployment,
 )
 from .sync_github import bind_expected_base
 from .sync_poll import RequiredCheckRedError
@@ -398,6 +399,22 @@ class ControllerExecution:
         evidence,
         receipt,
     ) -> tuple[AutonomousSyncResult, DeploymentRecord]:
+        intent = controller._write_merge_intent(
+            self.config,
+            candidate=reviewed,
+            evidence=evidence,
+            premerge_receipt=receipt,
+            runner=self.deps.runner,
+        )
+        self.state = replace(
+            self.state,
+            stage=ControllerStage.MERGE_INTENT,
+            candidate=reviewed,
+            merge_sha=None,
+            deployment_checkpoint_sha256=(
+                controller.deployment_checkpoint_sha256(intent)
+            ),
+        )
         bind_expected_base(self.deps.github, evidence.base_sha)
         merge_sha = self.deps.github.merge_exact(
             evidence.number, expected_head=reviewed.candidate_sha
@@ -405,15 +422,11 @@ class ControllerExecution:
         final_receipt = controller.finalize_sync_receipt(
             receipt.path, merge_sha=merge_sha
         )
-        from .sync_controller import _write_pending_deploy
-
-        checkpoint_sha = _write_pending_deploy(
+        checkpoint, checkpoint_sha = controller._advance_pending_deploy(
             self.config,
-            candidate=reviewed,
-            evidence=evidence,
+            intent,
             merge_sha=merge_sha,
             final_receipt=final_receipt,
-            runner=self.deps.runner,
         )
         self.state = replace(
             self.state,
@@ -440,6 +453,24 @@ class ControllerExecution:
             sleeper=self.deps.sleeper,
             verify_runtime_fn=self.deps.verify_runtime_fn or (lambda sha: False),
         )
+        if outcome.state is AutonomousSyncState.NEEDS_OLE:
+            terminal = terminalize_pending_deployment(
+                self.config.receipt_root,
+                checkpoint,
+                reason=outcome.reason or "automatic recovery failed",
+                reason_code=outcome.reason_code or "AUTOMATIC_RECOVERY_FAILED",
+                failed_gate=outcome.failed_gate or "protected_recovery",
+                rollback_state=outcome.rollback_state or deployment.status,
+                rollback_sha=outcome.rollback_sha or deployment.previous_sha,
+                revert_state=outcome.revert_state or "NEEDS_OLE",
+                revert_sha=outcome.revert_sha,
+            )
+            outcome = replace(
+                outcome,
+                details_artifact=(
+                    f"deployment/pending-deployment-{terminal.sha256}.json"
+                ),
+            )
         return outcome, deployment
 
     def _clear_healthy_deployment(self) -> None:

@@ -43,6 +43,7 @@ from .sync_deployment_checkpoint import (
     clear_pending_deployment,
     deployment_checkpoint_sha256,
     load_pending_deployment,
+    terminalize_pending_deployment,
     write_pending_deployment,
 )
 from .sync_receipt import (
@@ -91,6 +92,7 @@ class AutonomousSyncState(str, Enum):
 class ControllerStage(str, Enum):
     INITIAL = "initial"
     CANDIDATE = "candidate"
+    MERGE_INTENT = "merge_intent"
     MERGED = "merged"
     RECOVERY = "recovery"
 
@@ -142,9 +144,15 @@ class ControllerRunState:
         ):
             raise ValueError("controller deployment checkpoint is required")
         if self.stage is ControllerStage.CANDIDATE and (
-            (self.reconstruction is None) != (self.merge_sha is None)
+            self.deployment_checkpoint_sha256 is not None
+            or (self.reconstruction is None) != (self.merge_sha is None)
         ):
             raise ValueError("controller candidate recovery evidence is crossed")
+        if self.stage is ControllerStage.MERGE_INTENT and (
+            self.merge_sha is not None
+            or self.deployment_checkpoint_sha256 is None
+        ):
+            raise ValueError("controller merge intent evidence is crossed")
         if self.upstream_refreshes < 0:
             raise ValueError("controller refresh count is invalid")
 
@@ -336,37 +344,69 @@ def _git_sha(
     return value
 
 
-def _write_pending_deploy(
+def _write_merge_intent(
     config: AutonomousSyncConfig,
     *,
     candidate: SyncResult,
     evidence: SyncPullRequestEvidence,
-    merge_sha: str,
-    final_receipt: SyncReceiptArtifact,
+    premerge_receipt: SyncReceiptArtifact,
     runner: CommandRunner,
-) -> str:
-    if not isinstance(final_receipt.sha256, str) or re.fullmatch(
-        r"[0-9a-f]{64}", final_receipt.sha256
+) -> PendingDeploymentCheckpoint:
+    if not isinstance(premerge_receipt.sha256, str) or re.fullmatch(
+        r"[0-9a-f]{64}", premerge_receipt.sha256
     ) is None:
-        raise AutonomousSyncError("final sync receipt digest is unavailable")
+        raise AutonomousSyncError("premerge sync receipt digest is unavailable")
     checkpoint = PendingDeploymentCheckpoint(
         schema_version=1,
         repo_slug=config.sync.repo_slug,
+        stage="merge_intent",
         candidate_sha=candidate.candidate_sha or "",
         candidate_tree_sha=candidate.candidate_tree_sha or "",
         pr_number=evidence.number,
         pr_head_sha=evidence.head_sha,
         base_sha=evidence.base_sha,
         upstream_sha=candidate.upstream_sha or "",
-        merge_sha=merge_sha,
-        final_receipt_path=str(Path(final_receipt.path).resolve(strict=False)),
-        final_receipt_sha256=final_receipt.sha256,
+        premerge_receipt_path=str(
+            Path(premerge_receipt.path).resolve(strict=False)
+        ),
+        premerge_receipt_sha256=premerge_receipt.sha256,
+        merge_sha=None,
+        final_receipt_path=None,
+        final_receipt_sha256=None,
         install_root=str(Path(config.deploy.install_root).resolve(strict=False)),
         previous_installed_sha=_git_sha(
             runner, config.deploy.install_root, "HEAD"
         ),
+        terminal_reason=None,
+        terminal_reason_code=None,
+        terminal_failed_gate=None,
+        rollback_state=None,
+        rollback_sha=None,
+        revert_state=None,
+        revert_sha=None,
     )
-    return write_pending_deployment(config.receipt_root, checkpoint).sha256
+    write_pending_deployment(config.receipt_root, checkpoint)
+    return checkpoint
+
+
+def _advance_pending_deploy(
+    config: AutonomousSyncConfig,
+    intent: PendingDeploymentCheckpoint,
+    *,
+    merge_sha: str,
+    final_receipt: SyncReceiptArtifact,
+) -> tuple[PendingDeploymentCheckpoint, str]:
+    if intent.stage != "merge_intent":
+        raise AutonomousSyncError("pending merge intent stage changed")
+    checkpoint = replace(
+        intent,
+        stage="merged_pending_deploy",
+        merge_sha=merge_sha,
+        final_receipt_path=str(Path(final_receipt.path).resolve(strict=False)),
+        final_receipt_sha256=final_receipt.sha256,
+    )
+    artifact = write_pending_deployment(config.receipt_root, checkpoint)
+    return checkpoint, artifact.sha256
 
 
 def _candidate_from_pending_receipt(
@@ -391,6 +431,108 @@ def _candidate_from_pending_receipt(
     )
 
 
+def _load_trusted_sync_receipt(
+    config: AutonomousSyncConfig,
+    *,
+    path_value: str | None,
+    expected_digest: str | None,
+) -> tuple[Path, SyncEligibilityReceipt]:
+    if path_value is None or expected_digest is None:
+        raise AutonomousSyncError("pending deployment receipt identity is missing")
+    receipt_root = Path(config.receipt_root).resolve(strict=False)
+    try:
+        receipt_path = Path(path_value).resolve(strict=True)
+        content = receipt_path.read_bytes()
+    except OSError as exc:
+        raise AutonomousSyncError(
+            "pending deployment receipt is unreadable"
+        ) from exc
+    if not receipt_path.is_relative_to(receipt_root):
+        raise AutonomousSyncError("pending deployment receipt escaped trusted root")
+    if hashlib.sha256(content).hexdigest() != expected_digest:
+        raise AutonomousSyncError("pending deployment receipt digest changed")
+    return receipt_path, SyncEligibilityReceipt.load(receipt_path)
+
+
+def _receipt_matches_checkpoint(
+    receipt: SyncEligibilityReceipt,
+    checkpoint: PendingDeploymentCheckpoint,
+    *,
+    required_check: str,
+    merge_sha: str | None,
+) -> bool:
+    return (
+        receipt.repo_slug == checkpoint.repo_slug
+        and receipt.candidate_sha == checkpoint.candidate_sha
+        and receipt.pr_head_sha == checkpoint.pr_head_sha
+        and receipt.pr_number == checkpoint.pr_number
+        and receipt.base_sha == checkpoint.base_sha
+        and receipt.upstream_sha == checkpoint.upstream_sha
+        and receipt.merge_sha == merge_sha
+        and receipt.required_check == required_check
+    )
+
+
+def _resolve_merge_intent(
+    config: AutonomousSyncConfig,
+    checkpoint: PendingDeploymentCheckpoint,
+    *,
+    runner: CommandRunner,
+    github: ProtectedRevertGitHubPort,
+) -> PendingDeploymentCheckpoint:
+    premerge_path, receipt = _load_trusted_sync_receipt(
+        config,
+        path_value=checkpoint.premerge_receipt_path,
+        expected_digest=checkpoint.premerge_receipt_sha256,
+    )
+    if not _receipt_matches_checkpoint(
+        receipt, checkpoint, required_check=config.required_check, merge_sha=None
+    ):
+        raise AutonomousSyncError("pending merge intent receipt identity changed")
+    evidence = github.evidence(checkpoint.pr_number)
+    exact = (
+        evidence.number == checkpoint.pr_number
+        and evidence.base_sha == checkpoint.base_sha
+        and evidence.head_sha == checkpoint.pr_head_sha
+        and evidence.required_check == receipt.required_check
+        and evidence.required_check_conclusion == "success"
+        and evidence.workflow_run_id == receipt.workflow_run_id
+        and evidence.required_check_run_id == receipt.required_check_run_id
+    )
+    if not exact:
+        raise AutonomousSyncError("pending merge intent GitHub authority changed")
+    if evidence.state == "open" and evidence.merge_sha is None:
+        bind_expected_base(github, checkpoint.base_sha)
+        merge_sha = github.merge_exact(
+            checkpoint.pr_number, expected_head=checkpoint.pr_head_sha
+        )
+    elif evidence.state == "merged" and evidence.merge_sha is not None:
+        merge_sha = evidence.merge_sha
+    else:
+        raise AutonomousSyncError("pending merge intent state is ambiguous")
+    fetched = runner.run(
+        ["git", "fetch", "--no-tags", config.sync.origin, "main"],
+        cwd=config.sync.repo,
+        timeout=300,
+    )
+    if fetched.returncode != 0 or _git_sha(
+        runner,
+        config.sync.repo,
+        f"refs/remotes/{config.sync.origin}/main",
+    ) != merge_sha:
+        raise AutonomousSyncError("pending merge intent fork main changed")
+    final_receipt = finalize_sync_receipt(premerge_path, merge_sha=merge_sha)
+    merged = replace(
+        checkpoint,
+        stage="merged_pending_deploy",
+        merge_sha=merge_sha,
+        final_receipt_path=str(final_receipt.path.resolve(strict=False)),
+        final_receipt_sha256=final_receipt.sha256,
+    )
+    write_pending_deployment(config.receipt_root, merged)
+    return merged
+
+
 def _validate_pending_deploy(
     config: AutonomousSyncConfig,
     checkpoint: PendingDeploymentCheckpoint,
@@ -398,28 +540,22 @@ def _validate_pending_deploy(
     runner: CommandRunner,
     github: SyncGitHubPort,
 ) -> tuple[SyncResult, Path, str]:
+    if checkpoint.stage != "merged_pending_deploy":
+        raise AutonomousSyncError("pending deployment stage is not deployable")
     expected_install = Path(config.deploy.install_root).resolve(strict=False)
     if Path(checkpoint.install_root).resolve(strict=False) != expected_install:
         raise AutonomousSyncError("pending deployment install scope changed")
-    receipt_root = Path(config.receipt_root).resolve(strict=False)
-    receipt_path = Path(checkpoint.final_receipt_path).resolve(strict=True)
-    if not receipt_path.is_relative_to(receipt_root):
-        raise AutonomousSyncError("pending deployment receipt escaped trusted root")
-    content = receipt_path.read_bytes()
-    if hashlib.sha256(content).hexdigest() != checkpoint.final_receipt_sha256:
-        raise AutonomousSyncError("pending deployment receipt digest changed")
-    receipt = SyncEligibilityReceipt.load(receipt_path)
-    exact_receipt = (
-        receipt.repo_slug == checkpoint.repo_slug
-        and receipt.candidate_sha == checkpoint.candidate_sha
-        and receipt.pr_head_sha == checkpoint.pr_head_sha
-        and receipt.pr_number == checkpoint.pr_number
-        and receipt.base_sha == checkpoint.base_sha
-        and receipt.upstream_sha == checkpoint.upstream_sha
-        and receipt.merge_sha == checkpoint.merge_sha
-        and receipt.required_check == config.required_check
+    receipt_path, receipt = _load_trusted_sync_receipt(
+        config,
+        path_value=checkpoint.final_receipt_path,
+        expected_digest=checkpoint.final_receipt_sha256,
     )
-    if not exact_receipt:
+    if not _receipt_matches_checkpoint(
+        receipt,
+        checkpoint,
+        required_check=config.required_check,
+        merge_sha=checkpoint.merge_sha,
+    ):
         raise AutonomousSyncError("pending deployment receipt identity changed")
 
     fetched = runner.run(
@@ -475,6 +611,26 @@ def _resume_pending_deploy(
     clock: Callable[[], float],
     sleeper: Callable[[float], None],
 ) -> AutonomousSyncResult:
+    if checkpoint.stage == "failed_terminal":
+        digest = deployment_checkpoint_sha256(checkpoint)
+        return AutonomousSyncResult.needs_human(
+            checkpoint.terminal_reason or "terminal deployment recovery failure",
+            candidate_sha=checkpoint.candidate_sha,
+            pr_number=checkpoint.pr_number,
+            merge_sha=checkpoint.merge_sha,
+            installed_sha=checkpoint.rollback_sha,
+            reason_code=checkpoint.terminal_reason_code,
+            failed_gate=checkpoint.terminal_failed_gate,
+            rollback_state=checkpoint.rollback_state,
+            rollback_sha=checkpoint.rollback_sha,
+            revert_state=checkpoint.revert_state,
+            revert_sha=checkpoint.revert_sha,
+            details_artifact=f"deployment/pending-deployment-{digest}.json",
+        )
+    if checkpoint.stage == "merge_intent":
+        checkpoint = _resolve_merge_intent(
+            config, checkpoint, runner=runner, github=github
+        )
     candidate, receipt_path, installed_sha = _validate_pending_deploy(
         config, checkpoint, runner=runner, github=github
     )
@@ -547,6 +703,24 @@ def _resume_pending_deploy(
                 resolution_record_sha256=None,
                 reason="resumed deployment rolled back and protected revert completed",
                 resume_attempts=0,
+            ),
+        )
+    elif outcome.state is AutonomousSyncState.NEEDS_OLE:
+        terminal = terminalize_pending_deployment(
+            config.receipt_root,
+            checkpoint,
+            reason=outcome.reason or "automatic recovery failed",
+            reason_code=outcome.reason_code or "AUTOMATIC_RECOVERY_FAILED",
+            failed_gate=outcome.failed_gate or "protected_recovery",
+            rollback_state=outcome.rollback_state or deployment.status,
+            rollback_sha=outcome.rollback_sha or deployment.previous_sha,
+            revert_state=outcome.revert_state or "NEEDS_OLE",
+            revert_sha=outcome.revert_sha,
+        )
+        outcome = replace(
+            outcome,
+            details_artifact=(
+                f"deployment/pending-deployment-{terminal.sha256}.json"
             ),
         )
     return outcome

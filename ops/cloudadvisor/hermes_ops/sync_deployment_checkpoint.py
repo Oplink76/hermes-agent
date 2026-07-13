@@ -19,17 +19,27 @@ _ARTIFACT = re.compile(r"pending-deployment-(?P<digest>[0-9a-f]{64})\.json\Z")
 _FIELDS = {
     "schema_version",
     "repo_slug",
+    "stage",
     "candidate_sha",
     "candidate_tree_sha",
     "pr_number",
     "pr_head_sha",
     "base_sha",
     "upstream_sha",
+    "premerge_receipt_path",
+    "premerge_receipt_sha256",
     "merge_sha",
     "final_receipt_path",
     "final_receipt_sha256",
     "install_root",
     "previous_installed_sha",
+    "terminal_reason",
+    "terminal_reason_code",
+    "terminal_failed_gate",
+    "rollback_state",
+    "rollback_sha",
+    "revert_state",
+    "revert_sha",
 }
 _POINTER_FIELDS = {"schema_version", "repo_slug", "artifact_sha256"}
 
@@ -42,17 +52,27 @@ class SyncDeploymentCheckpointError(ValueError):
 class PendingDeploymentCheckpoint:
     schema_version: int
     repo_slug: str
+    stage: str
     candidate_sha: str
     candidate_tree_sha: str
     pr_number: int
     pr_head_sha: str
     base_sha: str
     upstream_sha: str
-    merge_sha: str
-    final_receipt_path: str
-    final_receipt_sha256: str
+    premerge_receipt_path: str
+    premerge_receipt_sha256: str
+    merge_sha: str | None
+    final_receipt_path: str | None
+    final_receipt_sha256: str | None
     install_root: str
     previous_installed_sha: str
+    terminal_reason: str | None
+    terminal_reason_code: str | None
+    terminal_failed_gate: str | None
+    rollback_state: str | None
+    rollback_sha: str | None
+    revert_state: str | None
+    revert_sha: str | None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -78,23 +98,40 @@ def _canonical_json(payload: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
-def _validate(checkpoint: PendingDeploymentCheckpoint) -> None:
+def _valid_repo_slug(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value == value.strip()
+        and value.count("/") == 1
+        and all(value.split("/"))
+    )
+
+
+def _terminal_values(
+    checkpoint: PendingDeploymentCheckpoint,
+) -> tuple[str | None, ...]:
+    return (
+        checkpoint.terminal_reason,
+        checkpoint.terminal_reason_code,
+        checkpoint.terminal_failed_gate,
+        checkpoint.rollback_state,
+        checkpoint.rollback_sha,
+        checkpoint.revert_state,
+        checkpoint.revert_sha,
+    )
+
+
+def _validate_common(checkpoint: PendingDeploymentCheckpoint) -> None:
     if checkpoint.schema_version != SCHEMA_VERSION:
         raise SyncDeploymentCheckpointError("deployment checkpoint schema is unsupported")
-    if (
-        not isinstance(checkpoint.repo_slug, str)
-        or checkpoint.repo_slug != checkpoint.repo_slug.strip()
-        or checkpoint.repo_slug.count("/") != 1
-        or not all(checkpoint.repo_slug.split("/"))
-    ):
+    if not _valid_repo_slug(checkpoint.repo_slug):
         raise SyncDeploymentCheckpointError("deployment repository is invalid")
-    shas = (
+    shas: tuple[object, ...] = (
         checkpoint.candidate_sha,
         checkpoint.candidate_tree_sha,
         checkpoint.pr_head_sha,
         checkpoint.base_sha,
         checkpoint.upstream_sha,
-        checkpoint.merge_sha,
         checkpoint.previous_installed_sha,
     )
     if not all(isinstance(value, str) and _FULL_SHA.fullmatch(value) for value in shas):
@@ -103,16 +140,86 @@ def _validate(checkpoint: PendingDeploymentCheckpoint) -> None:
         raise SyncDeploymentCheckpointError("deployment candidate identity is crossed")
     if type(checkpoint.pr_number) is not int or checkpoint.pr_number < 1:
         raise SyncDeploymentCheckpointError("deployment PR identity is invalid")
-    if _DIGEST.fullmatch(checkpoint.final_receipt_sha256) is None:
-        raise SyncDeploymentCheckpointError("deployment receipt digest is invalid")
+    if _DIGEST.fullmatch(checkpoint.premerge_receipt_sha256) is None:
+        raise SyncDeploymentCheckpointError("deployment premerge digest is invalid")
     for name, value in (
-        ("receipt", checkpoint.final_receipt_path),
+        ("premerge receipt", checkpoint.premerge_receipt_path),
         ("install", checkpoint.install_root),
     ):
         if not isinstance(value, str) or not value or not Path(value).is_absolute():
             raise SyncDeploymentCheckpointError(
                 f"deployment {name} path is invalid"
             )
+
+
+def _validate_merge_intent(checkpoint: PendingDeploymentCheckpoint) -> None:
+    crossed = (
+        checkpoint.merge_sha is not None
+        or checkpoint.final_receipt_path is not None
+        or checkpoint.final_receipt_sha256 is not None
+        or any(value is not None for value in _terminal_values(checkpoint))
+    )
+    if crossed:
+        raise SyncDeploymentCheckpointError(
+            "deployment merge intent evidence is crossed"
+        )
+
+
+def _validate_merged(checkpoint: PendingDeploymentCheckpoint) -> None:
+    if not isinstance(checkpoint.merge_sha, str):
+        raise SyncDeploymentCheckpointError("deployment merged evidence is invalid")
+    if _FULL_SHA.fullmatch(checkpoint.merge_sha) is None:
+        raise SyncDeploymentCheckpointError("deployment merged evidence is invalid")
+    if not isinstance(checkpoint.final_receipt_path, str):
+        raise SyncDeploymentCheckpointError("deployment merged evidence is invalid")
+    if not Path(checkpoint.final_receipt_path).is_absolute():
+        raise SyncDeploymentCheckpointError("deployment merged evidence is invalid")
+    if not isinstance(checkpoint.final_receipt_sha256, str):
+        raise SyncDeploymentCheckpointError("deployment merged evidence is invalid")
+    if _DIGEST.fullmatch(checkpoint.final_receipt_sha256) is None:
+        raise SyncDeploymentCheckpointError("deployment merged evidence is invalid")
+
+
+def _validate_terminal(checkpoint: PendingDeploymentCheckpoint) -> None:
+    if (
+        not isinstance(checkpoint.terminal_reason, str)
+        or not checkpoint.terminal_reason.strip()
+        or not isinstance(checkpoint.terminal_reason_code, str)
+        or re.fullmatch(r"[A-Z][A-Z0-9_]*", checkpoint.terminal_reason_code) is None
+        or not isinstance(checkpoint.terminal_failed_gate, str)
+        or re.fullmatch(r"[a-z][a-z0-9_]*", checkpoint.terminal_failed_gate) is None
+        or not isinstance(checkpoint.rollback_state, str)
+        or not checkpoint.rollback_state
+        or not isinstance(checkpoint.revert_state, str)
+        or not checkpoint.revert_state
+    ):
+        raise SyncDeploymentCheckpointError(
+            "deployment terminal evidence is invalid"
+        )
+    for value in (checkpoint.rollback_sha, checkpoint.revert_sha):
+        if value is not None and (
+            not isinstance(value, str) or _FULL_SHA.fullmatch(value) is None
+        ):
+            raise SyncDeploymentCheckpointError(
+                "deployment terminal SHA is invalid"
+            )
+
+
+def _validate(checkpoint: PendingDeploymentCheckpoint) -> None:
+    _validate_common(checkpoint)
+    if checkpoint.stage == "merge_intent":
+        _validate_merge_intent(checkpoint)
+        return
+    if checkpoint.stage not in {"merged_pending_deploy", "failed_terminal"}:
+        raise SyncDeploymentCheckpointError("deployment merged evidence is invalid")
+    _validate_merged(checkpoint)
+    if checkpoint.stage == "merged_pending_deploy":
+        if any(value is not None for value in _terminal_values(checkpoint)):
+            raise SyncDeploymentCheckpointError(
+                "deployment pending evidence contains terminal state"
+            )
+        return
+    _validate_terminal(checkpoint)
 
 
 def _root(receipt_root: Path, *, create: bool = False) -> Path:
@@ -191,6 +298,40 @@ def write_pending_deployment(
         _load_artifact(target)
     _write_pointer(root, repo_slug=checkpoint.repo_slug, digest=digest)
     return SyncDeploymentCheckpointArtifact(path=target, sha256=digest)
+
+
+def terminalize_pending_deployment(
+    receipt_root: Path,
+    checkpoint: PendingDeploymentCheckpoint,
+    *,
+    reason: str,
+    reason_code: str,
+    failed_gate: str,
+    rollback_state: str,
+    rollback_sha: str | None,
+    revert_state: str,
+    revert_sha: str | None,
+) -> SyncDeploymentCheckpointArtifact:
+    if checkpoint.stage != "merged_pending_deploy":
+        raise SyncDeploymentCheckpointError(
+            "only a merged pending deployment can become terminal"
+        )
+    return write_pending_deployment(
+        receipt_root,
+        PendingDeploymentCheckpoint(
+            **{
+                **checkpoint.to_dict(),
+                "stage": "failed_terminal",
+                "terminal_reason": reason,
+                "terminal_reason_code": reason_code,
+                "terminal_failed_gate": failed_gate,
+                "rollback_state": rollback_state,
+                "rollback_sha": rollback_sha,
+                "revert_state": revert_state,
+                "revert_sha": revert_sha,
+            }
+        ),
+    )
 
 
 def _load_artifact(path: Path) -> PendingDeploymentCheckpoint:

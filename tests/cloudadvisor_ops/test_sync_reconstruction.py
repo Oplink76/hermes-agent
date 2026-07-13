@@ -5,8 +5,9 @@ import sys
 import os
 from pathlib import Path
 
+from ops.cloudadvisor.hermes_ops import sync_controller as sync_controller_module
 from ops.cloudadvisor.hermes_ops.command import SubprocessCommandRunner
-from ops.cloudadvisor.hermes_ops.deploy import DeployConfig, DeploymentRecord
+from ops.cloudadvisor.hermes_ops.deploy import DeployConfig, DeploymentRecord, PreflightError
 from ops.cloudadvisor.hermes_ops.health import HealthCheck
 from ops.cloudadvisor.hermes_ops.sync import (
     SyncClassification,
@@ -29,6 +30,7 @@ from ops.cloudadvisor.hermes_ops.sync_reconstruction_checkpoint import (
     load_pending_reconstruction,
 )
 from ops.cloudadvisor.hermes_ops.sync_github import SyncPullRequestEvidence
+from ops.cloudadvisor.hermes_ops.sync_receipt import SyncReceiptArtifact
 from ops.cloudadvisor.hermes_ops.sync_remediation import CodexCandidateRemediator
 from ops.cloudadvisor.hermes_ops.sync_review import ConflictReviewReceipt
 
@@ -38,6 +40,10 @@ def _git(cwd: Path, *args: str) -> str:
         ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
     )
     return completed.stdout.strip()
+
+
+def _receipt(path: Path) -> SyncReceiptArtifact:
+    return SyncReceiptArtifact(path=path, sha256="e" * 64)
 
 
 def test_real_reconstruction_reintroduces_failed_tree_on_verified_revert_main(
@@ -346,10 +352,17 @@ def test_controller_persists_then_resumes_complete_tree_across_invocations(
         lock_path=tmp_path / "sync.lock",
     )
     receipt_root = tmp_path / "receipts"
+    install = tmp_path / "install"
+    subprocess.run(
+        ["git", "clone", str(origin), str(install)],
+        check=True,
+        capture_output=True,
+    )
+    _git(install, "switch", "--detach", base)
     config = AutonomousSyncConfig(
         sync=sync_config,
         deploy=DeployConfig(
-            install_root=tmp_path / "install",
+            install_root=install,
             origin="origin",
             record_root=tmp_path / "deployments",
             repo_slug=sync_config.repo_slug,
@@ -445,11 +458,11 @@ def test_controller_persists_then_resumes_complete_tree_across_invocations(
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "pre"})(),
+        lambda *args, **kwargs: _receipt(tmp_path / "pre"),
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
-        lambda *args, **kwargs: type("Artifact", (), {"path": tmp_path / "merged"})(),
+        lambda *args, **kwargs: _receipt(tmp_path / "merged"),
     )
     outcomes = [
         AutonomousSyncResult(
@@ -550,6 +563,7 @@ def test_real_controller_routes_rollback_through_reconstruction_and_reviewed_rep
     _git(repo, "revert", "-m", "1", "--no-edit", failed_merge)
     revert_main = _git(repo, "rev-parse", "HEAD")
     _git(repo, "push", "origin", "main")
+    _git(repo, "push", "--force", "origin", f"{failed_merge}:main")
     rolling = tmp_path / "rolling-candidate"
     _git(repo, "worktree", "add", str(rolling), "auto-sync/upstream")
 
@@ -613,10 +627,17 @@ def test_real_controller_routes_rollback_through_reconstruction_and_reviewed_rep
         repo_slug="Oplink76/hermes-agent",
         lock_path=tmp_path / "sync.lock",
     )
+    install = tmp_path / "install"
+    subprocess.run(
+        ["git", "clone", str(origin), str(install)],
+        check=True,
+        capture_output=True,
+    )
+    _git(install, "switch", "--detach", base)
     config = AutonomousSyncConfig(
         sync=sync_config,
         deploy=DeployConfig(
-            install_root=tmp_path / "install",
+            install_root=install,
             origin="origin",
             record_root=tmp_path / "deployments",
             repo_slug=sync_config.repo_slug,
@@ -652,6 +673,18 @@ def test_real_controller_routes_rollback_through_reconstruction_and_reviewed_rep
                     "success",
                     101,
                     202,
+                )
+            if self.evidence_calls == 2:
+                return SyncPullRequestEvidence(
+                    7,
+                    "merged",
+                    base,
+                    candidate_sha,
+                    "All required checks pass",
+                    "success",
+                    101,
+                    202,
+                    failed_merge,
                 )
             repaired_head = _git(
                 repo, "ls-remote", "origin", "refs/heads/auto-sync/upstream"
@@ -721,6 +754,10 @@ def test_real_controller_routes_rollback_through_reconstruction_and_reviewed_rep
         lambda *args, **kwargs: "a" * 40,
     )
     monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller_execution._refresh_current_upstream_sha",
+        lambda *args, **kwargs: "a" * 40,
+    )
+    monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.resume_failed_candidate_reconstruction",
         lambda config, *, failed, failed_merge_sha, revert_main_sha, github, runner, **kwargs: reconstruct_failed_candidate(
             config,
@@ -732,16 +769,20 @@ def test_real_controller_routes_rollback_through_reconstruction_and_reviewed_rep
         ),
     )
     reviews: list[object] = []
+    real_write_receipt = sync_controller_module.write_sync_receipt
+    real_finalize_receipt = sync_controller_module.finalize_sync_receipt
+
+    def write_receipt(*args, **kwargs):
+        reviews.append(kwargs.get("conflict_review"))
+        return real_write_receipt(*args, **kwargs)
+
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
-        lambda *args, **kwargs: reviews.append(kwargs.get("conflict_review"))
-        or type("Artifact", (), {"path": tmp_path / "pre"})(),
+        write_receipt,
     )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
-        lambda *args, **kwargs: type(
-            "Artifact", (), {"path": tmp_path / "merged"}
-        )(),
+        real_finalize_receipt,
     )
     outcomes = [
         AutonomousSyncResult(
@@ -754,9 +795,16 @@ def test_real_controller_routes_rollback_through_reconstruction_and_reviewed_rep
             deployed_sha="f" * 40,
         ),
     ]
+
+    def finish(*args, **kwargs):
+        outcome = outcomes.pop(0)
+        if outcome.state is AutonomousSyncState.ROLLED_BACK_REVERTED:
+            _git(repo, "push", "--force", "origin", f"{revert_main}:main")
+        return outcome
+
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.finish_or_recover",
-        lambda *args, **kwargs: outcomes.pop(0),
+        finish,
     )
     deployments = [
         DeploymentRecord(
@@ -773,10 +821,45 @@ def test_real_controller_routes_rollback_through_reconstruction_and_reviewed_rep
         DeploymentRecord("fixed", "f" * 40, base, {}, {}, {}, (), "deployed", None),
     ]
 
+    github = GitHub()
+    interrupted = run_autonomous_sync(
+        config,
+        runner=SubprocessCommandRunner(),
+        github=github,
+        resolver=None,
+        reviewer=Reviewer(),
+        remediator=Remediator(),
+        deploy_fn=lambda *args: (_ for _ in ()).throw(
+            PreflightError("simulated crash before resumed deployment")
+        ),
+        verify_runtime_fn=lambda sha: True,
+    )
+    assert interrupted.state is AutonomousSyncState.NEEDS_OLE
+    assert (
+        _git(repo, "ls-remote", "origin", "refs/heads/main").split()[0]
+        == failed_merge
+    )
+
+    recovered = run_autonomous_sync(
+        config,
+        runner=SubprocessCommandRunner(),
+        github=github,
+        resolver=None,
+        reviewer=Reviewer(),
+        remediator=Remediator(),
+        deploy_fn=lambda *args: deployments.pop(0),
+        verify_runtime_fn=lambda sha: True,
+    )
+    assert recovered.state is AutonomousSyncState.ROLLED_BACK_REVERTED, (
+        recovered.reason,
+        recovered.reason_code,
+        recovered.failed_gate,
+    )
+
     result = run_autonomous_sync(
         config,
         runner=SubprocessCommandRunner(),
-        github=GitHub(),
+        github=github,
         resolver=None,
         reviewer=Reviewer(),
         remediator=Remediator(),
@@ -784,7 +867,11 @@ def test_real_controller_routes_rollback_through_reconstruction_and_reviewed_rep
         verify_runtime_fn=lambda sha: True,
     )
 
-    assert result.state is AutonomousSyncState.DEPLOYED
+    assert result.state is AutonomousSyncState.DEPLOYED, (
+        result.reason,
+        result.reason_code,
+        result.failed_gate,
+    )
     assert len(reviewed_heads) == 1
     assert reviews[0] is None
     assert reviews[1].candidate_sha == reviewed_heads[0]
