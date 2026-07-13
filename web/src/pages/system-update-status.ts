@@ -15,7 +15,7 @@ export function formatHermesSyncSummary(
   }
   if (upstreamBehind == null || upstreamBehind <= 0) return null;
   const noun = upstreamBehind === 1 ? "commit" : "commits";
-  const active = new Set(["PR_UPDATED", "PENDING_REFRESH", "REFRESH_REQUIRED"]);
+  const active = new Set(["PR_UPDATED", "PENDING_REFRESH"]);
   const suffix = active.has(info.sync_state ?? "") ? "syncing" : "pending";
   if (info.sync_state === "ROLLED_BACK_REVERTED") {
     return `Installed current · ${upstreamBehind} official upstream ${noun} pending after safe rollback`;

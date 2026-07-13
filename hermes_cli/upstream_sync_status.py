@@ -14,7 +14,7 @@ from typing import Any
 
 
 _TERMINAL_SUCCESS = {"NO_CHANGE", "DEPLOYED"}
-_ACTIVE_STATES = {"PR_UPDATED", "PENDING_REFRESH", "REFRESH_REQUIRED"}
+_ACTIVE_STATES = {"PR_UPDATED", "PENDING_REFRESH"}
 _FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _DEPLOYMENT_FIELDS = {
@@ -171,45 +171,6 @@ def installed_sync_message(
     return f"Installed current · {upstream_behind} official upstream {noun} {suffix}"
 
 
-class SyncNotificationState:
-    """Persist the active emitted escalation decision, not delivery claims."""
-
-    def __init__(self, path: Path):
-        self.path = path
-
-    def _active_fingerprint(self) -> str | None:
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
-            return None
-        if not isinstance(payload, dict) or set(payload) != {
-            "schema_version",
-            "active_fingerprint",
-        }:
-            return None
-        if payload.get("schema_version") != 1:
-            return None
-        value = payload.get("active_fingerprint")
-        return value if isinstance(value, str) and value else None
-
-    def should_emit(self, fingerprint: str) -> bool:
-        fingerprint = _optional_string(fingerprint, field="fingerprint") or ""
-        return fingerprint != self._active_fingerprint()
-
-    def record_emitted(self, fingerprint: str) -> None:
-        fingerprint = _optional_string(fingerprint, field="fingerprint") or ""
-        write_json_atomic(
-            self.path,
-            {"schema_version": 1, "active_fingerprint": fingerprint},
-        )
-
-    def clear(self) -> None:
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            pass
-
-
 def _canonical_json(payload: dict[str, Any]) -> bytes:
     return (
         json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -217,61 +178,113 @@ def _canonical_json(payload: dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
-def pending_deployment_state(receipt_root: Path) -> str | None:
-    """Inspect packaged checkpoint evidence; malformed/crossed state blocks."""
+@dataclass(frozen=True)
+class PendingDeploymentEvidence:
+    artifact_sha256: str
+    payload: dict[str, Any]
+
+
+def _read_trusted_file(path: Path, *, mode: int) -> bytes:
+    try:
+        metadata = path.lstat()
+        content = path.read_bytes()
+    except OSError as exc:
+        raise ValueError("deployment checkpoint file is unreadable") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or (os.name != "nt" and stat.S_IMODE(metadata.st_mode) != mode)
+    ):
+        raise ValueError("deployment checkpoint file is untrusted")
+    return content
+
+
+def _decode_exact(content: bytes, *, fields: set[str]) -> dict[str, Any]:
+    try:
+        payload = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("deployment checkpoint JSON is unreadable") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != fields
+        or _canonical_json(payload) != content
+    ):
+        raise ValueError("deployment checkpoint schema is invalid")
+    return payload
+
+
+def _valid_repo_slug(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value == value.strip()
+        and value.count("/") == 1
+        and all(value.split("/"))
+    )
+
+
+def load_deployment_artifact_payload(
+    path: Path,
+    *,
+    expected_digest: str | None = None,
+) -> dict[str, Any]:
+    path = Path(path)
+    match = re.fullmatch(r"pending-deployment-([0-9a-f]{64})\.json", path.name)
+    if match is None:
+        raise ValueError("deployment artifact name is invalid")
+    digest = match.group(1)
+    if expected_digest is not None and digest != expected_digest:
+        raise ValueError("deployment artifact digest is crossed")
+    content = _read_trusted_file(path, mode=0o400)
+    if hashlib.sha256(content).hexdigest() != digest:
+        raise ValueError("deployment artifact digest is invalid")
+    return _decode_exact(content, fields=_DEPLOYMENT_FIELDS)
+
+
+def load_pending_deployment_evidence(
+    receipt_root: Path,
+    *,
+    repo_slug: str | None = None,
+) -> PendingDeploymentEvidence | None:
     root = Path(receipt_root).expanduser().resolve(strict=False) / "deployment"
-    pointer = root / "pending.json"
     try:
         root_metadata = root.lstat()
-        metadata = pointer.lstat()
-        pointer_content = pointer.read_bytes()
-        pointer_payload = json.loads(pointer_content)
     except FileNotFoundError:
         return None
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return "crossed_invalid"
-    if (
-        stat.S_ISLNK(root_metadata.st_mode)
-        or not stat.S_ISDIR(root_metadata.st_mode)
-        or stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISREG(metadata.st_mode)
-        or (os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o600)
-        or not isinstance(pointer_payload, dict)
-        or set(pointer_payload)
-        != {"schema_version", "repo_slug", "artifact_sha256"}
-        or pointer_payload.get("schema_version") != 1
-        or _canonical_json(pointer_payload) != pointer_content
-        or _DIGEST.fullmatch(str(pointer_payload.get("artifact_sha256"))) is None
-    ):
-        return "crossed_invalid"
-    repo_slug = pointer_payload.get("repo_slug")
-    if (
-        not isinstance(repo_slug, str)
-        or repo_slug != repo_slug.strip()
-        or repo_slug.count("/") != 1
-        or not all(repo_slug.split("/"))
-    ):
-        return "crossed_invalid"
-    digest = pointer_payload["artifact_sha256"]
-    artifact = root / f"pending-deployment-{digest}.json"
+    except OSError as exc:
+        raise ValueError("deployment checkpoint scope is unreadable") from exc
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+        raise ValueError("deployment checkpoint scope is untrusted")
+    pointer = root / "pending.json"
     try:
-        artifact_metadata = artifact.lstat()
-        content = artifact.read_bytes()
-        payload = json.loads(content)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return "crossed_invalid"
+        pointer.lstat()
+    except FileNotFoundError:
+        return None
+    pointer_payload = _decode_exact(
+        _read_trusted_file(pointer, mode=0o600),
+        fields={"schema_version", "repo_slug", "artifact_sha256"},
+    )
+    pointer_repo = pointer_payload.get("repo_slug")
+    digest = pointer_payload.get("artifact_sha256")
     if (
-        stat.S_ISLNK(artifact_metadata.st_mode)
-        or not stat.S_ISREG(artifact_metadata.st_mode)
-        or (os.name != "nt" and stat.S_IMODE(artifact_metadata.st_mode) != 0o400)
-        or hashlib.sha256(content).hexdigest() != digest
-        or not isinstance(payload, dict)
-        or set(payload) != _DEPLOYMENT_FIELDS
-        or _canonical_json(payload) != content
-        or payload.get("schema_version") != 1
-        or payload.get("repo_slug") != repo_slug
+        pointer_payload.get("schema_version") != 1
+        or not _valid_repo_slug(pointer_repo)
+        or _DIGEST.fullmatch(str(digest)) is None
+        or (repo_slug is not None and pointer_repo != repo_slug)
     ):
-        return "crossed_invalid"
+        raise ValueError("deployment pointer identity is invalid")
+    payload = load_deployment_artifact_payload(
+        root / f"pending-deployment-{digest}.json",
+        expected_digest=digest,
+    )
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("repo_slug") != pointer_repo
+    ):
+        raise ValueError("deployment artifact identity is crossed")
+    return PendingDeploymentEvidence(artifact_sha256=digest, payload=payload)
+
+
+def _base_blocking_evidence_valid(payload: dict[str, Any]) -> bool:
     shas = (
         payload.get("candidate_sha"),
         payload.get("candidate_tree_sha"),
@@ -280,65 +293,88 @@ def pending_deployment_state(receipt_root: Path) -> str | None:
         payload.get("upstream_sha"),
         payload.get("previous_installed_sha"),
     )
-    if (
-        not all(isinstance(value, str) and _FULL_SHA.fullmatch(value) for value in shas)
-        or payload.get("candidate_sha") != payload.get("pr_head_sha")
-        or type(payload.get("pr_number")) is not int
-        or payload["pr_number"] < 1
-        or _DIGEST.fullmatch(str(payload.get("premerge_receipt_sha256"))) is None
-        or not isinstance(payload.get("premerge_receipt_path"), str)
-        or not Path(payload["premerge_receipt_path"]).is_absolute()
-        or not isinstance(payload.get("install_root"), str)
-        or not Path(payload["install_root"]).is_absolute()
-    ):
+    return (
+        all(isinstance(value, str) and _FULL_SHA.fullmatch(value) for value in shas)
+        and payload.get("candidate_sha") == payload.get("pr_head_sha")
+        and type(payload.get("pr_number")) is int
+        and payload["pr_number"] >= 1
+        and _DIGEST.fullmatch(str(payload.get("premerge_receipt_sha256"))) is not None
+        and isinstance(payload.get("premerge_receipt_path"), str)
+        and Path(payload["premerge_receipt_path"]).is_absolute()
+        and isinstance(payload.get("install_root"), str)
+        and Path(payload["install_root"]).is_absolute()
+    )
+
+
+_TERMINAL_FIELDS = (
+    "terminal_reason",
+    "terminal_reason_code",
+    "terminal_failed_gate",
+    "rollback_state",
+    "rollback_sha",
+    "revert_state",
+    "revert_sha",
+)
+
+
+def _merged_blocking_evidence_valid(payload: dict[str, Any]) -> bool:
+    return (
+        isinstance(payload.get("merge_sha"), str)
+        and _FULL_SHA.fullmatch(payload["merge_sha"]) is not None
+        and isinstance(payload.get("final_receipt_path"), str)
+        and Path(payload["final_receipt_path"]).is_absolute()
+        and _DIGEST.fullmatch(str(payload.get("final_receipt_sha256"))) is not None
+    )
+
+
+def _terminal_blocking_evidence_valid(payload: dict[str, Any]) -> bool:
+    sha_values = (payload.get("rollback_sha"), payload.get("revert_sha"))
+    return (
+        isinstance(payload.get("terminal_reason_code"), str)
+        and re.fullmatch(r"[A-Z][A-Z0-9_]*", payload["terminal_reason_code"])
+        is not None
+        and isinstance(payload.get("terminal_failed_gate"), str)
+        and re.fullmatch(r"[a-z][a-z0-9_]*", payload["terminal_failed_gate"])
+        is not None
+        and isinstance(payload.get("rollback_state"), str)
+        and isinstance(payload.get("revert_state"), str)
+        and all(
+            value is None
+            or (isinstance(value, str) and _FULL_SHA.fullmatch(value) is not None)
+            for value in sha_values
+        )
+    )
+
+
+def _blocking_stage(payload: dict[str, Any]) -> str:
+    if not _base_blocking_evidence_valid(payload):
         return "crossed_invalid"
     stage = payload.get("stage")
-    terminal_fields = (
-        "terminal_reason",
-        "terminal_reason_code",
-        "terminal_failed_gate",
-        "rollback_state",
-        "rollback_sha",
-        "revert_state",
-        "revert_sha",
-    )
     if stage == "merge_intent":
         crossed = (
             payload.get("merge_sha") is not None
             or payload.get("final_receipt_path") is not None
             or payload.get("final_receipt_sha256") is not None
-            or any(payload.get(field) is not None for field in terminal_fields)
+            or any(payload.get(field) is not None for field in _TERMINAL_FIELDS)
         )
         return "crossed_invalid" if crossed else stage
     if stage not in {"merged_pending_deploy", "failed_terminal"}:
         return "crossed_invalid"
-    if (
-        not isinstance(payload.get("merge_sha"), str)
-        or _FULL_SHA.fullmatch(payload["merge_sha"]) is None
-        or not isinstance(payload.get("final_receipt_path"), str)
-        or not Path(payload["final_receipt_path"]).is_absolute()
-        or _DIGEST.fullmatch(str(payload.get("final_receipt_sha256"))) is None
-    ):
+    if not _merged_blocking_evidence_valid(payload):
         return "crossed_invalid"
     if stage == "merged_pending_deploy":
         return (
             "crossed_invalid"
-            if any(payload.get(field) is not None for field in terminal_fields)
+            if any(payload.get(field) is not None for field in _TERMINAL_FIELDS)
             else stage
         )
-    if (
-        not isinstance(payload.get("terminal_reason_code"), str)
-        or re.fullmatch(r"[A-Z][A-Z0-9_]*", payload["terminal_reason_code"]) is None
-        or not isinstance(payload.get("terminal_failed_gate"), str)
-        or re.fullmatch(r"[a-z][a-z0-9_]*", payload["terminal_failed_gate"]) is None
-        or not isinstance(payload.get("rollback_state"), str)
-        or not isinstance(payload.get("revert_state"), str)
-    ):
+    return stage if _terminal_blocking_evidence_valid(payload) else "crossed_invalid"
+
+
+def pending_deployment_state(receipt_root: Path) -> str | None:
+    """Inspect packaged checkpoint evidence; malformed/crossed state blocks."""
+    try:
+        evidence = load_pending_deployment_evidence(receipt_root)
+    except ValueError:
         return "crossed_invalid"
-    for field in ("rollback_sha", "revert_sha"):
-        value = payload.get(field)
-        if value is not None and (
-            not isinstance(value, str) or _FULL_SHA.fullmatch(value) is None
-        ):
-            return "crossed_invalid"
-    return stage
+    return None if evidence is None else _blocking_stage(evidence.payload)

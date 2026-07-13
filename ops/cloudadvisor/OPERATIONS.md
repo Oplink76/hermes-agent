@@ -51,7 +51,8 @@ The production schedule runs `sync-auto` at 06:00 and 18:00 Europe/Copenhagen.
 A clean sync, an independently reviewed minor conflict, and an already-converged
 run are quiet successes. `PR_UPDATED` is an in-progress state, not success.
 `NEEDS_OLE` stages a durable outbox record and keeps `notify_ole: true` until the
-versioned `cron_wrapper` delivers and atomically acknowledges the exact packet,
+versioned `cron_wrapper` invokes the configured direct delivery command and
+atomically acknowledges only after that command returns success for the exact packet,
 fingerprint, digest, and idempotency key. The wrapper drains an older pending
 record before starting a new sync; neither a healthy terminal cycle nor changed
 evidence may erase an unacknowledged alert. A delivery failure remains pending
@@ -60,6 +61,14 @@ packet, so downstream delivery should deduplicate its stable decision id. This
 at-least-once boundary prefers a controlled duplicate over losing Ole's only
 alert. Malformed or contradictory output fails closed on stderr and is never
 reported as `NO_CHANGE`.
+
+The direct command receives the message on stdin, not argv or config, and must
+return nonzero on Slack failure. The production command uses `hermes send`,
+which reads the existing profile-scoped Slack credential without exposing it to
+the wrapper. The sync cron job's scheduler-level `deliver` field must be `none`;
+otherwise Slack would receive a second post-exit copy after the wrapper has
+already delivered and acknowledged. The independent `health` action retains its
+existing stdout/scheduler delivery behavior.
 
 The `sync-auto` controller writes the canonical, secret-free status atomically
 to the configured `sync.status_file` before releasing its exclusive sync lock.

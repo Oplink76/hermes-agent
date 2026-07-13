@@ -22,7 +22,7 @@ _QUIET_STATES = {
     "PENDING_REFRESH": 75,
     "LOCKED": 75,
 }
-_KNOWN_STATES = _QUIET_STATES.keys() | {"NEEDS_OLE", "REFRESH_REQUIRED"}
+_KNOWN_STATES = _QUIET_STATES.keys() | {"NEEDS_OLE"}
 _SYNC_FIELDS = {
     "state",
     "candidate_sha",
@@ -61,6 +61,7 @@ class CronWrapperConfig:
     operations_config: Path
     trusted_root: Path
     outbox_store: Path
+    delivery_command: tuple[str, ...]
 
 
 def _load_exact_object(raw: str) -> dict[str, object]:
@@ -70,6 +71,15 @@ def _load_exact_object(raw: str) -> dict[str, object]:
         raise ValueError("invalid sync-auto JSON") from exc
     if not isinstance(payload, dict) or set(payload) != _SYNC_FIELDS:
         raise ValueError("sync-auto JSON fields do not match the wrapper schema")
+    _validate_basic_fields(payload)
+    _validate_sha_fields(payload)
+    _validate_optional_strings(payload)
+    _validate_affected_files(payload)
+    _validate_structured_ids(payload)
+    return payload
+
+
+def _validate_basic_fields(payload: dict[str, object]) -> None:
     state = payload.get("state")
     if not isinstance(state, str) or state not in _KNOWN_STATES:
         raise ValueError("sync-auto state is invalid")
@@ -77,6 +87,16 @@ def _load_exact_object(raw: str) -> dict[str, object]:
         raise ValueError("sync-auto notify_ole must be boolean")
     if type(payload.get("needs_ole")) is not bool:
         raise ValueError("sync-auto needs_ole must be boolean")
+    pr_number = payload.get("pr_number")
+    if pr_number is not None and (type(pr_number) is not int or pr_number <= 0):
+        raise ValueError("sync-auto pr_number is invalid")
+    for field in ("upstream_behind", "fork_behind"):
+        value = payload.get(field)
+        if value is not None and (type(value) is not int or value < 0):
+            raise ValueError(f"sync-auto {field} is invalid")
+
+
+def _validate_sha_fields(payload: dict[str, object]) -> None:
     for field in (
         "candidate_sha",
         "merge_sha",
@@ -93,13 +113,9 @@ def _load_exact_object(raw: str) -> dict[str, object]:
             or any(character not in "0123456789abcdef" for character in value)
         ):
             raise ValueError(f"sync-auto {field} is invalid")
-    pr_number = payload.get("pr_number")
-    if pr_number is not None and (type(pr_number) is not int or pr_number <= 0):
-        raise ValueError("sync-auto pr_number is invalid")
-    for field in ("upstream_behind", "fork_behind"):
-        value = payload.get(field)
-        if value is not None and (type(value) is not int or value < 0):
-            raise ValueError(f"sync-auto {field} is invalid")
+
+
+def _validate_optional_strings(payload: dict[str, object]) -> None:
     for field in (
         "reason",
         "checked_at",
@@ -118,6 +134,9 @@ def _load_exact_object(raw: str) -> dict[str, object]:
         value = payload.get(field)
         if value is not None and (not isinstance(value, str) or not value):
             raise ValueError(f"sync-auto {field} is invalid")
+
+
+def _validate_affected_files(payload: dict[str, object]) -> None:
     affected_files = payload.get("affected_files")
     if (
         not isinstance(affected_files, list)
@@ -131,6 +150,9 @@ def _load_exact_object(raw: str) -> dict[str, object]:
         or len(affected_files) != len(set(affected_files))
     ):
         raise ValueError("sync-auto affected_files is invalid")
+
+
+def _validate_structured_ids(payload: dict[str, object]) -> None:
     repo_slug = payload.get("repo_slug")
     if (
         not isinstance(repo_slug, str)
@@ -149,7 +171,6 @@ def _load_exact_object(raw: str) -> dict[str, object]:
         r"[a-z][a-z0-9_]*", failed_gate
     ) is None:
         raise ValueError("sync-auto failed_gate is invalid")
-    return payload
 
 
 def _matches_packet(payload: dict[str, object], packet) -> bool:
@@ -184,6 +205,7 @@ def _deliver_pending(
     pending,
     *,
     deliver: Callable[[str], None] | None,
+    delivery_run: Callable[..., subprocess.CompletedProcess[str]],
 ) -> None:
     packet_path = Path(pending.packet_path)
     packet = load_escalation_decision_packet(
@@ -205,11 +227,22 @@ def _deliver_pending(
         lines.append(f"Pull request: #{packet.pr_number}")
     lines.append(f"Approve / Wait / Details: {packet.details_artifact}")
     message = "\n".join(lines) + "\n"
-    if deliver is None:
-        sys.stdout.write(message)
-        sys.stdout.flush()
-    else:
+    if deliver is not None:
         deliver(message)
+    else:
+        if not config.delivery_command:
+            raise ValueError("sync decision delivery command is not configured")
+        completed = delivery_run(
+            list(config.delivery_command),
+            cwd=config.install_root,
+            text=True,
+            input=message,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+        if completed.returncode != 0:
+            raise OSError("sync decision delivery command failed")
     SyncDecisionOutbox(config.outbox_store).acknowledge(
         fingerprint=pending.escalation_fingerprint,
         packet_sha256=pending.packet_sha256,
@@ -217,17 +250,83 @@ def _deliver_pending(
     )
 
 
+def _result_requires_no_delivery(
+    payload: dict[str, object],
+    *,
+    returncode: int,
+) -> bool:
+    state = str(payload["state"])
+    notify = bool(payload["notify_ole"])
+    if state in _QUIET_STATES:
+        if returncode != _QUIET_STATES[state] or notify:
+            raise ValueError("sync-auto exit code or notification contradicts state")
+        return True
+    if state == "NEEDS_OLE" and not notify:
+        if returncode != 2:
+            raise ValueError("NEEDS_OLE exit code contradicts state")
+        return True
+    if state != "NEEDS_OLE" or not payload.get("needs_ole") or not notify:
+        raise ValueError("non-routine sync outcome lacks a valid Ole notification")
+    if returncode != 2:
+        raise ValueError("NEEDS_OLE exit code contradicts state")
+    return False
+
+
+def _pending_from_payload(
+    config: CronWrapperConfig,
+    outbox: SyncDecisionOutbox,
+    payload: dict[str, object],
+):
+    fingerprint = payload.get("escalation_fingerprint")
+    packet_path = payload.get("decision_packet_path")
+    packet_sha256 = payload.get("decision_packet_sha256")
+    idempotency_key = payload.get("decision_idempotency_key")
+    identities = (fingerprint, packet_path, packet_sha256, idempotency_key)
+    if not all(isinstance(value, str) for value in identities):
+        raise ValueError("Ole notification is missing packet identity")
+    packet = load_escalation_decision_packet(
+        Path(packet_path),
+        trusted_root=config.trusted_root,
+    )
+    if not _matches_packet(payload, packet):
+        raise ValueError("decision packet fingerprint or evidence does not match")
+    pending = outbox.load()
+    observed = None
+    if pending is not None:
+        observed = (
+            pending.escalation_fingerprint,
+            pending.packet_path,
+            pending.packet_sha256,
+            pending.idempotency_key,
+        )
+    expected = (
+        fingerprint,
+        str(Path(packet_path).resolve(strict=False)),
+        packet_sha256,
+        idempotency_key,
+    )
+    if pending is None or pending.status != "pending" or observed != expected:
+        raise ValueError("Ole notification does not match the pending outbox")
+    return pending
+
+
 def run_sync_auto(
     config: CronWrapperConfig,
     *,
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     deliver: Callable[[str], None] | None = None,
+    delivery_run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> int:
     try:
         outbox = SyncDecisionOutbox(config.outbox_store)
         existing = outbox.load()
         if existing is not None and existing.status == "pending":
-            _deliver_pending(config, existing, deliver=deliver)
+            _deliver_pending(
+                config,
+                existing,
+                deliver=deliver,
+                delivery_run=delivery_run,
+            )
             return 0
         completed = run(
             [
@@ -245,54 +344,15 @@ def run_sync_auto(
             timeout=3600,
         )
         payload = _load_exact_object(completed.stdout or "")
-        state = str(payload["state"])
-        notify = bool(payload["notify_ole"])
-        if state in _QUIET_STATES:
-            if completed.returncode != _QUIET_STATES[state] or notify:
-                raise ValueError("sync-auto exit code or notification contradicts state")
+        if _result_requires_no_delivery(payload, returncode=completed.returncode):
             return 0
-        if state == "NEEDS_OLE" and not notify:
-            if completed.returncode != 2:
-                raise ValueError("NEEDS_OLE exit code contradicts state")
-            return 0
-        if state != "NEEDS_OLE" or not payload.get("needs_ole") or not notify:
-            raise ValueError("non-routine sync outcome lacks a valid Ole notification")
-        if completed.returncode != 2:
-            raise ValueError("NEEDS_OLE exit code contradicts state")
-        fingerprint = payload.get("escalation_fingerprint")
-        packet_path = payload.get("decision_packet_path")
-        packet_sha256 = payload.get("decision_packet_sha256")
-        idempotency_key = payload.get("decision_idempotency_key")
-        if not all(
-            isinstance(value, str)
-            for value in (
-                fingerprint,
-                packet_path,
-                packet_sha256,
-                idempotency_key,
-            )
-        ):
-            raise ValueError("Ole notification is missing packet identity")
-        packet = load_escalation_decision_packet(
-            Path(packet_path),
-            trusted_root=config.trusted_root,
+        pending = _pending_from_payload(config, outbox, payload)
+        _deliver_pending(
+            config,
+            pending,
+            deliver=deliver,
+            delivery_run=delivery_run,
         )
-        if not _matches_packet(payload, packet):
-            raise ValueError("decision packet fingerprint or evidence does not match")
-        pending = outbox.load()
-        if pending is None or pending.status != "pending" or (
-            pending.escalation_fingerprint,
-            pending.packet_path,
-            pending.packet_sha256,
-            pending.idempotency_key,
-        ) != (
-            fingerprint,
-            str(Path(packet_path).resolve(strict=False)),
-            packet_sha256,
-            idempotency_key,
-        ):
-            raise ValueError("Ole notification does not match the pending outbox")
-        _deliver_pending(config, pending, deliver=deliver)
         return 0
     except subprocess.TimeoutExpired:
         print("sync-auto wrapper failed: command timed out", file=sys.stderr)
@@ -371,6 +431,7 @@ def _config_from_args(args: argparse.Namespace) -> CronWrapperConfig:
         operations_config=args.config.resolve(strict=False),
         trusted_root=policy.receipt_root,
         outbox_store=policy.notification_store,
+        delivery_command=policy.delivery_command,
     )
 
 

@@ -668,12 +668,3 @@ class ControllerExecution:
             reviewed, evidence, receipt
         )
         return self._handle_deployment_outcome(reviewed, deployment, outcome)
-
-
-def execute_autonomous_sync(
-    config: AutonomousSyncConfig,
-    dependencies: ControllerDependencies,
-) -> tuple[AutonomousSyncResult, ControllerRunState]:
-    execution = ControllerExecution(config, dependencies)
-    result = execution.execute()
-    return result, execution.state

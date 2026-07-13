@@ -44,13 +44,29 @@ def test_sync_auto_returns_terminal_state_exit_codes(tmp_path: Path, monkeypatch
         check_timeout_seconds=10,
         poll_interval_seconds=1,
         resolver_backend="codex",
+        delivery_command=("hermes", "send"),
     )
     operations = cli.OperationsConfig(
         environment="production",
         install_root=tmp_path,
         uid=501,
-        services=(),
-        gateway_targets=(),
+        services=(
+            cli.LaunchdService(
+                label="ai.hermes.gateway",
+                plist_path=tmp_path / "gateway.plist",
+            ),
+            cli.LaunchdService(
+                label="com.cloudadvisor.hermes-dashboard",
+                plist_path=tmp_path / "dashboard.plist",
+            ),
+        ),
+        gateway_targets=(
+            cli.RuntimeTarget(
+                profile="default",
+                hermes_home=tmp_path / "home",
+                plist_path=tmp_path / "gateway.plist",
+            ),
+        ),
         deploy_config=cli.DeployConfig(
             install_root=tmp_path,
             origin="origin",
@@ -104,7 +120,6 @@ def test_sync_auto_returns_terminal_state_exit_codes(tmp_path: Path, monkeypatch
         (AutonomousSyncState.DEPLOYED, 0),
         (AutonomousSyncState.ROLLED_BACK_REVERTED, 0),
         (AutonomousSyncState.NO_CHANGE, 0),
-        (AutonomousSyncState.REFRESH_REQUIRED, 75),
         (AutonomousSyncState.PENDING_REFRESH, 75),
         (AutonomousSyncState.LOCKED, 75),
         (AutonomousSyncState.NEEDS_OLE, 2),
@@ -118,6 +133,66 @@ def test_sync_auto_returns_terminal_state_exit_codes(tmp_path: Path, monkeypatch
             ),
         )
         assert cli.main(["sync-auto", "--config", str(config_path)]) == expected
+
+
+def test_sync_auto_rejects_trading_scope_before_constructing_runtime(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path = _write_operations_config(tmp_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["runtime"]["services"].append(
+        {
+            "label": "com.cloudadvisor.trading.gateway",
+            "plist": str(tmp_path / "trading.plist"),
+        }
+    )
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    actions: list[str] = []
+    monkeypatch.setattr(cli, "load_sync_config", lambda path: object())
+    monkeypatch.setattr(cli, "load_sync_policy_config", lambda path: object())
+    monkeypatch.setattr(
+        cli,
+        "SubprocessCommandRunner",
+        lambda: actions.append("runner-created"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_autonomous_sync",
+        lambda *args, **kwargs: actions.append("controller-run"),
+    )
+
+    with pytest.raises(ValueError, match="exactly the approved"):
+        cli.main(["sync-auto", "--config", str(config_path)])
+
+    assert actions == []
+
+
+def test_sync_auto_rejects_nondefault_profile_before_runtime_actions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path = _write_operations_config(tmp_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["runtime"]["gateways"].append(
+        {
+            "profile": "trading-writer",
+            "hermes_home": str(tmp_path / "trading-home"),
+            "plist": str(tmp_path / "trading.plist"),
+        }
+    )
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    actions: list[str] = []
+    monkeypatch.setattr(cli, "load_sync_config", lambda path: object())
+    monkeypatch.setattr(cli, "load_sync_policy_config", lambda path: object())
+    monkeypatch.setattr(
+        cli,
+        "SubprocessCommandRunner",
+        lambda: actions.append("runner-created"),
+    )
+
+    with pytest.raises(ValueError, match="only the default profile"):
+        cli.main(["sync-auto", "--config", str(config_path)])
+
+    assert actions == []
 
 
 def _write_operations_config(
@@ -138,12 +213,15 @@ def _write_operations_config(
             "  poll_interval_seconds: 15",
             "  resolver_backend: codex",
             "  reviewer_backend: claude",
+            "  delivery_command: [hermes, send, --to, slack:C123, --file, '-']",
             "runtime:",
             f"  install_root: {tmp_path / 'repo'}",
             "  uid: 501",
             "  services:",
             "    - label: ai.hermes.gateway",
             f"      plist: {tmp_path / 'gateway.plist'}",
+            "    - label: com.cloudadvisor.hermes-dashboard",
+            f"      plist: {tmp_path / 'dashboard.plist'}",
             "  gateways:",
             "    - profile: default",
             f"      hermes_home: {tmp_path / 'home'}",
@@ -202,6 +280,7 @@ def test_load_sync_policy_config_reads_exact_authority_settings(tmp_path: Path):
             "  poll_interval_seconds: 15",
             "  resolver_backend: codex",
             "  reviewer_backend: claude",
+            "  delivery_command: [hermes, send, --to, slack:C123, --file, '-']",
         ])
         + "\n",
         encoding="utf-8",
@@ -219,6 +298,14 @@ def test_load_sync_policy_config_reads_exact_authority_settings(tmp_path: Path):
     assert policy.poll_interval_seconds == 15
     assert policy.resolver_backend == "codex"
     assert policy.reviewer_backend == "claude"
+    assert policy.delivery_command == (
+        "hermes",
+        "send",
+        "--to",
+        "slack:C123",
+        "--file",
+        "-",
+    )
     assert policy.resolver_backend.casefold() != policy.reviewer_backend.casefold()
 
 
@@ -370,7 +457,10 @@ def test_health_cli_reports_mandatory_matrix_and_exit_status(
 
         def check(self, *, expected_sha: str, services: tuple[str, ...]):
             assert expected_sha == "approved-sha"
-            assert services == ("ai.hermes.gateway",)
+            assert services == (
+                "ai.hermes.gateway",
+                "com.cloudadvisor.hermes-dashboard",
+            )
             return HealthReport(
                 checks=(HealthCheck("service:ai.hermes.gateway", True, "healthy"),)
             )

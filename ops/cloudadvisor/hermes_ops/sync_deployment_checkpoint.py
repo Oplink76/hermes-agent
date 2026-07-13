@@ -11,39 +11,14 @@ import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from hermes_cli.upstream_sync_status import (
+    load_deployment_artifact_payload,
+    load_pending_deployment_evidence,
+)
 
 SCHEMA_VERSION = 1
 _FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
-_ARTIFACT = re.compile(r"pending-deployment-(?P<digest>[0-9a-f]{64})\.json\Z")
-_FIELDS = {
-    "schema_version",
-    "repo_slug",
-    "stage",
-    "candidate_sha",
-    "candidate_tree_sha",
-    "pr_number",
-    "pr_head_sha",
-    "base_sha",
-    "upstream_sha",
-    "premerge_receipt_path",
-    "premerge_receipt_sha256",
-    "merge_sha",
-    "final_receipt_path",
-    "final_receipt_sha256",
-    "install_root",
-    "previous_installed_sha",
-    "terminal_reason",
-    "terminal_reason_code",
-    "terminal_failed_gate",
-    "rollback_state",
-    "rollback_sha",
-    "revert_state",
-    "revert_sha",
-}
-_POINTER_FIELDS = {"schema_version", "repo_slug", "artifact_sha256"}
-
-
 class SyncDeploymentCheckpointError(ValueError):
     """Pending deployment evidence is missing, stale, or untrusted."""
 
@@ -334,31 +309,7 @@ def terminalize_pending_deployment(
     )
 
 
-def _load_artifact(path: Path) -> PendingDeploymentCheckpoint:
-    try:
-        metadata = path.lstat()
-        content = path.read_bytes()
-    except OSError as exc:
-        raise SyncDeploymentCheckpointError("deployment artifact is missing") from exc
-    match = _ARTIFACT.fullmatch(path.name)
-    if (
-        match is None
-        or stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISREG(metadata.st_mode)
-        or (os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o400)
-        or hashlib.sha256(content).hexdigest() != match.group("digest")
-    ):
-        raise SyncDeploymentCheckpointError("deployment artifact is untrusted")
-    try:
-        payload = json.loads(content)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise SyncDeploymentCheckpointError("deployment artifact is unreadable") from exc
-    if (
-        not isinstance(payload, dict)
-        or set(payload) != _FIELDS
-        or _canonical_json(payload) != content
-    ):
-        raise SyncDeploymentCheckpointError("deployment artifact schema is invalid")
+def _checkpoint_from_payload(payload: dict[str, object]) -> PendingDeploymentCheckpoint:
     try:
         checkpoint = PendingDeploymentCheckpoint(**payload)
     except TypeError as exc:
@@ -367,57 +318,36 @@ def _load_artifact(path: Path) -> PendingDeploymentCheckpoint:
     return checkpoint
 
 
+def _load_artifact(path: Path) -> PendingDeploymentCheckpoint:
+    try:
+        payload = load_deployment_artifact_payload(path)
+    except ValueError as exc:
+        raise SyncDeploymentCheckpointError(str(exc)) from exc
+    return _checkpoint_from_payload(payload)
+
+
 def load_pending_deployment(
     receipt_root: Path, *, repo_slug: str
 ) -> PendingDeploymentCheckpoint | None:
-    root = _root(receipt_root)
-    pointer = root / "pending.json"
     try:
-        metadata = pointer.lstat()
-        content = pointer.read_bytes()
-        payload = json.loads(content)
-    except FileNotFoundError:
-        return None
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise SyncDeploymentCheckpointError("deployment pointer is unreadable") from exc
-    if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISREG(metadata.st_mode)
-        or (os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o600)
-        or not isinstance(payload, dict)
-        or set(payload) != _POINTER_FIELDS
-        or _canonical_json(payload) != content
-        or payload["schema_version"] != SCHEMA_VERSION
-        or payload["repo_slug"] != repo_slug
-        or _DIGEST.fullmatch(str(payload["artifact_sha256"])) is None
-    ):
-        raise SyncDeploymentCheckpointError("deployment pointer is invalid")
-    checkpoint = _load_artifact(
-        root / f"pending-deployment-{payload['artifact_sha256']}.json"
-    )
-    if checkpoint.repo_slug != repo_slug:
-        raise SyncDeploymentCheckpointError("deployment repository does not match")
-    return checkpoint
+        evidence = load_pending_deployment_evidence(
+            receipt_root,
+            repo_slug=repo_slug,
+        )
+    except ValueError as exc:
+        raise SyncDeploymentCheckpointError(str(exc)) from exc
+    return None if evidence is None else _checkpoint_from_payload(evidence.payload)
 
 
 def clear_pending_deployment(receipt_root: Path, *, sha256: str) -> None:
     if _DIGEST.fullmatch(sha256) is None:
         raise SyncDeploymentCheckpointError("deployment digest is invalid")
-    root = _root(receipt_root)
-    pointer = root / "pending.json"
     try:
-        content = pointer.read_bytes()
-        payload = json.loads(content)
-    except FileNotFoundError:
-        return
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise SyncDeploymentCheckpointError("deployment pointer is unreadable") from exc
-    if (
-        not isinstance(payload, dict)
-        or set(payload) != _POINTER_FIELDS
-        or _canonical_json(payload) != content
-    ):
-        raise SyncDeploymentCheckpointError("deployment pointer is invalid")
-    if payload["artifact_sha256"] == sha256:
+        evidence = load_pending_deployment_evidence(receipt_root)
+    except ValueError as exc:
+        raise SyncDeploymentCheckpointError(str(exc)) from exc
+    if evidence is not None and evidence.artifact_sha256 == sha256:
+        root = _root(receipt_root)
+        pointer = root / "pending.json"
         pointer.unlink()
         _fsync_directory(root)

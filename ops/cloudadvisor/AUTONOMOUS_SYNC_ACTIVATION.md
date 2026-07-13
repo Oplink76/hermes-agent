@@ -15,8 +15,10 @@ cron, launchd, service, or installation state.
    `/Users/cloudadvisor/.hermes/scripts/upstream-sync.sh`; preserve executable
    mode and owner. Do not edit the embedded production paths during activation.
 4. Confirm the 06:00 and 18:00 Europe/Copenhagen jobs invoke the wrapper with its
-   default `sync-auto` action. Keep the existing health job by invoking the same
-   wrapper with `health`.
+   default `sync-auto` action. Set this sync job's scheduler-level `deliver` to
+   `none`: the wrapper now delivers directly and acknowledges only after Slack
+   success. Keep the existing health job and its scheduler delivery by invoking
+   the same wrapper with `health`.
 5. Run the installed wrapper immediately. Routine `NO_CHANGE`, `DEPLOYED`,
    `ROLLED_BACK_REVERTED`, `PENDING_REFRESH`, and `LOCKED` results produce no
    stdout. Only a `notify_ole=true` result with a matching content-addressed

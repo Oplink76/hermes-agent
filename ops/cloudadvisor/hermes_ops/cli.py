@@ -79,6 +79,30 @@ class SyncPolicyConfig:
     poll_interval_seconds: int
     resolver_backend: str
     reviewer_backend: str
+    delivery_command: tuple[str, ...] = ()
+
+
+_AUTONOMOUS_SERVICE_LABELS = frozenset(
+    {"ai.hermes.gateway", "com.cloudadvisor.hermes-dashboard"}
+)
+_AUTONOMOUS_GATEWAY_PROFILES = frozenset({"default"})
+
+
+def _validate_autonomous_runtime_scope(config: OperationsConfig) -> None:
+    labels = tuple(service.label for service in config.services)
+    profiles = tuple(target.profile for target in config.gateway_targets)
+    if len(labels) != len(set(labels)) or set(labels) != _AUTONOMOUS_SERVICE_LABELS:
+        raise ValueError(
+            "sync-auto runtime.services must be exactly the approved Hermes "
+            "gateway and dashboard labels"
+        )
+    if (
+        len(profiles) != len(set(profiles))
+        or set(profiles) != _AUTONOMOUS_GATEWAY_PROFILES
+    ):
+        raise ValueError(
+            "sync-auto runtime.gateways must contain only the default profile"
+        )
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -288,6 +312,20 @@ def load_sync_policy_config(path: Path) -> SyncPolicyConfig:
     )
     if status_file == notification_store:
         raise ValueError("sync.status_file and sync.notification_store must differ")
+    delivery_command = _command(
+        values.get("delivery_command"),
+        field="sync.delivery_command",
+        required=False,
+    )
+    forbidden_delivery_fragments = ("xoxb-", "xapp-", "token=", "password=")
+    if any(
+        "\0" in argument
+        or "\n" in argument
+        or "\r" in argument
+        or any(fragment in argument.casefold() for fragment in forbidden_delivery_fragments)
+        for argument in delivery_command
+    ):
+        raise ValueError("sync.delivery_command must not contain credentials")
     return SyncPolicyConfig(
         receipt_root=receipt_root,
         status_file=status_file,
@@ -297,6 +335,7 @@ def load_sync_policy_config(path: Path) -> SyncPolicyConfig:
         poll_interval_seconds=positive_integer("poll_interval_seconds"),
         resolver_backend=resolver_backend,
         reviewer_backend=reviewer_backend,
+        delivery_command=delivery_command,
     )
 
 
@@ -639,6 +678,9 @@ def main(argv: list[str] | None = None) -> int:
         sync_config = load_sync_config(args.config)
         policy = load_sync_policy_config(args.config)
         operations = load_operations_config(args.config)
+        _validate_autonomous_runtime_scope(operations)
+        if not policy.delivery_command:
+            raise ValueError("sync-auto requires a configured direct delivery command")
         if policy.required_check != operations.deploy_config.required_check:
             raise ValueError(
                 "sync and deploy required_check settings must be identical"
@@ -731,7 +773,6 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if result.state in {
             AutonomousSyncState.LOCKED,
-            AutonomousSyncState.REFRESH_REQUIRED,
             AutonomousSyncState.PENDING_REFRESH,
         }:
             return 75
