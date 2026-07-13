@@ -367,15 +367,14 @@ class BaseEnvironment(ABC):
         # Without this the snapshot bootstrap ``cd`` below fails on Windows and
         # ``pwd -P`` captures the login shell's directory, not ``terminal.cwd``.
         _quoted_cwd = self._quote_cwd_for_cd(self.cwd)
-        # Quote the snapshot / cwd-file paths so Git Bash on Windows handles
-        # ``C:/Users/...``-shaped paths without glob-splitting the colon or
-        # tripping on drive letters.  On POSIX this is a no-op (no colons /
-        # special chars in a /tmp path).  Previously unquoted interpolation
-        # caused ``C:/Users/.../hermes-snap-*.sh: No such file or directory``
-        # errors on Windows, leaking via stderr (merged into stdout on Linux
-        # backends) into every terminal-tool response.
-        _quoted_snap = shlex.quote(self._snapshot_path)
-        _quoted_cwd_file = shlex.quote(self._cwd_file)
+        # Quote snapshot / cwd-file paths via ``_quote_shell_path`` so the
+        # LocalEnvironment override can rewrite ``C:/...`` (and mixed
+        # ``/c/Users\\...``) to ``/c/...`` before quoting — bare drive paths
+        # in the bootstrap script trip MSYS into the
+        # ``Directory \\drivers\\etc does not exist`` failure class.
+        # On POSIX this is plain ``shlex.quote``.
+        _quoted_snap = self._quote_shell_path(self._snapshot_path)
+        _quoted_cwd_file = self._quote_shell_path(self._cwd_file)
         # Use atomic file replacement: assemble the snapshot in a temp file,
         # then mv it over the final path.  This prevents concurrent source()
         # calls from reading a half-written snapshot when another terminal
@@ -388,7 +387,7 @@ class BaseEnvironment(ABC):
         # parent PID in background subshells, while ``$BASHPID`` is unavailable
         # in Apple bash 3.2. mktemp is portable across supported POSIX/Git-Bash
         # environments and keeps each writer isolated on every bash version.
-        _snap_template = shlex.quote(self._snapshot_path + ".tmp.XXXXXX")
+        _snap_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXX")
         bootstrap = (
             f"umask 077\n"
             f"__hermes_snap_tmp=$(mktemp {_snap_template})\n"
@@ -458,17 +457,24 @@ class BaseEnvironment(ABC):
             return f"$HOME/{shlex.quote(cwd[2:])}"
         return shlex.quote(cwd)
 
+    def _quote_shell_path(self, path: str) -> str:
+        """Quote *path* for interpolation into a bash script.
+
+        LocalEnvironment overrides this to rewrite native/mixed Windows
+        paths to ``/c/...`` before quoting. Remote backends leave paths
+        as-is (they already speak POSIX).
+        """
+        return shlex.quote(path)
+
     def _wrap_command(self, command: str, cwd: str) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
         escaped = command.replace("'", "'\\''")
 
-        # Quote the snapshot / cwd-file paths so Git Bash on Windows handles
-        # ``C:/Users/...``-shaped paths without glob-splitting the colon or
-        # tripping on drive letters.  POSIX paths are unaffected.  See
-        # :meth:`init_session` for the same fix on the bootstrap block.
-        _quoted_snap = shlex.quote(self._snapshot_path)
-        _quoted_cwd_file = shlex.quote(self._cwd_file)
+        # Quote snapshot/cwd-file paths (see init_session — LocalEnvironment
+        # rewrites ``C:/...`` to ``/c/...`` so MSYS doesn't mangle them).
+        _quoted_snap = self._quote_shell_path(self._snapshot_path)
+        _quoted_cwd_file = self._quote_shell_path(self._cwd_file)
         # Use atomic file replacement for env snapshot updates (issue #38249).
         # Assemble into a per-writer-unique temp file, then mv to atomically
         # replace the snapshot so concurrent source() calls never read a
