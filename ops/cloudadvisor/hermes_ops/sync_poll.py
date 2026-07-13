@@ -6,7 +6,11 @@ import math
 from dataclasses import dataclass
 from typing import Callable
 
-from .sync_github import SyncGitHubPort, SyncPullRequestEvidence
+from .sync_github import (
+    RequiredCheckPendingError,
+    SyncGitHubPort,
+    SyncPullRequestEvidence,
+)
 
 
 class ExactHeadPollError(RuntimeError):
@@ -49,6 +53,12 @@ def poll_exact_head(
             raise ExactHeadPollError("required check timed out")
         try:
             evidence = github.evidence(expectation.pr_number)
+        except RequiredCheckPendingError as exc:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                raise ExactHeadPollError("required check timed out") from exc
+            sleeper(min(poll_interval_seconds, remaining))
+            continue
         except Exception as exc:
             transient_failures += 1
             if transient_failures > 1:

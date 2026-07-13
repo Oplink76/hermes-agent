@@ -14,6 +14,7 @@ from .github_authority import (
     AmbiguousRequiredCheckEvidenceError,
     GitHubAuthorityError,
     GitHubAuthorityReader,
+    MissingRequiredCheckEvidenceError,
     RequiredCheckEvidenceError,
     required_check_conclusion,
     resolve_gh_executable,
@@ -28,6 +29,10 @@ _ALLOWED_PR_COMMANDS = frozenset(
 
 class SyncGitHubError(RuntimeError):
     """A redacted GitHub sync boundary failure."""
+
+
+class RequiredCheckPendingError(SyncGitHubError):
+    """The aggregate required check has not been published yet."""
 
 
 @dataclass(frozen=True)
@@ -200,6 +205,10 @@ class GhSyncGitHub:
                 required_check_run_id=authority.required_check_run_id,
                 merge_sha=authority.merge_sha,
             )
+        except MissingRequiredCheckEvidenceError as exc:
+            raise RequiredCheckPendingError(
+                "aggregate required check is not available yet"
+            ) from exc
         except AmbiguousRequiredCheckEvidenceError as exc:
             raise SyncGitHubError(str(exc)) from exc
         except GitHubAuthorityError as exc:

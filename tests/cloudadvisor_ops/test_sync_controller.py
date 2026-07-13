@@ -30,7 +30,10 @@ from ops.cloudadvisor.hermes_ops.sync_controller import (
     ControllerStage,
     run_autonomous_sync,
 )
-from ops.cloudadvisor.hermes_ops.sync_github import SyncPullRequestEvidence
+from ops.cloudadvisor.hermes_ops.sync_github import (
+    RequiredCheckPendingError,
+    SyncPullRequestEvidence,
+)
 from ops.cloudadvisor.hermes_ops.sync_deployment_checkpoint import (
     load_pending_deployment,
 )
@@ -854,6 +857,43 @@ def test_upstream_churn_exhaustion_is_pending_without_ole(
 
 def test_one_transient_evidence_failure_is_retried(tmp_path: Path, monkeypatch):
     github = GitHub([RuntimeError("temporary"), evidence()])
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: candidate(),
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.write_sync_receipt",
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "pre"),
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.finalize_sync_receipt",
+        lambda *args, **kwargs: receipt_artifact(tmp_path / "merged"),
+    )
+
+    result = run_autonomous_sync(
+        config(tmp_path),
+        runner=Runner(),
+        github=github,
+        resolver=None,
+        reviewer=None,
+        deploy_fn=lambda *args: deployed_record(),
+        sleeper=lambda seconds: None,
+    )
+
+    assert result.state is AutonomousSyncState.DEPLOYED
+
+
+def test_missing_aggregate_check_remains_pending_until_it_exists(
+    tmp_path: Path,
+    monkeypatch,
+):
+    github = GitHub(
+        [
+            RequiredCheckPendingError("aggregate check is not available yet"),
+            RequiredCheckPendingError("aggregate check is not available yet"),
+            evidence(),
+        ]
+    )
     monkeypatch.setattr(
         "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
         lambda *args, **kwargs: candidate(),
