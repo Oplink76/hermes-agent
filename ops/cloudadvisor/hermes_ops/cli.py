@@ -126,6 +126,12 @@ def _path(value: object, *, field: str) -> Path:
     return Path(value).expanduser().resolve(strict=False)
 
 
+def _backend_executable_path(value: object, *, field: str) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty path")
+    return Path(os.path.abspath(Path(value).expanduser()))
+
+
 def _command(value: object, *, field: str, required: bool = True) -> tuple[str, ...]:
     if value is None and not required:
         return ()
@@ -351,7 +357,7 @@ def load_conflict_resolver(path: Path) -> CodexConflictResolver | None:
     if not isinstance(prompt, str):
         raise ValueError("sync.conflict_resolver.prompt must be a string")
     return CodexConflictResolver(
-        executable=_path(
+        executable=_backend_executable_path(
             resolver.get("codex_executable"),
             field="sync.conflict_resolver.codex_executable",
         ),
@@ -371,7 +377,7 @@ def load_conflict_reviewer(
     if policy.reviewer_backend.casefold() != "claude":
         raise ValueError("the configured conflict reviewer backend is not Claude")
     return ClaudeConflictReviewer(
-        executable=_path(
+        executable=_backend_executable_path(
             reviewer.get("claude_executable"),
             field="sync.conflict_reviewer.claude_executable",
         ),

@@ -192,6 +192,32 @@ def test_versioned_migration_preserves_july_10_config_and_rolls_back_exactly(
     assert stat.S_IMODE(config_path.stat().st_mode) == original_mode
 
 
+def test_migration_accepts_canonical_claude_symlink_launcher(
+    tmp_path: Path,
+) -> None:
+    config_path, _ = _july_10_config(tmp_path)
+    target = _executable(tmp_path / "share" / "claude" / "versions" / "2.1.206")
+    claude = tmp_path / "bin" / "claude"
+    claude.parent.mkdir(parents=True, exist_ok=True)
+    claude.symlink_to(target)
+
+    migrate_operations_config(
+        config_path,
+        backup_dir=tmp_path / "backups",
+        claude_executable=claude,
+    )
+    (config_path.parents[1] / "recovery").mkdir(exist_ok=True)
+    gh = _executable(tmp_path / "bin" / "gh")
+
+    report = run_sync_preflight(config_path, which=lambda name: str(gh))
+    migrated = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    assert report.ok is True
+    assert migrated["sync"]["conflict_reviewer"] == {
+        "claude_executable": str(claude)
+    }
+
+
 @pytest.mark.parametrize(
     "mutate",
     [

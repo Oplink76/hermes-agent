@@ -114,7 +114,7 @@ def _migrated_payload(
     install_root, sync = _require_source_contract(payload)
     hermes_root = install_root.parent
     recovery_root = hermes_root / "recovery"
-    claude = Path(claude_executable).expanduser().resolve(strict=False)
+    claude = Path(os.path.abspath(Path(claude_executable).expanduser()))
     if claude.name != "claude":
         raise ValueError("sync conflict reviewer path must identify Claude")
     values: dict[str, object] = {
