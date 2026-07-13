@@ -173,6 +173,8 @@ def test_sync_auto_publishes_status_api_and_deduplicated_alert_decision(
     assert packet.escalation_fingerprint == first["escalation_fingerprint"]
     assert packet.actions == ("Approve", "Wait", "Details")
     assert packet.reason_code == "MERGE_CONFLICT_MAJOR"
+    assert packet.fork_main_sha == first["fork_main_sha"] == installed_sha
+    assert packet.installed_sha == first["installed_sha"] == installed_sha
     outbox = SyncDecisionOutbox(tmp_path / "notifications.json")
     outbox.acknowledge(
         fingerprint=first["escalation_fingerprint"],

@@ -506,8 +506,13 @@ def _publish_sync_outcome(
     decision_idempotency_key = None
     decision_details_path = None
     if status.escalation_fingerprint is not None:
-        packet = publish_escalation_decision_packet(
+        packet_result = replace(
             result,
+            fork_main_sha=status.fork_main_sha,
+            installed_sha=status.installed_sha,
+        )
+        packet = publish_escalation_decision_packet(
+            packet_result,
             fingerprint=status.escalation_fingerprint,
             trusted_root=policy.receipt_root,
             repo_slug=sync_config.repo_slug,
