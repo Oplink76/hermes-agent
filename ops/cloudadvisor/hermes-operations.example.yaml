@@ -8,9 +8,34 @@ sync:
   candidate_branch: auto-sync/upstream
   repo_slug: Oplink76/hermes-agent
   lock_path: /Users/cloudadvisor/.hermes/locks/upstream-sync.lock
+  receipt_root: /Users/cloudadvisor/.hermes/recovery/sync-receipts
+  # Content-addressed Ole decision packets are written below
+  # receipt_root/decision-packets and must remain operator-owned.
+  status_file: /Users/cloudadvisor/.hermes/recovery/sync-status.json
+  # Durable pending/acknowledged delivery outbox (schema v2).
+  notification_store: /Users/cloudadvisor/.hermes/recovery/sync-notifications.json
+  # Decision packets/details are derived below receipt_root; no separate path
+  # is configurable, preventing crossed trust roots during activation.
+  # Direct, credential-safe handoff: message body is piped on stdin. The
+  # Hermes sender reads existing profile credentials; no token appears here.
+  delivery_command:
+    - /Users/cloudadvisor/.hermes/hermes-agent/.venv/bin/hermes
+    - send
+    - --to
+    - slack:C0BFLTFC2LS
+    - --file
+    - "-"
+    - --quiet
+  required_check: All required checks pass
+  check_timeout_seconds: 2700
+  poll_interval_seconds: 15
+  resolver_backend: codex
+  reviewer_backend: claude
   conflict_resolver:
     codex_executable: /Users/cloudadvisor/.local/bin/codex
     prompt: Resolve only the current Git merge conflicts. Do not commit, push, or change remotes.
+  conflict_reviewer:
+    claude_executable: /Users/cloudadvisor/.local/bin/claude
 
 runtime:
   install_root: /Users/cloudadvisor/.hermes/hermes-agent

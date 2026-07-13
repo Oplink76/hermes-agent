@@ -302,6 +302,13 @@ export interface DesktopUpdateStatus {
   commits?: DesktopUpdateCommit[]
   dirty?: boolean
   fetchedAt?: number
+  upstreamBehind?: number
+  syncState?: string
+  syncUpdateBlocked?: boolean
+  syncDeploymentState?: string
+  syncPrNumber?: number
+  syncRequiredCheck?: string
+  installedSha?: string
 }
 
 export type DesktopUpdateDirtyStrategy = 'abort' | 'stash' | 'force'

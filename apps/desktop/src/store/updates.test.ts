@@ -210,6 +210,79 @@ describe('checkBackendUpdates', () => {
     expect($backendUpdateStatus.get()?.commits?.[0]?.summary).toBe('feat: x')
   })
 
+  it('keeps official upstream sync state separate from installed-versus-fork state', async () => {
+    setRemote(true)
+    checkHermesUpdateSpy.mockResolvedValue({
+      install_method: 'git',
+      current_version: '0.17.0',
+      behind: 0,
+      fork_behind: 0,
+      upstream_behind: 54,
+      sync_state: 'PR_UPDATED',
+      sync_pr_number: 7,
+      sync_required_check: 'All required checks pass',
+      installed_sha: 'a'.repeat(40),
+      update_available: false,
+      can_apply: true,
+      update_command: 'hermes update',
+      message: 'Installed current · 54 official upstream commits syncing'
+    })
+
+    const result = await checkBackendUpdates()
+
+    expect(result?.behind).toBe(0)
+    expect(result?.updateAvailable).toBe(false)
+    expect(result?.upstreamBehind).toBe(54)
+    expect(result?.syncState).toBe('PR_UPDATED')
+    expect(result?.syncPrNumber).toBe(7)
+    expect(result?.syncRequiredCheck).toBe('All required checks pass')
+    expect(result?.installedSha).toBe('a'.repeat(40))
+  })
+
+  it('suppresses backend update action when autonomous sync needs attention', async () => {
+    setRemote(true)
+    checkHermesUpdateSpy.mockResolvedValue({
+      install_method: 'git',
+      current_version: '0.17.0',
+      behind: 1,
+      update_available: true,
+      can_apply: true,
+      update_command: 'hermes update',
+      message: 'Installed current · Official upstream sync needs attention',
+      sync_state: 'NEEDS_OLE',
+      sync_update_blocked: true
+    })
+
+    const result = await checkBackendUpdates()
+
+    expect(result?.updateAvailable).toBe(false)
+    expect(result?.supported).toBe(false)
+    expect(result?.targetSha).toBeUndefined()
+    expect(result?.message).toContain('needs attention')
+    expect(result?.syncUpdateBlocked).toBe(true)
+  })
+
+  it('suppresses backend update action while a merge is pending deployment', async () => {
+    setRemote(true)
+    checkHermesUpdateSpy.mockResolvedValue({
+      install_method: 'git',
+      current_version: '0.17.0',
+      behind: 1,
+      update_available: true,
+      can_apply: true,
+      update_command: 'hermes update',
+      message: 'Autonomous upstream sync deployment is active',
+      sync_deployment_state: 'merged_pending_deploy'
+    })
+
+    const result = await checkBackendUpdates()
+
+    expect(result?.updateAvailable).toBe(false)
+    expect(result?.supported).toBe(false)
+    expect(result?.syncUpdateBlocked).toBe(true)
+    expect(result?.syncDeploymentState).toBe('merged_pending_deploy')
+  })
+
   it('preserves backend update_available when the backend cannot count commits', async () => {
     setRemote(true)
     checkHermesUpdateSpy.mockResolvedValue({
@@ -373,6 +446,7 @@ describe('applyBackendUpdate recovery', () => {
     checkHermesUpdateSpy.mockReset()
     updateHermesSpy.mockReset()
     getActionStatusSpy.mockReset()
+    $backendUpdateStatus.set(null)
     $backendUpdateApply.set({
       applying: false,
       stage: 'idle',
@@ -387,6 +461,22 @@ describe('applyBackendUpdate recovery', () => {
 
   afterEach(() => {
     vi.useRealTimers()
+  })
+
+  it('does not call the update API while autonomous sync is blocked', async () => {
+    $backendUpdateStatus.set({
+      supported: false,
+      updateAvailable: false,
+      behind: 1,
+      syncState: 'NEEDS_OLE',
+      syncUpdateBlocked: true,
+      message: 'Official upstream sync needs attention'
+    })
+
+    const result = await applyBackendUpdate()
+
+    expect(result.error).toBe('sync-blocked')
+    expect(updateHermesSpy).not.toHaveBeenCalled()
   })
 
   it('waits for the backend to return after the restart drops the connection, then clears the overlay', async () => {

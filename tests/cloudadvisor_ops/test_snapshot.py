@@ -10,6 +10,7 @@ from ops.cloudadvisor.hermes_ops.snapshot import (
     SnapshotCoordinator,
     create_snapshot,
     restore_snapshot,
+    snapshot_record_from_dict,
     verify_snapshot,
 )
 
@@ -71,6 +72,7 @@ def test_snapshot_creates_verified_git_bundle_and_restorable_sqlite_backups(
     assert len(snapshot.databases) == 1
     assert snapshot.manifest_path.exists()
     assert verify_snapshot(snapshot, runner=SubprocessCommandRunner()) is True
+    assert snapshot_record_from_dict(snapshot.to_dict()) == snapshot
 
     _database(database, "after")
     restore_snapshot(snapshot)

@@ -108,6 +108,35 @@ class SnapshotCoordinator:
             raise TypeError("snapshot is not a SnapshotRecord")
         restore_snapshot(snapshot)
 
+    def load(self, payload: object) -> SnapshotRecord:
+        return snapshot_record_from_dict(payload)
+
+
+def snapshot_record_from_dict(payload: object) -> SnapshotRecord:
+    if not isinstance(payload, dict):
+        raise TypeError("snapshot journal is not an object")
+    try:
+        databases = tuple(
+            DatabaseSnapshot(
+                original_path=Path(row["original_path"]),
+                backup_path=Path(row["backup_path"]),
+                sha256=str(row["sha256"]),
+            )
+            for row in payload["databases"]
+        )
+        return SnapshotRecord(
+            id=str(payload["id"]),
+            directory=Path(payload["directory"]),
+            install_root=Path(payload["install_root"]),
+            source_sha=str(payload["source_sha"]),
+            git_bundle=Path(payload["git_bundle"]),
+            git_bundle_sha256=str(payload["git_bundle_sha256"]),
+            databases=databases,
+            manifest_path=Path(payload["manifest_path"]),
+        )
+    except (KeyError, TypeError) as exc:
+        raise TypeError("snapshot journal is incomplete") from exc
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()

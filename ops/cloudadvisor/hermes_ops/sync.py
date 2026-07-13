@@ -5,7 +5,9 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+import json
+import stat
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Protocol
@@ -17,6 +19,11 @@ from .locking import try_exclusive_file_lock
 
 
 FIXED_CANDIDATE_BRANCH = "auto-sync/upstream"
+
+
+def is_canonical_backend_executable(path: Path, backend: str) -> bool:
+    """Accept only one canonical backend binary or its Windows launch shims."""
+    return Path(path).name in {backend, f"{backend}.exe", f"{backend}.cmd"}
 
 
 class SyncState(str, Enum):
@@ -32,6 +39,18 @@ class SyncState(str, Enum):
     VERIFY_FAILED = "VERIFY_FAILED"
     PUSHED = "PUSHED"
     PR_UPDATED = "PR_UPDATED"
+
+
+class SyncClassification(str, Enum):
+    CLEAN = "clean"
+    MINOR_REVIEW_REQUIRED = "minor_review_required"
+    MINOR_RESOLVED = "minor_resolved"
+    MAJOR = "major"
+
+
+class ConflictResolutionStrategy(str, Enum):
+    PRESERVE_FORK = "preserve_fork_behavior"
+    UPSTREAM_COMPATIBILITY = "upstream_first_compatibility"
 
 
 @dataclass(frozen=True)
@@ -67,11 +86,17 @@ class SyncResult:
     base_sha: str | None = None
     upstream_sha: str | None = None
     candidate_sha: str | None = None
+    candidate_tree_sha: str | None = None
     pr_number: int | None = None
     checks: tuple[CheckResult, ...] = ()
     risk: str = "unknown"
     changed_files: tuple[str, ...] = ()
     transitions: tuple[SyncState, ...] = ()
+    classification: SyncClassification = SyncClassification.MAJOR
+    conflicted_files: tuple[str, ...] = ()
+    resolution_record: Path | None = None
+    resolution_evidence_dir: Path | None = None
+    resolution_strategy: str | None = None
 
 
 class GitHubPullRequests(Protocol):
@@ -90,7 +115,13 @@ class GitHubPullRequests(Protocol):
 
 
 class ConflictResolver(Protocol):
-    def resolve(self, worktree: Path, runner: CommandRunner) -> bool: ...
+    def resolve(
+        self,
+        worktree: Path,
+        runner: CommandRunner,
+        *,
+        strategy: ConflictResolutionStrategy,
+    ) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -99,12 +130,21 @@ class CodexConflictResolver:
 
     executable: Path
     prompt: str
+    resolution_record: Path = Path(".hermes-sync-resolution.json")
+    _resolved_record: Path | None = field(default=None, init=False, repr=False)
+    _evidence_dir: Path | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.executable.name not in {"codex", "codex.exe"}:
+        if not is_canonical_backend_executable(self.executable, "codex"):
             raise ValueError("conflict resolver must use the Codex executable")
         if not self.prompt.strip():
             raise ValueError("conflict resolver prompt must not be empty")
+        if (
+            self.resolution_record.is_absolute()
+            or ".." in self.resolution_record.parts
+            or self.resolution_record.name != str(self.resolution_record)
+        ):
+            raise ValueError("resolution record must be one worktree-local filename")
 
     @property
     def command(self) -> tuple[str, ...]:
@@ -118,7 +158,13 @@ class CodexConflictResolver:
             self.prompt,
         )
 
-    def resolve(self, worktree: Path, runner: CommandRunner) -> bool:
+    def resolve(
+        self,
+        worktree: Path,
+        runner: CommandRunner,
+        *,
+        strategy: ConflictResolutionStrategy = ConflictResolutionStrategy.PRESERVE_FORK,
+    ) -> bool:
         git_common_dir = runner.run(
             [
                 "git",
@@ -137,10 +183,87 @@ class CodexConflictResolver:
             or not common_dir_path.is_dir()
         ):
             return False
+        evidence_dir = common_dir_path / "hermes-sync-evidence"
+        try:
+            evidence_dir.mkdir(mode=0o700, exist_ok=True)
+            evidence_meta = evidence_dir.lstat()
+        except OSError:
+            return False
+        if stat.S_ISLNK(evidence_meta.st_mode) or not stat.S_ISDIR(
+            evidence_meta.st_mode
+        ):
+            return False
+        resolution_record = evidence_dir / self.resolution_record
+        object.__setattr__(self, "_resolved_record", resolution_record)
+        object.__setattr__(self, "_evidence_dir", evidence_dir)
+        try:
+            existing = resolution_record.lstat()
+        except FileNotFoundError:
+            existing = None
+        except OSError:
+            return False
+        if existing is not None:
+            if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+                return False
+            try:
+                resolution_record.unlink()
+            except OSError:
+                return False
         command = list(self.command)
         command[5:5] = ["--add-dir", str(common_dir_path)]
+        command[-1] = (
+            f"{self.prompt.rstrip()}\n\n"
+            f"Resolution strategy: {strategy.value}. "
+            + (
+                "Preserve established fork behavior and safety invariants while "
+                "integrating upstream changes. "
+                if strategy is ConflictResolutionStrategy.PRESERVE_FORK
+                else "Start from upstream semantics and reapply only the minimal "
+                "compatibility required by documented fork safety invariants. "
+            )
+            + "After resolving, write a JSON object to "
+            f"{resolution_record}. It must contain a non-empty `conflicts` array "
+            "covering every conflicted file exactly once. Each row must contain "
+            "non-empty string fields `path` and `decision`, and the top-level "
+            f"`strategy` must equal `{strategy.value}`. Do not commit or push."
+        )
         completed = runner.run(command, cwd=worktree, timeout=1800)
-        return completed.returncode == 0
+        if completed.returncode != 0:
+            return False
+        try:
+            created = resolution_record.lstat()
+            if stat.S_ISLNK(created.st_mode) or not stat.S_ISREG(created.st_mode):
+                return False
+            payload = json.loads(resolution_record.read_text(encoding="utf-8"))
+            conflicts = payload["conflicts"]
+            return bool(
+                isinstance(payload, dict)
+                and payload.get("strategy") == strategy.value
+                and isinstance(conflicts, list)
+                and conflicts
+                and all(
+                    isinstance(row, dict)
+                    and isinstance(row.get("path"), str)
+                    and bool(row["path"].strip())
+                    and isinstance(row.get("decision"), str)
+                    and bool(row["decision"].strip())
+                    for row in conflicts
+                )
+            )
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            return False
+
+    def resolution_record_path(self, worktree: Path) -> Path:
+        del worktree
+        if self._resolved_record is None:
+            raise ValueError("resolution record is unavailable before resolver execution")
+        return self._resolved_record
+
+    def resolution_evidence_directory(self, worktree: Path) -> Path:
+        del worktree
+        if self._evidence_dir is None:
+            raise ValueError("resolution evidence is unavailable before execution")
+        return self._evidence_dir
 
 
 def _run(
@@ -164,21 +287,33 @@ def _result(
     base_sha: str | None = None,
     upstream_sha: str | None = None,
     candidate_sha: str | None = None,
+    candidate_tree_sha: str | None = None,
     pr_number: int | None = None,
     checks: list[CheckResult] | None = None,
     risk: str = "unknown",
     changed_files: tuple[str, ...] = (),
+    conflicted_files: tuple[str, ...] = (),
+    classification: SyncClassification = SyncClassification.MAJOR,
+    resolution_record: Path | None = None,
+    resolution_evidence_dir: Path | None = None,
+    resolution_strategy: str | None = None,
 ) -> SyncResult:
     return SyncResult(
         state=state,
         base_sha=base_sha,
         upstream_sha=upstream_sha,
         candidate_sha=candidate_sha,
+        candidate_tree_sha=candidate_tree_sha,
         pr_number=pr_number,
         checks=tuple(checks or ()),
         risk=risk,
         changed_files=changed_files,
+        conflicted_files=conflicted_files,
         transitions=tuple(transitions),
+        classification=classification,
+        resolution_record=resolution_record,
+        resolution_evidence_dir=resolution_evidence_dir,
+        resolution_strategy=resolution_strategy,
     )
 
 
@@ -304,6 +439,381 @@ def _push_candidate(
     )
 
 
+def prepare_candidate(
+    config: SyncConfig,
+    *,
+    github: GitHubPullRequests,
+    runner: CommandRunner,
+    resolver: ConflictResolver | None = None,
+) -> SyncResult:
+    """Prepare and push the rolling PR; the caller owns ``config.lock_path``."""
+    transitions: list[SyncState] = []
+
+    for remote in (config.origin, config.upstream):
+        fetched = _run(
+            runner, ["git", "fetch", remote, "main"], config.repo, timeout=600
+        )
+        if fetched.returncode != 0:
+            return _result(SyncState.NEEDS_DECISION, transitions)
+    transitions.append(SyncState.FETCHED)
+
+    base_result = _run(
+        runner, ["git", "rev-parse", f"{config.origin}/main"], config.repo
+    )
+    upstream_result = _run(
+        runner,
+        ["git", "rev-parse", f"{config.upstream}/main"],
+        config.repo,
+    )
+    backlog_result = _run(
+        runner,
+        [
+            "git",
+            "rev-list",
+            "--count",
+            f"{config.origin}/main..{config.upstream}/main",
+        ],
+        config.repo,
+    )
+    if any(
+        result.returncode != 0
+        for result in (base_result, upstream_result, backlog_result)
+    ):
+        return _result(SyncState.NEEDS_DECISION, transitions)
+    base_sha = _output(base_result)
+    upstream_sha = _output(upstream_result)
+    backlog = int(_output(backlog_result))
+    if backlog == 0:
+        transitions.append(SyncState.NO_CHANGE)
+        return _result(
+            SyncState.NO_CHANGE,
+            transitions,
+            base_sha=base_sha,
+            upstream_sha=upstream_sha,
+            risk="none",
+        )
+
+    _run(
+        runner,
+        [
+            "git",
+            "fetch",
+            config.origin,
+            (
+                f"refs/heads/{FIXED_CANDIDATE_BRANCH}:"
+                f"refs/remotes/{config.origin}/{FIXED_CANDIDATE_BRANCH}"
+            ),
+        ],
+        config.repo,
+        timeout=600,
+    )
+    candidate_ref = f"refs/remotes/{config.origin}/{FIXED_CANDIDATE_BRANCH}"
+    previous_result = _run(
+        runner,
+        ["git", "rev-parse", candidate_ref],
+        config.repo,
+    )
+    previous_candidate_sha = (
+        _output(previous_result) if previous_result.returncode == 0 else ""
+    )
+
+    branch_result = _run(
+        runner,
+        ["git", "branch", "--show-current"],
+        config.worktree,
+    )
+    status_result = _run(
+        runner,
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        config.worktree,
+    )
+    if (
+        branch_result.returncode != 0
+        or _output(branch_result) != FIXED_CANDIDATE_BRANCH
+        or status_result.returncode != 0
+        or _output(status_result)
+    ):
+        transitions.append(SyncState.NEEDS_DECISION)
+        return _result(
+            SyncState.NEEDS_DECISION,
+            transitions,
+            base_sha=base_sha,
+            upstream_sha=upstream_sha,
+            risk="candidate_worktree_not_disposable",
+        )
+
+    reset = _run(
+        runner,
+        ["git", "reset", "--hard", f"{config.origin}/main"],
+        config.worktree,
+    )
+    if reset.returncode != 0:
+        return _result(
+            SyncState.NEEDS_DECISION,
+            transitions,
+            base_sha=base_sha,
+            upstream_sha=upstream_sha,
+        )
+    transitions.append(SyncState.CANDIDATE_RESET)
+
+    merged = _run(
+        runner,
+        ["git", "merge", "--no-edit", f"{config.upstream}/main"],
+        config.worktree,
+        timeout=900,
+    )
+    conflicted_files: tuple[str, ...] = ()
+    resolution_record: Path | None = None
+    resolution_evidence_dir: Path | None = None
+    resolution_strategy: str | None = None
+    if merged.returncode == 0:
+        transitions.append(SyncState.MERGED_CLEAN)
+        classification = SyncClassification.CLEAN
+    else:
+        transitions.append(SyncState.CONFLICTED)
+        conflicted = _run(
+            runner,
+            ["git", "diff", "--name-only", "--diff-filter=U", "-z"],
+            config.worktree,
+        )
+        conflicted_files = tuple(
+            path for path in (conflicted.stdout or "").split("\0") if path
+        )
+        if (
+            conflicted.returncode != 0
+            or not conflicted_files
+            or len(set(conflicted_files)) != len(conflicted_files)
+        ):
+            transitions.append(SyncState.NEEDS_DECISION)
+            return _result(
+                SyncState.NEEDS_DECISION,
+                transitions,
+                base_sha=base_sha,
+                upstream_sha=upstream_sha,
+                risk="conflicted_files_unavailable",
+            )
+        if resolver is None:
+            transitions.append(SyncState.NEEDS_DECISION)
+            return _result(
+                SyncState.NEEDS_DECISION,
+                transitions,
+                base_sha=base_sha,
+                upstream_sha=upstream_sha,
+                conflicted_files=conflicted_files,
+                risk="conflict_resolver_unavailable",
+            )
+        resolved = False
+        strategies = (
+            ConflictResolutionStrategy.PRESERVE_FORK,
+            ConflictResolutionStrategy.UPSTREAM_COMPATIBILITY,
+        )
+        for attempt, strategy in enumerate(strategies):
+            if attempt:
+                _run(runner, ["git", "merge", "--abort"], config.worktree)
+                reset_attempt = _run(
+                    runner,
+                    ["git", "reset", "--hard", f"{config.origin}/main"],
+                    config.worktree,
+                )
+                clean_attempt = _run(
+                    runner, ["git", "clean", "-fd"], config.worktree
+                )
+                remerge = _run(
+                    runner,
+                    ["git", "merge", "--no-edit", f"{config.upstream}/main"],
+                    config.worktree,
+                    timeout=900,
+                )
+                fresh = _run(
+                    runner,
+                    ["git", "diff", "--name-only", "--diff-filter=U", "-z"],
+                    config.worktree,
+                )
+                fresh_files = tuple(
+                    path for path in (fresh.stdout or "").split("\0") if path
+                )
+                if (
+                    reset_attempt.returncode != 0
+                    or clean_attempt.returncode != 0
+                    or remerge.returncode == 0
+                    or fresh.returncode != 0
+                    or not fresh_files
+                    or len(set(fresh_files)) != len(fresh_files)
+                ):
+                    break
+                conflicted_files = fresh_files
+            if not resolver.resolve(
+                config.worktree, runner, strategy=strategy
+            ):
+                continue
+            record_path = getattr(resolver, "resolution_record_path", None)
+            evidence_directory = getattr(
+                resolver, "resolution_evidence_directory", None
+            )
+            resolution_record = (
+                Path(record_path(config.worktree))
+                if callable(record_path)
+                else None
+            )
+            resolution_evidence_dir = (
+                Path(evidence_directory(config.worktree))
+                if callable(evidence_directory)
+                else None
+            )
+            unmerged = _run(runner, ["git", "ls-files", "-u"], config.worktree)
+            merge_head = _run(
+                runner,
+                ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+                config.worktree,
+            )
+            if (
+                unmerged.returncode != 0
+                or _output(unmerged)
+                or merge_head.returncode != 0
+                or _output(merge_head) != upstream_sha
+            ):
+                continue
+            committed = _run(runner, ["git", "commit", "--no-edit"], config.worktree)
+            clean_after_resolver = _run(
+                runner,
+                ["git", "status", "--porcelain", "--untracked-files=all"],
+                config.worktree,
+            )
+            if (
+                committed.returncode != 0
+                or clean_after_resolver.returncode != 0
+                or _output(clean_after_resolver)
+            ):
+                continue
+            resolution_strategy = strategy.value
+            resolved = True
+            break
+        if not resolved:
+            _run(runner, ["git", "merge", "--abort"], config.worktree)
+            _run(
+                runner,
+                ["git", "reset", "--hard", f"{config.origin}/main"],
+                config.worktree,
+            )
+            _run(runner, ["git", "clean", "-fd"], config.worktree)
+            transitions.append(SyncState.NEEDS_DECISION)
+            return _result(
+                SyncState.NEEDS_DECISION,
+                transitions,
+                base_sha=base_sha,
+                upstream_sha=upstream_sha,
+                conflicted_files=conflicted_files,
+                risk="conflict_strategies_exhausted",
+            )
+        transitions.append(SyncState.AI_RESOLVED)
+        classification = SyncClassification.MINOR_REVIEW_REQUIRED
+
+    checks = _verify(config.worktree, runner)
+    if any(check.status != "passed" for check in checks):
+        transitions.append(SyncState.VERIFY_FAILED)
+        return _result(
+            SyncState.VERIFY_FAILED,
+            transitions,
+            base_sha=base_sha,
+            upstream_sha=upstream_sha,
+            checks=checks,
+            conflicted_files=conflicted_files,
+            risk="verification_failed",
+        )
+    transitions.append(SyncState.VERIFIED)
+
+    candidate_result = _run(runner, ["git", "rev-parse", "HEAD"], config.worktree)
+    candidate_tree_result = _run(
+        runner, ["git", "rev-parse", "HEAD^{tree}"], config.worktree
+    )
+    changed_result = _run(
+        runner,
+        ["git", "diff", "--name-only", f"{config.origin}/main...HEAD"],
+        config.worktree,
+    )
+    if (
+        candidate_result.returncode != 0
+        or not _output(candidate_result)
+        or candidate_tree_result.returncode != 0
+        or not _output(candidate_tree_result)
+        or changed_result.returncode != 0
+    ):
+        transitions.append(SyncState.VERIFY_FAILED)
+        return _result(
+            SyncState.VERIFY_FAILED,
+            transitions,
+            base_sha=base_sha,
+            upstream_sha=upstream_sha,
+            checks=checks,
+            conflicted_files=conflicted_files,
+        )
+    candidate_sha = _output(candidate_result)
+    candidate_tree_sha = _output(candidate_tree_result)
+    changed_files = tuple(
+        line for line in _output(changed_result).splitlines() if line
+    )
+
+    pushed = _push_candidate(config, runner, previous_candidate_sha)
+    if pushed.returncode != 0:
+        transitions.append(SyncState.NEEDS_DECISION)
+        return _result(
+            SyncState.NEEDS_DECISION,
+            transitions,
+            base_sha=base_sha,
+            upstream_sha=upstream_sha,
+            candidate_sha=candidate_sha,
+            candidate_tree_sha=candidate_tree_sha,
+            checks=checks,
+            changed_files=changed_files,
+            conflicted_files=conflicted_files,
+            risk="push_failed",
+        )
+    transitions.append(SyncState.PUSHED)
+
+    title = "chore(sync): update fork from upstream"
+    body = (
+        f"Automated PR-only upstream candidate.\n\n"
+        f"- Fork base: `{base_sha}`\n"
+        f"- Upstream: `{upstream_sha}`\n"
+        f"- Candidate: `{candidate_sha}`\n"
+        f"- Upstream commits: {backlog}\n"
+    )
+    pr_number = github.find_open_pull_request(FIXED_CANDIDATE_BRANCH, "main")
+    if pr_number is None:
+        pr_number = github.create_pull_request(
+            head=FIXED_CANDIDATE_BRANCH,
+            base="main",
+            title=title,
+            body=body,
+        )
+    else:
+        github.update_pull_request(pr_number, title=title, body=body)
+    transitions.append(SyncState.PR_UPDATED)
+    custom_prefixes = ("gateway/", "hermes_cli/kanban", "ops/cloudadvisor/")
+    risk = (
+        "fork_customizations_touched"
+        if any(path.startswith(custom_prefixes) for path in changed_files)
+        else "upstream_only"
+    )
+    return _result(
+        SyncState.PR_UPDATED,
+        transitions,
+        base_sha=base_sha,
+        upstream_sha=upstream_sha,
+        candidate_sha=candidate_sha,
+        candidate_tree_sha=candidate_tree_sha,
+        pr_number=pr_number,
+        checks=checks,
+        risk=risk,
+        changed_files=changed_files,
+        conflicted_files=conflicted_files,
+        classification=classification,
+        resolution_record=resolution_record,
+        resolution_evidence_dir=resolution_evidence_dir,
+        resolution_strategy=resolution_strategy,
+    )
+
+
 def run(
     config: SyncConfig,
     *,
@@ -312,259 +822,15 @@ def run(
     resolver: ConflictResolver | None = None,
 ) -> SyncResult:
     runner = runner or SubprocessCommandRunner()
-    transitions = [SyncState.LOCKED]
+    transitions = (SyncState.LOCKED,)
 
     with try_exclusive_file_lock(config.lock_path) as acquired:
         if not acquired:
-            return _result(SyncState.LOCKED, transitions)
-
-        for remote in (config.origin, config.upstream):
-            fetched = _run(
-                runner, ["git", "fetch", remote, "main"], config.repo, timeout=600
-            )
-            if fetched.returncode != 0:
-                return _result(SyncState.NEEDS_DECISION, transitions)
-        transitions.append(SyncState.FETCHED)
-
-        base_result = _run(
-            runner, ["git", "rev-parse", f"{config.origin}/main"], config.repo
+            return _result(SyncState.LOCKED, list(transitions))
+        result = prepare_candidate(
+            config,
+            github=github,
+            runner=runner,
+            resolver=resolver,
         )
-        upstream_result = _run(
-            runner,
-            ["git", "rev-parse", f"{config.upstream}/main"],
-            config.repo,
-        )
-        backlog_result = _run(
-            runner,
-            [
-                "git",
-                "rev-list",
-                "--count",
-                f"{config.origin}/main..{config.upstream}/main",
-            ],
-            config.repo,
-        )
-        if any(
-            result.returncode != 0
-            for result in (base_result, upstream_result, backlog_result)
-        ):
-            return _result(SyncState.NEEDS_DECISION, transitions)
-        base_sha = _output(base_result)
-        upstream_sha = _output(upstream_result)
-        backlog = int(_output(backlog_result))
-        if backlog == 0:
-            transitions.append(SyncState.NO_CHANGE)
-            return _result(
-                SyncState.NO_CHANGE,
-                transitions,
-                base_sha=base_sha,
-                upstream_sha=upstream_sha,
-                risk="none",
-            )
-
-        _run(
-            runner,
-            [
-                "git",
-                "fetch",
-                config.origin,
-                (
-                    f"refs/heads/{FIXED_CANDIDATE_BRANCH}:"
-                    f"refs/remotes/{config.origin}/{FIXED_CANDIDATE_BRANCH}"
-                ),
-            ],
-            config.repo,
-            timeout=600,
-        )
-        candidate_ref = f"refs/remotes/{config.origin}/{FIXED_CANDIDATE_BRANCH}"
-        previous_result = _run(
-            runner,
-            ["git", "rev-parse", candidate_ref],
-            config.repo,
-        )
-        previous_candidate_sha = (
-            _output(previous_result) if previous_result.returncode == 0 else ""
-        )
-
-        branch_result = _run(
-            runner,
-            ["git", "branch", "--show-current"],
-            config.worktree,
-        )
-        status_result = _run(
-            runner,
-            ["git", "status", "--porcelain", "--untracked-files=all"],
-            config.worktree,
-        )
-        if (
-            branch_result.returncode != 0
-            or _output(branch_result) != FIXED_CANDIDATE_BRANCH
-            or status_result.returncode != 0
-            or _output(status_result)
-        ):
-            transitions.append(SyncState.NEEDS_DECISION)
-            return _result(
-                SyncState.NEEDS_DECISION,
-                transitions,
-                base_sha=base_sha,
-                upstream_sha=upstream_sha,
-                risk="candidate_worktree_not_disposable",
-            )
-
-        reset = _run(
-            runner,
-            ["git", "reset", "--hard", f"{config.origin}/main"],
-            config.worktree,
-        )
-        if reset.returncode != 0:
-            return _result(
-                SyncState.NEEDS_DECISION,
-                transitions,
-                base_sha=base_sha,
-                upstream_sha=upstream_sha,
-            )
-        transitions.append(SyncState.CANDIDATE_RESET)
-
-        merged = _run(
-            runner,
-            ["git", "merge", "--no-edit", f"{config.upstream}/main"],
-            config.worktree,
-            timeout=900,
-        )
-        if merged.returncode == 0:
-            transitions.append(SyncState.MERGED_CLEAN)
-        else:
-            transitions.append(SyncState.CONFLICTED)
-            if resolver is None or not resolver.resolve(config.worktree, runner):
-                transitions.append(SyncState.NEEDS_DECISION)
-                return _result(
-                    SyncState.NEEDS_DECISION,
-                    transitions,
-                    base_sha=base_sha,
-                    upstream_sha=upstream_sha,
-                    risk="conflict",
-                )
-            unmerged = _run(runner, ["git", "ls-files", "-u"], config.worktree)
-            if unmerged.returncode != 0 or _output(unmerged):
-                transitions.append(SyncState.NEEDS_DECISION)
-                return _result(
-                    SyncState.NEEDS_DECISION,
-                    transitions,
-                    base_sha=base_sha,
-                    upstream_sha=upstream_sha,
-                    risk="conflict",
-                )
-            merge_head = _run(
-                runner,
-                ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
-                config.worktree,
-            )
-            if merge_head.returncode != 0 or _output(merge_head) != upstream_sha:
-                transitions.append(SyncState.NEEDS_DECISION)
-                return _result(
-                    SyncState.NEEDS_DECISION,
-                    transitions,
-                    base_sha=base_sha,
-                    upstream_sha=upstream_sha,
-                    risk="resolver_did_not_preserve_merge_state",
-                )
-            committed = _run(
-                runner,
-                ["git", "commit", "--no-edit"],
-                config.worktree,
-            )
-            if committed.returncode != 0:
-                transitions.append(SyncState.NEEDS_DECISION)
-                return _result(
-                    SyncState.NEEDS_DECISION,
-                    transitions,
-                    base_sha=base_sha,
-                    upstream_sha=upstream_sha,
-                    risk="resolved_merge_commit_failed",
-                )
-            transitions.append(SyncState.AI_RESOLVED)
-
-        checks = _verify(config.worktree, runner)
-        if any(check.status != "passed" for check in checks):
-            transitions.append(SyncState.VERIFY_FAILED)
-            return _result(
-                SyncState.VERIFY_FAILED,
-                transitions,
-                base_sha=base_sha,
-                upstream_sha=upstream_sha,
-                checks=checks,
-                risk="verification_failed",
-            )
-        transitions.append(SyncState.VERIFIED)
-
-        candidate_result = _run(runner, ["git", "rev-parse", "HEAD"], config.worktree)
-        changed_result = _run(
-            runner,
-            ["git", "diff", "--name-only", f"{config.origin}/main...HEAD"],
-            config.worktree,
-        )
-        if candidate_result.returncode != 0 or changed_result.returncode != 0:
-            transitions.append(SyncState.VERIFY_FAILED)
-            return _result(
-                SyncState.VERIFY_FAILED,
-                transitions,
-                base_sha=base_sha,
-                upstream_sha=upstream_sha,
-                checks=checks,
-            )
-        candidate_sha = _output(candidate_result)
-        changed_files = tuple(
-            line for line in _output(changed_result).splitlines() if line
-        )
-
-        pushed = _push_candidate(config, runner, previous_candidate_sha)
-        if pushed.returncode != 0:
-            transitions.append(SyncState.NEEDS_DECISION)
-            return _result(
-                SyncState.NEEDS_DECISION,
-                transitions,
-                base_sha=base_sha,
-                upstream_sha=upstream_sha,
-                candidate_sha=candidate_sha,
-                checks=checks,
-                changed_files=changed_files,
-                risk="push_failed",
-            )
-        transitions.append(SyncState.PUSHED)
-
-        title = "chore(sync): update fork from upstream"
-        body = (
-            f"Automated PR-only upstream candidate.\n\n"
-            f"- Fork base: `{base_sha}`\n"
-            f"- Upstream: `{upstream_sha}`\n"
-            f"- Candidate: `{candidate_sha}`\n"
-            f"- Upstream commits: {backlog}\n"
-        )
-        pr_number = github.find_open_pull_request(FIXED_CANDIDATE_BRANCH, "main")
-        if pr_number is None:
-            pr_number = github.create_pull_request(
-                head=FIXED_CANDIDATE_BRANCH,
-                base="main",
-                title=title,
-                body=body,
-            )
-        else:
-            github.update_pull_request(pr_number, title=title, body=body)
-        transitions.append(SyncState.PR_UPDATED)
-        custom_prefixes = ("gateway/", "hermes_cli/kanban", "ops/cloudadvisor/")
-        risk = (
-            "fork_customizations_touched"
-            if any(path.startswith(custom_prefixes) for path in changed_files)
-            else "upstream_only"
-        )
-        return _result(
-            SyncState.PR_UPDATED,
-            transitions,
-            base_sha=base_sha,
-            upstream_sha=upstream_sha,
-            candidate_sha=candidate_sha,
-            pr_number=pr_number,
-            checks=checks,
-            risk=risk,
-            changed_files=changed_files,
-        )
+    return replace(result, transitions=transitions + result.transitions)

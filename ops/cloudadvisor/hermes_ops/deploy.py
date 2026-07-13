@@ -10,14 +10,20 @@ import re
 import stat
 import tomllib
 import uuid
-from dataclasses import asdict, dataclass, is_dataclass, replace
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Callable, Literal, Protocol
 
 from .command import CommandRunner
 from .health import HealthCheck, HealthReport
+from .github_authority import (
+    AmbiguousRequiredCheckEvidenceError,
+    GitHubAuthorityError,
+    GitHubAuthorityReader,
+)
 from .locking import try_exclusive_file_lock
+from .sync_receipt import SyncEligibilityReceipt, SyncReceiptError
 from utils import atomic_json_write
 
 
@@ -78,8 +84,10 @@ class ApprovalRecord:
 class DeployRequest:
     sha: str
     pr_number: int
-    approval_record: Path
     actor: str
+    authority_kind: Literal["human", "automated_sync"] = "human"
+    authority_record: Path | None = None
+    approval_record: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +96,8 @@ class DeployConfig:
     origin: str
     record_root: Path
     lock_path: Path | None = None
+    repo_slug: str = ""
+    sync_receipt_root: Path | None = None
     required_approver: str = "Ole Ørum-Petersen"
     required_check: str = "All required checks pass"
     uv_extras: tuple[str, ...] = ()
@@ -99,6 +109,10 @@ class ReleaseEvidence:
     pr_number: int
     merged: bool
     merge_sha: str
+    repo_slug: str
+    head_sha: str
+    base_ref_name: str
+    base_sha: str
     required_check: str
     required_check_conclusion: str
 
@@ -119,6 +133,24 @@ class DeploymentRecord:
         return _jsonable(asdict(self))
 
 
+@dataclass(frozen=True)
+class DeploymentExecutionJournal:
+    schema_version: int
+    repo_slug: str
+    pr_number: int
+    record_id: str
+    requested_sha: str
+    previous_sha: str
+    snapshot: object
+    runtime_before: object
+    prior_services: tuple[str, ...]
+    previous_fingerprint: str
+    previous_identity_required: bool
+    preflight_checks: tuple[HealthCheck, ...]
+    stage: str
+    record: object | None = None
+
+
 class ReleaseVerifier(Protocol):
     def verify(self, pr_number: int) -> ReleaseEvidence: ...
 
@@ -133,58 +165,40 @@ class GhReleaseVerifier:
         required_check: str,
         runner: CommandRunner,
         cwd: Path,
+        gh_executable: str | Path | None = None,
     ):
         self.repo_slug = repo_slug
         self.required_check = required_check
         self.runner = runner
         self.cwd = Path(cwd)
+        try:
+            self._authority = GitHubAuthorityReader(
+                repo_slug=repo_slug,
+                required_check=required_check,
+                runner=runner,
+                cwd=cwd,
+                gh_executable=gh_executable,
+            )
+        except GitHubAuthorityError as exc:
+            raise PreflightError(str(exc)) from exc
 
     def verify(self, pr_number: int) -> ReleaseEvidence:
-        completed = self.runner.run(
-            [
-                "gh",
-                "pr",
-                "view",
-                str(pr_number),
-                "--repo",
-                self.repo_slug,
-                "--json",
-                "number,state,mergedAt,mergeCommit,statusCheckRollup",
-            ],
-            cwd=self.cwd,
-            timeout=300,
-        )
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "").strip()
-            raise PreflightError(f"could not verify GitHub release evidence: {detail}")
         try:
-            payload = json.loads(completed.stdout or "{}")
-            merge_commit = payload.get("mergeCommit") or {}
-            checks = payload.get("statusCheckRollup") or []
-            required = next(
-                (
-                    check
-                    for check in checks
-                    if (check.get("name") or check.get("context"))
-                    == self.required_check
-                ),
-                None,
-            )
-            conclusion = (
-                (required.get("conclusion") or required.get("state") or "missing")
-                if isinstance(required, dict)
-                else "missing"
-            )
+            authority = self._authority.read(pr_number)
             return ReleaseEvidence(
-                pr_number=int(payload["number"]),
-                merged=bool(
-                    payload.get("mergedAt") or payload.get("state") == "MERGED"
-                ),
-                merge_sha=str(merge_commit["oid"]),
+                pr_number=authority.number,
+                merged=authority.merged,
+                merge_sha=authority.merge_sha or "",
+                repo_slug=self.repo_slug,
+                head_sha=authority.head_sha,
+                base_ref_name=authority.base_ref_name,
+                base_sha=authority.base_sha,
                 required_check=self.required_check,
-                required_check_conclusion=str(conclusion).lower(),
+                required_check_conclusion=authority.required_check_conclusion,
             )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        except AmbiguousRequiredCheckEvidenceError as exc:
+            raise PreflightError(str(exc)) from exc
+        except GitHubAuthorityError as exc:
             raise PreflightError("GitHub release evidence was incomplete") from exc
 
 
@@ -225,6 +239,124 @@ class DeploymentStore:
     def write(self, record: DeploymentRecord) -> None:
         path = self.root / f"{record.id}.json"
         atomic_json_write(path, record.to_dict(), mode=0o600, sort_keys=True)
+
+
+def _execution_journal_path(config: DeployConfig) -> Path:
+    return Path(config.record_root).expanduser().resolve(strict=False) / (
+        "pending-deployment-execution.json"
+    )
+
+
+def _write_execution_journal(
+    config: DeployConfig,
+    journal: DeploymentExecutionJournal,
+) -> None:
+    atomic_json_write(
+        _execution_journal_path(config),
+        _jsonable(asdict(journal)),
+        mode=0o600,
+        sort_keys=True,
+    )
+
+
+def _clear_execution_journal(config: DeployConfig) -> None:
+    _execution_journal_path(config).unlink(missing_ok=True)
+
+
+def _health_checks(payload: object) -> tuple[HealthCheck, ...]:
+    if not isinstance(payload, list):
+        raise PreflightError("deployment execution health evidence is invalid")
+    checks = []
+    for row in payload:
+        if not isinstance(row, dict):
+            raise PreflightError("deployment execution health evidence is invalid")
+        if type(row.get("passed")) is not bool:
+            raise PreflightError("deployment execution health evidence is invalid")
+        if type(row.get("mandatory", True)) is not bool:
+            raise PreflightError("deployment execution health evidence is invalid")
+        try:
+            checks.append(
+                HealthCheck(
+                    name=str(row["name"]),
+                    passed=row["passed"],
+                    detail=str(row.get("detail", "")),
+                    mandatory=row.get("mandatory", True),
+                )
+            )
+        except KeyError as exc:
+            raise PreflightError(
+                "deployment execution health evidence is invalid"
+            ) from exc
+    return tuple(checks)
+
+
+def _load_execution_journal(
+    config: DeployConfig,
+) -> DeploymentExecutionJournal | None:
+    path = _execution_journal_path(config)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        expected = {field.name for field in fields(DeploymentExecutionJournal)}
+        if not isinstance(payload, dict) or set(payload) != expected:
+            raise TypeError
+        prior_services = payload["prior_services"]
+        if not isinstance(prior_services, list) or not all(
+            isinstance(service, str) and service for service in prior_services
+        ):
+            raise TypeError
+        journal = DeploymentExecutionJournal(
+            schema_version=payload["schema_version"],
+            repo_slug=payload["repo_slug"],
+            pr_number=payload["pr_number"],
+            record_id=payload["record_id"],
+            requested_sha=payload["requested_sha"],
+            previous_sha=payload["previous_sha"],
+            snapshot=payload["snapshot"],
+            runtime_before=payload["runtime_before"],
+            prior_services=tuple(prior_services),
+            previous_fingerprint=payload["previous_fingerprint"],
+            previous_identity_required=payload["previous_identity_required"],
+            preflight_checks=_health_checks(payload["preflight_checks"]),
+            stage=payload["stage"],
+            record=payload["record"],
+        )
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise PreflightError("deployment execution journal is invalid") from exc
+    if (
+        journal.schema_version != 1
+        or journal.repo_slug != config.repo_slug
+        or type(journal.pr_number) is not int
+        or journal.pr_number < 1
+        or not journal.record_id
+        or not journal.requested_sha
+        or not journal.previous_sha
+        or not journal.previous_fingerprint
+        or type(journal.previous_identity_required) is not bool
+        or journal.stage not in {"prepared", "rolled_back_healthy", "rollback_failed"}
+    ):
+        raise PreflightError("deployment execution journal is invalid")
+    return journal
+
+
+def _deployment_record_from_payload(payload: object) -> DeploymentRecord:
+    if not isinstance(payload, dict):
+        raise PreflightError("deployment execution result is invalid")
+    try:
+        return DeploymentRecord(
+            id=str(payload["id"]),
+            requested_sha=str(payload["requested_sha"]),
+            previous_sha=str(payload["previous_sha"]),
+            snapshot=payload["snapshot"],
+            runtime_before=payload["runtime_before"],
+            runtime_after=payload["runtime_after"],
+            checks=_health_checks(payload["checks"]),
+            status=str(payload["status"]),
+            rollback=payload["rollback"],
+        )
+    except KeyError as exc:
+        raise PreflightError("deployment execution result is invalid") from exc
 
 
 def _jsonable(value):
@@ -303,7 +435,7 @@ def _run_required(
     return (completed.stdout or "").strip()
 
 
-def _validate_approval(
+def _validate_human_authority(
     request: DeployRequest,
     approval: ApprovalRecord,
     config: DeployConfig,
@@ -311,6 +443,10 @@ def _validate_approval(
 ) -> None:
     if not request.actor.strip():
         raise PreflightError("deployment actor is missing")
+    if not config.repo_slug or evidence.repo_slug != config.repo_slug:
+        raise PreflightError("GitHub evidence repository does not match configuration")
+    if evidence.base_ref_name != "main":
+        raise PreflightError("GitHub PR base branch is not main")
     if approval.approver != config.required_approver:
         raise PreflightError("approval record does not name the required approver")
     if (
@@ -376,6 +512,118 @@ def _validate_approval(
         raise PreflightError("required GitHub check did not conclude success")
 
 
+def _validate_sync_authority(
+    request: DeployRequest,
+    receipt: SyncEligibilityReceipt,
+    config: DeployConfig,
+    evidence: ReleaseEvidence,
+) -> None:
+    if not request.actor.strip():
+        raise PreflightError("deployment actor is missing")
+    if not config.repo_slug or receipt.repo_slug != config.repo_slug:
+        raise PreflightError("sync authority repository does not match configuration")
+    if evidence.repo_slug != config.repo_slug:
+        raise PreflightError("GitHub evidence repository does not match configuration")
+    if receipt.pr_number != request.pr_number or evidence.pr_number != request.pr_number:
+        raise PreflightError("sync authority or GitHub evidence names a different PR")
+    if evidence.head_sha != receipt.candidate_sha:
+        raise PreflightError("GitHub PR head does not match sync candidate")
+    if evidence.base_ref_name != "main":
+        raise PreflightError("GitHub PR base branch is not main")
+    if evidence.base_sha != receipt.base_sha:
+        raise PreflightError("GitHub PR base SHA does not match sync authority")
+    if receipt.merge_sha is None:
+        raise PreflightError("sync authority must be a finalized merged receipt")
+    if receipt.merge_sha != request.sha:
+        raise PreflightError("requested SHA is not the exact merged SHA in sync authority")
+    if evidence.merge_sha != request.sha:
+        raise PreflightError("requested SHA does not equal the PR merge SHA")
+    if not evidence.merged:
+        raise PreflightError("pull request is not merged")
+    if (
+        receipt.required_check != config.required_check
+        or evidence.required_check != config.required_check
+    ):
+        raise PreflightError("required GitHub check identity does not match")
+    if (
+        receipt.required_check_conclusion != "success"
+        or evidence.required_check_conclusion.lower() != "success"
+    ):
+        raise PreflightError("required GitHub check did not conclude success")
+
+
+def _load_authority(
+    request: DeployRequest,
+    config: DeployConfig,
+) -> ApprovalRecord | SyncEligibilityReceipt:
+    if request.authority_kind == "human":
+        if request.authority_record is not None:
+            raise PreflightError("human deployment received a sync authority record")
+        if request.approval_record is None:
+            raise PreflightError("human authority record is missing")
+        try:
+            approval = ApprovalRecord.load(request.approval_record)
+        except PreflightError as exc:
+            raise PreflightError(f"human authority record is invalid: {exc}") from exc
+        return approval
+    if request.authority_kind == "automated_sync":
+        if request.approval_record is not None:
+            raise PreflightError("automated sync received a human authority record")
+        if request.authority_record is None:
+            raise PreflightError("sync authority record is missing")
+        if config.sync_receipt_root is None:
+            raise PreflightError("trusted receipt root is not configured")
+        try:
+            trusted_root = Path(config.sync_receipt_root).expanduser().resolve(
+                strict=True
+            )
+            artifact = Path(request.authority_record).expanduser().resolve(strict=True)
+            if artifact.parent != trusted_root:
+                raise PreflightError(
+                    "sync authority record is outside the trusted receipt root"
+                )
+            return SyncEligibilityReceipt.load(request.authority_record)
+        except PreflightError:
+            raise
+        except OSError as exc:
+            raise PreflightError("trusted receipt root is missing or unreadable") from exc
+        except SyncReceiptError as exc:
+            raise PreflightError(
+                f"sync authority record is not eligible: {exc}"
+            ) from exc
+    raise PreflightError(f"unsupported deployment authority kind: {request.authority_kind}")
+
+
+def _validate_authority(
+    request: DeployRequest,
+    authority: ApprovalRecord | SyncEligibilityReceipt,
+    config: DeployConfig,
+    evidence: ReleaseEvidence,
+) -> HealthCheck:
+    if request.authority_kind == "human" and isinstance(authority, ApprovalRecord):
+        _validate_human_authority(request, authority, config, evidence)
+        return HealthCheck(
+            "preflight:approval",
+            True,
+            f"approver={authority.approver} "
+            f"pr={request.pr_number} actor={request.actor} "
+            f"approval_artifact={authority.artifact_sha256} "
+            f"packet={authority.decision_packet_sha256}",
+        )
+    if request.authority_kind == "automated_sync" and isinstance(
+        authority, SyncEligibilityReceipt
+    ):
+        _validate_sync_authority(request, authority, config, evidence)
+        return HealthCheck(
+            "preflight:authority",
+            True,
+            f"kind=automated_sync pr={request.pr_number} actor={request.actor} "
+            f"receipt={Path(request.authority_record).name} "
+            f"candidate={authority.candidate_sha} merge={authority.merge_sha}",
+        )
+    raise PreflightError("deployment authority record type does not match authority kind")
+
+
 def _record_id(sha: str) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{timestamp}-{sha[:12]}-{uuid.uuid4().hex[:8]}"
@@ -403,6 +651,21 @@ def deploy(
     with try_exclusive_file_lock(lock_path) as acquired:
         if not acquired:
             raise PreflightError("another deployment is already in progress")
+        pending = _load_execution_journal(config)
+        if pending is not None:
+            resumed = _resume_interrupted_deployment(
+                request,
+                pending,
+                config=config,
+                runner=runner,
+                snapshots=snapshots,
+                services=services,
+                health=health,
+                store=store,
+                fingerprint_fn=fingerprint_fn,
+            )
+            if resumed is not None:
+                return resumed
         return _deploy_locked(
             request,
             config=config,
@@ -414,6 +677,110 @@ def deploy(
             store=store,
             fingerprint_fn=fingerprint_fn,
         )
+
+
+def _snapshot_from_journal(snapshots: SnapshotProvider, payload: object) -> object:
+    loader = getattr(snapshots, "load", None)
+    if callable(loader):
+        return loader(payload)
+    return payload
+
+
+def _resume_interrupted_deployment(
+    request: DeployRequest,
+    journal: DeploymentExecutionJournal,
+    *,
+    config: DeployConfig,
+    runner: CommandRunner,
+    snapshots: SnapshotProvider,
+    services: ServiceController,
+    health: HealthChecker,
+    store: RecordStore | None,
+    fingerprint_fn: Callable[[Path], str],
+) -> DeploymentRecord | None:
+    if request.sha != journal.requested_sha or request.pr_number != journal.pr_number:
+        if journal.stage == "rolled_back_healthy":
+            _clear_execution_journal(config)
+            return None
+        raise PreflightError("another interrupted deployment requires recovery")
+    if journal.record is not None:
+        return _deployment_record_from_payload(journal.record)
+    root = Path(config.install_root).expanduser().resolve(strict=True)
+    if not snapshots.verify_preservation():
+        raise PreflightError("Package 1 preservation verification failed")
+    snapshot = _snapshot_from_journal(snapshots, journal.snapshot)
+    if not snapshots.verify(snapshot):
+        raise PreflightError("interrupted deployment snapshot verification failed")
+    installed_sha = _run_required(runner, ["git", "rev-parse", "HEAD"], cwd=root)
+    if installed_sha not in {journal.requested_sha, journal.previous_sha}:
+        raise PreflightError("interrupted deployment install identity changed")
+    record_store = store or DeploymentStore(config.record_root)
+    trigger = "deployment process was interrupted after mutation began"
+    record = DeploymentRecord(
+        id=journal.record_id,
+        requested_sha=journal.requested_sha,
+        previous_sha=journal.previous_sha,
+        snapshot=snapshot,
+        runtime_before=journal.runtime_before,
+        runtime_after=None,
+        checks=journal.preflight_checks,
+        status="rolling_back",
+        rollback={"trigger": trigger, "status": "running"},
+    )
+    record_store.write(record)
+    try:
+        loaded = services.loaded_services()
+        candidate_services = tuple(
+            service for service in journal.prior_services if service in loaded
+        )
+        if candidate_services:
+            services.stop(candidate_services)
+        _run_required(
+            runner,
+            ["git", "switch", "--detach", journal.previous_sha],
+            cwd=root,
+        )
+        snapshots.restore(snapshot)
+        if fingerprint_fn(root) != journal.previous_fingerprint:
+            _run_required(runner, _uv_sync_command(config), cwd=root)
+        services.start(journal.prior_services)
+        rollback_report = health.check(
+            expected_sha=journal.previous_sha,
+            services=journal.prior_services,
+            identity_required=journal.previous_identity_required,
+            apply_injection=False,
+        )
+        status = (
+            "rolled_back_healthy" if rollback_report.healthy else "rollback_failed"
+        )
+        record = replace(
+            record,
+            runtime_after=services.inventory(),
+            checks=journal.preflight_checks + rollback_report.checks,
+            status=status,
+            rollback={
+                "trigger": trigger,
+                "status": status,
+                "checks": _jsonable(rollback_report.checks),
+            },
+        )
+    except Exception as rollback_failure:
+        logger.exception("Interrupted exact-SHA deployment rollback failed")
+        record = replace(
+            record,
+            status="rollback_failed",
+            rollback={
+                "trigger": trigger,
+                "status": "rollback_failed",
+                "error": str(rollback_failure),
+            },
+        )
+    record_store.write(record)
+    _write_execution_journal(
+        config,
+        replace(journal, stage=record.status, record=record.to_dict()),
+    )
+    return record
 
 
 def _deploy_locked(
@@ -431,18 +798,11 @@ def _deploy_locked(
     root = Path(config.install_root).expanduser().resolve(strict=True)
     record_store = store or DeploymentStore(config.record_root)
 
-    approval = ApprovalRecord.load(request.approval_record)
+    authority = _load_authority(request, config)
     evidence = github.verify(request.pr_number)
-    _validate_approval(request, approval, config, evidence)
+    authority_check = _validate_authority(request, authority, config, evidence)
     preflight_checks = [
-        HealthCheck(
-            "preflight:approval",
-            True,
-            f"approver={approval.approver} "
-            f"pr={request.pr_number} actor={request.actor} "
-            f"approval_artifact={approval.artifact_sha256} "
-            f"packet={approval.decision_packet_sha256}",
-        ),
+        authority_check,
         HealthCheck(
             "preflight:github",
             True,
@@ -475,6 +835,27 @@ def _deploy_locked(
     preflight_checks.append(
         HealthCheck("preflight:exact_sha", True, f"origin/main={origin_sha}")
     )
+    if isinstance(authority, SyncEligibilityReceipt):
+        contained = runner.run(
+            [
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                authority.candidate_sha,
+                request.sha,
+            ],
+            cwd=root,
+            timeout=600,
+        )
+        if contained.returncode != 0:
+            raise PreflightError("sync candidate is not contained in merge SHA")
+        preflight_checks.append(
+            HealthCheck(
+                "preflight:sync_ancestry",
+                True,
+                f"candidate={authority.candidate_sha} merge={request.sha}",
+            )
+        )
 
     previous_sha = _run_required(runner, ["git", "rev-parse", "HEAD"], cwd=root)
     _validate_uv_extras_for_revisions(
@@ -506,6 +887,22 @@ def _deploy_locked(
         rollback=None,
     )
     record_store.write(record)
+    execution = DeploymentExecutionJournal(
+        schema_version=1,
+        repo_slug=config.repo_slug,
+        pr_number=request.pr_number,
+        record_id=record.id,
+        requested_sha=request.sha,
+        previous_sha=previous_sha,
+        snapshot=snapshot,
+        runtime_before=runtime_before,
+        prior_services=prior_services,
+        previous_fingerprint=previous_fingerprint,
+        previous_identity_required=previous_identity_required,
+        preflight_checks=tuple(preflight_checks),
+        stage="prepared",
+    )
+    _write_execution_journal(config, execution)
 
     state_may_have_changed = False
     candidate_fingerprint = previous_fingerprint
@@ -552,6 +949,7 @@ def _deploy_locked(
             status="deployed",
         )
         record_store.write(record)
+        _clear_execution_journal(config)
         return record
     except Exception as failure:
         if not isinstance(failure, _HealthFailure):
@@ -626,4 +1024,8 @@ def _deploy_locked(
                 },
             )
         record_store.write(record)
+        _write_execution_journal(
+            config,
+            replace(execution, stage=record.status, record=record.to_dict()),
+        )
         return record

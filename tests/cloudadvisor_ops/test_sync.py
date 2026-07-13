@@ -12,8 +12,10 @@ if os.name != "nt":
 
 from ops.cloudadvisor.hermes_ops.sync import (
     CodexConflictResolver,
+    SyncClassification,
     SyncConfig,
     SyncState,
+    prepare_candidate,
     run,
 )
 
@@ -62,13 +64,17 @@ class FakeGitHub:
 
 
 class FakeResolver:
-    def __init__(self, resolved: bool):
-        self.resolved = resolved
+    def __init__(self, resolved: bool | list[bool]):
+        self.results = [resolved] if isinstance(resolved, bool) else list(resolved)
         self.calls = 0
+        self.strategies: list[object] = []
+        self.last_runner_call: tuple[str, ...] | None = None
 
-    def resolve(self, worktree: Path, runner: FakeRunner) -> bool:
+    def resolve(self, worktree: Path, runner: FakeRunner, *, strategy=None) -> bool:
         self.calls += 1
-        return self.resolved
+        self.strategies.append(strategy)
+        self.last_runner_call = runner.calls[-1].argv if runner.calls else None
+        return self.results[min(self.calls - 1, len(self.results) - 1)]
 
 
 def config(tmp_path: Path) -> SyncConfig:
@@ -88,7 +94,7 @@ def config(tmp_path: Path) -> SyncConfig:
 
 
 def base_responses(*, backlog: int = 3, merge_returncode: int = 0):
-    return {
+    responses = {
         ("git", "rev-parse", "origin/main"): (0, "base-sha\n", ""),
         ("git", "rev-parse", "upstream/main"): (0, "upstream-sha\n", ""),
         ("git", "rev-list", "--count", "origin/main..upstream/main"): (
@@ -109,6 +115,7 @@ def base_responses(*, backlog: int = 3, merge_returncode: int = 0):
             "conflict",
         ),
         ("git", "rev-parse", "HEAD"): (0, "candidate-sha\n", ""),
+        ("git", "rev-parse", "HEAD^{tree}"): (0, "candidate-tree-sha\n", ""),
         ("git", "diff", "--name-only", "origin/main...HEAD"): (
             0,
             "gateway/run.py\n",
@@ -120,6 +127,13 @@ def base_responses(*, backlog: int = 3, merge_returncode: int = 0):
             "",
         ),
     }
+    if merge_returncode != 0:
+        responses[("git", "diff", "--name-only", "--diff-filter=U", "-z")] = (
+            0,
+            "gateway/run.py\0",
+            "",
+        )
+    return responses
 
 
 def pushes(runner: FakeRunner) -> list[Call]:
@@ -160,6 +174,16 @@ def test_clean_merge_updates_exactly_one_existing_pull_request(tmp_path: Path):
         for call in push_calls
         for destination in call.argv
     )
+
+
+def test_clean_merge_classifies_clean(tmp_path: Path):
+    runner = FakeRunner(base_responses())
+
+    result = prepare_candidate(
+        config(tmp_path), runner=runner, github=FakeGitHub(existing_pr=17)
+    )
+
+    assert result.classification is SyncClassification.CLEAN
 
 
 def test_clean_merge_creates_one_pull_request_when_none_exists(tmp_path: Path):
@@ -214,7 +238,8 @@ def test_unresolved_merge_conflict_requires_decision_without_push(tmp_path: Path
     result = run(config(tmp_path), runner=runner, github=github, resolver=resolver)
 
     assert result.state is SyncState.NEEDS_DECISION
-    assert resolver.calls == 1
+    assert result.conflicted_files == ("gateway/run.py",)
+    assert resolver.calls == 2
     assert pushes(runner) == []
 
 
@@ -225,20 +250,13 @@ def test_command_conflict_resolver_runs_only_configured_command_in_worktree(
     worktree.mkdir()
     git_common_dir = tmp_path / "repo" / ".git"
     git_common_dir.mkdir(parents=True)
+    executable = tmp_path / "bin" / ("codex.cmd" if os.name == "nt" else "codex")
     resolver = CodexConflictResolver(
-        executable=Path("/usr/local/bin/codex"),
+        executable=executable,
         prompt="resolve current merge conflicts",
     )
-    command = (
-        "/usr/local/bin/codex",
-        "exec",
-        "--ignore-user-config",
-        "--sandbox",
-        "workspace-write",
-        "--add-dir",
-        str(git_common_dir),
-        "--ephemeral",
-        "resolve current merge conflicts",
+    resolution_record = (
+        git_common_dir / "hermes-sync-evidence" / ".hermes-sync-resolution.json"
     )
     common_dir_command = (
         "git",
@@ -246,18 +264,91 @@ def test_command_conflict_resolver_runs_only_configured_command_in_worktree(
         "--path-format=absolute",
         "--git-common-dir",
     )
-    runner = FakeRunner({
+    class ResolutionRunner(FakeRunner):
+        def run(self, argv: list[str], cwd: Path, timeout: int = 300):
+            completed = super().run(argv, cwd, timeout)
+            if Path(argv[0]) == executable and argv[1] == "exec":
+                resolution_record.parent.mkdir(parents=True, exist_ok=True)
+                resolution_record.write_text(
+                    '{"conflicts":[{"path":"gateway/run.py",'
+                    '"decision":"preserve fork behavior"}],'
+                    '"strategy":"preserve_fork_behavior"}',
+                    encoding="utf-8",
+                )
+            return completed
+
+    runner = ResolutionRunner({
         common_dir_command: (0, f"{git_common_dir}\n", ""),
-        command: (0, "resolved", ""),
     })
 
     resolved = resolver.resolve(worktree, runner)
 
     assert resolved is True
-    assert runner.calls == [
-        Call(common_dir_command, worktree, 300),
-        Call(command, worktree, 1800),
-    ]
+    assert runner.calls[0] == Call(common_dir_command, worktree, 300)
+    command = runner.calls[1]
+    assert command.argv[:7] == (
+        str(executable),
+        "exec",
+        "--ignore-user-config",
+        "--sandbox",
+        "workspace-write",
+        "--add-dir",
+        str(git_common_dir),
+    )
+    assert command.argv[-2] == "--ephemeral"
+    assert str(resolution_record) in command.argv[-1]
+    assert "every conflicted file" in command.argv[-1]
+    assert command.cwd == worktree
+    assert resolver.resolution_record_path(worktree) == resolution_record
+
+
+def test_command_conflict_resolver_fails_when_record_is_missing(tmp_path: Path):
+    worktree = tmp_path / "candidate"
+    worktree.mkdir()
+    git_common_dir = tmp_path / "repo" / ".git"
+    git_common_dir.mkdir(parents=True)
+    resolver = CodexConflictResolver(
+        executable=tmp_path / "bin" / ("codex.cmd" if os.name == "nt" else "codex"),
+        prompt="resolve current merge conflicts",
+    )
+    runner = FakeRunner({
+        (
+            "git",
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ): (0, f"{git_common_dir}\n", ""),
+    })
+
+    assert resolver.resolve(worktree, runner) is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges")
+def test_command_conflict_resolver_rejects_stale_evidence_symlink(tmp_path: Path):
+    worktree = tmp_path / "candidate"
+    worktree.mkdir()
+    git_common_dir = tmp_path / "repo" / ".git"
+    evidence_dir = git_common_dir / "hermes-sync-evidence"
+    evidence_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.json"
+    outside.write_text("do not delete", encoding="utf-8")
+    (evidence_dir / ".hermes-sync-resolution.json").symlink_to(outside)
+    resolver = CodexConflictResolver(
+        executable=tmp_path / "bin" / ("codex.cmd" if os.name == "nt" else "codex"),
+        prompt="resolve current merge conflicts",
+    )
+    runner = FakeRunner({
+        (
+            "git",
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ): (0, f"{git_common_dir}\n", ""),
+    })
+
+    assert resolver.resolve(worktree, runner) is False
+    assert outside.read_text(encoding="utf-8") == "do not delete"
+    assert len(runner.calls) == 1
 
 
 def test_conflict_resolver_fails_closed_when_git_common_dir_is_unavailable(
@@ -266,7 +357,7 @@ def test_conflict_resolver_fails_closed_when_git_common_dir_is_unavailable(
     worktree = tmp_path / "candidate"
     worktree.mkdir()
     resolver = CodexConflictResolver(
-        executable=Path("/usr/local/bin/codex"),
+        executable=tmp_path / "bin" / ("codex.cmd" if os.name == "nt" else "codex"),
         prompt="resolve current merge conflicts",
     )
     common_dir_command = (
@@ -290,7 +381,7 @@ def test_conflict_resolver_fails_closed_when_git_common_dir_does_not_exist(
     worktree.mkdir()
     missing_common_dir = tmp_path / "missing" / ".git"
     resolver = CodexConflictResolver(
-        executable=Path("/usr/local/bin/codex"),
+        executable=tmp_path / "bin" / ("codex.cmd" if os.name == "nt" else "codex"),
         prompt="resolve current merge conflicts",
     )
     common_dir_command = (
@@ -313,6 +404,18 @@ def test_conflict_resolver_rejects_arbitrary_executable():
             executable=Path("/bin/bash"),
             prompt="git push origin HEAD:main",
         )
+
+
+@pytest.mark.parametrize("name", ["codex", "codex.exe", "codex.cmd"])
+def test_conflict_resolver_accepts_canonical_executable_names(
+    tmp_path: Path, name: str
+):
+    executable = tmp_path / "Program Files" / "Codex" / name
+    resolver = CodexConflictResolver(
+        executable=executable,
+        prompt="resolve conflicts",
+    )
+    assert Path(resolver.command[0]) == executable
 
 
 def test_resolved_merge_conflict_runs_gates_before_push(tmp_path: Path):
@@ -345,6 +448,122 @@ def test_resolved_merge_conflict_runs_gates_before_push(tmp_path: Path):
     assert len(pushes(runner)) == 1
 
 
+def test_resolved_merge_conflict_requires_review(tmp_path: Path):
+    responses = base_responses(merge_returncode=1)
+    capture_command = ("git", "diff", "--name-only", "--diff-filter=U", "-z")
+    responses[capture_command] = (
+        0,
+        "gateway/run.py\0ops/cloudadvisor/hermes_ops/sync.py\0",
+        "",
+    )
+    responses[("git", "rev-parse", "-q", "--verify", "MERGE_HEAD")] = (
+        0,
+        "upstream-sha\n",
+        "",
+    )
+    resolver = FakeResolver(True)
+
+    result = prepare_candidate(
+        config(tmp_path),
+        runner=FakeRunner(responses),
+        github=FakeGitHub(existing_pr=17),
+        resolver=resolver,
+    )
+
+    assert (
+        result.classification is SyncClassification.MINOR_REVIEW_REQUIRED
+    )
+    assert result.conflicted_files == (
+        "gateway/run.py",
+        "ops/cloudadvisor/hermes_ops/sync.py",
+    )
+    assert resolver.last_runner_call == capture_command
+
+
+def test_second_materially_different_conflict_strategy_runs_after_isolated_reset(
+    tmp_path: Path,
+):
+    responses = base_responses(merge_returncode=1)
+    responses[("git", "rev-parse", "-q", "--verify", "MERGE_HEAD")] = (
+        0,
+        "upstream-sha\n",
+        "",
+    )
+    resolver = FakeResolver([False, True])
+    runner = FakeRunner(responses)
+
+    result = prepare_candidate(
+        config(tmp_path),
+        runner=runner,
+        github=FakeGitHub(existing_pr=17),
+        resolver=resolver,
+    )
+
+    assert result.state is SyncState.PR_UPDATED
+    assert result.classification is SyncClassification.MINOR_REVIEW_REQUIRED
+    assert resolver.calls == 2
+    assert resolver.strategies[0] != resolver.strategies[1]
+    reset_calls = [call for call in runner.calls if call.argv[:3] == ("git", "reset", "--hard")]
+    assert len(reset_calls) == 2
+    assert any(call.argv == ("git", "clean", "-fd") for call in runner.calls)
+
+
+def test_two_failed_conflict_strategies_exhaust_before_human(tmp_path: Path):
+    resolver = FakeResolver([False, False])
+    result = prepare_candidate(
+        config(tmp_path),
+        runner=FakeRunner(base_responses(merge_returncode=1)),
+        github=FakeGitHub(),
+        resolver=resolver,
+    )
+    assert result.state is SyncState.NEEDS_DECISION
+    assert result.risk == "conflict_strategies_exhausted"
+    assert resolver.calls == 2
+    assert resolver.strategies[0] != resolver.strategies[1]
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout"),
+    [(1, ""), (0, "")],
+    ids=["command-failed", "empty-conflict-set"],
+)
+def test_conflicted_file_capture_fails_closed_before_resolver(
+    tmp_path: Path,
+    returncode: int,
+    stdout: str,
+):
+    responses = base_responses(merge_returncode=1)
+    responses[("git", "diff", "--name-only", "--diff-filter=U", "-z")] = (
+        returncode,
+        stdout,
+        "capture failed",
+    )
+    resolver = FakeResolver(True)
+
+    result = prepare_candidate(
+        config(tmp_path),
+        runner=FakeRunner(responses),
+        github=FakeGitHub(),
+        resolver=resolver,
+    )
+
+    assert result.state is SyncState.NEEDS_DECISION
+    assert result.classification is SyncClassification.MAJOR
+    assert result.risk == "conflicted_files_unavailable"
+    assert resolver.calls == 0
+
+
+def test_unresolved_merge_conflict_classifies_major(tmp_path: Path):
+    result = prepare_candidate(
+        config(tmp_path),
+        runner=FakeRunner(base_responses(merge_returncode=1)),
+        github=FakeGitHub(),
+        resolver=FakeResolver(False),
+    )
+
+    assert result.classification is SyncClassification.MAJOR
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Contention fixture uses POSIX flock")
 def test_concurrent_lock_contention_returns_locked_without_git_calls(tmp_path: Path):
     sync_config = config(tmp_path)
@@ -357,6 +576,22 @@ def test_concurrent_lock_contention_returns_locked_without_git_calls(tmp_path: P
 
     assert result.state is SyncState.LOCKED
     assert runner.calls == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Contention fixture uses POSIX flock")
+def test_prepare_candidate_does_not_acquire_file_lock(tmp_path: Path):
+    sync_config = config(tmp_path)
+    sync_config.lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with sync_config.lock_path.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        runner = FakeRunner(base_responses())
+
+        result = prepare_candidate(
+            sync_config, runner=runner, github=FakeGitHub(existing_pr=17)
+        )
+
+    assert result.state is SyncState.PR_UPDATED
+    assert runner.calls
 
 
 def test_resolver_cannot_bypass_missing_merge_head(tmp_path: Path):

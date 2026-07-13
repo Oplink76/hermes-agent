@@ -3521,6 +3521,31 @@ async def update_hermes():
             "update_command": "managed outside dashboard",
         }
 
+    pending_deployment_state = _pending_sync_deployment_state()
+    try:
+        from hermes_cli.upstream_sync_status import SyncStatus
+
+        sync_status = SyncStatus.load(_upstream_sync_status_path())
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+        sync_status = None
+    if pending_deployment_state is not None or (
+        sync_status is not None
+        and sync_status.sync_state in {"NEEDS_OLE", "ROLLED_BACK_REVERTED"}
+    ):
+        message = (
+            "Hermes update is blocked while autonomous upstream sync needs "
+            "attention or is recovering."
+        )
+        _record_completed_action("hermes-update", message, exit_code=1)
+        return {
+            "ok": False,
+            "pid": None,
+            "name": "hermes-update",
+            "error": "upstream_sync_update_blocked",
+            "message": message,
+            "update_command": "managed by autonomous upstream sync",
+        }
+
     install_method = detect_install_method(PROJECT_ROOT)
     if install_method == "docker":
         message = format_docker_update_message()
@@ -3594,6 +3619,113 @@ def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
         return []
 
 
+def _with_upstream_sync_status(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Add fork-sync state without changing the installed-versus-fork contract."""
+    enriched = dict(payload)
+    enriched.update(
+        {
+            "upstream_behind": None,
+            "sync_state": None,
+            "sync_pr_number": None,
+            "sync_required_check": None,
+            "fork_behind": payload.get("behind"),
+            "installed_sha": None,
+            "sync_update_blocked": False,
+            "sync_deployment_state": None,
+        }
+    )
+    deployment_state = _pending_sync_deployment_state()
+    if deployment_state is not None:
+        enriched.update(
+            {
+                "update_available": False,
+                "can_apply": False,
+                "commits": [],
+                "sync_update_blocked": True,
+                "sync_deployment_state": deployment_state,
+                "message": (
+                    "Autonomous upstream sync deployment is active or requires "
+                    "recovery · Update action blocked"
+                ),
+            }
+        )
+    try:
+        from hermes_cli.upstream_sync_status import (
+            SyncStatus,
+            installed_sync_message,
+        )
+
+        status = SyncStatus.load(_upstream_sync_status_path())
+    except FileNotFoundError:
+        return enriched
+    except (OSError, ValueError, json.JSONDecodeError):
+        _log.warning("Ignoring invalid autonomous upstream sync status")
+        return enriched
+
+    enriched.update(
+        {
+            "upstream_behind": status.upstream_behind,
+            "sync_state": status.sync_state,
+            "sync_pr_number": status.sync_pr_number,
+            "sync_required_check": status.required_check,
+            "fork_behind": (
+                status.fork_behind
+                if status.fork_behind is not None
+                else payload.get("behind")
+            ),
+            "installed_sha": status.installed_sha,
+        }
+    )
+    if status.sync_state in {"NEEDS_OLE", "ROLLED_BACK_REVERTED"}:
+        enriched.update(
+            {
+                "update_available": False,
+                "can_apply": False,
+                "commits": [],
+                "sync_update_blocked": True,
+            }
+        )
+    message = installed_sync_message(
+        installed_current=payload.get("behind") == 0,
+        upstream_behind=status.upstream_behind,
+        sync_state=status.sync_state,
+    )
+    if message is not None and deployment_state is None:
+        enriched["message"] = message
+    elif deployment_state is None and status.sync_state == "ROLLED_BACK_REVERTED":
+        enriched["message"] = (
+            "Official upstream sync recovery active after safe rollback · "
+            "Update action blocked"
+        )
+    elif deployment_state is None and status.sync_state == "NEEDS_OLE":
+        enriched["message"] = (
+            "Official upstream sync needs attention · Update action blocked"
+        )
+    return enriched
+
+
+def _upstream_sync_status_path() -> Path:
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root() / "recovery" / "sync-status.json"
+
+
+def _upstream_sync_receipt_root() -> Path:
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root() / "recovery" / "sync-receipts"
+
+
+def _pending_sync_deployment_state() -> str | None:
+    """Return a trusted blocking stage; malformed evidence fails closed."""
+    try:
+        from hermes_cli.upstream_sync_status import pending_deployment_state
+
+        return pending_deployment_state(_upstream_sync_receipt_root())
+    except (OSError, ValueError):
+        return "crossed_invalid"
+
+
 @app.get("/api/hermes/update/check")
 async def check_hermes_update(force: bool = False):
     """Report whether a Hermes update is available, without applying it.
@@ -3621,18 +3753,20 @@ async def check_hermes_update(force: bool = False):
                  changed". Additive: existing consumers ignore it.
     """
     if _dashboard_local_update_managed_externally():
-        return {
-            "install_method": "managed-runtime",
-            "current_version": __version__,
-            "behind": None,
-            "update_available": False,
-            "can_apply": False,
-            "update_command": "managed outside dashboard",
-            "message": (
-                "Hermes updates are managed outside this dashboard in "
-                "containerized environments."
-            ),
-        }
+        return _with_upstream_sync_status(
+            {
+                "install_method": "managed-runtime",
+                "current_version": __version__,
+                "behind": None,
+                "update_available": False,
+                "can_apply": False,
+                "update_command": "managed outside dashboard",
+                "message": (
+                    "Hermes updates are managed outside this dashboard in "
+                    "containerized environments."
+                ),
+            }
+        )
 
     install_method = detect_install_method(PROJECT_ROOT)
     update_command = recommended_update_command_for_method(install_method)
@@ -3649,7 +3783,7 @@ async def check_hermes_update(force: bool = False):
 
     if install_method == "docker":
         payload["message"] = format_docker_update_message()
-        return payload
+        return _with_upstream_sync_status(payload)
 
     # banner.check_for_updates() handles git / pypi / nix-revision paths and
     # caches the result for 6h. ``force`` busts the cache so the "Check now"
@@ -3681,7 +3815,7 @@ async def check_hermes_update(force: bool = False):
         if install_method in ("git", "pip"):
             payload["commits"] = await asyncio.to_thread(_recent_upstream_commits)
 
-    return payload
+    return _with_upstream_sync_status(payload)
 
 
 @app.post("/api/audio/transcribe")

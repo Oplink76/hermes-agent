@@ -286,13 +286,28 @@ function isRemoteMode(): boolean {
 function mapBackendCheck(res: BackendUpdateCheckResponse): DesktopUpdateStatus {
   const behind = res.behind ?? 0
 
+  const syncBlocked =
+    res.sync_update_blocked === true ||
+    res.sync_deployment_state === 'merge_intent' ||
+    res.sync_deployment_state === 'merged_pending_deploy' ||
+    res.sync_deployment_state === 'crossed_invalid' ||
+    res.sync_state === 'NEEDS_OLE' ||
+    res.sync_state === 'ROLLED_BACK_REVERTED'
+
   return {
-    supported: res.can_apply,
+    supported: res.can_apply && !syncBlocked,
     message: res.message ?? undefined,
-    updateAvailable: res.update_available,
+    updateAvailable: res.update_available && !syncBlocked,
     behind: behind > 0 ? behind : 0,
-    targetSha: res.update_available ? `backend:${res.current_version}` : undefined,
+    targetSha: res.update_available && !syncBlocked ? `backend:${res.current_version}` : undefined,
     commits: res.commits,
+    upstreamBehind: res.upstream_behind ?? undefined,
+    syncState: res.sync_state ?? undefined,
+    syncUpdateBlocked: syncBlocked,
+    syncDeploymentState: res.sync_deployment_state ?? undefined,
+    syncPrNumber: res.sync_pr_number ?? undefined,
+    syncRequiredCheck: res.sync_required_check ?? undefined,
+    installedSha: res.installed_sha ?? undefined,
     fetchedAt: Date.now()
   }
 }
@@ -525,6 +540,21 @@ function ingestBackendActionStatus(status: Awaited<ReturnType<typeof getActionSt
 }
 
 export async function applyBackendUpdate(): Promise<DesktopUpdateApplyResult> {
+  const status = $backendUpdateStatus.get()
+
+  if (status?.syncUpdateBlocked) {
+    const message = status.message || 'Backend update is blocked while autonomous upstream sync needs attention.'
+    $backendUpdateApply.set({
+      ...IDLE,
+      applying: false,
+      stage: 'error',
+      error: 'sync-blocked',
+      message
+    })
+
+    return { ok: false, error: 'sync-blocked', message }
+  }
+
   dismissNotification(UPDATE_TOAST_ID)
   $backendUpdateApply.set({
     ...IDLE,

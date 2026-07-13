@@ -1672,6 +1672,14 @@ export interface UpdateCheckResponse {
   can_apply: boolean;
   update_command: string;
   message: string | null;
+  upstream_behind?: number | null;
+  sync_state?: string | null;
+  sync_update_blocked?: boolean;
+  sync_deployment_state?: string | null;
+  sync_pr_number?: number | null;
+  sync_required_check?: string | null;
+  fork_behind?: number | null;
+  installed_sha?: string | null;
 }
 
 export interface SystemStats {

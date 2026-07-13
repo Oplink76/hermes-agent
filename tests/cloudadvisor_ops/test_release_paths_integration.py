@@ -15,7 +15,19 @@ from ops.cloudadvisor.hermes_ops.deploy import (
 )
 from ops.cloudadvisor.hermes_ops.health import HealthCheck, HealthReport
 from ops.cloudadvisor.hermes_ops.snapshot import SnapshotCoordinator
-from ops.cloudadvisor.hermes_ops.sync import SyncConfig, SyncState, run as run_sync
+from ops.cloudadvisor.hermes_ops.sync import (
+    CheckResult,
+    SyncClassification,
+    SyncConfig,
+    SyncResult,
+    SyncState,
+    run as run_sync,
+)
+from ops.cloudadvisor.hermes_ops.sync_github import SyncPullRequestEvidence
+from ops.cloudadvisor.hermes_ops.sync_receipt import (
+    finalize_sync_receipt,
+    write_sync_receipt,
+)
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -170,6 +182,10 @@ class ReleaseVerifier:
             pr_number=pr_number,
             merged=True,
             merge_sha=self.sha,
+            repo_slug="Oplink76/hermes-agent",
+            head_sha=self.sha,
+            base_ref_name="main",
+            base_sha="integration-base",
             required_check="All required checks pass",
             required_check_conclusion="success",
         )
@@ -244,6 +260,189 @@ class FailCandidateHealth:
         )
 
 
+class ExactHealthyRuntime:
+    def __init__(self, install_root: Path):
+        self.install_root = install_root
+
+    def check(
+        self,
+        *,
+        expected_sha: str,
+        services: tuple[str, ...],
+        identity_required: bool = True,
+        apply_injection: bool = True,
+    ) -> HealthReport:
+        del services, identity_required, apply_injection
+        actual_sha = _git(self.install_root, "rev-parse", "HEAD")
+        return HealthReport(
+            checks=(
+                HealthCheck(
+                    "integration:checkout_identity",
+                    actual_sha == expected_sha,
+                    actual_sha,
+                ),
+            )
+        )
+
+
+class SyncReleaseVerifier:
+    def __init__(
+        self, *, pr_number: int, base_sha: str, candidate_sha: str, merge_sha: str
+    ):
+        self.pr_number = pr_number
+        self.base_sha = base_sha
+        self.candidate_sha = candidate_sha
+        self.merge_sha = merge_sha
+
+    def verify(self, pr_number: int) -> ReleaseEvidence:
+        assert pr_number == self.pr_number
+        return ReleaseEvidence(
+            pr_number=pr_number,
+            merged=True,
+            merge_sha=self.merge_sha,
+            repo_slug="Oplink76/hermes-agent",
+            head_sha=self.candidate_sha,
+            base_ref_name="main",
+            base_sha=self.base_sha,
+            required_check="All required checks pass",
+            required_check_conclusion="success",
+        )
+
+
+def test_automated_sync_receipt_deploys_only_exact_real_merge_without_human_artifact(
+    tmp_path: Path,
+):
+    seed, origin, upstream = _seed_remotes(tmp_path)
+    base_sha = _git(seed, "rev-parse", "HEAD")
+    _git(seed, "remote", "add", "origin", str(origin))
+    _git(seed, "remote", "add", "upstream", str(upstream))
+    (seed / "upstream.txt").write_text("official upstream\n", encoding="utf-8")
+    _git(seed, "add", "upstream.txt")
+    _git(seed, "commit", "-m", "official upstream change")
+    candidate_sha = _git(seed, "rev-parse", "HEAD")
+    candidate_tree_sha = _git(seed, "rev-parse", "HEAD^{tree}")
+    _git(seed, "push", "upstream", "HEAD:main")
+    _git(seed, "push", "origin", "HEAD:auto-sync/upstream")
+
+    required_checks = tuple(
+        CheckResult(name, "passed", "real integration path")
+        for name in (
+            "diff_check",
+            "unmerged_index",
+            "conflict_markers",
+            "compileall",
+            "tests",
+        )
+    )
+    candidate = SyncResult(
+        state=SyncState.PR_UPDATED,
+        base_sha=base_sha,
+        upstream_sha=candidate_sha,
+        candidate_sha=candidate_sha,
+        candidate_tree_sha=candidate_tree_sha,
+        pr_number=41,
+        checks=required_checks,
+        changed_files=("upstream.txt",),
+        classification=SyncClassification.CLEAN,
+    )
+    evidence = SyncPullRequestEvidence(
+        number=41,
+        state="open",
+        base_sha=base_sha,
+        head_sha=candidate_sha,
+        required_check="All required checks pass",
+        required_check_conclusion="success",
+        workflow_run_id=4100,
+        required_check_run_id=4101,
+    )
+    receipt_root = tmp_path / "receipts"
+    premerge = write_sync_receipt(
+        receipt_root,
+        candidate,
+        evidence,
+        repo_slug="Oplink76/hermes-agent",
+    )
+
+    protected_merge = tmp_path / "protected-merge"
+    subprocess.run(
+        ["git", "clone", str(origin), str(protected_merge)],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    _git(protected_merge, "config", "user.name", "Protected GitHub")
+    _git(protected_merge, "config", "user.email", "github@example.invalid")
+    _git(protected_merge, "fetch", "origin", "auto-sync/upstream")
+    assert _git(protected_merge, "rev-parse", "FETCH_HEAD") == candidate_sha
+    _git(
+        protected_merge,
+        "merge",
+        "--no-ff",
+        "FETCH_HEAD",
+        "-m",
+        "merge exact autonomous candidate",
+    )
+    merge_sha = _git(protected_merge, "rev-parse", "HEAD")
+    _git(protected_merge, "push", "origin", "main")
+    finalized = finalize_sync_receipt(premerge.path, merge_sha=merge_sha)
+
+    install_root = tmp_path / "install"
+    subprocess.run(
+        ["git", "clone", str(origin), str(install_root)],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    _git(install_root, "switch", "--detach", base_sha)
+    runner = DeployRunner(tmp_path / "unused.sqlite")
+    snapshots = SnapshotCoordinator(
+        install_root=install_root,
+        hermes_homes=(),
+        snapshot_root=tmp_path / "snapshots",
+        preservation_command=("python", "verify-preservation.py"),
+        runner=runner,
+    )
+    services = Services()
+    record = deploy(
+        DeployRequest(
+            sha=merge_sha,
+            pr_number=41,
+            actor="hermes-upstream-sync",
+            authority_kind="automated_sync",
+            authority_record=finalized.path,
+        ),
+        config=DeployConfig(
+            install_root=install_root,
+            origin="origin",
+            record_root=tmp_path / "records",
+            repo_slug="Oplink76/hermes-agent",
+            sync_receipt_root=receipt_root,
+            required_check="All required checks pass",
+            uv_extras=("dev",),
+        ),
+        runner=runner,
+        github=SyncReleaseVerifier(
+            pr_number=41,
+            base_sha=base_sha,
+            candidate_sha=candidate_sha,
+            merge_sha=merge_sha,
+        ),
+        snapshots=snapshots,
+        services=services,
+        health=ExactHealthyRuntime(install_root),
+    )
+
+    assert record.status == "deployed"
+    assert record.requested_sha == merge_sha
+    assert _git(install_root, "rev-parse", "HEAD") == merge_sha
+    assert (
+        _git(install_root, "merge-base", "--is-ancestor", candidate_sha, merge_sha)
+        == ""
+    )
+    assert any(check.name == "preflight:authority" for check in record.checks)
+    assert not list(tmp_path.rglob("approval*.json"))
+
+
 def test_deploy_real_git_and_sqlite_path_restores_previous_state_on_failure(
     tmp_path: Path,
 ):
@@ -315,13 +514,14 @@ def test_deploy_real_git_and_sqlite_path_restores_previous_state_on_failure(
             approval_record=approval,
             actor="integration-test",
         ),
-            config=DeployConfig(
-                install_root=install_root,
-                origin="origin",
-                record_root=tmp_path / "records",
-                uv_extras=("dev",),
-                postinstall_commands=(("python", "migrate.py"),),
-            ),
+        config=DeployConfig(
+            install_root=install_root,
+            origin="origin",
+            record_root=tmp_path / "records",
+            repo_slug="Oplink76/hermes-agent",
+            uv_extras=("dev",),
+            postinstall_commands=(("python", "migrate.py"),),
+        ),
         runner=runner,
         github=ReleaseVerifier(candidate_sha),
         snapshots=snapshots,
