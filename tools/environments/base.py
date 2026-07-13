@@ -387,7 +387,7 @@ class BaseEnvironment(ABC):
         # parent PID in background subshells, while ``$BASHPID`` is unavailable
         # in Apple bash 3.2. mktemp is portable across supported POSIX/Git-Bash
         # environments and keeps each writer isolated on every bash version.
-        _snap_template = shlex.quote(self._snapshot_path + ".tmp.XXXXXX")
+        _snap_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXX")
         bootstrap = (
             f"umask 077\n"
             f"__hermes_snap_tmp=$(mktemp {_snap_template})\n"
