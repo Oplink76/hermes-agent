@@ -42,6 +42,7 @@ def escalation_fingerprint(result: AutonomousSyncResult) -> str | None:
         "candidate_sha": result.candidate_sha,
         "details_artifact": result.details_artifact,
         "failed_gate": result.failed_gate,
+        "fork_main_sha": result.fork_main_sha,
         "installed_sha": result.installed_sha,
         "merge_sha": result.merge_sha,
         "pr_number": result.pr_number,
