@@ -463,6 +463,30 @@ def test_create_pull_request_returns_number_from_url(tmp_path: Path):
     assert runner.calls[0].argv[:3] == ("gh", "pr", "create")
 
 
+@pytest.mark.parametrize(
+    "tail",
+    ("0", "-1", "+1", "01", "1.0", "True", " 1", "1 ", ""),
+)
+def test_create_pull_request_rejects_noncanonical_number_tail(
+    tmp_path: Path, tail: str
+):
+    created = subprocess.CompletedProcess(
+        [],
+        0,
+        f"https://github.com/Oplink76/hermes-agent/pull/{tail}\n",
+        "",
+    )
+    github, _ = _github(tmp_path, created)
+
+    with pytest.raises(SyncGitHubError, match="number was missing"):
+        github.create_pull_request(
+            head="auto-sync/upstream",
+            base="main",
+            title="sync",
+            body="body",
+        )
+
+
 def test_update_pull_request_uses_normalized_edit_command(tmp_path: Path):
     github, runner = _github(tmp_path, _completed())
 

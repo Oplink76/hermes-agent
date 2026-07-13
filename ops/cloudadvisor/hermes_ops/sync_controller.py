@@ -636,20 +636,17 @@ def _resume_pending_deploy(
     )
     checkpoint_sha = deployment_checkpoint_sha256(checkpoint)
     if installed_sha == checkpoint.merge_sha:
-        if verify_runtime_fn is None or not verify_runtime_fn(checkpoint.merge_sha):
-            raise AutonomousSyncError(
-                "pending deployment installed merge is not verifiably healthy"
+        if verify_runtime_fn is not None and verify_runtime_fn(checkpoint.merge_sha):
+            clear_pending_deployment(config.receipt_root, sha256=checkpoint_sha)
+            return AutonomousSyncResult(
+                state=AutonomousSyncState.DEPLOYED,
+                candidate_sha=checkpoint.candidate_sha,
+                pr_number=checkpoint.pr_number,
+                merge_sha=checkpoint.merge_sha,
+                deployed_sha=checkpoint.merge_sha,
+                fork_main_sha=checkpoint.merge_sha,
+                installed_sha=checkpoint.merge_sha,
             )
-        clear_pending_deployment(config.receipt_root, sha256=checkpoint_sha)
-        return AutonomousSyncResult(
-            state=AutonomousSyncState.DEPLOYED,
-            candidate_sha=checkpoint.candidate_sha,
-            pr_number=checkpoint.pr_number,
-            merge_sha=checkpoint.merge_sha,
-            deployed_sha=checkpoint.merge_sha,
-            fork_main_sha=checkpoint.merge_sha,
-            installed_sha=checkpoint.merge_sha,
-        )
     deployment = deploy_fn(
         receipt_path, checkpoint.merge_sha, checkpoint.pr_number
     )
@@ -675,7 +672,7 @@ def _resume_pending_deploy(
             raise AutonomousSyncError(
                 "resumed deployment recovery identity is incomplete"
             )
-        write_pending_reconstruction(
+        artifact = write_pending_reconstruction(
             config.receipt_root,
             PendingReconstructionCheckpoint(
                 schema_version=2,
@@ -703,6 +700,12 @@ def _resume_pending_deploy(
                 resolution_record_sha256=None,
                 reason="resumed deployment rolled back and protected revert completed",
                 resume_attempts=0,
+            ),
+        )
+        outcome = replace(
+            outcome,
+            details_artifact=(
+                f"reconstruction/pending-reconstruction-{artifact.sha256}.json"
             ),
         )
     elif outcome.state is AutonomousSyncState.NEEDS_OLE:

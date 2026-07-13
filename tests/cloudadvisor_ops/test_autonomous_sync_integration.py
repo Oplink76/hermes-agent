@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from ops.cloudadvisor.hermes_ops.command import SubprocessCommandRunner
 from ops.cloudadvisor.hermes_ops.deploy import (
     DeployConfig,
@@ -54,6 +56,7 @@ def _python_launcher(tmp_path: Path, name: str, source: str) -> Path:
 class GateRunner(SubprocessCommandRunner):
     def __init__(self):
         self.local_gate_calls: list[tuple[str, ...]] = []
+        self.interrupt_next_uv_sync = False
 
     def run(self, argv: list[str], cwd: Path, timeout: int = 300):
         if argv[:5] == [
@@ -63,6 +66,9 @@ class GateRunner(SubprocessCommandRunner):
             "sync",
             "--locked",
         ]:
+            if self.interrupt_next_uv_sync:
+                self.interrupt_next_uv_sync = False
+                raise KeyboardInterrupt("simulated process loss after checkout")
             return subprocess.CompletedProcess(argv, 0, "synced\n", "")
         if (
             len(argv) >= 3
@@ -114,8 +120,13 @@ class ProtectedGitHub:
         return SyncPullRequestEvidence(
             number=pr_number,
             state=str(row["state"]),
-            base_sha=self._remote_sha("refs/heads/main"),
-            head_sha=self._remote_sha(f"refs/heads/{row['head']}"),
+            base_sha=str(
+                row["base_sha"] or self._remote_sha("refs/heads/main")
+            ),
+            head_sha=str(
+                row["head_sha"]
+                or self._remote_sha(f"refs/heads/{row['head']}")
+            ),
             required_check="All required checks pass",
             required_check_conclusion="success",
             workflow_run_id=1000 + pr_number,
@@ -245,7 +256,7 @@ class FailSecondCandidateHealth:
         return HealthReport((HealthCheck("runtime:default", True),))
 
 
-def test_real_controller_clean_deploy_then_rollback_revert_repair_and_redeploy(
+def test_real_controller_recovers_interrupted_checkout_then_reverts_repairs_and_redeploys(
     tmp_path: Path,
 ):
     origin = tmp_path / "origin.git"
@@ -432,6 +443,53 @@ def test_real_controller_clean_deploy_then_rollback_revert_repair_and_redeploy(
     _git(upstream_work, "commit", "-am", "failing upstream change")
     _git(upstream_work, "push", "origin", "main")
     upstream_sha = _git(upstream_work, "rev-parse", "HEAD")
+    runner.interrupt_next_uv_sync = True
+    with pytest.raises(KeyboardInterrupt, match="process loss after checkout"):
+        run_autonomous_sync(
+            config,
+            runner=runner,
+            github=github,
+            resolver=None,
+            reviewer=reviewer,
+            remediator=Remediator(),
+            deploy_fn=deploy_exact,
+            verify_runtime_fn=lambda sha: (
+                _git(install, "rev-parse", "HEAD") == sha
+                and services.running == ("ai.hermes.gateway",)
+            ),
+            clock=lambda: 0.0,
+            sleeper=lambda seconds: None,
+        )
+
+    interrupted_merge = str(github.prs[8]["merge_sha"])
+    assert _git(install, "rev-parse", "HEAD") == interrupted_merge
+    recovered = run_autonomous_sync(
+        config,
+        runner=runner,
+        github=github,
+        resolver=None,
+        reviewer=reviewer,
+        remediator=Remediator(),
+        deploy_fn=deploy_exact,
+        verify_runtime_fn=lambda sha: (
+            _git(install, "rev-parse", "HEAD") == sha
+            and services.running == ("ai.hermes.gateway",)
+        ),
+        clock=lambda: 0.0,
+        sleeper=lambda seconds: None,
+    )
+    assert recovered.state is AutonomousSyncState.ROLLED_BACK_REVERTED, (
+        recovered.reason,
+        recovered.reason_code,
+        recovered.failed_gate,
+    )
+    assert recovered.candidate_sha == github.prs[8]["head_sha"]
+    assert recovered.merge_sha == interrupted_merge
+    assert recovered.details_artifact is not None
+    assert recovered.details_artifact.startswith(
+        "reconstruction/pending-reconstruction-"
+    )
+    health.candidate_checks = 2
     result = run_autonomous_sync(
         config,
         runner=runner,
@@ -440,7 +498,10 @@ def test_real_controller_clean_deploy_then_rollback_revert_repair_and_redeploy(
         reviewer=reviewer,
         remediator=Remediator(),
         deploy_fn=deploy_exact,
-        verify_runtime_fn=lambda sha: _git(install, "rev-parse", "HEAD") == sha,
+        verify_runtime_fn=lambda sha: (
+            _git(install, "rev-parse", "HEAD") == sha
+            and services.running == ("ai.hermes.gateway",)
+        ),
         clock=lambda: 0.0,
         sleeper=lambda seconds: None,
     )
@@ -455,29 +516,28 @@ def test_real_controller_clean_deploy_then_rollback_revert_repair_and_redeploy(
     assert failed_deployment.status == "rolled_back_healthy"
     assert failed_deployment.previous_sha == clean_result.deployed_sha
     assert failed_deployment.rollback["status"] == "rolled_back_healthy"
-    assert any(not check.passed for check in failed_deployment.checks)
+    assert "interrupted" in failed_deployment.rollback["trigger"]
     assert final_deployment.status == "deployed"
     assert final_deployment.previous_sha == clean_result.deployed_sha
     assert final_deployment.requested_sha == result.deployed_sha
     assert _git(install, "rev-parse", "HEAD") == result.deployed_sha
     assert snapshots.restore_count == 1
-    assert services.stop_count == 4
-    assert services.start_count == 4
+    assert services.stop_count == 3
+    assert services.start_count == 3
     assert services.running == ("ai.hermes.gateway",)
     health_events = [event for event in deploy_events if event[0] == "health"]
     assert [event[1] for event in health_events] == [
         clean_deployment.requested_sha,
-        failed_deployment.requested_sha,
         clean_result.deployed_sha,
         final_deployment.requested_sha,
     ]
-    assert [event[4] for event in health_events] == [True, True, False, True]
+    assert [event[4] for event in health_events] == [True, False, True]
     failed_pr = github.prs[8]
     revert_pr = github.prs[9]
     repaired_pr = github.prs[10]
     assert failed_pr["merge_sha"] == failed_deployment.requested_sha
     assert repaired_pr["merge_sha"] == result.deployed_sha
-    assert health_events[2][1:] == (
+    assert health_events[1][1:] == (
         clean_result.deployed_sha,
         ("ai.hermes.gateway",),
         False,

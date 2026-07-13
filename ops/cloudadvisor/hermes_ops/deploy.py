@@ -10,7 +10,7 @@ import re
 import stat
 import tomllib
 import uuid
-from dataclasses import asdict, dataclass, is_dataclass, replace
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Literal, Protocol
@@ -133,6 +133,24 @@ class DeploymentRecord:
         return _jsonable(asdict(self))
 
 
+@dataclass(frozen=True)
+class DeploymentExecutionJournal:
+    schema_version: int
+    repo_slug: str
+    pr_number: int
+    record_id: str
+    requested_sha: str
+    previous_sha: str
+    snapshot: object
+    runtime_before: object
+    prior_services: tuple[str, ...]
+    previous_fingerprint: str
+    previous_identity_required: bool
+    preflight_checks: tuple[HealthCheck, ...]
+    stage: str
+    record: object | None = None
+
+
 class ReleaseVerifier(Protocol):
     def verify(self, pr_number: int) -> ReleaseEvidence: ...
 
@@ -221,6 +239,124 @@ class DeploymentStore:
     def write(self, record: DeploymentRecord) -> None:
         path = self.root / f"{record.id}.json"
         atomic_json_write(path, record.to_dict(), mode=0o600, sort_keys=True)
+
+
+def _execution_journal_path(config: DeployConfig) -> Path:
+    return Path(config.record_root).expanduser().resolve(strict=False) / (
+        "pending-deployment-execution.json"
+    )
+
+
+def _write_execution_journal(
+    config: DeployConfig,
+    journal: DeploymentExecutionJournal,
+) -> None:
+    atomic_json_write(
+        _execution_journal_path(config),
+        _jsonable(asdict(journal)),
+        mode=0o600,
+        sort_keys=True,
+    )
+
+
+def _clear_execution_journal(config: DeployConfig) -> None:
+    _execution_journal_path(config).unlink(missing_ok=True)
+
+
+def _health_checks(payload: object) -> tuple[HealthCheck, ...]:
+    if not isinstance(payload, list):
+        raise PreflightError("deployment execution health evidence is invalid")
+    checks = []
+    for row in payload:
+        if not isinstance(row, dict):
+            raise PreflightError("deployment execution health evidence is invalid")
+        if type(row.get("passed")) is not bool:
+            raise PreflightError("deployment execution health evidence is invalid")
+        if type(row.get("mandatory", True)) is not bool:
+            raise PreflightError("deployment execution health evidence is invalid")
+        try:
+            checks.append(
+                HealthCheck(
+                    name=str(row["name"]),
+                    passed=row["passed"],
+                    detail=str(row.get("detail", "")),
+                    mandatory=row.get("mandatory", True),
+                )
+            )
+        except KeyError as exc:
+            raise PreflightError(
+                "deployment execution health evidence is invalid"
+            ) from exc
+    return tuple(checks)
+
+
+def _load_execution_journal(
+    config: DeployConfig,
+) -> DeploymentExecutionJournal | None:
+    path = _execution_journal_path(config)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        expected = {field.name for field in fields(DeploymentExecutionJournal)}
+        if not isinstance(payload, dict) or set(payload) != expected:
+            raise TypeError
+        prior_services = payload["prior_services"]
+        if not isinstance(prior_services, list) or not all(
+            isinstance(service, str) and service for service in prior_services
+        ):
+            raise TypeError
+        journal = DeploymentExecutionJournal(
+            schema_version=payload["schema_version"],
+            repo_slug=payload["repo_slug"],
+            pr_number=payload["pr_number"],
+            record_id=payload["record_id"],
+            requested_sha=payload["requested_sha"],
+            previous_sha=payload["previous_sha"],
+            snapshot=payload["snapshot"],
+            runtime_before=payload["runtime_before"],
+            prior_services=tuple(prior_services),
+            previous_fingerprint=payload["previous_fingerprint"],
+            previous_identity_required=payload["previous_identity_required"],
+            preflight_checks=_health_checks(payload["preflight_checks"]),
+            stage=payload["stage"],
+            record=payload["record"],
+        )
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise PreflightError("deployment execution journal is invalid") from exc
+    if (
+        journal.schema_version != 1
+        or journal.repo_slug != config.repo_slug
+        or type(journal.pr_number) is not int
+        or journal.pr_number < 1
+        or not journal.record_id
+        or not journal.requested_sha
+        or not journal.previous_sha
+        or not journal.previous_fingerprint
+        or type(journal.previous_identity_required) is not bool
+        or journal.stage not in {"prepared", "rolled_back_healthy", "rollback_failed"}
+    ):
+        raise PreflightError("deployment execution journal is invalid")
+    return journal
+
+
+def _deployment_record_from_payload(payload: object) -> DeploymentRecord:
+    if not isinstance(payload, dict):
+        raise PreflightError("deployment execution result is invalid")
+    try:
+        return DeploymentRecord(
+            id=str(payload["id"]),
+            requested_sha=str(payload["requested_sha"]),
+            previous_sha=str(payload["previous_sha"]),
+            snapshot=payload["snapshot"],
+            runtime_before=payload["runtime_before"],
+            runtime_after=payload["runtime_after"],
+            checks=_health_checks(payload["checks"]),
+            status=str(payload["status"]),
+            rollback=payload["rollback"],
+        )
+    except KeyError as exc:
+        raise PreflightError("deployment execution result is invalid") from exc
 
 
 def _jsonable(value):
@@ -515,6 +651,21 @@ def deploy(
     with try_exclusive_file_lock(lock_path) as acquired:
         if not acquired:
             raise PreflightError("another deployment is already in progress")
+        pending = _load_execution_journal(config)
+        if pending is not None:
+            resumed = _resume_interrupted_deployment(
+                request,
+                pending,
+                config=config,
+                runner=runner,
+                snapshots=snapshots,
+                services=services,
+                health=health,
+                store=store,
+                fingerprint_fn=fingerprint_fn,
+            )
+            if resumed is not None:
+                return resumed
         return _deploy_locked(
             request,
             config=config,
@@ -526,6 +677,110 @@ def deploy(
             store=store,
             fingerprint_fn=fingerprint_fn,
         )
+
+
+def _snapshot_from_journal(snapshots: SnapshotProvider, payload: object) -> object:
+    loader = getattr(snapshots, "load", None)
+    if callable(loader):
+        return loader(payload)
+    return payload
+
+
+def _resume_interrupted_deployment(
+    request: DeployRequest,
+    journal: DeploymentExecutionJournal,
+    *,
+    config: DeployConfig,
+    runner: CommandRunner,
+    snapshots: SnapshotProvider,
+    services: ServiceController,
+    health: HealthChecker,
+    store: RecordStore | None,
+    fingerprint_fn: Callable[[Path], str],
+) -> DeploymentRecord | None:
+    if request.sha != journal.requested_sha or request.pr_number != journal.pr_number:
+        if journal.stage == "rolled_back_healthy":
+            _clear_execution_journal(config)
+            return None
+        raise PreflightError("another interrupted deployment requires recovery")
+    if journal.record is not None:
+        return _deployment_record_from_payload(journal.record)
+    root = Path(config.install_root).expanduser().resolve(strict=True)
+    if not snapshots.verify_preservation():
+        raise PreflightError("Package 1 preservation verification failed")
+    snapshot = _snapshot_from_journal(snapshots, journal.snapshot)
+    if not snapshots.verify(snapshot):
+        raise PreflightError("interrupted deployment snapshot verification failed")
+    installed_sha = _run_required(runner, ["git", "rev-parse", "HEAD"], cwd=root)
+    if installed_sha not in {journal.requested_sha, journal.previous_sha}:
+        raise PreflightError("interrupted deployment install identity changed")
+    record_store = store or DeploymentStore(config.record_root)
+    trigger = "deployment process was interrupted after mutation began"
+    record = DeploymentRecord(
+        id=journal.record_id,
+        requested_sha=journal.requested_sha,
+        previous_sha=journal.previous_sha,
+        snapshot=snapshot,
+        runtime_before=journal.runtime_before,
+        runtime_after=None,
+        checks=journal.preflight_checks,
+        status="rolling_back",
+        rollback={"trigger": trigger, "status": "running"},
+    )
+    record_store.write(record)
+    try:
+        loaded = services.loaded_services()
+        candidate_services = tuple(
+            service for service in journal.prior_services if service in loaded
+        )
+        if candidate_services:
+            services.stop(candidate_services)
+        _run_required(
+            runner,
+            ["git", "switch", "--detach", journal.previous_sha],
+            cwd=root,
+        )
+        snapshots.restore(snapshot)
+        if fingerprint_fn(root) != journal.previous_fingerprint:
+            _run_required(runner, _uv_sync_command(config), cwd=root)
+        services.start(journal.prior_services)
+        rollback_report = health.check(
+            expected_sha=journal.previous_sha,
+            services=journal.prior_services,
+            identity_required=journal.previous_identity_required,
+            apply_injection=False,
+        )
+        status = (
+            "rolled_back_healthy" if rollback_report.healthy else "rollback_failed"
+        )
+        record = replace(
+            record,
+            runtime_after=services.inventory(),
+            checks=journal.preflight_checks + rollback_report.checks,
+            status=status,
+            rollback={
+                "trigger": trigger,
+                "status": status,
+                "checks": _jsonable(rollback_report.checks),
+            },
+        )
+    except Exception as rollback_failure:
+        logger.exception("Interrupted exact-SHA deployment rollback failed")
+        record = replace(
+            record,
+            status="rollback_failed",
+            rollback={
+                "trigger": trigger,
+                "status": "rollback_failed",
+                "error": str(rollback_failure),
+            },
+        )
+    record_store.write(record)
+    _write_execution_journal(
+        config,
+        replace(journal, stage=record.status, record=record.to_dict()),
+    )
+    return record
 
 
 def _deploy_locked(
@@ -632,6 +887,22 @@ def _deploy_locked(
         rollback=None,
     )
     record_store.write(record)
+    execution = DeploymentExecutionJournal(
+        schema_version=1,
+        repo_slug=config.repo_slug,
+        pr_number=request.pr_number,
+        record_id=record.id,
+        requested_sha=request.sha,
+        previous_sha=previous_sha,
+        snapshot=snapshot,
+        runtime_before=runtime_before,
+        prior_services=prior_services,
+        previous_fingerprint=previous_fingerprint,
+        previous_identity_required=previous_identity_required,
+        preflight_checks=tuple(preflight_checks),
+        stage="prepared",
+    )
+    _write_execution_journal(config, execution)
 
     state_may_have_changed = False
     candidate_fingerprint = previous_fingerprint
@@ -678,6 +949,7 @@ def _deploy_locked(
             status="deployed",
         )
         record_store.write(record)
+        _clear_execution_journal(config)
         return record
     except Exception as failure:
         if not isinstance(failure, _HealthFailure):
@@ -752,4 +1024,8 @@ def _deploy_locked(
                 },
             )
         record_store.write(record)
+        _write_execution_journal(
+            config,
+            replace(execution, stage=record.status, record=record.to_dict()),
+        )
         return record

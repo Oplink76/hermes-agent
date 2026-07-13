@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -162,9 +163,12 @@ class GhSyncGitHub:
             "--body",
             body,
         ])
-        url = (completed.stdout or "").strip().rstrip("/")
+        url = (completed.stdout or "").rstrip("\r\n")
         try:
-            return int(url.rsplit("/", maxsplit=1)[1])
+            tail = url.rsplit("/", maxsplit=1)[1]
+            if re.fullmatch(r"[1-9][0-9]*", tail) is None:
+                raise ValueError
+            return int(tail)
         except (IndexError, ValueError) as exc:
             raise SyncGitHubError("created pull request number was missing") from exc
 

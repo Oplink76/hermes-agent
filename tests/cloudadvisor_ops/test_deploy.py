@@ -863,6 +863,69 @@ def test_health_failure_rolls_back_source_state_services_and_health_checks(
     ) in events
 
 
+def test_interrupted_post_checkout_deploy_resumes_exact_rollback_without_redeploy(
+    tmp_path: Path,
+):
+    events: list[tuple] = []
+    config = _config(tmp_path)
+    request = _request(tmp_path)
+    snapshots = FakeSnapshots(events)
+    services = FakeServices(events)
+
+    class CrashAfterCheckoutRunner(FakeRunner):
+        def run(self, argv: list[str], cwd: Path, timeout: int = 300):
+            if tuple(argv) == UV_SYNC_COMMAND:
+                self.events.append(("crash_after_checkout",))
+                raise KeyboardInterrupt("simulated process loss")
+            return super().run(argv, cwd, timeout)
+
+    with pytest.raises(KeyboardInterrupt, match="simulated process loss"):
+        deploy(
+            request,
+            config=config,
+            runner=CrashAfterCheckoutRunner(_responses(), events),
+            github=FakeGitHub(_evidence()),
+            snapshots=snapshots,
+            services=services,
+            health=FakeHealth([], events),
+            store=RecordingStore(events),
+        )
+
+    resumed_responses = _responses()
+    resumed_responses[("git", "rev-parse", "HEAD")] = (0, "new-sha\n", "")
+    resumed_runner = FakeRunner(resumed_responses, events)
+    recovered = deploy(
+        request,
+        config=config,
+        runner=resumed_runner,
+        github=FakeGitHub(_evidence()),
+        snapshots=snapshots,
+        services=services,
+        health=FakeHealth([_green("rollback-runtime")], events),
+        store=RecordingStore(events),
+    )
+
+    assert recovered.status == "rolled_back_healthy"
+    assert recovered.requested_sha == "new-sha"
+    assert recovered.previous_sha == "old-sha"
+    assert snapshots.restored is True
+    assert ("command", ("git", "switch", "--detach", "old-sha")) in events
+    assert events.count(("command", ("git", "switch", "--detach", "new-sha"))) == 1
+
+    cached = deploy(
+        request,
+        config=config,
+        runner=FakeRunner(_responses(), events),
+        github=FakeGitHub(_evidence()),
+        snapshots=snapshots,
+        services=services,
+        health=FakeHealth([], events),
+        store=RecordingStore(events),
+    )
+    assert cached.status == "rolled_back_healthy"
+    assert events.count(("command", ("git", "switch", "--detach", "new-sha"))) == 1
+
+
 def test_modern_rollback_keeps_runtime_identity_mandatory(tmp_path: Path):
     events: list[tuple] = []
     config = _config(tmp_path)
