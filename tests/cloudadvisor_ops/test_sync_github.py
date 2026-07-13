@@ -16,6 +16,10 @@ from ops.cloudadvisor.hermes_ops.sync_github import (
     RequiredCheckPendingError,
     SyncGitHubError,
 )
+from ops.cloudadvisor.hermes_ops.sync_poll import (
+    ExactHeadExpectation,
+    poll_exact_head,
+)
 
 
 REPO = "Oplink76/hermes-agent"
@@ -170,6 +174,35 @@ def test_missing_aggregate_check_is_typed_as_pending(tmp_path: Path):
         github.evidence(7)
 
     assert all(call.argv[2] != "merge" for call in runner.calls)
+
+
+def test_poll_waits_for_real_github_adapter_to_publish_aggregate_check(
+    tmp_path: Path,
+):
+    github, runner = _github(
+        tmp_path,
+        _completed(_pr(conclusion=None)),
+        _completed(_pr(conclusion=None)),
+        _completed(_pr()),
+    )
+    now = [0.0]
+
+    evidence = poll_exact_head(
+        github,
+        ExactHeadExpectation(
+            pr_number=7,
+            base_sha=BASE_SHA,
+            head_sha=HEAD_SHA,
+            required_check=CHECK,
+        ),
+        timeout_seconds=10,
+        poll_interval_seconds=1,
+        clock=lambda: now[0],
+        sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    )
+
+    assert evidence.required_check_conclusion == "success"
+    assert [call.argv[2] for call in runner.calls] == ["view", "view", "view"]
 
 
 def test_merge_exact_rejects_closed_pull_request(tmp_path: Path):
