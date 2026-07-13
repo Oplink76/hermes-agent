@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -72,6 +73,7 @@ def test_pending_reconstruction_is_content_addressed_and_discoverable(
         assert stat.S_IMODE(pointer.stat().st_mode) == 0o600
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink requires privileges")
 def test_pending_reconstruction_rejects_symlinked_checkpoint_scope(tmp_path: Path):
     external = tmp_path / "external"
     external.mkdir()
