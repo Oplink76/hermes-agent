@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import subprocess
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 from hermes_cli.upstream_sync_status import (
-    SyncNotificationState,
     SyncStatus,
+    write_json_atomic,
 )
 
 from .command import CommandRunner
@@ -36,11 +38,18 @@ def escalation_fingerprint(result: AutonomousSyncResult) -> str | None:
     if _state_value(result) != AutonomousSyncState.NEEDS_OLE.value:
         return None
     evidence = {
+        "affected_files": list(result.affected_files),
         "candidate_sha": result.candidate_sha,
+        "details_artifact": result.details_artifact,
+        "failed_gate": result.failed_gate,
         "installed_sha": result.installed_sha,
         "merge_sha": result.merge_sha,
         "pr_number": result.pr_number,
-        "reason": result.reason,
+        "reason_code": result.reason_code,
+        "revert_sha": result.revert_sha,
+        "revert_state": result.revert_state,
+        "rollback_sha": result.rollback_sha,
+        "rollback_state": result.rollback_state,
         "state": _state_value(result),
     }
     canonical = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
@@ -120,21 +129,150 @@ def status_from_result(
     )
 
 
-class SyncNotificationStore:
-    """Result-aware facade over the packaged active-decision state."""
+@dataclass(frozen=True)
+class SyncDecisionOutboxRecord:
+    status: str
+    escalation_fingerprint: str
+    packet_path: str
+    packet_sha256: str
+    idempotency_key: str
+
+
+class SyncDecisionOutbox:
+    """Durable at-least-once handoff; acknowledgement follows delivery."""
+
+    _FIELDS = {
+        "schema_version",
+        "status",
+        "escalation_fingerprint",
+        "packet_path",
+        "packet_sha256",
+        "idempotency_key",
+    }
 
     def __init__(self, path: Path):
-        self._state = SyncNotificationState(path)
+        self.path = Path(path)
 
-    def should_emit(self, result: AutonomousSyncResult) -> bool:
-        fingerprint = escalation_fingerprint(result)
-        return fingerprint is not None and self._state.should_emit(fingerprint)
+    @staticmethod
+    def _digest(value: object, *, field: str) -> str:
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(f"{field} must be 64 lowercase hex characters")
+        return value
 
-    def record_emitted(self, result: AutonomousSyncResult) -> None:
-        fingerprint = escalation_fingerprint(result)
-        if fingerprint is None:
-            raise ValueError("only NEEDS_OLE decisions can be recorded")
-        self._state.record_emitted(fingerprint)
+    def load(self) -> SyncDecisionOutboxRecord | None:
+        try:
+            metadata = self.path.lstat()
+            raw = self.path.read_text(encoding="utf-8")
+            payload = json.loads(raw)
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("sync decision outbox is unreadable") from exc
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or (os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o600)
+            or not isinstance(payload, dict)
+            or set(payload) != self._FIELDS
+            or payload.get("schema_version") != 2
+            or payload.get("status") not in {"pending", "acknowledged"}
+            or raw
+            != json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+        ):
+            raise ValueError("sync decision outbox schema is invalid")
+        packet_path = payload.get("packet_path")
+        if not isinstance(packet_path, str) or not Path(packet_path).is_absolute():
+            raise ValueError("sync decision outbox packet path is invalid")
+        return SyncDecisionOutboxRecord(
+            status=payload["status"],
+            escalation_fingerprint=self._digest(
+                payload.get("escalation_fingerprint"), field="fingerprint"
+            ),
+            packet_path=packet_path,
+            packet_sha256=self._digest(
+                payload.get("packet_sha256"), field="packet digest"
+            ),
+            idempotency_key=self._digest(
+                payload.get("idempotency_key"), field="idempotency key"
+            ),
+        )
+
+    def stage(
+        self,
+        *,
+        fingerprint: str,
+        packet_path: Path,
+        packet_sha256: str,
+    ) -> bool:
+        fingerprint = self._digest(fingerprint, field="fingerprint")
+        packet_sha256 = self._digest(packet_sha256, field="packet digest")
+        path = Path(packet_path).expanduser().resolve(strict=False)
+        idempotency_key = hashlib.sha256(
+            f"{fingerprint}:{packet_sha256}".encode("ascii")
+        ).hexdigest()
+        requested = SyncDecisionOutboxRecord(
+            status="pending",
+            escalation_fingerprint=fingerprint,
+            packet_path=str(path),
+            packet_sha256=packet_sha256,
+            idempotency_key=idempotency_key,
+        )
+        current = self.load()
+        if current is not None and current.status == "pending" and current != requested:
+            raise ValueError("a different sync decision is still pending delivery")
+        if current is not None and current.status == "acknowledged" and (
+            current.escalation_fingerprint,
+            current.packet_sha256,
+            current.idempotency_key,
+        ) == (
+            requested.escalation_fingerprint,
+            requested.packet_sha256,
+            requested.idempotency_key,
+        ):
+            return False
+        if current != requested:
+            write_json_atomic(
+                self.path,
+                {"schema_version": 2, **asdict(requested)},
+            )
+        return True
+
+    def acknowledge(
+        self,
+        *,
+        fingerprint: str,
+        packet_sha256: str,
+        idempotency_key: str,
+    ) -> None:
+        current = self.load()
+        expected = (
+            self._digest(fingerprint, field="fingerprint"),
+            self._digest(packet_sha256, field="packet digest"),
+            self._digest(idempotency_key, field="idempotency key"),
+        )
+        if current is None or current.status != "pending" or (
+            current.escalation_fingerprint,
+            current.packet_sha256,
+            current.idempotency_key,
+        ) != expected:
+            raise ValueError("delivery acknowledgement does not match pending packet")
+        write_json_atomic(
+            self.path,
+            {
+                "schema_version": 2,
+                **asdict(replace(current, status="acknowledged")),
+            },
+        )
 
     def clear_resolved(self) -> None:
-        self._state.clear()
+        current = self.load()
+        if current is not None and current.status == "pending":
+            return
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass

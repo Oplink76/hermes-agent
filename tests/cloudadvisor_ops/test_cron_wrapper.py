@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -18,15 +19,23 @@ from ops.cloudadvisor.hermes_ops.sync_controller import (
     AutonomousSyncResult,
     AutonomousSyncState,
 )
+from ops.cloudadvisor.hermes_ops.sync_status import SyncDecisionOutbox
 
 
 class FakeRun:
-    def __init__(self, completed: subprocess.CompletedProcess[str]):
+    def __init__(
+        self,
+        completed: subprocess.CompletedProcess[str],
+        before_return=None,
+    ):
         self.completed = completed
+        self.before_return = before_return
         self.calls: list[list[str]] = []
 
     def __call__(self, argv: list[str], **kwargs):
         self.calls.append(argv)
+        if self.before_return is not None:
+            self.before_return()
         return self.completed
 
 
@@ -44,7 +53,7 @@ def _config(tmp_path: Path) -> CronWrapperConfig:
         install_root=tmp_path / "repo",
         operations_config=tmp_path / "operations.yaml",
         trusted_root=tmp_path / "receipts",
-        delivery_store=tmp_path / "sync-deliveries.json",
+        outbox_store=tmp_path / "sync-notifications.json",
     )
 
 
@@ -55,10 +64,19 @@ def _payload(**overrides: object) -> dict[str, object]:
         "pr_number": None,
         "merge_sha": None,
         "deployed_sha": None,
-        "fork_main_sha": "a" * 40,
-        "installed_sha": "a" * 40,
+        "fork_main_sha": None,
+        "installed_sha": None,
         "needs_ole": False,
         "reason": None,
+        "reason_code": None,
+        "failed_gate": None,
+        "repo_slug": "Oplink76/hermes-agent",
+        "affected_files": [],
+        "rollback_state": None,
+        "rollback_sha": None,
+        "revert_state": None,
+        "revert_sha": None,
+        "details_artifact": None,
         "checked_at": "2026-07-13T00:00:00+00:00",
         "upstream_behind": 0,
         "fork_behind": 0,
@@ -66,9 +84,17 @@ def _payload(**overrides: object) -> dict[str, object]:
         "notify_ole": False,
         "escalation_fingerprint": None,
         "decision_packet_path": None,
+        "decision_packet_sha256": None,
+        "decision_idempotency_key": None,
     }
     payload.update(overrides)
     return payload
+
+
+def _idempotency(fingerprint: str, packet_sha256: str) -> str:
+    return hashlib.sha256(
+        f"{fingerprint}:{packet_sha256}".encode("ascii")
+    ).hexdigest()
 
 
 @pytest.mark.parametrize(
@@ -114,12 +140,22 @@ def test_notify_ole_delivers_one_matching_decision_packet(
         fork_main_sha="a" * 40,
         installed_sha="b" * 40,
         needs_ole=True,
+        reason_code="GITHUB_AUTHORITY_INVALID",
+        failed_gate="github_authority",
     )
     packet = publish_escalation_decision_packet(
         result,
         fingerprint="1" * 64,
         trusted_root=tmp_path / "receipts",
+        repo_slug="Oplink76/hermes-agent",
     )
+    outbox = SyncDecisionOutbox(tmp_path / "sync-notifications.json")
+    def stage() -> None:
+        outbox.stage(
+            fingerprint="1" * 64,
+            packet_path=packet.path,
+            packet_sha256=packet.sha256,
+        )
     raw = json.dumps(
         _payload(
             state="NEEDS_OLE",
@@ -130,12 +166,20 @@ def test_notify_ole_delivers_one_matching_decision_packet(
             installed_sha="b" * 40,
             needs_ole=True,
             reason="not forwarded",
+            reason_code="GITHUB_AUTHORITY_INVALID",
+            failed_gate="github_authority",
+            details_artifact=str(packet.details_path),
             notify_ole=True,
             escalation_fingerprint="1" * 64,
             decision_packet_path=str(packet.path),
+            decision_packet_sha256=packet.sha256,
+            decision_idempotency_key=_idempotency("1" * 64, packet.sha256),
         )
     )
-    run = FakeRun(subprocess.CompletedProcess([], 2, stdout=raw, stderr=""))
+    run = FakeRun(
+        subprocess.CompletedProcess([], 2, stdout=raw, stderr=""),
+        before_return=stage,
+    )
 
     assert run_sync_auto(_config(tmp_path), run=run) == 0
     delivered = capsys.readouterr().out
@@ -144,8 +188,7 @@ def test_notify_ole_delivers_one_matching_decision_packet(
     assert "Approve / Wait / Details" in delivered
     assert "secret" not in delivered
 
-    assert run_sync_auto(_config(tmp_path), run=run) == 0
-    assert capsys.readouterr() == ("", "")
+    assert outbox.load().status == "acknowledged"
 
 
 def test_malformed_sync_output_fails_closed_without_claiming_no_change(
@@ -168,27 +211,165 @@ def test_notify_ole_rejects_packet_with_wrong_fingerprint(
     result = AutonomousSyncResult(
         state=AutonomousSyncState.NEEDS_OLE,
         needs_ole=True,
+        reason_code="GITHUB_AUTHORITY_INVALID",
+        failed_gate="github_authority",
     )
     packet = publish_escalation_decision_packet(
         result,
         fingerprint="2" * 64,
         trusted_root=tmp_path / "receipts",
+        repo_slug="Oplink76/hermes-agent",
     )
+    outbox = SyncDecisionOutbox(tmp_path / "sync-notifications.json")
+    def stage() -> None:
+        outbox.stage(
+            fingerprint="1" * 64,
+            packet_path=packet.path,
+            packet_sha256=packet.sha256,
+        )
     raw = json.dumps(
         _payload(
             state="NEEDS_OLE",
             needs_ole=True,
+            reason_code="GITHUB_AUTHORITY_INVALID",
+            failed_gate="github_authority",
+            details_artifact=str(packet.details_path),
             notify_ole=True,
             escalation_fingerprint="1" * 64,
             decision_packet_path=str(packet.path),
+            decision_packet_sha256=packet.sha256,
+            decision_idempotency_key=_idempotency("1" * 64, packet.sha256),
         )
     )
-    run = FakeRun(subprocess.CompletedProcess([], 2, stdout=raw, stderr=""))
+    run = FakeRun(
+        subprocess.CompletedProcess([], 2, stdout=raw, stderr=""),
+        before_return=stage,
+    )
 
     assert run_sync_auto(_config(tmp_path), run=run) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "fingerprint" in captured.err
+
+
+def test_delivery_failure_leaves_pending_outbox_for_retry(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = AutonomousSyncResult(
+        state=AutonomousSyncState.NEEDS_OLE,
+        candidate_sha="c" * 40,
+        needs_ole=True,
+        reason_code="GITHUB_AUTHORITY_INVALID",
+        failed_gate="github_authority",
+    )
+    packet = publish_escalation_decision_packet(
+        result,
+        fingerprint="3" * 64,
+        trusted_root=tmp_path / "receipts",
+        repo_slug="Oplink76/hermes-agent",
+    )
+    outbox = SyncDecisionOutbox(tmp_path / "sync-notifications.json")
+    def stage() -> None:
+        outbox.stage(
+            fingerprint="3" * 64,
+            packet_path=packet.path,
+            packet_sha256=packet.sha256,
+        )
+    raw = json.dumps(
+        _payload(
+            state="NEEDS_OLE",
+            candidate_sha="c" * 40,
+            needs_ole=True,
+            reason_code="GITHUB_AUTHORITY_INVALID",
+            failed_gate="github_authority",
+            details_artifact=str(packet.details_path),
+            notify_ole=True,
+            escalation_fingerprint="3" * 64,
+            decision_packet_path=str(packet.path),
+            decision_packet_sha256=packet.sha256,
+            decision_idempotency_key=_idempotency("3" * 64, packet.sha256),
+        )
+    )
+    run = FakeRun(
+        subprocess.CompletedProcess([], 2, stdout=raw, stderr=""),
+        before_return=stage,
+    )
+
+    def fail_delivery(message: str) -> None:
+        raise OSError("delivery unavailable")
+
+    assert run_sync_auto(_config(tmp_path), run=run, deliver=fail_delivery) == 2
+    assert outbox.load().status == "pending"
+    assert "delivery unavailable" in capsys.readouterr().err
+
+    delivered: list[str] = []
+    assert run_sync_auto(_config(tmp_path), run=run, deliver=delivered.append) == 0
+    assert len(delivered) == 1
+    assert outbox.load().status == "acknowledged"
+
+
+def test_ack_failure_after_delivery_retries_with_same_idempotency_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = AutonomousSyncResult(
+        state=AutonomousSyncState.NEEDS_OLE,
+        needs_ole=True,
+        reason_code="GITHUB_AUTHORITY_INVALID",
+        failed_gate="github_authority",
+    )
+    packet = publish_escalation_decision_packet(
+        result,
+        fingerprint="4" * 64,
+        trusted_root=tmp_path / "receipts",
+        repo_slug="Oplink76/hermes-agent",
+    )
+    outbox = SyncDecisionOutbox(tmp_path / "sync-notifications.json")
+    def stage() -> None:
+        outbox.stage(
+            fingerprint="4" * 64,
+            packet_path=packet.path,
+            packet_sha256=packet.sha256,
+        )
+    idempotency_key = _idempotency("4" * 64, packet.sha256)
+    raw = json.dumps(
+        _payload(
+            state="NEEDS_OLE",
+            needs_ole=True,
+            reason_code="GITHUB_AUTHORITY_INVALID",
+            failed_gate="github_authority",
+            details_artifact=str(packet.details_path),
+            notify_ole=True,
+            escalation_fingerprint="4" * 64,
+            decision_packet_path=str(packet.path),
+            decision_packet_sha256=packet.sha256,
+            decision_idempotency_key=idempotency_key,
+        )
+    )
+    run = FakeRun(
+        subprocess.CompletedProcess([], 2, stdout=raw, stderr=""),
+        before_return=stage,
+    )
+    delivered: list[str] = []
+    real_acknowledge = SyncDecisionOutbox.acknowledge
+    monkeypatch.setattr(
+        SyncDecisionOutbox,
+        "acknowledge",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("ack crash")),
+    )
+
+    assert run_sync_auto(_config(tmp_path), run=run, deliver=delivered.append) == 2
+    assert len(delivered) == 1
+    assert outbox.load().status == "pending"
+    assert "ack crash" in capsys.readouterr().err
+
+    monkeypatch.setattr(SyncDecisionOutbox, "acknowledge", real_acknowledge)
+    assert run_sync_auto(_config(tmp_path), run=run, deliver=delivered.append) == 0
+    assert len(delivered) == 2
+    assert outbox.load().status == "acknowledged"
+    assert outbox.load().idempotency_key == idempotency_key
 
 
 def test_health_action_is_quiet_when_installed_runtime_is_healthy(

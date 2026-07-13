@@ -305,6 +305,7 @@ export interface DesktopUpdateStatus {
   upstreamBehind?: number
   syncState?: string
   syncUpdateBlocked?: boolean
+  syncDeploymentState?: string
   syncPrNumber?: number
   syncRequiredCheck?: string
   installedSha?: string

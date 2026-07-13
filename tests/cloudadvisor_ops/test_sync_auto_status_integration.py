@@ -18,6 +18,7 @@ from ops.cloudadvisor.hermes_ops.sync_controller import (
     AutonomousSyncResult,
     AutonomousSyncState,
 )
+from ops.cloudadvisor.hermes_ops.sync_status import SyncDecisionOutbox
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -130,6 +131,9 @@ def test_sync_auto_publishes_status_api_and_deduplicated_alert_decision(
         pr_number=7,
         needs_ole=True,
         reason="major conflict",
+        reason_code="MERGE_CONFLICT_MAJOR",
+        failed_gate="conflict_classification",
+        affected_files=("conflicted.py",),
     )
     outcomes = iter([
         needs_ole,
@@ -165,6 +169,13 @@ def test_sync_auto_publishes_status_api_and_deduplicated_alert_decision(
     )
     assert packet.escalation_fingerprint == first["escalation_fingerprint"]
     assert packet.actions == ("Approve", "Wait", "Details")
+    assert packet.reason_code == "MERGE_CONFLICT_MAJOR"
+    outbox = SyncDecisionOutbox(tmp_path / "notifications.json")
+    outbox.acknowledge(
+        fingerprint=first["escalation_fingerprint"],
+        packet_sha256=first["decision_packet_sha256"],
+        idempotency_key=first["decision_idempotency_key"],
+    )
     status = SyncStatus.load(tmp_path / "sync-status.json")
     assert status.upstream_behind == 1
     assert status.fork_behind == 0

@@ -3521,16 +3521,17 @@ async def update_hermes():
             "update_command": "managed outside dashboard",
         }
 
+    pending_deployment_state = _pending_sync_deployment_state()
     try:
         from hermes_cli.upstream_sync_status import SyncStatus
 
         sync_status = SyncStatus.load(_upstream_sync_status_path())
     except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
         sync_status = None
-    if sync_status is not None and sync_status.sync_state in {
-        "NEEDS_OLE",
-        "ROLLED_BACK_REVERTED",
-    }:
+    if pending_deployment_state is not None or (
+        sync_status is not None
+        and sync_status.sync_state in {"NEEDS_OLE", "ROLLED_BACK_REVERTED"}
+    ):
         message = (
             "Hermes update is blocked while autonomous upstream sync needs "
             "attention or is recovering."
@@ -3630,8 +3631,24 @@ def _with_upstream_sync_status(payload: Dict[str, Any]) -> Dict[str, Any]:
             "fork_behind": payload.get("behind"),
             "installed_sha": None,
             "sync_update_blocked": False,
+            "sync_deployment_state": None,
         }
     )
+    deployment_state = _pending_sync_deployment_state()
+    if deployment_state is not None:
+        enriched.update(
+            {
+                "update_available": False,
+                "can_apply": False,
+                "commits": [],
+                "sync_update_blocked": True,
+                "sync_deployment_state": deployment_state,
+                "message": (
+                    "Autonomous upstream sync deployment is active or requires "
+                    "recovery · Update action blocked"
+                ),
+            }
+        )
     try:
         from hermes_cli.upstream_sync_status import (
             SyncStatus,
@@ -3673,14 +3690,14 @@ def _with_upstream_sync_status(payload: Dict[str, Any]) -> Dict[str, Any]:
         upstream_behind=status.upstream_behind,
         sync_state=status.sync_state,
     )
-    if message is not None:
+    if message is not None and deployment_state is None:
         enriched["message"] = message
-    elif status.sync_state == "ROLLED_BACK_REVERTED":
+    elif deployment_state is None and status.sync_state == "ROLLED_BACK_REVERTED":
         enriched["message"] = (
             "Official upstream sync recovery active after safe rollback · "
             "Update action blocked"
         )
-    elif status.sync_state == "NEEDS_OLE":
+    elif deployment_state is None and status.sync_state == "NEEDS_OLE":
         enriched["message"] = (
             "Official upstream sync needs attention · Update action blocked"
         )
@@ -3691,6 +3708,22 @@ def _upstream_sync_status_path() -> Path:
     from hermes_constants import get_default_hermes_root
 
     return get_default_hermes_root() / "recovery" / "sync-status.json"
+
+
+def _upstream_sync_receipt_root() -> Path:
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root() / "recovery" / "sync-receipts"
+
+
+def _pending_sync_deployment_state() -> str | None:
+    """Return a trusted blocking stage; malformed evidence fails closed."""
+    try:
+        from hermes_cli.upstream_sync_status import pending_deployment_state
+
+        return pending_deployment_state(_upstream_sync_receipt_root())
+    except (OSError, ValueError):
+        return "crossed_invalid"
 
 
 @app.get("/api/hermes/update/check")

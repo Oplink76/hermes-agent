@@ -26,6 +26,9 @@ export function formatHermesSyncSummary(
 export function isHermesSyncUpdateBlocked(info: UpdateCheckResponse): boolean {
   return (
     info.sync_update_blocked === true ||
+    info.sync_deployment_state === "merge_intent" ||
+    info.sync_deployment_state === "merged_pending_deploy" ||
+    info.sync_deployment_state === "crossed_invalid" ||
     info.sync_state === "NEEDS_OLE" ||
     info.sync_state === "ROLLED_BACK_REVERTED"
   );

@@ -288,6 +288,9 @@ function mapBackendCheck(res: BackendUpdateCheckResponse): DesktopUpdateStatus {
 
   const syncBlocked =
     res.sync_update_blocked === true ||
+    res.sync_deployment_state === 'merge_intent' ||
+    res.sync_deployment_state === 'merged_pending_deploy' ||
+    res.sync_deployment_state === 'crossed_invalid' ||
     res.sync_state === 'NEEDS_OLE' ||
     res.sync_state === 'ROLLED_BACK_REVERTED'
 
@@ -301,6 +304,7 @@ function mapBackendCheck(res: BackendUpdateCheckResponse): DesktopUpdateStatus {
     upstreamBehind: res.upstream_behind ?? undefined,
     syncState: res.sync_state ?? undefined,
     syncUpdateBlocked: syncBlocked,
+    syncDeploymentState: res.sync_deployment_state ?? undefined,
     syncPrNumber: res.sync_pr_number ?? undefined,
     syncRequiredCheck: res.sync_required_check ?? undefined,
     installedSha: res.installed_sha ?? undefined,

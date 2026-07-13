@@ -105,4 +105,19 @@ describe("formatHermesSyncSummary", () => {
     expect(formatHermesSyncSummary(info)).toContain("safe rollback");
     expect(canApplyHermesUpdate(info)).toBe(false);
   });
+
+  it("suppresses Update now during a durable pending deployment", () => {
+    const info = {
+      install_method: "git",
+      current_version: "0.17.0",
+      behind: 1,
+      update_available: true,
+      can_apply: true,
+      update_command: "hermes update",
+      message: "Autonomous upstream sync deployment is active",
+      sync_deployment_state: "merged_pending_deploy",
+    };
+
+    expect(canApplyHermesUpdate(info)).toBe(false);
+  });
 });

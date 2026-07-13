@@ -12,6 +12,7 @@ sync:
   # Content-addressed Ole decision packets are written below
   # receipt_root/decision-packets and must remain operator-owned.
   status_file: /Users/cloudadvisor/.hermes/recovery/sync-status.json
+  # Durable pending/acknowledged delivery outbox (schema v2).
   notification_store: /Users/cloudadvisor/.hermes/recovery/sync-notifications.json
   required_check: All required checks pass
   check_timeout_seconds: 2700

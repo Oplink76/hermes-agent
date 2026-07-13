@@ -4,13 +4,15 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from ops.cloudadvisor.hermes_ops.sync_controller import (
     AutonomousSyncResult,
     AutonomousSyncState,
 )
 from ops.cloudadvisor.hermes_ops.sync_status import (
     SyncStatusContext,
-    SyncNotificationStore,
+    SyncDecisionOutbox,
     SyncStatus,
     status_from_result,
 )
@@ -152,35 +154,109 @@ def test_status_collection_survives_unavailable_git_evidence(tmp_path: Path) -> 
     assert status.installed_sha is None
 
 
-def test_same_needs_ole_fingerprint_notified_once(tmp_path: Path) -> None:
-    store = SyncNotificationStore(tmp_path / "notifications.json")
-    packet = _result(AutonomousSyncState.NEEDS_OLE, reason="major conflict")
+def test_pending_decision_retries_until_exact_delivery_ack(tmp_path: Path) -> None:
+    store = SyncDecisionOutbox(tmp_path / "notifications.json")
+    packet_path = (tmp_path / "packet.json").resolve()
 
-    assert store.should_emit(packet) is True
-    store.record_emitted(packet)
-    assert store.should_emit(packet) is False
+    assert store.stage(
+        fingerprint="1" * 64,
+        packet_path=packet_path,
+        packet_sha256="2" * 64,
+    ) is True
+    pending = store.load()
+    assert pending is not None
+    assert pending.status == "pending"
+    assert store.stage(
+        fingerprint="1" * 64,
+        packet_path=packet_path,
+        packet_sha256="2" * 64,
+    ) is True
 
-
-def test_notification_fingerprint_changes_with_escalation_evidence(
-    tmp_path: Path,
-) -> None:
-    store = SyncNotificationStore(tmp_path / "notifications.json")
-    first = _result(AutonomousSyncState.NEEDS_OLE, reason="major conflict")
-    second = _result(
-        AutonomousSyncState.NEEDS_OLE,
-        candidate_sha="b" * 40,
-        reason="major conflict",
+    store.acknowledge(
+        fingerprint="1" * 64,
+        packet_sha256="2" * 64,
+        idempotency_key=pending.idempotency_key,
     )
 
-    store.record_emitted(first)
+    assert store.load().status == "acknowledged"
+    assert store.stage(
+        fingerprint="1" * 64,
+        packet_path=packet_path,
+        packet_sha256="2" * 64,
+    ) is False
 
-    assert store.should_emit(second) is True
+
+def test_changed_decision_reopens_acknowledged_outbox(
+    tmp_path: Path,
+) -> None:
+    store = SyncDecisionOutbox(tmp_path / "notifications.json")
+    packet_path = (tmp_path / "packet.json").resolve()
+    store.stage(
+        fingerprint="1" * 64,
+        packet_path=packet_path,
+        packet_sha256="2" * 64,
+    )
+    pending = store.load()
+    store.acknowledge(
+        fingerprint="1" * 64,
+        packet_sha256="2" * 64,
+        idempotency_key=pending.idempotency_key,
+    )
+
+    assert store.stage(
+        fingerprint="3" * 64,
+        packet_path=(tmp_path / "changed.json").resolve(),
+        packet_sha256="4" * 64,
+    ) is True
+    assert store.load().status == "pending"
+    assert store.load().escalation_fingerprint == "3" * 64
 
 
-def test_non_escalation_result_never_notifies(tmp_path: Path) -> None:
-    store = SyncNotificationStore(tmp_path / "notifications.json")
+def test_pending_decision_cannot_be_overwritten_or_cleared(tmp_path: Path) -> None:
+    store = SyncDecisionOutbox(tmp_path / "notifications.json")
+    store.stage(
+        fingerprint="1" * 64,
+        packet_path=(tmp_path / "packet.json").resolve(),
+        packet_sha256="2" * 64,
+    )
 
-    assert store.should_emit(_result(AutonomousSyncState.DEPLOYED)) is False
+    with pytest.raises(ValueError, match="still pending"):
+        store.stage(
+            fingerprint="3" * 64,
+            packet_path=(tmp_path / "changed.json").resolve(),
+            packet_sha256="4" * 64,
+        )
+    store.clear_resolved()
+
+    assert store.load().status == "pending"
+    assert store.load().escalation_fingerprint == "1" * 64
+
+
+def test_resolved_cycle_clears_ack_and_same_future_decision_can_reopen(
+    tmp_path: Path,
+) -> None:
+    store = SyncDecisionOutbox(tmp_path / "notifications.json")
+    packet_path = (tmp_path / "packet.json").resolve()
+    store.stage(
+        fingerprint="1" * 64,
+        packet_path=packet_path,
+        packet_sha256="2" * 64,
+    )
+    pending = store.load()
+    store.acknowledge(
+        fingerprint="1" * 64,
+        packet_sha256="2" * 64,
+        idempotency_key=pending.idempotency_key,
+    )
+
+    store.clear_resolved()
+
+    assert store.load() is None
+    assert store.stage(
+        fingerprint="1" * 64,
+        packet_path=packet_path,
+        packet_sha256="2" * 64,
+    ) is True
 
 
 def test_status_write_is_canonical_atomic_and_excludes_reason(tmp_path: Path) -> None:

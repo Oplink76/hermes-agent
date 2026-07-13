@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 from .decision_packet import load_escalation_decision_packet
-from hermes_cli.upstream_sync_status import SyncNotificationState
+from .sync_status import SyncDecisionOutbox
 
 
 _QUIET_STATES = {
@@ -32,6 +33,15 @@ _SYNC_FIELDS = {
     "installed_sha",
     "needs_ole",
     "reason",
+    "reason_code",
+    "failed_gate",
+    "repo_slug",
+    "affected_files",
+    "rollback_state",
+    "rollback_sha",
+    "revert_state",
+    "revert_sha",
+    "details_artifact",
     "checked_at",
     "upstream_behind",
     "fork_behind",
@@ -39,6 +49,8 @@ _SYNC_FIELDS = {
     "notify_ole",
     "escalation_fingerprint",
     "decision_packet_path",
+    "decision_packet_sha256",
+    "decision_idempotency_key",
 }
 
 
@@ -48,7 +60,7 @@ class CronWrapperConfig:
     install_root: Path
     operations_config: Path
     trusted_root: Path
-    delivery_store: Path
+    outbox_store: Path
 
 
 def _load_exact_object(raw: str) -> dict[str, object]:
@@ -65,7 +77,15 @@ def _load_exact_object(raw: str) -> dict[str, object]:
         raise ValueError("sync-auto notify_ole must be boolean")
     if type(payload.get("needs_ole")) is not bool:
         raise ValueError("sync-auto needs_ole must be boolean")
-    for field in ("candidate_sha", "merge_sha", "deployed_sha", "fork_main_sha", "installed_sha"):
+    for field in (
+        "candidate_sha",
+        "merge_sha",
+        "deployed_sha",
+        "fork_main_sha",
+        "installed_sha",
+        "rollback_sha",
+        "revert_sha",
+    ):
         value = payload.get(field)
         if value is not None and (
             not isinstance(value, str)
@@ -86,33 +106,129 @@ def _load_exact_object(raw: str) -> dict[str, object]:
         "sync_required_check",
         "escalation_fingerprint",
         "decision_packet_path",
+        "decision_packet_sha256",
+        "decision_idempotency_key",
+        "reason_code",
+        "failed_gate",
+        "repo_slug",
+        "rollback_state",
+        "revert_state",
+        "details_artifact",
     ):
         value = payload.get(field)
         if value is not None and (not isinstance(value, str) or not value):
             raise ValueError(f"sync-auto {field} is invalid")
+    affected_files = payload.get("affected_files")
+    if (
+        not isinstance(affected_files, list)
+        or not all(
+            isinstance(path, str)
+            and path
+            and not Path(path).is_absolute()
+            and ".." not in Path(path).parts
+            for path in affected_files
+        )
+        or len(affected_files) != len(set(affected_files))
+    ):
+        raise ValueError("sync-auto affected_files is invalid")
+    repo_slug = payload.get("repo_slug")
+    if (
+        not isinstance(repo_slug, str)
+        or repo_slug != repo_slug.strip()
+        or repo_slug.count("/") != 1
+        or not all(repo_slug.split("/"))
+    ):
+        raise ValueError("sync-auto repo_slug is invalid")
+    reason_code = payload.get("reason_code")
+    if reason_code is not None and re.fullmatch(
+        r"[A-Z][A-Z0-9_]*", reason_code
+    ) is None:
+        raise ValueError("sync-auto reason_code is invalid")
+    failed_gate = payload.get("failed_gate")
+    if failed_gate is not None and re.fullmatch(
+        r"[a-z][a-z0-9_]*", failed_gate
+    ) is None:
+        raise ValueError("sync-auto failed_gate is invalid")
     return payload
 
 
 def _matches_packet(payload: dict[str, object], packet) -> bool:
-    return all(
+    scalar_match = all(
         payload.get(field) == getattr(packet, field)
         for field in (
             "state",
+            "reason_code",
+            "failed_gate",
+            "repo_slug",
             "candidate_sha",
             "pr_number",
             "merge_sha",
             "fork_main_sha",
             "installed_sha",
+            "rollback_state",
+            "rollback_sha",
+            "revert_state",
+            "revert_sha",
+            "details_artifact",
         )
-    ) and payload.get("escalation_fingerprint") == packet.escalation_fingerprint
+    )
+    return (
+        scalar_match
+        and tuple(payload.get("affected_files", ())) == packet.affected_files
+        and payload.get("escalation_fingerprint") == packet.escalation_fingerprint
+    )
+
+
+def _deliver_pending(
+    config: CronWrapperConfig,
+    pending,
+    *,
+    deliver: Callable[[str], None] | None,
+) -> None:
+    packet_path = Path(pending.packet_path)
+    packet = load_escalation_decision_packet(
+        packet_path,
+        trusted_root=config.trusted_root,
+    )
+    if (
+        packet.escalation_fingerprint != pending.escalation_fingerprint
+        or packet_path.name != f"{pending.packet_sha256}.json"
+    ):
+        raise ValueError("pending decision packet identity does not match")
+    lines = [
+        "🚨 Hermes upstream sync needs attention",
+        f"Recommendation: {packet.recommendation}",
+        packet.summary,
+        f"Decision id: {pending.idempotency_key}",
+    ]
+    if packet.pr_number is not None:
+        lines.append(f"Pull request: #{packet.pr_number}")
+    lines.append(f"Approve / Wait / Details: {packet.details_artifact}")
+    message = "\n".join(lines) + "\n"
+    if deliver is None:
+        sys.stdout.write(message)
+        sys.stdout.flush()
+    else:
+        deliver(message)
+    SyncDecisionOutbox(config.outbox_store).acknowledge(
+        fingerprint=pending.escalation_fingerprint,
+        packet_sha256=pending.packet_sha256,
+        idempotency_key=pending.idempotency_key,
+    )
 
 
 def run_sync_auto(
     config: CronWrapperConfig,
     *,
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    deliver: Callable[[str], None] | None = None,
 ) -> int:
     try:
+        outbox = SyncDecisionOutbox(config.outbox_store)
+        existing = outbox.load()
+        if existing is not None and existing.status == "pending":
+            _deliver_pending(config, existing, deliver=deliver)
+            return 0
         completed = run(
             [
                 str(config.python),
@@ -145,7 +261,17 @@ def run_sync_auto(
             raise ValueError("NEEDS_OLE exit code contradicts state")
         fingerprint = payload.get("escalation_fingerprint")
         packet_path = payload.get("decision_packet_path")
-        if not isinstance(fingerprint, str) or not isinstance(packet_path, str):
+        packet_sha256 = payload.get("decision_packet_sha256")
+        idempotency_key = payload.get("decision_idempotency_key")
+        if not all(
+            isinstance(value, str)
+            for value in (
+                fingerprint,
+                packet_path,
+                packet_sha256,
+                idempotency_key,
+            )
+        ):
             raise ValueError("Ole notification is missing packet identity")
         packet = load_escalation_decision_packet(
             Path(packet_path),
@@ -153,16 +279,20 @@ def run_sync_auto(
         )
         if not _matches_packet(payload, packet):
             raise ValueError("decision packet fingerprint or evidence does not match")
-        deliveries = SyncNotificationState(config.delivery_store)
-        if not deliveries.should_emit(fingerprint):
-            return 0
-        print("🚨 Hermes upstream sync needs attention")
-        print(f"Recommendation: {packet.recommendation}")
-        print(packet.summary)
-        if packet.pr_number is not None:
-            print(f"Pull request: #{packet.pr_number}")
-        print(f"Approve / Wait / Details: {packet_path}")
-        deliveries.record_emitted(fingerprint)
+        pending = outbox.load()
+        if pending is None or pending.status != "pending" or (
+            pending.escalation_fingerprint,
+            pending.packet_path,
+            pending.packet_sha256,
+            pending.idempotency_key,
+        ) != (
+            fingerprint,
+            str(Path(packet_path).resolve(strict=False)),
+            packet_sha256,
+            idempotency_key,
+        ):
+            raise ValueError("Ole notification does not match the pending outbox")
+        _deliver_pending(config, pending, deliver=deliver)
         return 0
     except subprocess.TimeoutExpired:
         print("sync-auto wrapper failed: command timed out", file=sys.stderr)
@@ -240,7 +370,7 @@ def _config_from_args(args: argparse.Namespace) -> CronWrapperConfig:
         install_root=args.install_root.resolve(strict=False),
         operations_config=args.config.resolve(strict=False),
         trusted_root=policy.receipt_root,
-        delivery_store=policy.notification_store.with_name("sync-deliveries.json"),
+        outbox_store=policy.notification_store,
     )
 
 

@@ -262,6 +262,27 @@ describe('checkBackendUpdates', () => {
     expect(result?.syncUpdateBlocked).toBe(true)
   })
 
+  it('suppresses backend update action while a merge is pending deployment', async () => {
+    setRemote(true)
+    checkHermesUpdateSpy.mockResolvedValue({
+      install_method: 'git',
+      current_version: '0.17.0',
+      behind: 1,
+      update_available: true,
+      can_apply: true,
+      update_command: 'hermes update',
+      message: 'Autonomous upstream sync deployment is active',
+      sync_deployment_state: 'merged_pending_deploy'
+    })
+
+    const result = await checkBackendUpdates()
+
+    expect(result?.updateAvailable).toBe(false)
+    expect(result?.supported).toBe(false)
+    expect(result?.syncUpdateBlocked).toBe(true)
+    expect(result?.syncDeploymentState).toBe('merged_pending_deploy')
+  })
+
   it('preserves backend update_available when the backend cannot count commits', async () => {
     setRemote(true)
     checkHermesUpdateSpy.mockResolvedValue({

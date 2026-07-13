@@ -48,7 +48,7 @@ from .sync_remediation import (
     GhActionsRemediator,
 )
 from .sync_status import (
-    SyncNotificationStore,
+    SyncDecisionOutbox,
     SyncStatus,
     SyncStatusContext,
     status_from_result,
@@ -393,6 +393,10 @@ def _autonomous_sync_payload(
     *,
     status: SyncStatus | None,
     decision_packet_path: Path | None,
+    decision_packet_sha256: str | None,
+    decision_idempotency_key: str | None,
+    decision_details_path: Path | None,
+    repo_slug: str,
 ) -> dict[str, object]:
     return {
         "state": result.state.value,
@@ -404,6 +408,17 @@ def _autonomous_sync_payload(
         "installed_sha": status.installed_sha if status else result.installed_sha,
         "needs_ole": result.needs_ole,
         "reason": result.reason,
+        "reason_code": result.reason_code,
+        "failed_gate": result.failed_gate,
+        "repo_slug": repo_slug,
+        "affected_files": list(result.affected_files),
+        "rollback_state": result.rollback_state,
+        "rollback_sha": result.rollback_sha,
+        "revert_state": result.revert_state,
+        "revert_sha": result.revert_sha,
+        "details_artifact": (
+            str(decision_details_path) if decision_details_path else None
+        ),
         "checked_at": status.checked_at if status else None,
         "upstream_behind": status.upstream_behind if status else None,
         "fork_behind": status.fork_behind if status else None,
@@ -415,6 +430,8 @@ def _autonomous_sync_payload(
         "decision_packet_path": (
             str(decision_packet_path) if decision_packet_path else None
         ),
+        "decision_packet_sha256": decision_packet_sha256,
+        "decision_idempotency_key": decision_idempotency_key,
     }
 
 
@@ -425,7 +442,7 @@ def _publish_sync_outcome(
     policy: SyncPolicyConfig,
     operations: OperationsConfig,
     runner: CommandRunner,
-) -> tuple[SyncStatus, bool, Path | None]:
+) -> tuple[SyncStatus, bool, Path | None, str | None, str | None, Path | None]:
     status = status_from_result(
         result,
         context=SyncStatusContext(
@@ -436,24 +453,42 @@ def _publish_sync_outcome(
         runner=runner,
     )
     status.write(policy.status_file)
-    notifications = SyncNotificationStore(policy.notification_store)
-    notify_ole = notifications.should_emit(result)
+    outbox = SyncDecisionOutbox(policy.notification_store)
+    notify_ole = False
     decision_packet_path = None
+    decision_packet_sha256 = None
+    decision_idempotency_key = None
+    decision_details_path = None
     if status.escalation_fingerprint is not None:
-        decision_packet_path = publish_escalation_decision_packet(
+        packet = publish_escalation_decision_packet(
             result,
             fingerprint=status.escalation_fingerprint,
             trusted_root=policy.receipt_root,
-        ).path
-    if notify_ole:
-        notifications.record_emitted(result)
+            repo_slug=sync_config.repo_slug,
+        )
+        decision_packet_path = packet.path
+        decision_packet_sha256 = packet.sha256
+        decision_details_path = packet.details_path
+        notify_ole = outbox.stage(
+            fingerprint=status.escalation_fingerprint,
+            packet_path=packet.path,
+            packet_sha256=packet.sha256,
+        )
+        decision_idempotency_key = outbox.load().idempotency_key
     elif result.state in {
         AutonomousSyncState.NO_CHANGE,
         AutonomousSyncState.DEPLOYED,
         AutonomousSyncState.ROLLED_BACK_REVERTED,
     }:
-        notifications.clear_resolved()
-    return status, notify_ole, decision_packet_path
+        outbox.clear_resolved()
+    return (
+        status,
+        notify_ole,
+        decision_packet_path,
+        decision_packet_sha256,
+        decision_idempotency_key,
+        decision_details_path,
+    )
 
 
 def current_checkout_sha(root: Path, runner: CommandRunner) -> str:
@@ -628,10 +663,22 @@ def main(argv: list[str] | None = None) -> int:
         )
         published_status: SyncStatus | None = None
         published_packet_path: Path | None = None
+        published_packet_sha256: str | None = None
+        published_idempotency_key: str | None = None
+        published_details_path: Path | None = None
 
         def publish_outcome(outcome: AutonomousSyncResult) -> bool:
-            nonlocal published_packet_path, published_status
-            published_status, notify_ole, published_packet_path = _publish_sync_outcome(
+            nonlocal published_idempotency_key
+            nonlocal published_details_path
+            nonlocal published_packet_path, published_packet_sha256, published_status
+            (
+                published_status,
+                notify_ole,
+                published_packet_path,
+                published_packet_sha256,
+                published_idempotency_key,
+                published_details_path,
+            ) = _publish_sync_outcome(
                 outcome,
                 sync_config=sync_config,
                 policy=policy,
@@ -667,6 +714,10 @@ def main(argv: list[str] | None = None) -> int:
                     result,
                     status=published_status,
                     decision_packet_path=published_packet_path,
+                    decision_packet_sha256=published_packet_sha256,
+                    decision_idempotency_key=published_idempotency_key,
+                    decision_details_path=published_details_path,
+                    repo_slug=sync_config.repo_slug,
                 ),
                 indent=2,
                 sort_keys=True,

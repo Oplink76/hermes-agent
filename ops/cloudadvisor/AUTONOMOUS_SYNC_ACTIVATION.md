@@ -22,8 +22,10 @@ cron, launchd, service, or installation state.
    stdout. Only a `notify_ole=true` result with a matching content-addressed
    decision packet may produce the concise `Approve / Wait / Details` handoff.
 6. Verify the status file, notification request state, delivery fingerprint,
-   decision packet, installed SHA, fork `main`, and runtime health. The wrapper
-   must not expose raw stdout/stderr or secrets.
+   decision packet, outbox acknowledgement, installed SHA, fork `main`, and
+   runtime health. Simulate one delivery failure: the outbox must remain pending
+   and the next run must retry the same decision id. The wrapper must not expose
+   raw stdout/stderr or secrets.
 7. If parsing, packet verification, schedule verification, or runtime health
    fails, restore the recorded rollback copy atomically and re-run `health`.
    Preserve all before/after checksums and command results in the recovery

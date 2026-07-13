@@ -94,6 +94,9 @@ def test_sync_auto_returns_terminal_state_exit_codes(tmp_path: Path, monkeypatch
             ),
             False,
             None,
+            None,
+            None,
+            None,
         ),
     )
 
