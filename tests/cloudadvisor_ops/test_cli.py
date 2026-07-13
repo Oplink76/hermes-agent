@@ -32,6 +32,41 @@ class FakeRunner:
         return self.response
 
 
+def test_sync_auto_preflight_is_read_only_and_does_not_enter_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "ops.yaml"
+    config_path.write_text("not: loaded-by-this-test\n", encoding="utf-8")
+    calls: list[tuple[str, Path]] = []
+
+    class Report:
+        ok = True
+
+        @staticmethod
+        def to_dict() -> dict[str, object]:
+            return {"ok": True, "checks": {"config": "ok"}}
+
+    monkeypatch.setattr(
+        cli,
+        "run_sync_preflight",
+        lambda path: calls.append(("preflight", path)) or Report(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_autonomous_sync",
+        lambda *args, **kwargs: calls.append(("controller", config_path)),
+    )
+
+    assert (
+        cli.main(["sync-auto", "--config", str(config_path), "--preflight"]) == 0
+    )
+    assert calls == [("preflight", config_path)]
+    assert json.loads(capsys.readouterr().out) == {
+        "checks": {"config": "ok"},
+        "ok": True,
+    }
+
+
 def test_sync_auto_returns_terminal_state_exit_codes(tmp_path: Path, monkeypatch):
     config_path = tmp_path / "ops.yaml"
     config_path.write_text("sync: {}\n", encoding="utf-8")

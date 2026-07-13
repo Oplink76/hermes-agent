@@ -26,6 +26,11 @@ their desired launchd state is explicitly approved.
 Run from the repository root with its `.venv` active:
 
 ```bash
+python -m ops.cloudadvisor.hermes_ops.config_migration migrate \
+  --config /path/to/operations.yaml \
+  --backup-dir /operator-owned/rollback-directory
+python -m ops.cloudadvisor.hermes_ops.cli sync-auto \
+  --config /path/to/operations.yaml --preflight
 python -m ops.cloudadvisor.hermes_ops.cli sync --config /path/to/operations.yaml
 python -m ops.cloudadvisor.hermes_ops.cli sync-auto --config /path/to/operations.yaml
 python -m ops.cloudadvisor.hermes_ops.cli health \
@@ -37,6 +42,21 @@ python -m ops.cloudadvisor.hermes_ops.cli deploy \
   --approval-record /path/to/approval.json \
   --actor operator-name
 ```
+
+The versioned migration is for an existing July 10 production config, not the
+fail-closed example. It refuses `/usr/bin/false`, requires and preserves
+`uv_extras: [all, dev, slack]`, preserves the complete Package-1 verifier and
+all unrelated runtime/deploy values, then writes the config atomically. Before
+replacement it records the original and migrated SHA-256 values, an exact
+read-only backup, and a versioned rollback manifest. Restore only through the
+checksum-gated command printed in the activation checklist; never copy the
+example over a live config.
+
+`sync-auto --preflight` is read-only. It validates the complete migrated
+schema, exact fork/upstream identities and remotes, state/decision paths,
+non-Trading runtime allowlist, Package-1 verifier, and availability of GitHub
+CLI, Codex, Claude, and the direct-delivery command. It does not acquire the
+sync lock, merge, deploy, write receipts/status/outbox files, or touch services.
 
 `health` returns success only when at least one mandatory check exists and all
 mandatory checks pass. `deploy` verifies the immutable approval, GitHub merge and
@@ -65,10 +85,15 @@ reported as `NO_CHANGE`.
 The direct command receives the message on stdin, not argv or config, and must
 return nonzero on Slack failure. The production command uses `hermes send`,
 which reads the existing profile-scoped Slack credential without exposing it to
-the wrapper. The sync cron job's scheduler-level `deliver` field must be `none`;
-otherwise Slack would receive a second post-exit copy after the wrapper has
-already delivered and acknowledged. The independent `health` action retains its
-existing stdout/scheduler delivery behavior.
+the wrapper. Keep the sync cron job's scheduler-level `deliver` value at
+`slack:C0BFLTFC2LS`. Direct delivery success and every routine result emit no
+output, so the no-agent scheduler converts them to its `[SILENT]` sentinel and
+sends nothing. A wrapper/config/direct-delivery failure instead emits only a
+concise safe failure; scheduler Slack delivery is the last-resort alert while
+the outbox remains pending for the next stable retry. Hermes `deliver: local`
+is a sentinel meaning “no delivery target”, not a fallback channel, so changing
+the production job to `local` would remove this safety net. The independent
+`health` action retains its existing stdout/scheduler delivery behavior.
 
 The `sync-auto` controller writes the canonical, secret-free status atomically
 to the configured `sync.status_file` before releasing its exclusive sync lock.

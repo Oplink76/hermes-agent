@@ -53,6 +53,7 @@ from .sync_status import (
     SyncStatusContext,
     status_from_result,
 )
+from .sync_preflight import run_sync_preflight
 
 
 @dataclass(frozen=True)
@@ -626,6 +627,11 @@ def main(argv: list[str] | None = None) -> int:
         "sync-auto", help="converge upstream through protected merge and deployment"
     )
     sync_auto_parser.add_argument("--config", type=Path, required=True)
+    sync_auto_parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="validate activation dependencies without changing state",
+    )
     health_parser = subparsers.add_parser(
         "health", help="check configured services against an approved SHA"
     )
@@ -675,6 +681,14 @@ def main(argv: list[str] | None = None) -> int:
             return 3
         return 2
     if args.command == "sync-auto":
+        if args.preflight:
+            try:
+                report = run_sync_preflight(args.config)
+            except (OSError, RuntimeError, ValueError) as exc:
+                print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
+                return 2
+            print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+            return 0
         sync_config = load_sync_config(args.config)
         policy = load_sync_policy_config(args.config)
         operations = load_operations_config(args.config)

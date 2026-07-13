@@ -14,6 +14,8 @@ sync:
   status_file: /Users/cloudadvisor/.hermes/recovery/sync-status.json
   # Durable pending/acknowledged delivery outbox (schema v2).
   notification_store: /Users/cloudadvisor/.hermes/recovery/sync-notifications.json
+  # Decision packets/details are derived below receipt_root; no separate path
+  # is configurable, preventing crossed trust roots during activation.
   # Direct, credential-safe handoff: message body is piped on stdin. The
   # Hermes sender reads existing profile credentials; no token appears here.
   delivery_command:

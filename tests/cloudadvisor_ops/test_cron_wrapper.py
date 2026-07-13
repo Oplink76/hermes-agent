@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import hashlib
+import importlib
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -497,3 +499,151 @@ def test_health_action_preserves_attention_output_for_failed_check(
 
     assert run_health(_config(tmp_path), run=run) == 0
     assert "gateway: down" in capsys.readouterr().out
+
+
+def _no_agent_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / ".hermes"
+    (home / "scripts").mkdir(parents=True)
+    (home / "cron").mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import hermes_constants
+    import cron.jobs
+    import cron.scheduler
+
+    importlib.reload(hermes_constants)
+    importlib.reload(cron.jobs)
+    importlib.reload(cron.scheduler)
+    return home
+
+
+def _no_agent_policy(tmp_path: Path) -> Path:
+    config = tmp_path / "operations.yaml"
+    config.write_text(
+        "\n".join(
+            [
+                "sync:",
+                f"  receipt_root: {tmp_path / 'receipts'}",
+                f"  status_file: {tmp_path / 'sync-status.json'}",
+                f"  notification_store: {tmp_path / 'sync-notifications.json'}",
+                "  required_check: All required checks pass",
+                "  check_timeout_seconds: 2700",
+                "  poll_interval_seconds: 15",
+                "  resolver_backend: codex",
+                "  reviewer_backend: claude",
+                "  delivery_command: [/usr/bin/true]",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return config
+
+
+def _install_no_agent_wrapper(
+    home: Path,
+    *,
+    config: Path,
+    inner_command: Path,
+) -> None:
+    repository = Path(__file__).resolve().parents[2]
+    (home / "scripts" / "upstream-sync.sh").write_text(
+        "\n".join(
+            [
+                "#!/bin/bash",
+                f"cd {repository}",
+                f"exec {sys.executable} -m ops.cloudadvisor.hermes_ops.cron_wrapper \\",
+                f"  sync-auto --config {config} --python {inner_command} \\",
+                f"  --install-root {repository}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _run_as_no_agent() -> tuple[bool, str, str, str | None]:
+    from cron.scheduler import run_job
+
+    return run_job(
+        {
+            "id": "upstream-sync-test",
+            "name": "Hermes fork upstream sync",
+            "script": "upstream-sync.sh",
+            "no_agent": True,
+            "deliver": "slack:C0BFLTFC2LS",
+        }
+    )
+
+
+def test_no_agent_routine_and_direct_success_are_scheduler_silent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = _no_agent_home(tmp_path, monkeypatch)
+    config = _no_agent_policy(tmp_path)
+    inner = tmp_path / "fake-sync-auto"
+    inner.write_text(
+        "#!/bin/sh\nprintf '%s\\n' '"
+        + json.dumps(_payload(), separators=(",", ":"))
+        + "'\n",
+        encoding="utf-8",
+    )
+    inner.chmod(0o755)
+    _install_no_agent_wrapper(home, config=config, inner_command=inner)
+
+    success, _, final_response, error = _run_as_no_agent()
+
+    from cron.scheduler import SILENT_MARKER
+
+    assert success is True
+    assert error is None
+    assert final_response == SILENT_MARKER
+
+    result = AutonomousSyncResult(
+        state=AutonomousSyncState.NEEDS_OLE,
+        needs_ole=True,
+        reason_code="GITHUB_AUTHORITY_INVALID",
+        failed_gate="github_authority",
+    )
+    packet = publish_escalation_decision_packet(
+        result,
+        fingerprint="7" * 64,
+        trusted_root=tmp_path / "receipts",
+        repo_slug="Oplink76/hermes-agent",
+    )
+    outbox = SyncDecisionOutbox(tmp_path / "sync-notifications.json")
+    outbox.stage(
+        fingerprint="7" * 64,
+        packet_path=packet.path,
+        packet_sha256=packet.sha256,
+    )
+
+    success, _, final_response, error = _run_as_no_agent()
+
+    assert success is True
+    assert error is None
+    assert final_response == SILENT_MARKER
+    assert outbox.load().status == "acknowledged"
+
+
+def test_no_agent_config_failure_is_safe_scheduler_fallback_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = _no_agent_home(tmp_path, monkeypatch)
+    config = tmp_path / "operations.yaml"
+    config.write_text("sync: {}\nsecret: must-not-leak\n", encoding="utf-8")
+    _install_no_agent_wrapper(
+        home,
+        config=config,
+        inner_command=tmp_path / "unused-inner-command",
+    )
+
+    success, _, final_response, error = _run_as_no_agent()
+
+    assert success is False
+    assert error is not None
+    assert "sync-auto wrapper failed: invalid configuration" in final_response
+    assert "Cron watchdog" in final_response
+    assert "Traceback" not in final_response
+    assert "must-not-leak" not in final_response

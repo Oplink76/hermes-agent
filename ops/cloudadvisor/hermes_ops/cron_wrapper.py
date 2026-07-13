@@ -442,7 +442,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--python", type=Path, required=True)
     parser.add_argument("--install-root", type=Path, required=True)
     args = parser.parse_args(argv)
-    config = _config_from_args(args)
+    try:
+        config = _config_from_args(args)
+    except (OSError, ValueError):
+        print("sync-auto wrapper failed: invalid configuration", file=sys.stderr)
+        return 2
     return run_health(config) if args.mode == "health" else run_sync_auto(config)
 
 
