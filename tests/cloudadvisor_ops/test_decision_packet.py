@@ -129,6 +129,41 @@ def test_escalation_packet_is_canonical_content_addressed_and_safe(tmp_path: Pat
         assert stat.S_IMODE(artifact.path.stat().st_mode) == 0o600
 
 
+def test_confirmed_major_packet_links_evidence_without_copying_findings(tmp_path: Path):
+    evidence_reference = f"conflict-reviews/review-{'e' * 64}.json"
+    result = AutonomousSyncResult(
+        state=AutonomousSyncState.NEEDS_OLE,
+        candidate_sha="c" * 40,
+        pr_number=7,
+        needs_ole=True,
+        reason="kanban release gate is absent",
+        reason_code="CONFLICT_REVIEW_CONFIRMED_MAJOR",
+        failed_gate="conflict_review",
+        details_artifact=evidence_reference,
+    )
+
+    artifact = publish_escalation_decision_packet(
+        result,
+        fingerprint="2" * 64,
+        trusted_root=tmp_path,
+        repo_slug="Oplink76/hermes-agent",
+    )
+
+    packet = load_escalation_decision_packet(
+        artifact.path,
+        trusted_root=tmp_path,
+    )
+    assert packet.summary == (
+        "Automation stopped at conflict_review "
+        "(CONFLICT_REVIEW_CONFIRMED_MAJOR)."
+    )
+    details = json.loads(artifact.details_path.read_text(encoding="utf-8"))
+    assert details["controller_details_artifact"] == evidence_reference
+    assert "kanban release gate is absent" not in artifact.path.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_escalation_packet_loader_rejects_path_outside_trusted_root(tmp_path: Path):
     outside = tmp_path / "outside.json"
     outside.write_text("{}", encoding="utf-8")
