@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -192,6 +193,7 @@ def test_versioned_migration_preserves_july_10_config_and_rolls_back_exactly(
     assert stat.S_IMODE(config_path.stat().st_mode) == original_mode
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink requires privileges")
 def test_migration_accepts_canonical_claude_symlink_launcher(
     tmp_path: Path,
 ) -> None:
