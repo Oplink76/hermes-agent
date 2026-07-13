@@ -241,6 +241,7 @@ def test_claude_reviewer_returns_exact_structured_receipt(tmp_path: Path):
     assert "--json-schema" in claude_command
     assert "--permission-mode" in claude_command
     assert "plan" in claude_command
+    assert claude_command[-2] == "--"
     assert CANDIDATE_SHA in claude_command[-1]
 
 

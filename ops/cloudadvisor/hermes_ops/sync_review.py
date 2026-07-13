@@ -155,6 +155,7 @@ class ClaudeConflictReviewer:
             "--safe-mode",
             "--add-dir",
             str(resolution_record.parent),
+            "--",
             prompt,
         ]
         completed = self.runner.run(command, cwd=worktree, timeout=1800)
