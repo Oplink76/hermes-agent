@@ -69,6 +69,28 @@ def test_controller_result_helpers_preserve_candidate_pr_number() -> None:
     assert AutonomousSyncResult.refresh_required(candidate).pr_number == 7
 
 
+def test_needs_ole_result_carries_only_structured_failure_evidence() -> None:
+    result = AutonomousSyncResult.needs_human(
+        "safe summary",
+        candidate_sha=SHA_CANDIDATE,
+        reason_code="GITHUB_AUTHORITY_INVALID",
+        failed_gate="github_authority",
+        affected_files=("ops/sync.py",),
+        rollback_state="rolled_back_healthy",
+        rollback_sha=SHA_BASE,
+        revert_state="NEEDS_OLE",
+        revert_sha=SHA_MERGE,
+        details_artifact="deployment/failed-abc.json",
+    )
+
+    assert result.reason_code == "GITHUB_AUTHORITY_INVALID"
+    assert result.failed_gate == "github_authority"
+    assert result.affected_files == ("ops/sync.py",)
+    assert result.rollback_sha == SHA_BASE
+    assert result.revert_sha == SHA_MERGE
+    assert result.details_artifact == "deployment/failed-abc.json"
+
+
 def test_controller_run_state_rejects_stage_without_required_evidence() -> None:
     with pytest.raises(ValueError, match="candidate"):
         ControllerRunState(stage=ControllerStage.CANDIDATE)

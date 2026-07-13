@@ -165,6 +165,38 @@ class AutonomousSyncResult:
     needs_ole: bool = False
     notify_ole: bool = False
     reason: str | None = None
+    reason_code: str | None = None
+    failed_gate: str | None = None
+    affected_files: tuple[str, ...] = ()
+    rollback_state: str | None = None
+    rollback_sha: str | None = None
+    revert_state: str | None = None
+    revert_sha: str | None = None
+    details_artifact: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.reason_code is not None and re.fullmatch(
+            r"[A-Z][A-Z0-9_]*", self.reason_code
+        ) is None:
+            raise ValueError("sync result reason code is invalid")
+        if self.failed_gate is not None and re.fullmatch(
+            r"[a-z][a-z0-9_]*", self.failed_gate
+        ) is None:
+            raise ValueError("sync result failed gate is invalid")
+        if len(self.affected_files) != len(set(self.affected_files)) or any(
+            not path
+            or "\0" in path
+            or Path(path).is_absolute()
+            or ".." in Path(path).parts
+            for path in self.affected_files
+        ):
+            raise ValueError("sync result affected files are invalid")
+        if self.details_artifact is not None and (
+            not self.details_artifact
+            or Path(self.details_artifact).is_absolute()
+            or ".." in Path(self.details_artifact).parts
+        ):
+            raise ValueError("sync result details artifact is invalid")
 
     @classmethod
     def locked(cls) -> "AutonomousSyncResult":
@@ -187,6 +219,14 @@ class AutonomousSyncResult:
         pr_number: int | None = None,
         merge_sha: str | None = None,
         installed_sha: str | None = None,
+        reason_code: str | None = None,
+        failed_gate: str | None = None,
+        affected_files: tuple[str, ...] = (),
+        rollback_state: str | None = None,
+        rollback_sha: str | None = None,
+        revert_state: str | None = None,
+        revert_sha: str | None = None,
+        details_artifact: str | None = None,
     ) -> "AutonomousSyncResult":
         return cls(
             state=AutonomousSyncState.NEEDS_OLE,
@@ -196,6 +236,14 @@ class AutonomousSyncResult:
             installed_sha=installed_sha,
             needs_ole=True,
             reason=reason,
+            reason_code=reason_code,
+            failed_gate=failed_gate,
+            affected_files=affected_files,
+            rollback_state=rollback_state,
+            rollback_sha=rollback_sha,
+            revert_state=revert_state,
+            revert_sha=revert_sha,
+            details_artifact=details_artifact,
         )
 
     @classmethod
@@ -940,6 +988,11 @@ def finish_or_recover(
                 candidate_sha=candidate.candidate_sha,
                 pr_number=candidate.pr_number,
                 merge_sha=merge_sha,
+                reason_code="DEPLOYMENT_RECORD_MISMATCH",
+                failed_gate="deployment_record",
+                affected_files=(
+                    candidate.conflicted_files or candidate.changed_files
+                ),
             )
         return AutonomousSyncResult(
             state=AutonomousSyncState.DEPLOYED,
@@ -976,6 +1029,11 @@ def finish_or_recover(
             fork_main_sha=recovery.revert_merge_sha,
             installed_sha=recovery.installed_sha,
             reason="runtime rolled back and protected revert merged",
+            affected_files=(candidate.conflicted_files or candidate.changed_files),
+            rollback_state=deployment.status,
+            rollback_sha=deployment.previous_sha,
+            revert_state=recovery.state.value,
+            revert_sha=recovery.revert_merge_sha,
         )
     return AutonomousSyncResult.needs_human(
         recovery.reason or "automatic recovery failed",
@@ -983,19 +1041,26 @@ def finish_or_recover(
         pr_number=candidate.pr_number,
         merge_sha=merge_sha,
         installed_sha=recovery.installed_sha,
+        reason_code="AUTOMATIC_RECOVERY_FAILED",
+        failed_gate="protected_recovery",
+        affected_files=(candidate.conflicted_files or candidate.changed_files),
+        rollback_state=deployment.status,
+        rollback_sha=deployment.previous_sha,
+        revert_state=recovery.state.value,
+        revert_sha=recovery.revert_merge_sha or recovery.revert_head_sha,
     )
 
 
-_ERROR_REASONS: tuple[tuple[type[Exception], str], ...] = (
-    (ConflictReviewError, "conflict review evidence is invalid"),
-    (ResolutionRecordError, "conflict resolution evidence is invalid"),
-    (SyncReceiptError, "sync eligibility evidence is invalid"),
-    (SyncGitHubError, "protected GitHub evidence is invalid"),
-    (PreflightError, "automated deployment authority failed"),
-    (SyncRemediationError, "bounded sync remediation failed"),
-    (ReconstructionError, "post-rollback candidate reconstruction failed"),
-    (ReconstructionCheckpointError, "pending reconstruction evidence is invalid"),
-    (SyncDeploymentCheckpointError, "pending deployment evidence is invalid"),
+_ERROR_REASONS: tuple[tuple[type[Exception], str, str, str], ...] = (
+    (ConflictReviewError, "conflict review evidence is invalid", "CONFLICT_REVIEW_INVALID", "conflict_review"),
+    (ResolutionRecordError, "conflict resolution evidence is invalid", "CONFLICT_RESOLUTION_INVALID", "conflict_resolution"),
+    (SyncReceiptError, "sync eligibility evidence is invalid", "SYNC_RECEIPT_INVALID", "sync_eligibility"),
+    (SyncGitHubError, "protected GitHub evidence is invalid", "GITHUB_AUTHORITY_INVALID", "github_authority"),
+    (PreflightError, "automated deployment authority failed", "DEPLOYMENT_AUTHORITY_FAILED", "deployment_authority"),
+    (SyncRemediationError, "bounded sync remediation failed", "SYNC_REMEDIATION_FAILED", "sync_remediation"),
+    (ReconstructionError, "post-rollback candidate reconstruction failed", "RECONSTRUCTION_FAILED", "reconstruction"),
+    (ReconstructionCheckpointError, "pending reconstruction evidence is invalid", "RECONSTRUCTION_CHECKPOINT_INVALID", "reconstruction_checkpoint"),
+    (SyncDeploymentCheckpointError, "pending deployment evidence is invalid", "DEPLOYMENT_CHECKPOINT_INVALID", "deployment_checkpoint"),
 )
 
 
@@ -1006,11 +1071,17 @@ def _error_result(
     candidate = state.candidate
     if isinstance(error, AutonomousSyncError):
         reason = str(error)
+        reason_code = "AUTONOMOUS_GATE_FAILED"
+        failed_gate = "controller"
     else:
         reason = "unexpected autonomous sync failure"
-        for error_type, message in _ERROR_REASONS:
+        reason_code = "UNEXPECTED_AUTONOMOUS_FAILURE"
+        failed_gate = "controller"
+        for error_type, message, code, gate in _ERROR_REASONS:
             if isinstance(error, error_type):
                 reason = message
+                reason_code = code
+                failed_gate = gate
                 break
         if reason == "unexpected autonomous sync failure":
             _log_unexpected("Autonomous sync failed unexpectedly", error)
@@ -1019,6 +1090,24 @@ def _error_result(
         candidate_sha=candidate.candidate_sha if candidate else None,
         pr_number=candidate.pr_number if candidate else None,
         merge_sha=state.merge_sha,
+        reason_code=reason_code,
+        failed_gate=failed_gate,
+        affected_files=(
+            candidate.conflicted_files or candidate.changed_files
+            if candidate
+            else ()
+        ),
+        details_artifact=(
+            f"reconstruction/pending-reconstruction-"
+            f"{state.reconstruction.checkpoint_sha256}.json"
+            if state.reconstruction is not None
+            else (
+                f"deployment/pending-deployment-"
+                f"{state.deployment_checkpoint_sha256}.json"
+                if state.deployment_checkpoint_sha256 is not None
+                else None
+            )
+        ),
     )
 
 
