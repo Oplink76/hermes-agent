@@ -40,7 +40,13 @@ from ops.cloudadvisor.hermes_ops.sync_reconstruction_checkpoint import (
     write_pending_reconstruction,
 )
 from ops.cloudadvisor.hermes_ops.sync_reconstruction import ReconstructionError
-from ops.cloudadvisor.hermes_ops.sync_review import ConflictReviewReceipt
+from ops.cloudadvisor.hermes_ops.sync_review import (
+    ConflictReviewError,
+    ConflictReviewReceipt,
+)
+from ops.cloudadvisor.hermes_ops.sync_review_evidence import (
+    write_conflict_review_attempt,
+)
 from ops.cloudadvisor.hermes_ops.sync_receipt import SyncReceiptArtifact
 
 
@@ -1796,6 +1802,208 @@ def test_minor_without_review_and_major_candidate_stop(tmp_path: Path, monkeypat
         )
         assert result.state is AutonomousSyncState.NEEDS_OLE
         assert result.needs_ole is True
+
+
+def test_confirmed_major_review_has_stable_reason_and_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    evidence_dir = tmp_path / ".git" / "hermes-sync-evidence"
+    record = evidence_dir / "resolution.json"
+    record.parent.mkdir(parents=True)
+    record.write_text(
+        '{"conflicts":[{"path":"gateway/run.py",'
+        '"decision":"preserve fork behavior"}],'
+        '"strategy":"preserve_fork_behavior"}',
+        encoding="utf-8",
+    )
+    minor = candidate(
+        classification=SyncClassification.MINOR_REVIEW_REQUIRED,
+        conflicted_files=("gateway/run.py",),
+        resolution_record=record,
+        resolution_evidence_dir=evidence_dir,
+        resolution_strategy="preserve_fork_behavior",
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: minor,
+    )
+    evidence_references: list[str] = []
+
+    class MajorReviewer:
+        def review(self, **kwargs):
+            digest = Path(kwargs["resolution_record"]).stem.removeprefix(
+                "resolution-"
+            )
+            root = Path(kwargs["resolution_record"]).parent.parent
+            initial = write_conflict_review_attempt(
+                root,
+                candidate_sha=kwargs["candidate_sha"],
+                resolution_record_sha256=digest,
+                resolver_backend="codex",
+                reviewer_backend="claude",
+                attempt=1,
+                review_kind="initial",
+                verdict="major",
+                findings=("kanban release gate may be absent",),
+                reviewed_at="2026-07-13T09:59:00Z",
+            )
+            confirmation = write_conflict_review_attempt(
+                root,
+                candidate_sha=kwargs["candidate_sha"],
+                resolution_record_sha256=digest,
+                resolver_backend="codex",
+                reviewer_backend="claude",
+                attempt=2,
+                review_kind="major_confirmation",
+                verdict="major",
+                findings=("kanban release gate is absent",),
+                reviewed_at="2026-07-13T10:00:00Z",
+                prior_artifact_sha256=initial.sha256,
+            )
+            evidence_references.extend(
+                (initial.relative_path, confirmation.relative_path)
+            )
+            return ConflictReviewReceipt(
+                candidate_sha=kwargs["candidate_sha"],
+                resolver_backend="codex",
+                reviewer_backend="claude",
+                verdict="major",
+                findings=("kanban release gate is absent",),
+                reviewed_at="2026-07-13T10:00:00Z",
+                resolution_record_sha256=digest,
+                evidence_artifacts=(
+                    initial.relative_path,
+                    confirmation.relative_path,
+                ),
+            )
+
+    result = run_autonomous_sync(
+        review_config(tmp_path),
+        runner=Runner(),
+        github=GitHub([evidence()]),
+        resolver=None,
+        reviewer=MajorReviewer(),
+        deploy_fn=lambda *args: deployed_record(),
+    )
+
+    assert result.state is AutonomousSyncState.NEEDS_OLE
+    assert result.reason_code == "CONFLICT_REVIEW_CONFIRMED_MAJOR"
+    assert result.failed_gate == "conflict_review"
+    assert result.details_artifact == evidence_references[-1]
+
+
+@pytest.mark.parametrize(
+    "evidence_artifacts",
+    [(), ("../review.json", f"conflict-reviews/review-{'e' * 64}.json")],
+)
+def test_untrusted_confirmed_major_evidence_is_invalid_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evidence_artifacts: tuple[str, ...],
+):
+    evidence_dir = tmp_path / ".git" / "hermes-sync-evidence"
+    record = evidence_dir / "resolution.json"
+    record.parent.mkdir(parents=True)
+    record.write_text(
+        '{"conflicts":[{"path":"gateway/run.py",'
+        '"decision":"preserve fork behavior"}],'
+        '"strategy":"preserve_fork_behavior"}',
+        encoding="utf-8",
+    )
+    minor = candidate(
+        classification=SyncClassification.MINOR_REVIEW_REQUIRED,
+        conflicted_files=("gateway/run.py",),
+        resolution_record=record,
+        resolution_evidence_dir=evidence_dir,
+        resolution_strategy="preserve_fork_behavior",
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: minor,
+    )
+
+    class MajorReviewer:
+        def review(self, **kwargs):
+            digest = Path(kwargs["resolution_record"]).stem.removeprefix(
+                "resolution-"
+            )
+            return ConflictReviewReceipt(
+                candidate_sha=kwargs["candidate_sha"],
+                resolver_backend="codex",
+                reviewer_backend="claude",
+                verdict="major",
+                findings=("kanban release gate is absent",),
+                reviewed_at="2026-07-13T10:00:00Z",
+                resolution_record_sha256=digest,
+                evidence_artifacts=evidence_artifacts,
+            )
+
+    result = run_autonomous_sync(
+        review_config(tmp_path),
+        runner=Runner(),
+        github=GitHub([evidence()]),
+        resolver=None,
+        reviewer=MajorReviewer(),
+        deploy_fn=lambda *args: deployed_record(),
+    )
+
+    assert result.reason_code == "CONFLICT_REVIEW_INVALID"
+    assert result.failed_gate == "conflict_review"
+    assert result.details_artifact is None
+
+
+@pytest.mark.parametrize(
+    ("reference", "expected_reference"),
+    [
+        (f"conflict-reviews/review-{'e' * 64}.json", f"conflict-reviews/review-{'e' * 64}.json"),
+        ("deployment/not-review-evidence.json", None),
+    ],
+)
+def test_confirmation_failure_links_only_trusted_initial_review_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reference: str,
+    expected_reference: str | None,
+):
+    evidence_dir = tmp_path / ".git" / "hermes-sync-evidence"
+    record = evidence_dir / "resolution.json"
+    record.parent.mkdir(parents=True)
+    record.write_text(
+        '{"conflicts":[{"path":"gateway/run.py",'
+        '"decision":"preserve fork behavior"}],'
+        '"strategy":"preserve_fork_behavior"}',
+        encoding="utf-8",
+    )
+    minor = candidate(
+        classification=SyncClassification.MINOR_REVIEW_REQUIRED,
+        conflicted_files=("gateway/run.py",),
+        resolution_record=record,
+        resolution_evidence_dir=evidence_dir,
+        resolution_strategy="preserve_fork_behavior",
+    )
+    monkeypatch.setattr(
+        "ops.cloudadvisor.hermes_ops.sync_controller.prepare_candidate",
+        lambda *args, **kwargs: minor,
+    )
+
+    class FailedReviewer:
+        def review(self, **kwargs):
+            raise ConflictReviewError(
+                "confirmation command failed", details_artifact=reference
+            )
+
+    result = run_autonomous_sync(
+        review_config(tmp_path),
+        runner=Runner(),
+        github=GitHub([evidence()]),
+        resolver=None,
+        reviewer=FailedReviewer(),
+        deploy_fn=lambda *args: deployed_record(),
+    )
+
+    assert result.reason_code == "CONFLICT_REVIEW_INVALID"
+    assert result.failed_gate == "conflict_review"
+    assert result.details_artifact == expected_reference
 
 
 def test_independently_reviewed_minor_candidate_auto_merges(

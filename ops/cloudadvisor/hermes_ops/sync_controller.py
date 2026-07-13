@@ -72,6 +72,7 @@ from .sync_recovery import (
     run_protected_revert,
 )
 from .sync_review import (
+    ConfirmedMajorReviewError,
     ConflictReviewError,
     ConflictReviewReceipt,
     IndependentConflictReviewer,
@@ -759,7 +760,10 @@ def require_conflict_review(
         conflicted_files=candidate.conflicted_files,
     )
     if classification is SyncClassification.MAJOR:
-        raise AutonomousSyncError("independent review classified conflict as major")
+        raise ConfirmedMajorReviewError(
+            "independent review confirmed major conflict findings",
+            details_artifact=receipt.evidence_artifact,
+        )
     return replace(candidate, classification=classification), receipt
 
 
@@ -1228,6 +1232,7 @@ def finish_or_recover(
 
 
 _ERROR_REASONS: tuple[tuple[type[Exception], str, str, str], ...] = (
+    (ConfirmedMajorReviewError, "independent conflict review confirmed major findings", "CONFLICT_REVIEW_CONFIRMED_MAJOR", "conflict_review"),
     (ConflictReviewError, "conflict review evidence is invalid", "CONFLICT_REVIEW_INVALID", "conflict_review"),
     (ResolutionRecordError, "conflict resolution evidence is invalid", "CONFLICT_RESOLUTION_INVALID", "conflict_resolution"),
     (SyncReceiptError, "sync eligibility evidence is invalid", "SYNC_RECEIPT_INVALID", "sync_eligibility"),
@@ -1240,11 +1245,28 @@ _ERROR_REASONS: tuple[tuple[type[Exception], str, str, str], ...] = (
 )
 
 
+def _trusted_review_details(error: Exception) -> str | None:
+    reference = getattr(error, "details_artifact", None)
+    if not isinstance(reference, str):
+        return None
+    path = Path(reference)
+    if (
+        path.is_absolute()
+        or ".." in path.parts
+        or len(path.parts) != 2
+        or path.parts[0] != "conflict-reviews"
+        or re.fullmatch(r"review-[0-9a-f]{64}\.json", path.parts[1]) is None
+    ):
+        return None
+    return reference
+
+
 def _error_result(
     error: Exception,
     state: ControllerRunState,
 ) -> AutonomousSyncResult:
     candidate = state.candidate
+    error_details = _trusted_review_details(error)
     if isinstance(error, AutonomousSyncError):
         reason = str(error)
         reason_code = "AUTONOMOUS_GATE_FAILED"
@@ -1274,14 +1296,17 @@ def _error_result(
             else ()
         ),
         details_artifact=(
-            f"reconstruction/pending-reconstruction-"
-            f"{state.reconstruction.checkpoint_sha256}.json"
-            if state.reconstruction is not None
-            else (
-                f"deployment/pending-deployment-"
-                f"{state.deployment_checkpoint_sha256}.json"
-                if state.deployment_checkpoint_sha256 is not None
-                else None
+            error_details
+            or (
+                f"reconstruction/pending-reconstruction-"
+                f"{state.reconstruction.checkpoint_sha256}.json"
+                if state.reconstruction is not None
+                else (
+                    f"deployment/pending-deployment-"
+                    f"{state.deployment_checkpoint_sha256}.json"
+                    if state.deployment_checkpoint_sha256 is not None
+                    else None
+                )
             )
         ),
     )

@@ -6,7 +6,7 @@ import json
 import os
 import re
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Protocol
@@ -14,10 +14,23 @@ from typing import Literal, Protocol
 from .command import CommandRunner
 from .sync import SyncClassification, is_canonical_backend_executable
 from .sync_resolution import ResolutionRecordArtifact, ResolutionRecordError
+from .sync_review_evidence import (
+    ConflictReviewAttemptArtifact,
+    ConflictReviewEvidenceError,
+    write_conflict_review_attempt,
+)
 
 
 class ConflictReviewError(ValueError):
     """The conflict review does not prove minor-resolution eligibility."""
+
+    def __init__(self, message: str, *, details_artifact: str | None = None):
+        super().__init__(message)
+        self.details_artifact = details_artifact
+
+
+class ConfirmedMajorReviewError(ConflictReviewError):
+    """Two exact Claude reviews confirmed actionable major findings."""
 
 
 @dataclass(frozen=True)
@@ -29,6 +42,11 @@ class ConflictReviewReceipt:
     findings: tuple[str, ...]
     reviewed_at: str
     resolution_record_sha256: str
+    evidence_artifacts: tuple[str, ...] = ()
+
+    @property
+    def evidence_artifact(self) -> str | None:
+        return self.evidence_artifacts[-1] if self.evidence_artifacts else None
 
 
 class IndependentConflictReviewer(Protocol):
@@ -42,6 +60,9 @@ class IndependentConflictReviewer(Protocol):
 
 
 _FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
+_REVIEW_REFERENCE = re.compile(
+    r"conflict-reviews/review-[0-9a-f]{64}\.json\Z"
+)
 _REVIEW_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -95,6 +116,77 @@ class ClaudeConflictReviewer:
             raise ConflictReviewError("conflict review worktree status is unavailable")
         return completed.stdout or ""
 
+    def _review_once(
+        self,
+        prompt: str,
+        *,
+        worktree: Path,
+        candidate_sha: str,
+        resolution: ResolutionRecordArtifact,
+        status_before: str,
+    ) -> ConflictReviewReceipt:
+        command = [
+            str(self.executable),
+            "--print",
+            "--output-format",
+            "json",
+            "--json-schema",
+            json.dumps(_REVIEW_SCHEMA, sort_keys=True, separators=(",", ":")),
+            "--permission-mode",
+            "plan",
+            "--no-session-persistence",
+            "--safe-mode",
+            "--add-dir",
+            str(resolution.path.parent),
+            "--",
+            prompt,
+        ]
+        completed = self.runner.run(command, cwd=worktree, timeout=1800)
+        if completed.returncode != 0:
+            raise ConflictReviewError("independent Claude review failed")
+        try:
+            envelope = json.loads(completed.stdout or "")
+            payload = envelope["structured_output"]
+            if not isinstance(payload, dict) or set(payload) != {
+                "verdict",
+                "findings",
+            }:
+                raise TypeError
+            verdict = payload["verdict"]
+            findings = payload["findings"]
+            if verdict not in {"green", "major"} or not isinstance(findings, list):
+                raise TypeError
+            if not all(
+                isinstance(finding, str)
+                and finding
+                and finding == finding.strip()
+                for finding in findings
+            ):
+                raise TypeError
+            if (verdict == "green" and findings) or (
+                verdict == "major" and not findings
+            ):
+                raise TypeError
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise ConflictReviewError(
+                "independent Claude review returned invalid structured output"
+            ) from exc
+        if self._head(worktree) != candidate_sha:
+            raise ConflictReviewError("conflict review candidate SHA changed")
+        if self._status(worktree) != status_before:
+            raise ConflictReviewError("independent review modified the worktree")
+        return ConflictReviewReceipt(
+            candidate_sha=candidate_sha,
+            resolver_backend=self.resolver_backend,
+            reviewer_backend=self.reviewer_backend,
+            verdict=verdict,
+            findings=tuple(findings),
+            reviewed_at=datetime.now(timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"),
+            resolution_record_sha256=resolution.sha256,
+        )
+
     def review(
         self,
         *,
@@ -142,59 +234,74 @@ class ClaudeConflictReviewer:
             "green only when the resolution is mechanically safe with zero findings; "
             "otherwise return major and concise findings."
         )
-        command = [
-            str(self.executable),
-            "--print",
-            "--output-format",
-            "json",
-            "--json-schema",
-            json.dumps(_REVIEW_SCHEMA, sort_keys=True, separators=(",", ":")),
-            "--permission-mode",
-            "plan",
-            "--no-session-persistence",
-            "--safe-mode",
-            "--add-dir",
-            str(resolution_record.parent),
-            "--",
+        initial = self._review_once(
             prompt,
-        ]
-        completed = self.runner.run(command, cwd=worktree, timeout=1800)
-        if completed.returncode != 0:
-            raise ConflictReviewError("independent Claude review failed")
-        try:
-            envelope = json.loads(completed.stdout or "")
-            payload = envelope["structured_output"]
-            if not isinstance(payload, dict) or set(payload) != {
-                "verdict",
-                "findings",
-            }:
-                raise TypeError
-            verdict = payload["verdict"]
-            findings = payload["findings"]
-            if verdict not in {"green", "major"} or not isinstance(findings, list):
-                raise TypeError
-            if not all(isinstance(finding, str) and finding.strip() for finding in findings):
-                raise TypeError
-            if verdict == "green" and findings:
-                raise TypeError
-        except (KeyError, TypeError, json.JSONDecodeError) as exc:
-            raise ConflictReviewError(
-                "independent Claude review returned invalid structured output"
-            ) from exc
-        if self._head(worktree) != candidate_sha:
-            raise ConflictReviewError("conflict review candidate SHA changed")
-        if self._status(worktree) != status_before:
-            raise ConflictReviewError("independent review modified the worktree")
-        return ConflictReviewReceipt(
+            worktree=worktree,
             candidate_sha=candidate_sha,
-            resolver_backend=self.resolver_backend,
-            reviewer_backend=self.reviewer_backend,
-            verdict=verdict,
-            findings=tuple(findings),
-            reviewed_at=datetime.now(timezone.utc)
-            .isoformat(timespec="seconds")
-            .replace("+00:00", "Z"),
-            resolution_record_sha256=resolution.sha256,
+            resolution=resolution,
+            status_before=status_before,
+        )
+        try:
+            initial_artifact = write_conflict_review_attempt(
+                self.evidence_dir.parent,
+                candidate_sha=candidate_sha,
+                resolution_record_sha256=resolution.sha256,
+                resolver_backend=self.resolver_backend,
+                reviewer_backend=self.reviewer_backend,
+                attempt=1,
+                review_kind="initial",
+                verdict=initial.verdict,
+                findings=initial.findings,
+                reviewed_at=initial.reviewed_at,
+            )
+        except ConflictReviewEvidenceError as exc:
+            raise ConflictReviewError(
+                "independent Claude review evidence could not be published"
+            ) from exc
+        if initial.verdict == "green":
+            return replace(
+                initial, evidence_artifacts=(initial_artifact.relative_path,)
+            )
+
+        confirmation_prompt = (
+            "Confirm or disprove only these findings from an independent review of "
+            f"exact HEAD {candidate_sha}: {json.dumps(list(initial.findings))}. "
+            f"Read immutable resolution record {resolution_record} with SHA-256 "
+            f"{resolution.sha256}. Return major only for findings directly supported "
+            "by the exact code and recorded conflict decisions; otherwise return green "
+            "with zero findings. Do not modify files, commit, push, or change remotes."
+        )
+        try:
+            confirmation = self._review_once(
+                confirmation_prompt,
+                worktree=worktree,
+                candidate_sha=candidate_sha,
+                resolution=resolution,
+                status_before=status_before,
+            )
+            confirmation_artifact = write_conflict_review_attempt(
+                self.evidence_dir.parent,
+                candidate_sha=candidate_sha,
+                resolution_record_sha256=resolution.sha256,
+                resolver_backend=self.resolver_backend,
+                reviewer_backend=self.reviewer_backend,
+                attempt=2,
+                review_kind="major_confirmation",
+                verdict=confirmation.verdict,
+                findings=confirmation.findings,
+                reviewed_at=confirmation.reviewed_at,
+                prior_artifact_sha256=initial_artifact.sha256,
+            )
+        except (ConflictReviewError, ConflictReviewEvidenceError) as exc:
+            raise ConflictReviewError(
+                str(exc), details_artifact=initial_artifact.relative_path
+            ) from exc
+        return replace(
+            confirmation,
+            evidence_artifacts=(
+                initial_artifact.relative_path,
+                confirmation_artifact.relative_path,
+            ),
         )
 
 
@@ -259,6 +366,79 @@ def validate_conflict_review(
         )
 
     if receipt.verdict == "major":
+        if (
+            not isinstance(receipt.findings, tuple)
+            or not receipt.findings
+            or not all(
+                isinstance(finding, str)
+                and finding
+                and finding == finding.strip()
+                for finding in receipt.findings
+            )
+        ):
+            raise ConflictReviewError(
+                "major conflict review must contain non-empty findings"
+            )
+        if (
+            not isinstance(receipt.evidence_artifacts, tuple)
+            or len(receipt.evidence_artifacts) != 2
+            or len(set(receipt.evidence_artifacts)) != 2
+            or not all(
+                isinstance(reference, str)
+                and _REVIEW_REFERENCE.fullmatch(reference) is not None
+                for reference in receipt.evidence_artifacts
+            )
+        ):
+            raise ConflictReviewError(
+                "confirmed major review evidence is missing or invalid"
+            )
+        receipt_root = Path(resolution_record).parent.parent
+        try:
+            initial, confirmation = (
+                ConflictReviewAttemptArtifact.load(
+                    receipt_root / reference,
+                    receipt_root=receipt_root,
+                )
+                for reference in receipt.evidence_artifacts
+            )
+        except ConflictReviewEvidenceError as exc:
+            raise ConflictReviewError(
+                "confirmed major review evidence is missing or invalid"
+            ) from exc
+        common_identity = (
+            receipt.candidate_sha,
+            receipt.resolution_record_sha256,
+            receipt.resolver_backend,
+            receipt.reviewer_backend,
+        )
+        if (
+            (
+                initial.candidate_sha,
+                initial.resolution_record_sha256,
+                initial.resolver_backend,
+                initial.reviewer_backend,
+            )
+            != common_identity
+            or (
+                confirmation.candidate_sha,
+                confirmation.resolution_record_sha256,
+                confirmation.resolver_backend,
+                confirmation.reviewer_backend,
+            )
+            != common_identity
+            or initial.attempt != 1
+            or initial.review_kind != "initial"
+            or initial.verdict != "major"
+            or confirmation.attempt != 2
+            or confirmation.review_kind != "major_confirmation"
+            or confirmation.verdict != "major"
+            or confirmation.prior_artifact_sha256 != initial.sha256
+            or confirmation.findings != receipt.findings
+            or confirmation.reviewed_at != receipt.reviewed_at
+        ):
+            raise ConflictReviewError(
+                "confirmed major review evidence is not exact"
+            )
         return SyncClassification.MAJOR
     if receipt.verdict != "green":
         raise ConflictReviewError("conflict review verdict is invalid")

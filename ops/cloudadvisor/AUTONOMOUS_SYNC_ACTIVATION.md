@@ -52,7 +52,12 @@ cron, launchd, service, or installation state.
    `ROLLED_BACK_REVERTED`, `PENDING_REFRESH`, and `LOCKED` results produce no
    stdout, as does a successfully delivered `notify_ole=true` decision. The
    wrapper sends the matching content-addressed `Approve / Wait / Details`
-   handoff directly and acknowledges it only after Slack succeeds.
+   handoff directly and acknowledges it only after Slack succeeds. One Claude
+   `major` review triggers exactly one findings-specific review of the same
+   candidate and resolution. A green confirmation continues automatically; a
+   second `major` escalates with its immutable review artifact. A confirmation
+   command, parse, exact-head, worktree-state, or evidence failure remains
+   fail-closed and links the first attempt when that artifact is trustworthy.
 8. Verify the status file, notification request state, delivery fingerprint,
    decision packet, outbox acknowledgement, installed SHA, fork `main`, and
    runtime health. Simulate one delivery failure: the outbox must remain pending
