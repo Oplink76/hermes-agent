@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from ops.cloudadvisor.hermes_ops.sync_status import (
     SyncStatusContext,
     SyncDecisionOutbox,
     SyncStatus,
+    escalation_fingerprint,
     status_from_result,
 )
 from ops.cloudadvisor.hermes_ops.command import SubprocessCommandRunner
@@ -152,6 +154,27 @@ def test_status_collection_survives_unavailable_git_evidence(tmp_path: Path) -> 
     assert status.fork_behind is None
     assert status.fork_main_sha is None
     assert status.installed_sha is None
+
+
+def test_escalation_fingerprint_binds_live_repository_identities() -> None:
+    result = AutonomousSyncResult(
+        state=AutonomousSyncState.NEEDS_OLE,
+        candidate_sha="c" * 40,
+        fork_main_sha="f" * 40,
+        installed_sha="1" * 40,
+        needs_ole=True,
+        reason_code="CONFLICT_REVIEW_INVALID",
+        failed_gate="conflict_review",
+    )
+    fingerprint = escalation_fingerprint(result)
+
+    assert fingerprint == escalation_fingerprint(replace(result))
+    assert fingerprint != escalation_fingerprint(
+        replace(result, fork_main_sha="a" * 40)
+    )
+    assert fingerprint != escalation_fingerprint(
+        replace(result, installed_sha="b" * 40)
+    )
 
 
 def test_pending_decision_retries_until_exact_delivery_ack(tmp_path: Path) -> None:

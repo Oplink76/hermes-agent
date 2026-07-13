@@ -42,6 +42,7 @@ def escalation_fingerprint(result: AutonomousSyncResult) -> str | None:
         "candidate_sha": result.candidate_sha,
         "details_artifact": result.details_artifact,
         "failed_gate": result.failed_gate,
+        "fork_main_sha": result.fork_main_sha,
         "installed_sha": result.installed_sha,
         "merge_sha": result.merge_sha,
         "pr_number": result.pr_number,
@@ -107,6 +108,11 @@ def status_from_result(
         context.install_root,
         ["git", "rev-parse", "HEAD"],
     )
+    evidenced_result = replace(
+        result,
+        fork_main_sha=result.fork_main_sha or fork_main_sha,
+        installed_sha=installed_sha,
+    )
     return SyncStatus(
         schema_version=1,
         checked_at=now().astimezone(timezone.utc).isoformat(),
@@ -123,9 +129,9 @@ def status_from_result(
         sync_state=_state_value(result),
         sync_pr_number=result.pr_number,
         required_check=context.required_check,
-        fork_main_sha=result.fork_main_sha or fork_main_sha,
+        fork_main_sha=evidenced_result.fork_main_sha,
         installed_sha=installed_sha,
-        escalation_fingerprint=escalation_fingerprint(result),
+        escalation_fingerprint=escalation_fingerprint(evidenced_result),
     )
 
 
