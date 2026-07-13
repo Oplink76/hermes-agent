@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from ops.cloudadvisor.hermes_ops import cron_wrapper
 from ops.cloudadvisor.hermes_ops.cron_wrapper import (
     CronWrapperConfig,
     run_health,
@@ -537,6 +538,43 @@ def _no_agent_policy(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return config
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink requires privileges")
+def test_wrapper_preserves_venv_python_launcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _no_agent_policy(tmp_path)
+    install_root = tmp_path / "repo"
+    install_root.mkdir()
+    target = tmp_path / "python-install" / "python3.12"
+    target.parent.mkdir()
+    target.touch()
+    launcher = tmp_path / ".venv" / "bin" / "python"
+    launcher.parent.mkdir(parents=True)
+    launcher.symlink_to(target)
+    captured: dict[str, CronWrapperConfig] = {}
+
+    def capture(wrapper_config: CronWrapperConfig) -> int:
+        captured["config"] = wrapper_config
+        return 0
+
+    monkeypatch.setattr(cron_wrapper, "run_sync_auto", capture)
+
+    assert cron_wrapper.main(
+        [
+            "sync-auto",
+            "--config",
+            str(config),
+            "--python",
+            str(launcher),
+            "--install-root",
+            str(install_root),
+        ]
+    ) == 0
+
+    assert captured["config"].python == launcher.absolute()
 
 
 def _install_no_agent_wrapper(

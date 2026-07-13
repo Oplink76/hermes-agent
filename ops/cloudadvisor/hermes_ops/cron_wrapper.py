@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -426,7 +427,7 @@ def _config_from_args(args: argparse.Namespace) -> CronWrapperConfig:
 
     policy = load_sync_policy_config(args.config)
     return CronWrapperConfig(
-        python=args.python.resolve(strict=False),
+        python=Path(os.path.abspath(args.python.expanduser())),
         install_root=args.install_root.resolve(strict=False),
         operations_config=args.config.resolve(strict=False),
         trusted_root=policy.receipt_root,
