@@ -11,7 +11,11 @@ from pathlib import Path
 import pytest
 
 from ops.cloudadvisor.hermes_ops.command import SubprocessCommandRunner
-from ops.cloudadvisor.hermes_ops.sync_github import GhSyncGitHub, SyncGitHubError
+from ops.cloudadvisor.hermes_ops.sync_github import (
+    GhSyncGitHub,
+    RequiredCheckPendingError,
+    SyncGitHubError,
+)
 
 
 REPO = "Oplink76/hermes-agent"
@@ -159,11 +163,11 @@ def test_merge_exact_rejects_non_green_aggregate_check(
     assert all(call.argv[2] != "merge" for call in runner.calls)
 
 
-def test_merge_exact_rejects_missing_aggregate_check(tmp_path: Path):
+def test_missing_aggregate_check_is_typed_as_pending(tmp_path: Path):
     github, runner = _github(tmp_path, _completed(_pr(conclusion=None)))
 
-    with pytest.raises(SyncGitHubError, match="evidence was incomplete"):
-        github.merge_exact(7, expected_head=HEAD_SHA)
+    with pytest.raises(RequiredCheckPendingError, match="not available yet"):
+        github.evidence(7)
 
     assert all(call.argv[2] != "merge" for call in runner.calls)
 

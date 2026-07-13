@@ -26,6 +26,10 @@ class RequiredCheckEvidenceError(GitHubAuthorityError):
     """Required-check evidence is malformed or ambiguous."""
 
 
+class MissingRequiredCheckEvidenceError(RequiredCheckEvidenceError):
+    """The configured aggregate check has not been published yet."""
+
+
 class AmbiguousRequiredCheckEvidenceError(RequiredCheckEvidenceError):
     """More than one row claims the configured required-check identity."""
 
@@ -153,7 +157,9 @@ def parse_pull_request_authority(
 
         row = required_check_row(payload["statusCheckRollup"], required_check)
         if row is None:
-            raise GitHubAuthorityError("required check evidence is missing")
+            raise MissingRequiredCheckEvidenceError(
+                "required check evidence is missing"
+            )
         conclusion = required_check_conclusion(
             payload["statusCheckRollup"], required_check
         )
