@@ -330,7 +330,9 @@ class CodexCandidateRemediator:
                 )
                 prompt += (
                     "Write .hermes-sync-repair.json with exactly the top-level "
-                    "keys `conflicts` and `strategy` and non-empty decisions. Run "
+                    "keys `conflicts` and `strategy`. Each `conflicts` entry must "
+                    "be an object with exactly `path` and `decision`. Both values "
+                    "must be non-empty strings. Run "
                     "`git diff --name-only HEAD` after editing and cover that exact "
                     "file set once each, with no missing, extra, or duplicate paths. "
                     f"Strategy must be {json.dumps(repair_strategy)}. "

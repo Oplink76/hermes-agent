@@ -218,6 +218,9 @@ def _repair_fixture(
     driver.write_text(
         "\n".join([
             "from pathlib import Path",
+            "import sys",
+            "assert 'Each `conflicts` entry must be an object with exactly ' "
+            "'`path` and `decision`.' in sys.argv[-1]",
             "Path('repaired.txt').write_text('repaired\\n', encoding='utf-8')",
             "Path('.hermes-sync-repair.json').write_text("
             f"{repair_payload!r}, encoding='utf-8')",
