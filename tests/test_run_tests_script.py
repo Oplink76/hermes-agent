@@ -8,12 +8,20 @@ import subprocess
 from pathlib import Path
 
 
-def _fake_venv(root: Path, label: str) -> None:
+def _fake_venv(root: Path, label: str, *, has_pytest: bool = True) -> None:
     bin_dir = root / "bin"
     bin_dir.mkdir(parents=True)
     (bin_dir / "activate").write_text("# test marker\n", encoding="utf-8")
     python = bin_dir / "python"
-    python.write_text(f"#!/bin/sh\necho {label}\n", encoding="utf-8")
+    pytest_probe_exit = 0 if has_pytest else 1
+    python.write_text(
+        "#!/bin/sh\n"
+        'if [ "${1:-}" = "-c" ]; then\n'
+        f"  exit {pytest_probe_exit}\n"
+        "fi\n"
+        f"echo {label}\n",
+        encoding="utf-8",
+    )
     python.chmod(0o755)
 
 
@@ -69,3 +77,30 @@ def test_checkout_legacy_venv_precedes_installed_home_dotvenv(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "CHECKOUT_LEGACY_VENV" in result.stdout
     assert "INSTALLED_DOTVENV" not in result.stdout
+
+
+def test_checkout_venv_without_pytest_falls_back_to_installed_home_dotvenv(tmp_path):
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    source = Path(__file__).resolve().parents[1] / "scripts" / "run_tests.sh"
+    shutil.copy2(source, scripts / "run_tests.sh")
+    _fake_venv(repo / ".venv", "INCOMPLETE_CHECKOUT_DOTVENV", has_pytest=False)
+
+    home = tmp_path / "home"
+    install = home / ".hermes" / "hermes-agent"
+    _fake_venv(install / ".venv", "INSTALLED_DOTVENV")
+
+    env = {"HOME": str(home), "PATH": os.environ["PATH"]}
+    result = subprocess.run(
+        ["bash", str(scripts / "run_tests.sh")],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "INSTALLED_DOTVENV" in result.stdout
+    assert "INCOMPLETE_CHECKOUT_DOTVENV" not in result.stdout

@@ -11,7 +11,7 @@
 #   * Env vars blanked (conftest.py also does this, but this
 #     is belt-and-suspenders for anyone running pytest outside our
 #     conftest path — e.g. on a single file)
-#   * Proper venv activation (probes .venv, venv, then ~/.hermes/...)
+#   * Proper venv activation (probes test-capable .venv, venv, then ~/.hermes/...)
 #
 # Usage:
 #   scripts/run_tests.sh                            # full suite
@@ -44,14 +44,15 @@ for candidate in \
   "$REPO_ROOT/venv" \
   "$HOME/.hermes/hermes-agent/.venv" \
   "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
+  if [ -f "$candidate/bin/activate" ] \
+    && "$candidate/bin/python" -c 'import pytest' >/dev/null 2>&1; then
     VENV="$candidate"
     break
   fi
 done
 
 if [ -z "$VENV" ]; then
-  echo "error: no Hermes virtualenv found (.venv preferred; legacy venv accepted)" >&2
+  echo "error: no test-capable Hermes virtualenv found (.venv preferred; legacy venv accepted)" >&2
   exit 1
 fi
 
