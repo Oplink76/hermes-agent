@@ -584,19 +584,23 @@ def _install_no_agent_wrapper(
     inner_command: Path,
 ) -> None:
     repository = Path(__file__).resolve().parents[2]
-    (home / "scripts" / "upstream-sync.sh").write_text(
-        "\n".join(
-            [
-                "#!/bin/bash",
-                f"cd {repository}",
-                f"exec {sys.executable} -m ops.cloudadvisor.hermes_ops.cron_wrapper \\",
-                f"  sync-auto --config {config} --python {inner_command} \\",
-                f"  --install-root {repository}",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
+    wrapper = (repository / "ops" / "cloudadvisor" / "upstream-sync.sh").read_text(
+        encoding="utf-8"
     )
+    wrapper = wrapper.replace(
+        "--python /Users/cloudadvisor/.hermes/hermes-agent/.venv/bin/python",
+        f"--python {inner_command}",
+    ).replace(
+        "exec /Users/cloudadvisor/.hermes/hermes-agent/.venv/bin/python",
+        f"exec {sys.executable}",
+    ).replace(
+        "/Users/cloudadvisor/.hermes/operations/hermes-operations.yaml",
+        str(config),
+    ).replace(
+        "/Users/cloudadvisor/.hermes/hermes-agent",
+        str(repository),
+    )
+    (home / "scripts" / "upstream-sync.sh").write_text(wrapper, encoding="utf-8")
 
 
 def _run_as_no_agent() -> tuple[bool, str, str, str | None]:
@@ -633,8 +637,8 @@ def test_no_agent_routine_and_direct_success_are_scheduler_silent(
 
     from cron.scheduler import SILENT_MARKER
 
-    assert success is True
     assert error is None
+    assert success is True
     assert final_response == SILENT_MARKER
 
     result = AutonomousSyncResult(

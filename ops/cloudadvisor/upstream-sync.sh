@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+cd /Users/cloudadvisor/.hermes/hermes-agent
+
 MODE=${1:-sync-auto}
 
 exec /Users/cloudadvisor/.hermes/hermes-agent/.venv/bin/python \
