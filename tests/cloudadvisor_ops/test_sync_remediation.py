@@ -29,8 +29,16 @@ CHECK_RUN_ID = 123
 
 
 class Runner:
-    def __init__(self, *, failed_step: str):
+    def __init__(
+        self,
+        *,
+        failed_step: str,
+        workflow_status: str = "completed",
+        workflow_conclusion: str = "failure",
+    ):
         self.failed_step = failed_step
+        self.workflow_status = workflow_status
+        self.workflow_conclusion = workflow_conclusion
         self.calls: list[tuple[str, ...]] = []
 
     def run(self, argv: list[str], cwd: Path, timeout: int = 300):
@@ -40,8 +48,8 @@ class Runner:
             payload = {
                 "databaseId": WORKFLOW_RUN_ID,
                 "headSha": HEAD,
-                "status": "completed",
-                "conclusion": "failure",
+                "status": self.workflow_status,
+                "conclusion": self.workflow_conclusion,
                 "jobs": [
                     {
                         "databaseId": CHECK_RUN_ID,
@@ -119,6 +127,25 @@ def test_candidate_failure_is_never_retried_as_infrastructure(tmp_path: Path):
 
     assert remediator.retry_infrastructure(candidate(), failed_evidence()) is False
     assert not any(call[1:3] == ("run", "rerun") for call in runner.calls)
+
+
+def test_completed_required_check_is_usable_while_optional_jobs_run(
+    tmp_path: Path,
+):
+    runner = Runner(
+        failed_step="Run tests",
+        workflow_status="in_progress",
+        workflow_conclusion="",
+    )
+    remediator = GhActionsRemediator(
+        repo_slug="Oplink76/hermes-agent",
+        required_check="All required checks pass",
+        runner=runner,
+        cwd=tmp_path,
+        gh_executable=tmp_path / "gh",
+    )
+
+    assert remediator.retry_infrastructure(candidate(), failed_evidence()) is False
 
 
 @pytest.mark.parametrize("name", ["codex", "codex.exe", "codex.cmd"])

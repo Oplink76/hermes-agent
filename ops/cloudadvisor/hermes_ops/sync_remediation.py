@@ -126,8 +126,11 @@ class GhActionsRemediator:
             not isinstance(detail, dict)
             or detail.get("databaseId") != run_id
             or detail.get("headSha") != candidate.candidate_sha
-            or detail.get("status") != "completed"
-            or detail.get("conclusion") != "failure"
+            or detail.get("status") not in {"in_progress", "completed"}
+            or (
+                detail.get("status") == "completed"
+                and detail.get("conclusion") != "failure"
+            )
         ):
             raise SyncRemediationError("GitHub Actions exact-run evidence changed")
         jobs = detail.get("jobs")
