@@ -17,7 +17,12 @@ from ops.cloudadvisor.hermes_ops.deploy import (
     deploy,
 )
 from ops.cloudadvisor.hermes_ops.health import HealthCheck, HealthReport
-from ops.cloudadvisor.hermes_ops.sync import CheckResult, SyncConfig
+from ops.cloudadvisor.hermes_ops.sync import (
+    CheckResult,
+    SyncConfig,
+    SyncState,
+    prepare_candidate,
+)
 from ops.cloudadvisor.hermes_ops.sync_controller import (
     AutonomousSyncConfig,
     AutonomousSyncState,
@@ -254,6 +259,83 @@ class FailSecondCandidateHealth:
         if apply_injection and self.candidate_checks == 2:
             return HealthReport((HealthCheck("runtime:default", False),))
         return HealthReport((HealthCheck("runtime:default", True),))
+
+
+def test_real_candidate_recreates_branch_after_remote_deletion(tmp_path: Path):
+    origin = tmp_path / "origin.git"
+    upstream = tmp_path / "upstream.git"
+    repo = tmp_path / "repo"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(origin)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "clone", str(origin), str(repo)], check=True, capture_output=True
+    )
+    _git(repo, "config", "user.name", "Hermes E2E")
+    _git(repo, "config", "user.email", "hermes@example.invalid")
+    (repo / "feature.txt").write_text("fork\n", encoding="utf-8")
+    _git(repo, "add", "feature.txt")
+    _git(repo, "commit", "-m", "fork base")
+    _git(repo, "push", "-u", "origin", "main")
+    subprocess.run(
+        ["git", "clone", "--bare", str(repo), str(upstream)],
+        check=True,
+        capture_output=True,
+    )
+    upstream_work = tmp_path / "upstream-work"
+    subprocess.run(
+        ["git", "clone", str(upstream), str(upstream_work)],
+        check=True,
+        capture_output=True,
+    )
+    _git(upstream_work, "config", "user.name", "Official Upstream")
+    _git(upstream_work, "config", "user.email", "upstream@example.invalid")
+    (upstream_work / "upstream.txt").write_text("upstream\n", encoding="utf-8")
+    _git(upstream_work, "add", "upstream.txt")
+    _git(upstream_work, "commit", "-m", "upstream change")
+    _git(upstream_work, "push", "origin", "main")
+    _git(repo, "remote", "add", "upstream", str(upstream))
+    candidate = tmp_path / "candidate"
+    _git(
+        repo,
+        "worktree",
+        "add",
+        "-b",
+        "auto-sync/upstream",
+        str(candidate),
+        "main",
+    )
+    _git(repo, "push", "-u", "origin", "auto-sync/upstream")
+    stale_sha = _git(
+        repo, "rev-parse", "refs/remotes/origin/auto-sync/upstream"
+    )
+    _git(origin, "update-ref", "-d", "refs/heads/auto-sync/upstream")
+    assert _git(repo, "ls-remote", "origin", "refs/heads/auto-sync/upstream") == ""
+    assert (
+        _git(repo, "rev-parse", "refs/remotes/origin/auto-sync/upstream")
+        == stale_sha
+    )
+
+    result = prepare_candidate(
+        SyncConfig(
+            repo=repo,
+            worktree=candidate,
+            origin="origin",
+            upstream="upstream",
+            candidate_branch="auto-sync/upstream",
+            repo_slug="Oplink76/hermes-agent",
+            lock_path=tmp_path / "sync.lock",
+        ),
+        runner=GateRunner(),
+        github=ProtectedGitHub(origin, repo),
+    )
+
+    assert result.state is SyncState.PR_UPDATED
+    assert result.candidate_sha == _git(
+        repo, "ls-remote", "origin", "refs/heads/auto-sync/upstream"
+    ).split()[0]
 
 
 def test_real_controller_recovers_interrupted_checkout_then_reverts_repairs_and_redeploys(
