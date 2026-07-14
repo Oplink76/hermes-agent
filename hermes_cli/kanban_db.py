@@ -11378,9 +11378,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     When the reap registry shows the worker exited cleanly (rc=0) but
     the task was still ``running`` in the DB, treat it as a protocol
     violation (worker answered conversationally without calling
-    ``kanban_complete`` / ``kanban_block``) and trip the circuit breaker
-    on the first occurrence — retrying a worker whose CLI keeps
-    returning 0 without a terminal transition just loops forever.
+    ``kanban_complete`` / ``kanban_block``). Product boards either adjudicate
+    from completion evidence or block immediately; other boards use the
+    bounded protocol-violation retry budget.
 
     When the reap registry shows the worker exited with the rate-limit
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
@@ -11547,8 +11547,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # breaker (the task transitions ready → blocked with a ``gave_up`` event
     # on top of the event we already emitted).
     #
-    # Protocol-violation crashes (clean exit, no terminal tool call) get a
-    # BOUNDED retry, not an immediate trip: empirically ~96% of these tasks
+    # Generic-board protocol violations (clean exit, no terminal tool call)
+    # get a bounded retry, not an immediate trip: empirically ~96% of these tasks
     # complete on a later run (a goal-mode finalize nudge, or the model simply
     # emitting kanban_complete/kanban_block next time), so blocking on the first
     # occurrence just churned them through the respawn cycle. The retry budget
@@ -11558,9 +11558,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # ``consecutive_failures`` counter, so the two budgets stay independent.
     # A per-task ``max_retries`` overrides the violation bound with the same
     # top precedence it has for every other failure kind. Systemic same-error
-    # crashes still trip immediately.
+    # crashes still trip immediately. Product boards preserve their stricter
+    # handoff contract: adjudicate from evidence or block on the first miss.
     auto_blocked: list[str] = []
     if crash_details:
+        product_board = product_board_metadata(_board_slug_for_connection(conn)) is not None
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
         for _, _, _, _, err_text in crash_details:
@@ -11571,6 +11573,19 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # Worker exited 0 without a terminal call but left completion
                 # evidence — Hermes advanced the card to the next role instead
                 # of tripping the breaker. Don't count a failure.
+                continue
+            if protocol_violation and product_board:
+                tripped = _record_task_failure(
+                    conn, tid,
+                    error=error_text,
+                    outcome="crashed",
+                    failure_limit=1,
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={"pid": pid, "claimer": claimer},
+                )
+                if tripped:
+                    auto_blocked.append(tid)
                 continue
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
