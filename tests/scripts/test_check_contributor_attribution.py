@@ -131,6 +131,10 @@ def test_author_map_email_is_mapped(tmp_path):
     assert result.ok is True
 
 
+def test_roseyco_email_keeps_original_contributor_credit():
+    assert AUTHOR_MAP["roseycomanagement@roseyco.co.uk"] == "Roseyco-management"
+
+
 def test_numbered_github_noreply_email_is_mapped_automatically(tmp_path):
     repo = make_repo(tmp_path)
     mapped_email = next(iter(AUTHOR_MAP))

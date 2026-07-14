@@ -11580,6 +11580,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     error=error_text,
                     outcome="crashed",
                     failure_limit=1,
+                    force_trip=True,
                     release_claim=False,
                     end_run=False,
                     event_payload_extra={"pid": pid, "claimer": claimer},
