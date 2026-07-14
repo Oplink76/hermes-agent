@@ -8866,7 +8866,10 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _make_running_product_card(conn, _kb, *, step, assignee="worker-profile", worker_pid=91001):
+def _make_running_product_card(
+    conn, _kb, *, step, assignee="worker-profile", worker_pid=91001,
+    max_retries=None,
+):
     host = _kb._claimer_id().split(":", 1)[0]
     tid = kb.create_task(
         conn,
@@ -8874,6 +8877,7 @@ def _make_running_product_card(conn, _kb, *, step, assignee="worker-profile", wo
         assignee=assignee,
         workflow_template_id="product",
         current_step_key=step,
+        max_retries=max_retries,
     )
     conn.execute(
         "UPDATE tasks SET status='running', worker_pid=?, claim_lock=? WHERE id=?",
@@ -8958,7 +8962,9 @@ def test_detect_crashed_workers_clean_exit_without_evidence_still_blocks(
 
     kb.create_board("prod", preset="product")
     with kb.connect(board="prod") as conn:
-        tid = _make_running_product_card(conn, _kb, step="architecture")
+        tid = _make_running_product_card(
+            conn, _kb, step="architecture", max_retries=5,
+        )
         # deliberately NO handoff comment
         kb.detect_crashed_workers(conn)
         task = kb.get_task(conn, tid)
@@ -8980,7 +8986,9 @@ def test_detect_crashed_workers_does_not_chain_adjudicated_advances(
     host = _kb._claimer_id().split(":", 1)[0]
     kb.create_board("prod", preset="product")
     with kb.connect(board="prod") as conn:
-        tid = _make_running_product_card(conn, _kb, step="architecture")
+        tid = _make_running_product_card(
+            conn, _kb, step="architecture", max_retries=5,
+        )
         _add_handoff_comment(conn, tid)
 
         # First clean-exit -> adjudicated advance to development.
