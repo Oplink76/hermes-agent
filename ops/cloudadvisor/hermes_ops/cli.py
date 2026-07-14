@@ -407,7 +407,12 @@ def _sync_remediator(
             config=sync_config,
             runner=runner,
             executable=resolver.executable,
-            prompt=resolver.prompt,
+            prompt=(
+                "Diagnose and repair only the failing GitHub Actions checks "
+                "for this exact upstream-sync candidate. Use the exact "
+                "workflow identity in the observed check evidence to inspect "
+                "the failed run. Do not change unrelated behavior."
+            ),
         ),
     )
 

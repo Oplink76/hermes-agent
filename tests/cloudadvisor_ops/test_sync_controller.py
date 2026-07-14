@@ -1016,7 +1016,15 @@ def test_red_candidate_gets_one_changed_locally_green_repair(
 
     assert result.state is AutonomousSyncState.DEPLOYED
     assert remediator.retry_calls == 1
-    assert len(remediator.repair_calls) == 1
+    assert remediator.repair_calls == [
+        (
+            "required_check:All required checks pass",
+            "required_check_conclusion:failure",
+            "workflow_run_id:101",
+            "required_check_run_id:202",
+            f"head_sha:{SHA_CANDIDATE}",
+        )
+    ]
     assert captured["candidate"].candidate_sha == SHA_REPAIRED
     assert github.merge_calls == [(7, SHA_REPAIRED)]
 

@@ -315,7 +315,17 @@ class ControllerExecution:
             )
         repaired = _valid_repair(
             reviewed,
-            remediator.repair_candidate(reviewed),
+            remediator.repair_candidate(
+                reviewed,
+                health_evidence=(
+                    f"required_check:{failure.evidence.required_check}",
+                    "required_check_conclusion:failure",
+                    f"workflow_run_id:{failure.evidence.workflow_run_id}",
+                    "required_check_run_id:"
+                    f"{failure.evidence.required_check_run_id}",
+                    f"head_sha:{failure.evidence.head_sha}",
+                ),
+            ),
             runner=self.deps.runner,
             repo=self.config.sync.repo,
         )
