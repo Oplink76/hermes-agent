@@ -493,6 +493,8 @@ def prepare_candidate(
             risk="none",
         )
 
+    candidate_ref = f"refs/remotes/{config.origin}/{FIXED_CANDIDATE_BRANCH}"
+    _run(runner, ["git", "update-ref", "-d", candidate_ref], config.repo)
     _run(
         runner,
         [
@@ -507,7 +509,6 @@ def prepare_candidate(
         config.repo,
         timeout=600,
     )
-    candidate_ref = f"refs/remotes/{config.origin}/{FIXED_CANDIDATE_BRANCH}"
     previous_result = _run(
         runner,
         ["git", "rev-parse", candidate_ref],
