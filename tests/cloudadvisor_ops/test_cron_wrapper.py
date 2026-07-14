@@ -588,17 +588,17 @@ def _install_no_agent_wrapper(
         encoding="utf-8"
     )
     wrapper = wrapper.replace(
-        "--python /Users/cloudadvisor/.hermes/hermes-agent/.venv/bin/python",
+        "/Users/cloudadvisor/.hermes/hermes-agent",
+        str(repository),
+    ).replace(
+        f"--python {repository}/.venv/bin/python",
         f"--python {inner_command}",
     ).replace(
-        "exec /Users/cloudadvisor/.hermes/hermes-agent/.venv/bin/python",
+        f"exec {repository}/.venv/bin/python",
         f"exec {sys.executable}",
     ).replace(
         "/Users/cloudadvisor/.hermes/operations/hermes-operations.yaml",
         str(config),
-    ).replace(
-        "/Users/cloudadvisor/.hermes/hermes-agent",
-        str(repository),
     )
     (home / "scripts" / "upstream-sync.sh").write_text(wrapper, encoding="utf-8")
 

@@ -15,7 +15,7 @@ from ops.cloudadvisor.hermes_ops.cli import (
     load_sync_policy_config,
 )
 from ops.cloudadvisor.hermes_ops.health import HealthCheck, HealthReport
-from ops.cloudadvisor.hermes_ops.sync import SyncResult, SyncState
+from ops.cloudadvisor.hermes_ops.sync import SyncConfig, SyncResult, SyncState
 from ops.cloudadvisor.hermes_ops.sync_controller import (
     AutonomousSyncResult,
     AutonomousSyncState,
@@ -30,6 +30,32 @@ class FakeRunner:
     def run(self, argv: list[str], cwd: Path, timeout: int = 300):
         self.calls.append((tuple(argv), Path(cwd)))
         return self.response
+
+
+def test_sync_remediator_uses_ci_specific_prompt(tmp_path: Path) -> None:
+    sync_config = SyncConfig(
+        repo=tmp_path / "repo",
+        worktree=tmp_path / "candidate",
+        origin="origin",
+        upstream="upstream",
+        candidate_branch="auto-sync/upstream",
+        repo_slug="Oplink76/hermes-agent",
+        lock_path=tmp_path / "sync.lock",
+    )
+    policy = SimpleNamespace(required_check="All required checks pass")
+    resolver = SimpleNamespace(
+        executable=tmp_path / "codex",
+        prompt="Resolve only the current Git merge conflicts.",
+    )
+    github = SimpleNamespace(gh_executable=tmp_path / "gh")
+    runner = FakeRunner(subprocess.CompletedProcess([], 0, "", ""))
+
+    remediator = cli._sync_remediator(
+        sync_config, policy, resolver, github, runner
+    )
+
+    assert "failing GitHub Actions checks" in remediator.candidate.prompt
+    assert "merge conflicts" not in remediator.candidate.prompt.casefold()
 
 
 def test_sync_auto_preflight_is_read_only_and_does_not_enter_controller(
