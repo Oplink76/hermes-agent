@@ -661,3 +661,29 @@ def test_candidate_sha_is_fetched_before_force_with_lease(tmp_path: Path):
         if call.argv[:2] == ("git", "push")
     )
     assert fetch_index < push_index
+
+
+def test_stale_candidate_tracking_ref_is_deleted_before_fetch(tmp_path: Path):
+    runner = FakeRunner(base_responses())
+
+    run(config(tmp_path), runner=runner, github=FakeGitHub(existing_pr=17))
+
+    delete = (
+        "git",
+        "update-ref",
+        "-d",
+        "refs/remotes/origin/auto-sync/upstream",
+    )
+    fetch = (
+        "git",
+        "fetch",
+        "origin",
+        "refs/heads/auto-sync/upstream:refs/remotes/origin/auto-sync/upstream",
+    )
+    delete_index = next(
+        index for index, call in enumerate(runner.calls) if call.argv == delete
+    )
+    fetch_index = next(
+        index for index, call in enumerate(runner.calls) if call.argv == fetch
+    )
+    assert delete_index < fetch_index
