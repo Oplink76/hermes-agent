@@ -603,7 +603,7 @@ def test_real_controller_recovers_interrupted_checkout_then_reverts_repairs_and_
     assert final_deployment.previous_sha == clean_result.deployed_sha
     assert final_deployment.requested_sha == result.deployed_sha
     assert _git(install, "rev-parse", "HEAD") == result.deployed_sha
-    assert snapshots.restore_count == 1
+    assert snapshots.restore_count == 0
     assert services.stop_count == 3
     assert services.start_count == 3
     assert services.running == ("ai.hermes.gateway",)

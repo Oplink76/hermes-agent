@@ -62,8 +62,9 @@ sync lock, merge, deploy, write receipts/status/outbox files, or touch services.
 mandatory checks pass. `deploy` verifies the immutable approval, GitHub merge and
 required check, Package 1 receipt, clean checkout, exact `origin/main` SHA, and a
 fresh Git/SQLite snapshot before stopping a service. A failed post-restart health
-matrix automatically switches back to the previous SHA, restores state, restarts
-the same service set, and records rollback health.
+matrix automatically switches back to the previous SHA, preserves live mutable
+state, restarts the same service set, and records rollback health. The snapshot
+is retained for explicit manual recovery only.
 
 ## Autonomous schedule and status
 

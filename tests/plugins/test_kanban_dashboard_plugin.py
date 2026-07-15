@@ -3346,6 +3346,39 @@ def test_conditional_manual_block_clears_stale_failure_state(client):
     assert row["last_failure_error"] is None
 
 
+def test_conditional_manual_block_fires_hook_and_stays_blocked(
+    client,
+    monkeypatch,
+):
+    fired = []
+    monkeypatch.setattr(
+        kb,
+        "_fire_kanban_lifecycle_hook",
+        lambda event, task_id, **fields: fired.append((event, task_id, fields)),
+    )
+    task_id = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "sticky operator block"},
+    ).json()["task"]["id"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "blocked", "block_reason": "waiting for operator"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(fired) == 1
+    event, fired_task_id, fields = fired[0]
+    assert event == "kanban_task_blocked"
+    assert fired_task_id == task_id
+    assert fields["reason"] == "waiting for operator"
+    with kb.connect() as conn:
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "blocked"
+
+
 def test_conditional_manual_block_preserves_product_preflight_routing(client):
     kb.ensure_product_board_defaults("prod", name="Product")
     task_id = client.post(
@@ -3410,6 +3443,33 @@ def test_conditional_reassign_rejects_stale_assignee_snapshot(client):
 
     assert resp.status_code == 409, resp.text
     assert _task_assignee(task_id) == "tester"
+
+
+def test_conditional_reassign_with_reclaim_rejects_stale_snapshot(client):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="running", assignee="architect")
+        assert kb.claim_task(conn, task_id) is not None
+    expected = _expected_operator_snapshot(task_id)
+    with kb.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET title='changed elsewhere' WHERE id=?",
+                (task_id,),
+            )
+    before = _operator_snapshot(task_id)
+
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/reassign",
+        json={
+            "profile": "developer",
+            "reclaim_first": True,
+            "reason": "Cockpit redirect",
+            **expected,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert _operator_snapshot(task_id) == before
 
 
 def test_conditional_reassign_rejects_active_current_run_even_when_snapshot_matches(client):
