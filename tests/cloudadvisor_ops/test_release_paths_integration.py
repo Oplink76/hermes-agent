@@ -443,7 +443,7 @@ def test_automated_sync_receipt_deploys_only_exact_real_merge_without_human_arti
     assert not list(tmp_path.rglob("approval*.json"))
 
 
-def test_deploy_real_git_and_sqlite_path_restores_previous_state_on_failure(
+def test_deploy_real_git_and_sqlite_path_preserves_mutated_state_on_failure(
     tmp_path: Path,
 ):
     seed, origin, _ = _seed_remotes(tmp_path)
@@ -530,10 +530,10 @@ def test_deploy_real_git_and_sqlite_path_restores_previous_state_on_failure(
     )
 
     with sqlite3.connect(database) as connection:
-        restored_value = connection.execute("SELECT value FROM state").fetchone()[0]
+        preserved_value = connection.execute("SELECT value FROM state").fetchone()[0]
     assert record.status == "rolled_back_healthy"
     assert _git(install_root, "rev-parse", "HEAD") == previous_sha
-    assert restored_value == "preserved"
+    assert preserved_value == "mutated"
     assert services.events == [
         ("stop", ("ai.hermes.gateway",)),
         ("start", ("ai.hermes.gateway",)),

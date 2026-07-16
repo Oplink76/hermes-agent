@@ -820,7 +820,7 @@ def test_successful_deploy_is_exact_sha_snapshot_first_and_health_gated(tmp_path
     assert ("command", UV_SYNC_COMMAND) in events
 
 
-def test_health_failure_rolls_back_source_state_services_and_health_checks(
+def test_health_failure_rolls_back_source_services_and_health_checks(
     tmp_path: Path,
 ):
     events = []
@@ -845,7 +845,7 @@ def test_health_failure_rolls_back_source_state_services_and_health_checks(
     )
 
     assert record.status == "rolled_back_healthy"
-    assert snapshots.restored is True
+    assert snapshots.restored is False
     assert ("command", ("git", "switch", "--detach", "old-sha")) in events
     assert (
         events.count((
@@ -869,7 +869,22 @@ def test_interrupted_post_checkout_deploy_resumes_exact_rollback_without_redeplo
     events: list[tuple] = []
     config = _config(tmp_path)
     request = _request(tmp_path)
-    snapshots = FakeSnapshots(events)
+
+    class MutableFakeSnapshots(FakeSnapshots):
+        def __init__(self, snapshot_events):
+            super().__init__(snapshot_events)
+            self.value = "before-deploy"
+
+        def create(self, previous_sha: str):
+            snapshot = super().create(previous_sha)
+            snapshot["value"] = self.value
+            return snapshot
+
+        def restore(self, snapshot) -> None:
+            super().restore(snapshot)
+            self.value = snapshot["value"]
+
+    snapshots = MutableFakeSnapshots(events)
     services = FakeServices(events)
 
     class CrashAfterCheckoutRunner(FakeRunner):
@@ -891,6 +906,8 @@ def test_interrupted_post_checkout_deploy_resumes_exact_rollback_without_redeplo
             store=RecordingStore(events),
         )
 
+    snapshots.value = "intervening-write"
+
     resumed_responses = _responses()
     resumed_responses[("git", "rev-parse", "HEAD")] = (0, "new-sha\n", "")
     resumed_runner = FakeRunner(resumed_responses, events)
@@ -908,7 +925,8 @@ def test_interrupted_post_checkout_deploy_resumes_exact_rollback_without_redeplo
     assert recovered.status == "rolled_back_healthy"
     assert recovered.requested_sha == "new-sha"
     assert recovered.previous_sha == "old-sha"
-    assert snapshots.restored is True
+    assert snapshots.restored is False
+    assert snapshots.value == "intervening-write"
     assert ("command", ("git", "switch", "--detach", "old-sha")) in events
     assert events.count(("command", ("git", "switch", "--detach", "new-sha"))) == 1
 
@@ -955,7 +973,7 @@ def test_modern_rollback_keeps_runtime_identity_mandatory(tmp_path: Path):
     ) in events
 
 
-def test_candidate_service_start_counts_as_state_mutation_for_rollback(tmp_path: Path):
+def test_candidate_service_start_does_not_restore_mutable_state(tmp_path: Path):
     events = []
     config = _config(tmp_path)
     config = DeployConfig(
@@ -981,7 +999,7 @@ def test_candidate_service_start_counts_as_state_mutation_for_rollback(tmp_path:
     )
 
     assert record.status == "rolled_back_healthy"
-    assert snapshots.restored is True
+    assert snapshots.restored is False
 
 
 def test_pre_restart_failure_does_not_stop_already_unloaded_services_twice(
@@ -1036,7 +1054,7 @@ def test_half_started_loaded_job_is_unloaded_before_rollback_restart(tmp_path: P
     assert sum(event[0] == "services_stopped" for event in events) == 2
     assert sum(event[0] == "services_half_started" for event in events) == 1
     assert sum(event[0] == "services_started" for event in events) == 1
-    assert snapshots.restored is True
+    assert snapshots.restored is False
 
 
 def test_loaded_but_inactive_service_is_not_kickstarted_by_deploy(tmp_path: Path):

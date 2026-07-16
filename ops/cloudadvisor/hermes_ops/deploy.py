@@ -740,7 +740,6 @@ def _resume_interrupted_deployment(
             ["git", "switch", "--detach", journal.previous_sha],
             cwd=root,
         )
-        snapshots.restore(snapshot)
         if fingerprint_fn(root) != journal.previous_fingerprint:
             _run_required(runner, _uv_sync_command(config), cwd=root)
         services.start(journal.prior_services)
@@ -868,6 +867,7 @@ def _deploy_locked(
     previous_fingerprint = fingerprint_fn(root)
     prior_services = services.running_services()
     runtime_before = services.inventory()
+    # Keep the snapshot for explicit recovery; never overwrite live state on rollback.
     snapshot = snapshots.create(previous_sha)
     if not snapshots.verify(snapshot):
         raise PreflightError("predeploy snapshot verification failed")
@@ -904,7 +904,6 @@ def _deploy_locked(
     )
     _write_execution_journal(config, execution)
 
-    state_may_have_changed = False
     candidate_fingerprint = previous_fingerprint
     candidate_report = HealthReport(checks=())
     try:
@@ -924,12 +923,10 @@ def _deploy_locked(
             cwd=root,
         )
         for command in config.postinstall_commands:
-            state_may_have_changed = True
             _run_required(runner, list(command), cwd=root)
 
         record = replace(record, status="restarting")
         record_store.write(record)
-        state_may_have_changed = True
         services.start(prior_services)
         record = replace(record, status="verifying")
         record_store.write(record)
@@ -978,8 +975,6 @@ def _deploy_locked(
                 ["git", "switch", "--detach", previous_sha],
                 cwd=root,
             )
-            if state_may_have_changed:
-                snapshots.restore(snapshot)
             if candidate_fingerprint != previous_fingerprint:
                 _run_required(
                     runner,
