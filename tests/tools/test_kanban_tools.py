@@ -1538,6 +1538,111 @@ def test_worker_product_complete_uses_env_board_for_backlog_handoff(monkeypatch,
     assert task.current_step_key == "architecture"
 
 
+def test_worker_product_complete_uses_db_connection_board_for_handoff(
+    monkeypatch, tmp_path,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "productowner")
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    board = "product-tool-db-handoff"
+    kb.create_board(board, name="Product Tool DB Handoff", preset="product")
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn, title="Story: resolve board from DB", assignee="productowner",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workflow_template_id = 'product', "
+                "current_step_key = 'backlog' WHERE id = ?",
+                (tid,),
+            )
+        claimed = kb.claim_task(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board)))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+
+    out = json.loads(kt._handle_complete({"summary": "PO says this is ready."}))
+    assert out["ok"] is True
+
+    with kb.connect(board=board) as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "ready"
+    assert task.assignee == "architect"
+    assert task.current_step_key == "architecture"
+
+
+def test_worker_resolves_release_preflight_before_release_validation(
+    monkeypatch, tmp_path,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    board = "product-tool-release-resolver"
+    kb.create_board(board, name="Product Tool Release Resolver", preset="product")
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: release resolver",
+            assignee="productowner",
+            workflow_template_id="product",
+            current_step_key="release_measure",
+        )
+        first = kb.claim_task(conn, tid)
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="Need release confirmation",
+            kind="needs_input",
+            attempted_resolutions=["checked recorded approval"],
+            expected_run_id=first.current_run_id,
+            board=board,
+        )
+        resolver = kb.claim_task(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resolver.current_run_id))
+
+    out = json.loads(kt._handle_complete({
+        "summary": "The recorded approval resolves the preflight.",
+        "resolver_action": {
+            "action": "resume",
+            "resolution": "Use the recorded release approval.",
+            "fix_task_id": None,
+        },
+    }))
+    assert out["ok"] is True
+
+    with kb.connect(board=board) as conn:
+        task = kb.get_task(conn, tid)
+        event_kinds = [event.kind for event in kb.list_events(conn, tid)]
+    assert task.status == "ready"
+    assert task.assignee == "productowner"
+    assert task.current_step_key == "release_measure"
+    assert event_kinds.count("human_input_preflight_resolved") == 1
+
+
 def test_worker_lifecycle_through_tools(worker_env):
     """Drive the full claim -> heartbeat -> comment -> complete lifecycle
     exclusively through the tools, then verify the DB state matches what
