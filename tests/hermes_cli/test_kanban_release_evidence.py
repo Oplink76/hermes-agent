@@ -801,6 +801,66 @@ def test_epic_child_integrates_before_child_done(release_home, tmp_path, monkeyp
         assert kb.get_task(conn, story).status == "done"
 
 
+def test_dependency_edges_do_not_turn_a_reviewed_story_into_an_epic(
+    release_home, tmp_path,
+):
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = "release-dependency-graph"
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        dependency = kb.create_task(
+            conn, title="Story: completed prerequisite", board=board,
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='done', current_step_key='done' WHERE id=?",
+                (dependency,),
+            )
+        story = _release_task(
+            conn, board, repo, branch, parents=[dependency],
+        )
+        kb.create_task(
+            conn,
+            title="Story: downstream acceptance",
+            board=board,
+            parents=[story],
+        )
+        _seed_structured_evidence(conn, story, branch, source_sha)
+
+        result = kb.release_product_task(
+            conn,
+            story,
+            board,
+            lambda _path: True,
+            None,
+            measurement_note="dependency-linked story released",
+        )
+
+        assert result.released is True
+        assert _git(repo, "merge-base", "--is-ancestor", source_sha, "main") == ""
+        event_kinds = [event.kind for event in kb.list_events(conn, story)]
+        assert "story_merged_to_main" in event_kinds
+        assert "story_integrated_to_epic" not in event_kinds
+        assert "epic_merged" not in event_kinds
+
+
+def test_dependency_parent_does_not_change_story_worktree_base(release_home):
+    board = "dependency-story-base"
+    kb.ensure_product_board_defaults(board)
+    with kb.connect(board=board) as conn:
+        dependency = kb.create_task(
+            conn, title="Story: completed prerequisite", board=board,
+        )
+        story = kb.create_task(
+            conn,
+            title="Story: dependent work",
+            board=board,
+            parents=[dependency],
+        )
+
+        assert kb._story_base_branch(conn, story, board=board) is None
+
+
 def test_epic_child_failed_candidate_verification_preserves_epic_and_release_state(
     release_home, tmp_path,
 ):

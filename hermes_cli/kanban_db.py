@@ -1010,7 +1010,7 @@ def _board_slug_for_connection(conn: sqlite3.Connection) -> str:
         filename = str(main["file"] if main is not None else "").strip()
         if filename:
             db_path = Path(filename).expanduser().resolve(strict=False)
-            if db_path == kanban_db_path(DEFAULT_BOARD).resolve(strict=False):
+            if db_path == (kanban_home() / "kanban.db").resolve(strict=False):
                 return DEFAULT_BOARD
             root = boards_root().resolve(strict=False)
             if db_path.name == "kanban.db" and db_path.parent.parent == root:
@@ -1959,6 +1959,14 @@ def _latest_unresolved_product_preflight(
     except Exception:
         payload = {}
     return payload if isinstance(payload, dict) else {}
+
+
+def has_unresolved_product_preflight(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Return whether product obstacle resolution must run before completion."""
+    return _latest_unresolved_product_preflight(conn, task_id) is not None
 
 
 def _complete_product_workflow_step(
@@ -6216,6 +6224,7 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    board = board or _board_slug_for_connection(conn)
     now = int(time.time())
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
@@ -7130,6 +7139,7 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+    board = board or _board_slug_for_connection(conn)
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
@@ -8176,10 +8186,30 @@ def _story_base_branch(
     meta = product_board_metadata(board)
     if not _handoff_v2_enabled(meta):
         return None
-    parents = parent_ids(conn, task_id)
-    if not parents:
+    epic_id = _epic_parent_id(conn, task_id)
+    if epic_id is None:
         return None
-    return epic_branch_for(parents[0])
+    return epic_branch_for(epic_id)
+
+
+def _is_epic_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Identify an epic from immutable Review evidence, with legacy title fallback."""
+    reviewed = _latest_approved_review_candidate(conn, task_id)
+    if reviewed is not None:
+        return reviewed[0] == epic_branch_for(task_id)
+    task = get_task(conn, task_id)
+    return bool(task and task.title.strip().lower().startswith("epic"))
+
+
+def _epic_parent_id(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    return next(
+        (
+            parent_id
+            for parent_id in parent_ids(conn, task_id)
+            if _is_epic_task(conn, parent_id)
+        ),
+        None,
+    )
 
 
 def _ensure_git_worktree(
@@ -8851,10 +8881,9 @@ def integrate_story_to_epic(
         return None
     _validate_stored_product_workflow_state(conn, story_id)
 
-    parents = parent_ids(conn, story_id)
-    if not parents:
+    epic_id = _epic_parent_id(conn, story_id)
+    if epic_id is None:
         return None
-    epic_id = parents[0]
 
     try:
         board_default = str(meta.get("default_workdir") or "").strip()
@@ -9054,7 +9083,7 @@ def _merge_standalone_story_to_main(
         return None
     _validate_stored_product_workflow_state(conn, story_id)
     # A story WITH an epic goes through integrate_story_to_epic + merge_epic_to_main.
-    if parent_ids(conn, story_id):
+    if _epic_parent_id(conn, story_id) is not None:
         return None
     story = get_task(conn, story_id)
     if story is None or (
@@ -9166,6 +9195,30 @@ def _latest_event_of_kind(
 ) -> Optional[Event]:
     events = [event for event in list_events(conn, task_id) if event.kind in kinds]
     return events[-1] if events else None
+
+
+def _latest_approved_review_candidate(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[tuple[str, str]]:
+    """Return the latest immutable branch/SHA approved by independent Review."""
+    for run in reversed(list_runs(conn, task_id, include_active=False)):
+        metadata = run.metadata if isinstance(run.metadata, dict) else {}
+        workflow = metadata.get("workflow_outcome")
+        reviewer = _provenance_payload(metadata).get("reviewer")
+        if (
+            run.step_key == "review"
+            and isinstance(workflow, dict)
+            and workflow.get("verdict") == "approved"
+            and isinstance(reviewer, dict)
+            and reviewer.get("verdict") == "approved"
+            and _reviewer_agent_from_metadata(metadata)
+        ):
+            branch = str(reviewer.get("reviewed_branch") or "").strip()
+            commit = str(reviewer.get("reviewed_commit") or "").strip()
+            if branch and commit:
+                return branch, commit
+    return None
 
 
 def _release_run_evidence(
@@ -9416,6 +9469,7 @@ def release_product_task(
     expected_run_id: Optional[int] = None,
 ) -> ReleaseResult:
     """Integrate, evaluate deployment policy, then atomically finish a product task."""
+    board = board or _board_slug_for_connection(conn)
     task = get_task(conn, task_id)
     meta = product_board_metadata(board)
     if (
@@ -9433,11 +9487,11 @@ def release_product_task(
 
     repo_value = str(meta.get("default_workdir") or task.workspace_path or "").strip()
     repo_root = _git_toplevel(Path(repo_value).expanduser()) if repo_value else None
-    parents = parent_ids(conn, task_id)
     children = child_ids(conn, task_id)
+    reviewed_candidate = _latest_approved_review_candidate(conn, task_id)
     branch = (
-        epic_branch_for(task_id)
-        if children
+        reviewed_candidate[0]
+        if reviewed_candidate is not None
         else str(task.branch_name or "").strip()
     )
     source_sha = _git_ref_sha(repo_root, branch) if repo_root and branch else None
@@ -9453,7 +9507,9 @@ def release_product_task(
     if not note:
         raise ReleaseEvidenceError(task_id, ["measurement_note"])
 
-    if children:
+    is_epic = bool(children and branch == epic_branch_for(task_id))
+    epic_parent_id = _epic_parent_id(conn, task_id)
+    if is_epic:
         target_branch = epic_branch_for(task_id)
         integrated_children = all(
             (child := get_task(conn, child_id)) is not None
@@ -9478,7 +9534,7 @@ def release_product_task(
             before_apply_fn=before_apply_fn,
         )
         integration_kinds = {"epic_merged"}
-    elif parents:
+    elif epic_parent_id is not None:
         integration_status = integrate_story_to_epic(
             conn,
             task_id,
@@ -10504,17 +10560,17 @@ def reconcile(
         if outcome == "integrated":
             result.integrated.append(story_id)
             if merge_after_green:
-                parents = parent_ids(conn, story_id)
-                if parents and epic_ready(conn, parents[0], board=board):
-                    if merge_epic_to_main(conn, parents[0], board=board) == "merged":
-                        result.merged_to_main.append(parents[0])
+                epic_id = _epic_parent_id(conn, story_id)
+                if epic_id and epic_ready(conn, epic_id, board=board):
+                    if merge_epic_to_main(conn, epic_id, board=board) == "merged":
+                        result.merged_to_main.append(epic_id)
             break
         if merge_after_green:
             if outcome == "already_integrated":
-                parents = parent_ids(conn, story_id)
-                if parents and epic_ready(conn, parents[0], board=board):
-                    if merge_epic_to_main(conn, parents[0], board=board) == "merged":
-                        result.merged_to_main.append(parents[0])
+                epic_id = _epic_parent_id(conn, story_id)
+                if epic_id and epic_ready(conn, epic_id, board=board):
+                    if merge_epic_to_main(conn, epic_id, board=board) == "merged":
+                        result.merged_to_main.append(epic_id)
                         break
             elif outcome is None:
                 if _merge_standalone_story_to_main(conn, story_id, board=board) == "merged":

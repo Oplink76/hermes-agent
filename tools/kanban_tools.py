@@ -742,6 +742,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     and task.workflow_template_id == "product"
                     and task.current_step_key == "release_measure"
                     and _product_workflow_enabled()
+                    and not kb.has_unresolved_product_preflight(conn, tid)
                 ):
                     release = kb.release_product_task(
                         conn,
