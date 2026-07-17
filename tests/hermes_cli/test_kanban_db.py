@@ -1093,6 +1093,39 @@ def test_resolve_product_preflight_rejects_wrong_run_profile(kanban_home):
         assert _resolver_state(conn, tid) == before
 
 
+def test_resolve_product_preflight_rejects_preflight_routed_to_other_profile(
+    kanban_home,
+):
+    board = "resolver-wrong-preflight-profile"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        preflight = conn.execute(
+            "SELECT id, payload FROM task_events "
+            "WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1",
+            (tid, kb.PRODUCT_WORKFLOW_PRECHECK_EVENT),
+        ).fetchone()
+        payload = json.loads(preflight["payload"])
+        payload["hermes_assignee"] = "architect"
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?",
+            (json.dumps(payload), preflight["id"]),
+        )
+        conn.commit()
+        before = _resolver_state(conn, tid)
+
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.resolve_product_preflight(
+                conn,
+                tid,
+                board=board,
+                request=_resolver_request(_resolver_expected(conn, tid, run_id)),
+                resolver_profile="resolver",
+                resolver_model=None,
+            )
+        assert _resolver_state(conn, tid) == before
+
+
 def test_resolver_workflow_repair_is_atomic_and_returns_to_ordinary_role(kanban_home):
     board = "resolver-workflow-repair"
     _v2_product_board(board)
