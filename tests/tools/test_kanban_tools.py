@@ -47,6 +47,7 @@ def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
 def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     """Worker sessions get task lifecycle tools, not board-routing tools."""
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -66,11 +67,31 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
+def test_resolver_worker_gets_resolve_not_complete_or_block(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_resolver")
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools  # ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    assert "kanban_resolve" in names
+    assert "kanban_complete" not in names
+    assert "kanban_block" not in names
+
+
 def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_path):
     """Dispatcher-spawned workers must get lifecycle tools even when the
     assignee profile restricts enabled toolsets and does not list kanban.
     """
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -100,6 +121,7 @@ def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_p
     worker and must not see kanban_list / kanban_unblock.
     """
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text("toolsets:\n  - kanban\n")
@@ -350,17 +372,11 @@ def test_complete_structured_workflow_fields_merge_into_metadata(worker_env):
         "target_step": "development",
         "findings": ["Fix cleanup"],
     }
-    resolver_action = {
-        "action": "resume",
-        "resolution": "Use the configured fixture",
-        "fix_task_id": None,
-    }
     out = kt._handle_complete(
         {
             "summary": "structured fields",
             "metadata": {"existing": True},
             "workflow_outcome": workflow_outcome,
-            "resolver_action": resolver_action,
         }
     )
     assert json.loads(out)["ok"] is True
@@ -370,7 +386,6 @@ def test_complete_structured_workflow_fields_merge_into_metadata(worker_env):
         run = kb.latest_run(conn, worker_env)
     assert run.metadata["existing"] is True
     assert run.metadata["workflow_outcome"] == workflow_outcome
-    assert run.metadata["resolver_action"] == resolver_action
 
 
 def test_complete_schema_declares_structured_product_fields():
@@ -383,19 +398,31 @@ def test_complete_schema_declares_structured_product_fields():
         "changes_requested",
         "architecture_invalid",
     }
-    assert props["resolver_action"]["properties"]["action"]["enum"] == [
-        "resume",
-        "create_fix_task",
-        "escalate",
-    ]
+    assert "resolver_action" not in props
     assert props["workflow_outcome"]["required"] == ["verdict"]
     assert props["workflow_outcome"]["additionalProperties"] is False
-    assert props["resolver_action"]["required"] == [
-        "action",
-        "resolution",
-        "fix_task_id",
+
+
+def test_resolve_schema_is_strict_and_bounded():
+    from tools import kanban_tools as kt
+
+    params = kt.KANBAN_RESOLVE_SCHEMA["parameters"]
+    assert params["required"] == [
+        "decision", "fault_domain", "diagnosis", "reason", "expected",
     ]
-    assert props["resolver_action"]["additionalProperties"] is False
+    assert params["additionalProperties"] is False
+    assert params["properties"]["decision"]["enum"] == [
+        "resume", "repair", "create_fix_task", "escalate",
+    ]
+    repair = params["properties"]["repair"]
+    workflow = repair["properties"]["workflow"]
+    assert repair["additionalProperties"] is False
+    assert workflow["additionalProperties"] is False
+    assert set(workflow["properties"]) == {"phase", "assignee", "project_id"}
+    assert set(params["properties"]) == {
+        "task_id", "board", "decision", "fault_domain", "diagnosis",
+        "reason", "expected", "repair", "fix_task_id",
+    }
 
 
 def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
@@ -1582,13 +1609,14 @@ def test_worker_product_complete_uses_db_connection_board_for_handoff(
     assert task.current_step_key == "architecture"
 
 
-def test_worker_resolves_release_preflight_before_release_validation(
+def test_resolver_tool_resumes_release_preflight(
     monkeypatch, tmp_path,
 ):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setenv("HERMES_PROFILE", "default")
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    monkeypatch.setenv("HERMES_INFERENCE_MODEL", "resolver-test-model")
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     from pathlib import Path as _Path
@@ -1617,20 +1645,39 @@ def test_worker_resolves_release_preflight_before_release_validation(
             attempted_resolutions=["checked recorded approval"],
             expected_run_id=first.current_run_id,
             board=board,
+            human_escalation_assignee="resolver",
         )
         resolver = kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        preflight = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "human_input_preflight"
+        ][-1]
+        expected = {
+            "run_id": task.current_run_id,
+            "preflight_event_id": preflight.id,
+            "status": task.status,
+            "phase": task.current_step_key,
+            "assignee": task.assignee,
+            "project_id": task.project_id,
+            "workflow_template_id": task.workflow_template_id,
+            "workspace_kind": task.workspace_kind,
+            "workspace_path": task.workspace_path,
+            "branch_name": task.branch_name,
+            "running": task.running,
+            "blocked": task.blocked,
+        }
 
     monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resolver.current_run_id))
 
-    out = json.loads(kt._handle_complete({
-        "summary": "The recorded approval resolves the preflight.",
-        "resolver_action": {
-            "action": "resume",
-            "resolution": "Use the recorded release approval.",
-            "fix_task_id": None,
-        },
+    out = json.loads(kt._handle_resolve({
+        "decision": "resume",
+        "fault_domain": "task_state",
+        "diagnosis": "The release confirmation already exists.",
+        "reason": "Use the recorded release approval.",
+        "expected": expected,
     }))
     assert out["ok"] is True
 
@@ -1641,6 +1688,65 @@ def test_worker_resolves_release_preflight_before_release_validation(
     assert task.assignee == "productowner"
     assert task.current_step_key == "release_measure"
     assert event_kinds.count("human_input_preflight_resolved") == 1
+
+
+def test_resolver_tool_rejects_foreign_task(monkeypatch):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_owned")
+    out = json.loads(kt._handle_resolve({
+        "task_id": "t_foreign",
+        "decision": "resume",
+        "fault_domain": "task_state",
+        "diagnosis": "foreign",
+        "reason": "foreign",
+        "expected": {},
+    }))
+    assert "scoped to task t_owned" in out["error"]
+
+
+def test_product_block_prefers_board_resolver_profile(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    board = "product-board-resolver-route"
+    kb.create_board(board, name="Resolver Route", preset="product")
+    meta = kb.read_board_metadata(board)
+    meta.pop("db_path", None)
+    meta.setdefault("product_workflow", {})["human_escalation_profile"] = "resolver"
+    kb.board_metadata_path(board).write_text(json.dumps(meta))
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: route to Resolver",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        task = kb.claim_task(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    out = json.loads(kt._handle_block({
+        "board": board,
+        "kind": "needs_input",
+        "reason": "Need framework reconciliation",
+        "attempted_resolutions": ["Inspected the recorded task state"],
+    }))
+    assert out["ok"] is True
+    with kb.connect(board=board) as conn:
+        routed = kb.get_task(conn, tid)
+    assert routed.assignee == "resolver"
 
 
 def test_worker_lifecycle_through_tools(worker_env):
@@ -2160,6 +2266,11 @@ def test_board_param_routes_show_to_alt_board(multi_board_env):
     good = json.loads(kt._handle_show({"task_id": alt_seed, "board": "alt"}))
     assert good["task"]["id"] == alt_seed
     assert good["task"]["title"] == "seed-alt"
+    assert {
+        "project_id", "branch_name", "workflow_template_id",
+        "current_step_key", "running", "blocked",
+    } <= set(good["task"])
+    assert all("id" in event for event in good["events"])
 
 
 def test_board_param_routes_assign_via_create_to_alt(multi_board_env):

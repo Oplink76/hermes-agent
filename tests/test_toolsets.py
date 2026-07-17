@@ -55,6 +55,14 @@ class TestResolveToolset:
         tools = resolve_toolset("web")
         assert set(tools) == {"web_search", "web_extract"}
 
+    def test_resolver_readonly_is_exact_and_non_composite(self):
+        expected = [
+            "read_file", "search_files", "web_search", "web_extract",
+        ]
+        assert TOOLSETS["resolver_readonly"]["tools"] == expected
+        assert set(resolve_toolset("resolver_readonly")) == set(expected)
+        assert TOOLSETS["resolver_readonly"]["includes"] == []
+
     def test_composite_toolset(self):
         tools = resolve_toolset("debugging")
         assert "terminal" in tools

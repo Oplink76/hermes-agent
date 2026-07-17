@@ -72,7 +72,7 @@ _HERMES_CORE_TOOLS = [
     # profile explicitly enables the kanban toolset. Gated via check_fn in
     # tools/kanban_tools.py.
     "kanban_show", "kanban_list",
-    "kanban_complete", "kanban_block", "kanban_heartbeat",
+    "kanban_complete", "kanban_block", "kanban_resolve", "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
@@ -269,10 +269,17 @@ TOOLSETS = {
         ),
         "tools": [
             "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
+            "kanban_resolve",
             "kanban_heartbeat", "kanban_comment",
             "kanban_create", "kanban_link",
             "kanban_unblock",
         ],
+        "includes": [],
+    },
+
+    "resolver_readonly": {
+        "description": "Minimal read-only evidence surface for Hermes Resolver.",
+        "tools": ["read_file", "search_files", "web_search", "web_extract"],
         "includes": [],
     },
 
