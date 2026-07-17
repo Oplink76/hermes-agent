@@ -119,6 +119,24 @@ def _evidence_attachments(*references):
     return tuple({"name": reference} for reference in references)
 
 
+def test_qualification_prompt_includes_exact_card_and_epic_output_shapes(conn, policy):
+    prompt = qualifier.build_qualification_prompt(
+        conn,
+        board_metadata=policy,
+        intake=_intake(conn),
+    )
+
+    assert "CARD OUTPUT SHAPE" in prompt
+    assert '"item_kind":"card"' in prompt
+    assert '"outcome":"Required measurable outcome"' in prompt
+    assert '"dependencies":[]' in prompt
+    assert '"classification":[' in prompt
+    assert "EPIC OUTPUT SHAPE" in prompt
+    assert '"item_kind":"epic"' in prompt
+    assert "PO PATH ADDITION" in prompt
+    assert '"po_evidence":{"run_id":123' in prompt
+
+
 def test_hermes_path_validates_without_product_owner_evidence(conn, policy):
     validated = qualifier.validate_decision(
         conn,

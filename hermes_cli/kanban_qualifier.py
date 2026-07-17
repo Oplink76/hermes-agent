@@ -460,6 +460,17 @@ def _repository_instructions(board_metadata: Mapping[str, Any]) -> dict[str, str
     return result
 
 
+_QUALIFICATION_OUTPUT_SHAPES = """
+CARD OUTPUT SHAPE:
+{"qualification_path":"hermes","work":{"item_kind":"card","work_type":"<allowed type>","title":"Required concise title","outcome":"Required measurable outcome","scope":["Included work"],"out_of_scope":["Unrelated work"]},"routing":{"entry_phase":"<allowed phase>","assignee":"<that phase's profile or null>","epic_id":null,"dependencies":[]},"entry_assessment":{"reason":"<reason>","skipped_phases":[],"evidence":[]},"handover":{"deliverables":["Required deliverable"],"required_evidence":["Required verification evidence"],"done_when":["The measurable outcome is verified"],"next_phase":"<next phase or done>","next_role":"<next phase's profile or null>"},"rules":{"allowed":["Work only inside the qualified scope"],"forbidden":["Bypass Hermes-owned workflow routing"]},"classification":["framework:<allowed type>","path:hermes"]}
+
+EPIC OUTPUT SHAPE:
+{"qualification_path":"hermes","work":{"item_kind":"epic","work_type":"<allowed type>","title":"Required concise Epic title","outcome":"Required measurable Epic outcome","scope":["Included body of work"],"out_of_scope":["Unrelated work"]},"routing":{"entry_phase":null,"assignee":null,"epic_id":null,"dependencies":[]},"entry_assessment":{"reason":"<reason>","skipped_phases":[],"evidence":[]},"handover":{"deliverables":["Required Epic result"],"required_evidence":["Evidence supplied by member cards"],"done_when":["The Epic outcome is verified"],"next_phase":null,"next_role":null},"rules":{"allowed":["Organize qualified member cards"],"forbidden":["Execute the Epic as a card"]},"classification":["framework:epic","path:hermes"]}
+
+PO PATH ADDITION: Set qualification_path to "po", use "path:po", and add only grounded evidence in "po_evidence":{"run_id":123,"artifact":"<referenced artifact>"}.
+""".strip()
+
+
 def build_qualification_prompt(
     conn: Any,
     *,
@@ -490,8 +501,12 @@ def build_qualification_prompt(
         "only for the PO path. Use only phases, profiles, work types, task ids, and "
         "Epic ids present below. Epics are non-executable containers; dependencies "
         "and Epic membership are separate. Late entry must explain every skipped "
-        "phase with evidence; Review entry needs independent writer/test provenance."
+        "phase with evidence; Review entry needs independent writer/test provenance. "
+        "Use the exact key structure below, replacing all example content with the "
+        "qualified request. Do not omit keys or copy example claims as evidence."
         + repair
+        + "\n\n"
+        + _QUALIFICATION_OUTPUT_SHAPES
         + "\n\nAUTHORITATIVE INPUT:\n"
         + json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     )
