@@ -481,6 +481,126 @@ def _epic_summary_for_task(
     }
 
 
+def _work_contract_summary(
+    conn: sqlite3.Connection, contract_id: Optional[str]
+) -> Optional[dict[str, Any]]:
+    """Return the public contract view without canonical/signing material."""
+
+    if not contract_id:
+        return None
+    stored = kanban_db.get_work_contract(conn, contract_id)
+    if stored is None:
+        return None
+    contract = stored["contract"]
+    return {
+        "id": contract_id,
+        "digest": stored["digest"],
+        "version": contract["version"],
+        "policy_version": contract["policy_version"],
+        "qualification_path": contract["qualification_path"],
+        "request_id": contract["request_id"],
+        "work": contract["work"],
+        "routing": contract["routing"],
+        "entry_assessment": contract.get("entry_assessment"),
+        "handover": contract["handover"],
+        "rules": contract["rules"],
+        "classification": contract["classification"],
+        "issuer": contract["issuer"],
+    }
+
+
+class IntakeBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request: dict[str, Any]
+    session_id: Optional[str] = None
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+
+
+@router.post("/intake", status_code=202)
+def submit_intake(payload: IntakeBody, board: Optional[str] = Query(None)):
+    """Persist one inert request through Hermes' official intake boundary."""
+
+    board = _resolve_board(board)
+    metadata = kanban_db.read_board_metadata(board)
+    if not kanban_intake.qualification_required(metadata):
+        raise HTTPException(
+            status_code=409,
+            detail="This board does not require qualified intake",
+        )
+    conn = _conn(board=board)
+    try:
+        return kanban_intake.submit_intake(
+            conn,
+            request=payload.request,
+            source="dashboard-api",
+            session_id=payload.session_id,
+            attachments=tuple(payload.attachments),
+        )
+    finally:
+        conn.close()
+
+
+@router.get("/intake")
+def list_intake(
+    board: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),
+):
+    """Return the filtered, durable qualification inbox."""
+
+    if status is not None and status not in {
+        "pending",
+        "qualified",
+        "rejected",
+        "overridden",
+    }:
+        raise HTTPException(status_code=400, detail="unknown intake status")
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        items = kanban_db.list_qualification_intakes(conn, status=status)
+        if source is not None:
+            items = [item for item in items if item["source"] == source]
+        return {"items": items, "count": len(items)}
+    finally:
+        conn.close()
+
+
+@router.get("/intake/{intake_id}")
+def get_intake(intake_id: str, board: Optional[str] = Query(None)):
+    """Return intake, latest decision, safe contract summary, and work item."""
+
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        record = kanban_db.get_qualification_intake(conn, intake_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"intake {intake_id} not found")
+        decisions = kanban_db.list_qualification_decisions(conn, intake_id)
+        decision = decisions[-1] if decisions else None
+        contract_id = decision.get("contract_id") if decision else None
+        contract_summary = _work_contract_summary(conn, contract_id)
+        materialized_item = None
+        if contract_id:
+            row = conn.execute(
+                "SELECT id FROM tasks WHERE work_contract_id = ?", (contract_id,)
+            ).fetchone()
+            if row is not None:
+                task = kanban_db.get_task(conn, row["id"])
+                if task is not None:
+                    materialized_item = _task_dict(task)
+        return {
+            "intake": record,
+            "decision": decision,
+            "decisions": decisions,
+            "contract_summary": contract_summary,
+            "materialized_item": materialized_item,
+        }
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # GET /board
 # ---------------------------------------------------------------------------
@@ -734,6 +854,7 @@ def get_task(
         }
         response = {
             "task": task_d,
+            "work_contract": _work_contract_summary(conn, task.work_contract_id),
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
             "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)],
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
@@ -751,8 +872,23 @@ def get_task(
             ],
         }
         if task.work_item_kind == "epic":
-            response["members"] = kanban_db.list_epic_members(conn, task_id)
-            response["progress"] = kanban_db.epic_progress(conn, task_id)
+            members = kanban_db.list_epic_members(conn, task_id)
+            progress = kanban_db.epic_progress(conn, task_id)
+            response["members"] = members
+            response["progress"] = progress
+            contract = response["work_contract"] or {}
+            work = contract.get("work") or {}
+            handover = contract.get("handover") or {}
+            rules = contract.get("rules") or {}
+            response["epic_detail"] = {
+                "outcome": work.get("outcome") or task.body,
+                "scope": work.get("scope") or [],
+                "constraints": rules.get("forbidden") or [],
+                "definition_of_done": handover.get("done_when") or [],
+                "members": members,
+                "progress": progress,
+                "release_state": progress["release_state"],
+            }
         return response
     finally:
         conn.close()

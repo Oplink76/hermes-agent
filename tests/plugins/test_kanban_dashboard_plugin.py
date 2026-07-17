@@ -22,6 +22,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_intake as intake
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +494,156 @@ def test_strict_board_post_tasks_returns_intake_without_task(client):
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
         record = kb.get_qualification_intake(conn, body["intake_id"])
     assert "dashboard request" in record["raw_request"]
+
+
+def test_official_intake_api_returns_receipt_filtered_inbox_and_detail(client):
+    kb.ensure_product_board_defaults("strict")
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    response = client.post(
+        "/api/plugins/kanban/intake?board=strict",
+        json={
+            "request": {"title": "Official intake", "body": "Keep intent"},
+            "session_id": "cockpit-session",
+            "attachments": [{"name": "brief.md"}],
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    receipt = response.json()
+    assert receipt["status"] == "qualification_required"
+    intake_id = receipt["intake_id"]
+
+    inbox = client.get(
+        "/api/plugins/kanban/intake?board=strict&status=pending"
+    )
+    assert inbox.status_code == 200
+    assert [item["id"] for item in inbox.json()["items"]] == [intake_id]
+
+    detail = client.get(
+        f"/api/plugins/kanban/intake/{intake_id}?board=strict"
+    )
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["intake"]["id"] == intake_id
+    assert "Official intake" in body["intake"]["raw_request"]
+    assert body["decision"] is None
+    assert body["contract_summary"] is None
+    assert body["materialized_item"] is None
+    assert "signature" not in json.dumps(body).lower()
+    assert "canonical_json" not in json.dumps(body).lower()
+    assert "internal_prompt" not in json.dumps(body).lower()
+
+
+def test_task_and_epic_detail_expose_safe_work_contract_views(client):
+    kb.ensure_product_board_defaults("strict")
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    secret = b"test-only-secret"
+
+    def contract(request_id, *, kind="card"):
+        is_epic = kind == "epic"
+        return intake.sign_work_contract(
+            {
+                "version": 1,
+                "policy_version": metadata["qualification"]["policy_version"],
+                "qualification_path": "hermes",
+                "request_id": request_id,
+                "work": {
+                    "item_kind": kind,
+                    "work_type": "maintenance",
+                    "title": "Release outcome" if is_epic else "Governed member",
+                    "outcome": "Customers receive the governed outcome",
+                    "scope": ["Hermes"],
+                    "out_of_scope": ["Unrelated systems"],
+                },
+                "routing": {
+                    "entry_phase": None if is_epic else "backlog",
+                    "assignee": None if is_epic else "productowner",
+                    "epic_id": None,
+                    "dependencies": [],
+                },
+                "entry_assessment": {
+                    "reason": "Explicit governed entry",
+                    "skipped_phases": [],
+                    "evidence": [],
+                },
+                "handover": {
+                    "deliverables": ["working outcome"],
+                    "required_evidence": ["release evidence"],
+                    "done_when": ["outcome measured"],
+                    "next_phase": None if is_epic else "architecture",
+                    "next_role": None if is_epic else "architect",
+                },
+                "rules": {
+                    "allowed": ["scoped implementation"],
+                    "forbidden": ["bypass release evidence"],
+                },
+                "classification": ["framework:maintenance"],
+                "issuer": {"profile": "hermes", "run_id": None, "issued_at": 10},
+            },
+            secret=secret,
+        )
+
+    with kb.connect(board="strict") as conn:
+        epic_intake = kb.create_qualification_intake(
+            conn, raw_request="Epic request", source="hermes"
+        )
+        epic_id = intake.materialize_contract(
+            conn,
+            board="strict",
+            signed_contract=contract(epic_intake, kind="epic"),
+            secret=secret,
+        )
+        card_intake = kb.create_qualification_intake(
+            conn, raw_request="Card request", source="hermes"
+        )
+        signed_card = contract(card_intake)
+        signed_card["contract"]["routing"]["epic_id"] = epic_id
+        signed_card = intake.sign_work_contract(signed_card["contract"], secret=secret)
+        card_id = intake.materialize_contract(
+            conn,
+            board="strict",
+            signed_contract=signed_card,
+            secret=secret,
+        )
+
+    intake_detail = client.get(
+        f"/api/plugins/kanban/intake/{card_intake}?board=strict"
+    ).json()
+    assert intake_detail["decision"]["decision"] == "qualified"
+    assert intake_detail["contract_summary"]["work"]["title"] == "Governed member"
+    assert intake_detail["materialized_item"]["id"] == card_id
+
+    card = client.get(
+        f"/api/plugins/kanban/tasks/{card_id}?board=strict"
+    ).json()
+    assert card["work_contract"]["entry_assessment"]["reason"] == "Explicit governed entry"
+    assert card["work_contract"]["handover"]["done_when"] == ["outcome measured"]
+    assert card["work_contract"]["rules"]["forbidden"] == ["bypass release evidence"]
+    assert card["relations"]["epic"]["id"] == epic_id
+
+    epic = client.get(
+        f"/api/plugins/kanban/tasks/{epic_id}?board=strict"
+    ).json()
+    assert epic["epic_detail"] == {
+        "outcome": "Customers receive the governed outcome",
+        "scope": ["Hermes"],
+        "constraints": ["bypass release evidence"],
+        "definition_of_done": ["outcome measured"],
+        "members": [card_id],
+        "progress": {"done": 0, "total": 1, "release_state": "pending"},
+        "release_state": "pending",
+    }
+    serialized = json.dumps(epic).lower()
+    assert "signature" not in serialized
+    assert "canonical_json" not in serialized
+    assert "signing" not in serialized
 
 
 def test_strict_board_rejects_client_contract_and_routing_mutations(client):
