@@ -474,3 +474,48 @@ def test_materialization_revalidates_late_entry_evidence_before_writing(
         assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
     finally:
         connection.close()
+
+
+def test_materialization_revalidates_product_owner_evidence_for_epics(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.ensure_product_board_defaults("strict")
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    connection = kb.connect(board="strict")
+    try:
+        request_id = kb.create_qualification_intake(
+            connection, raw_request="PO Epic", source="productowner"
+        )
+        contract = _signed_contract(request_id)["contract"]
+        contract["qualification_path"] = "po"
+        contract["work"]["item_kind"] = "epic"
+        contract["routing"] = {
+            "entry_phase": None,
+            "assignee": None,
+            "epic_id": None,
+            "dependencies": [],
+        }
+        contract["handover"]["next_phase"] = None
+        contract["handover"]["next_role"] = None
+        contract["po_evidence"] = {"run_id": 999, "artifact": "brief.md"}
+        signed = intake.sign_work_contract(contract, secret=b"test-only-secret")
+
+        with pytest.raises(intake.WorkContractError, match="Product Owner run"):
+            intake.materialize_contract(
+                connection,
+                board="strict",
+                signed_contract=signed,
+                secret=b"test-only-secret",
+            )
+
+        assert connection.execute("SELECT COUNT(*) FROM work_contracts").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        connection.close()

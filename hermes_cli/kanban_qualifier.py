@@ -250,8 +250,7 @@ def revalidate_contract_evidence(
     routing = contract.get("routing")
     if not isinstance(work, Mapping) or not isinstance(routing, Mapping):
         raise QualificationValidationError(["work and routing are required"])
-    if work.get("item_kind") == "epic":
-        return
+    is_epic = work.get("item_kind") == "epic"
 
     policy_value = board_metadata.get("qualification")
     policy = policy_value if isinstance(policy_value, Mapping) else {}
@@ -263,16 +262,17 @@ def revalidate_contract_evidence(
     )
     entry_phase = routing.get("entry_phase")
     errors: list[str] = []
-    if entry_phase not in phase_assignees:
-        errors.append("entry phase is not defined by board policy")
-    else:
-        _validate_late_entry(
-            contract,
-            intake=intake,
-            phases=list(phase_assignees),
-            entry_phase=str(entry_phase),
-            errors=errors,
-        )
+    if not is_epic:
+        if entry_phase not in phase_assignees:
+            errors.append("entry phase is not defined by board policy")
+        else:
+            _validate_late_entry(
+                contract,
+                intake=intake,
+                phases=list(phase_assignees),
+                entry_phase=str(entry_phase),
+                errors=errors,
+            )
     if contract.get("qualification_path") == "po":
         _validate_po_evidence(
             conn,
