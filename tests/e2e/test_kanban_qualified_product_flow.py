@@ -112,18 +112,29 @@ def test_real_entry_shapes_qualify_or_reject_without_bypassing_routing(
     with kb.connect(board=board) as conn:
         materialized = []
         for title, phase, work_type, path in cases:
-            attachments = (
-                ({"name": "product-brief.md", "path": brief_path},)
-                if path == "po"
-                else ()
+            decision = _decision(title, phase, work_type, path=path)
+            evidence_refs = [
+                evidence
+                for skipped in decision["entry_assessment"]["skipped_phases"]
+                for evidence in skipped["evidence"]
+            ]
+            provenance = decision["entry_assessment"].get("provenance", {})
+            evidence_refs.extend(
+                value["artifact"] for value in provenance.values()
             )
+            attachments = tuple(
+                {"name": reference} for reference in evidence_refs
+            )
+            if path == "po":
+                attachments += (
+                    {"name": "product-brief.md", "path": brief_path},
+                )
             receipt = qualifier.submit_request(
                 conn,
                 request={"title": title, "evidence": f"fixture:{phase}"},
                 source="e2e",
                 attachments=attachments,
             )
-            decision = _decision(title, phase, work_type, path=path)
             if path == "po":
                 decision["po_evidence"] = {
                     "run_id": po_run_id,

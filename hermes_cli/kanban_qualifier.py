@@ -96,9 +96,25 @@ def _validate_po_evidence(
         errors.append("Product Owner artifact is not referenced by the run or intake")
 
 
+def _evidence_corpus(conn: Any, intake: Mapping[str, Any]) -> str:
+    parts = [str(intake.get("raw_request") or "")]
+    parts.append(json.dumps(intake.get("attachments") or [], default=str))
+    for row in conn.execute(
+        "SELECT summary, metadata, error FROM task_runs"
+    ).fetchall():
+        parts.extend(str(row[key] or "") for key in ("summary", "metadata", "error"))
+    for row in conn.execute("SELECT payload FROM task_events").fetchall():
+        parts.append(str(row["payload"] or ""))
+    for row in conn.execute("SELECT body FROM task_comments").fetchall():
+        parts.append(str(row["body"] or ""))
+    return "\n".join(parts)
+
+
 def _validate_late_entry(
+    conn: Any,
     decision: Mapping[str, Any],
     *,
+    intake: Mapping[str, Any],
     phases: list[str],
     entry_phase: str,
     errors: list[str],
@@ -112,17 +128,28 @@ def _validate_late_entry(
     if not isinstance(skipped, list):
         errors.append("entry assessment must list skipped phases")
         return
-    actual = [item.get("phase") for item in skipped if isinstance(item, Mapping)]
+    if not all(isinstance(item, Mapping) for item in skipped):
+        errors.append("skipped phases must contain objects only")
+        return
+    actual = [item.get("phase") for item in skipped]
     if actual != expected:
         errors.append(
             "skipped phases must exactly match the phases before " + entry_phase
         )
         return
+    evidence_corpus = _evidence_corpus(conn, intake)
     for item in skipped:
         reason = item.get("reason")
         evidence = item.get("evidence")
         if not isinstance(reason, str) or not reason.strip() or not _non_empty_strings(evidence):
             errors.append("each skipped phase requires a reason and evidence")
+            break
+        missing = [reference for reference in evidence if reference not in evidence_corpus]
+        if missing:
+            errors.append(
+                "skipped-phase evidence is not grounded in submitted or existing evidence: "
+                + ", ".join(missing)
+            )
             break
 
     if entry_phase != "review":
@@ -144,6 +171,17 @@ def _validate_late_entry(
         errors.append("Review entry requires independent writer and test provenance")
     elif writer_profile == tester_profile:
         errors.append("Review entry writer and tester must be independent")
+    else:
+        ungrounded = [
+            artifact
+            for artifact in (writer_artifact, tester_artifact)
+            if artifact not in evidence_corpus
+        ]
+        if ungrounded:
+            errors.append(
+                "Review provenance is not grounded in submitted or existing evidence: "
+                + ", ".join(ungrounded)
+            )
 
 
 def validate_decision(
@@ -218,7 +256,9 @@ def validate_decision(
                 else:
                     errors.append("assignee does not match the entry phase role")
             _validate_late_entry(
+                conn,
                 normalized,
+                intake=intake,
                 phases=phases,
                 entry_phase=str(entry_phase),
                 errors=errors,
@@ -261,6 +301,24 @@ def validate_decision(
         for field in ("deliverables", "required_evidence", "done_when"):
             if not _non_empty_strings(handover.get(field)):
                 errors.append(f"handover.{field} must contain at least one item")
+        for field in ("next_phase", "next_role"):
+            if field not in handover:
+                errors.append(f"handover.{field} is required")
+        if item_kind == "epic":
+            if handover.get("next_phase") is not None or handover.get("next_role") is not None:
+                errors.append("Epic handover cannot declare a next phase or role")
+        elif entry_phase in phase_assignees:
+            phase_index = phases.index(entry_phase)
+            expected_next_phase = (
+                phases[phase_index + 1]
+                if phase_index + 1 < len(phases)
+                else "done"
+            )
+            expected_next_role = phase_assignees.get(expected_next_phase)
+            if handover.get("next_phase") != expected_next_phase:
+                errors.append("handover.next_phase does not follow the entry phase")
+            if handover.get("next_role") != expected_next_role:
+                errors.append("handover.next_role does not match board policy")
     rules = normalized.get("rules")
     if not isinstance(rules, Mapping):
         errors.append("rules must be an object")
@@ -453,9 +511,13 @@ def qualify_intake(
         }
         if qualification_path == "po":
             contract["po_evidence"] = copy.deepcopy(decision["po_evidence"])
-        signed = kanban_intake.sign_work_contract(
-            contract, secret=secret, hermes_home=hermes_home
-        )
+        try:
+            signed = kanban_intake.sign_work_contract(
+                contract, secret=secret, hermes_home=hermes_home
+            )
+        except kanban_intake.WorkContractError as exc:
+            validation_errors = (str(exc),)
+            continue
         task_id = kanban_intake.materialize_contract(
             conn,
             board=board,

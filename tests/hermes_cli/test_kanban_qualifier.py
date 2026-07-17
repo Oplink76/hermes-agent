@@ -115,6 +115,10 @@ def _late_assessment(*phases, provenance=None):
     return value
 
 
+def _evidence_attachments(*references):
+    return tuple({"name": reference} for reference in references)
+
+
 def test_hermes_path_validates_without_product_owner_evidence(conn, policy):
     validated = qualifier.validate_decision(
         conn,
@@ -230,12 +234,44 @@ def test_late_entry_requires_reasons_and_evidence_for_every_skipped_phase(conn, 
         )
 
     decision["entry_assessment"] = _late_assessment("backlog", "architecture")
+    decision["handover"].update(next_phase="test", next_role="tester")
     assert qualifier.validate_decision(
         conn,
         board_metadata=policy,
-        intake=_intake(conn),
+        intake=_intake(
+            conn,
+            attachments=_evidence_attachments(
+                "backlog-artifact", "architecture-artifact"
+            ),
+        ),
         decision=decision,
     )["routing"]["entry_phase"] == "development"
+
+
+def test_late_entry_rejects_non_object_and_unsubmitted_evidence(conn, policy):
+    decision = _decision()
+    decision["routing"].update(
+        {"entry_phase": "architecture", "assignee": "architect"}
+    )
+    decision["handover"].update(next_phase="development", next_role="developer")
+    decision["entry_assessment"] = _late_assessment("backlog")
+
+    with pytest.raises(qualifier.QualificationValidationError, match="not grounded"):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=_intake(conn),
+            decision=decision,
+        )
+
+    decision["entry_assessment"]["skipped_phases"].append("not-an-object")
+    with pytest.raises(qualifier.QualificationValidationError, match="objects"):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=_intake(conn),
+            decision=decision,
+        )
 
 
 def test_review_entry_requires_independent_writer_and_test_provenance(conn, policy):
@@ -251,12 +287,21 @@ def test_review_entry_requires_independent_writer_and_test_provenance(conn, poli
             "tester": {"profile": "developer", "artifact": "tests:green"},
         },
     )
+    decision["handover"].update(next_phase="release_measure", next_role=None)
+    evidence = _evidence_attachments(
+        "backlog-artifact",
+        "architecture-artifact",
+        "development-artifact",
+        "test-artifact",
+        "commit:abc",
+        "tests:green",
+    )
 
     with pytest.raises(qualifier.QualificationValidationError, match="independent"):
         qualifier.validate_decision(
             conn,
             board_metadata=policy,
-            intake=_intake(conn),
+            intake=_intake(conn, attachments=evidence),
             decision=decision,
         )
 
@@ -264,7 +309,7 @@ def test_review_entry_requires_independent_writer_and_test_provenance(conn, poli
     assert qualifier.validate_decision(
         conn,
         board_metadata=policy,
-        intake=_intake(conn),
+        intake=_intake(conn, attachments=evidence),
         decision=decision,
     )["entry_assessment"]["provenance"]["tester"]["profile"] == "tester"
 
@@ -279,6 +324,19 @@ def test_release_measure_cannot_be_assigned_to_an_ordinary_worker(conn, policy):
     )
 
     with pytest.raises(qualifier.QualificationValidationError, match="release_measure.*unassigned"):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=_intake(conn),
+            decision=decision,
+        )
+
+
+def test_handover_requires_legal_next_phase_and_role(conn, policy):
+    decision = _decision()
+    del decision["handover"]["next_role"]
+
+    with pytest.raises(qualifier.QualificationValidationError, match="next_role"):
         qualifier.validate_decision(
             conn,
             board_metadata=policy,
@@ -323,14 +381,9 @@ def test_invalid_model_decision_retries_once_then_stores_rejection_without_card(
 
         def invalid_model(prompt):
             calls.append(prompt)
-            return _decision(
-                routing={
-                    "entry_phase": "development",
-                    "assignee": "default",
-                    "epic_id": None,
-                    "dependencies": [],
-                }
-            )
+            value = _decision()
+            del value["handover"]["next_role"]
+            return value
 
         result = qualifier.qualify_intake(
             connection,
@@ -343,6 +396,6 @@ def test_invalid_model_decision_retries_once_then_stores_rejection_without_card(
 
         assert result["status"] == "rejected"
         assert len(calls) == 2
-        assert "assignee" in calls[1]
+        assert "next_role" in calls[1]
         assert kb.get_qualification_intake(connection, receipt["intake_id"])["status"] == "rejected"
         assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
