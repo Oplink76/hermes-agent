@@ -22,6 +22,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
+from hermes_cli.kanban_intake import (
+    SIGNING_KEY_RELATIVE_PATH,
+    _restrict_signing_key_permissions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +126,12 @@ _IMPORT_SKIP_NAMES = {
 }
 
 # zipfile.open() drops Unix mode bits on extract; restore tightens these to 0600.
-_SECRET_FILE_NAMES = {".env", "auth.json", "state.db"}
+_SECRET_FILE_NAMES = {
+    ".env",
+    "auth.json",
+    "state.db",
+    Path(SIGNING_KEY_RELATIVE_PATH).name,
+}
 
 # Reserved archive subtree for provider state that lives OUTSIDE HERMES_HOME
 # (e.g. ~/.honcho, ~/.hindsight). The active memory provider declares these via
@@ -757,6 +766,7 @@ _QUICK_STATE_FILES = (
     "config.yaml",
     ".env",
     "auth.json",
+    SIGNING_KEY_RELATIVE_PATH,
     "cron/jobs.json",
     "gateway_state.json",
     "channel_directory.json",
@@ -790,6 +800,12 @@ def _quick_snapshot_root(hermes_home: Optional[Path] = None) -> Path:
     return home / _QUICK_SNAPSHOTS_DIR
 
 
+def _quick_shared_state_root(home: Path) -> Path:
+    """Resolve the shared Hermes root for a default or named profile home."""
+
+    return home.parent.parent if home.parent.name == "profiles" else home
+
+
 def create_quick_snapshot(
     label: Optional[str] = None,
     hermes_home: Optional[Path] = None,
@@ -812,9 +828,11 @@ def create_quick_snapshot(
     snap_dir.mkdir(parents=True, exist_ok=True)
 
     manifest: Dict[str, int] = {}  # rel_path -> file size
+    shared_home = _quick_shared_state_root(home)
 
     for rel in _QUICK_STATE_FILES:
-        src = home / rel
+        src_root = shared_home if rel == SIGNING_KEY_RELATIVE_PATH else home
+        src = src_root / rel
         if not src.exists():
             continue
 
@@ -952,6 +970,7 @@ def restore_quick_snapshot(
         meta = json.load(f)
 
     restored = 0
+    shared_home = _quick_shared_state_root(home)
     for rel in meta.get("files", {}):
         # Security: reject absolute paths and traversals in manifest entries
         src = snap_dir / rel
@@ -961,9 +980,10 @@ def restore_quick_snapshot(
             logger.error("Manifest path traversal blocked: %s", rel)
             continue
 
-        dst = home / rel
+        dst_root = shared_home if rel == SIGNING_KEY_RELATIVE_PATH else home
+        dst = dst_root / rel
         try:
-            dst.resolve().relative_to(home.resolve())
+            dst.resolve().relative_to(dst_root.resolve())
         except ValueError:
             logger.error("Manifest path traversal blocked: %s", rel)
             continue
@@ -982,6 +1002,8 @@ def restore_quick_snapshot(
                 shutil.move(str(tmp), str(dst))
             else:
                 shutil.copy2(src, dst)
+                if rel == SIGNING_KEY_RELATIVE_PATH:
+                    _restrict_signing_key_permissions(dst)
             restored += 1
         except (OSError, PermissionError) as exc:
             logger.error("Failed to restore %s: %s", rel, exc)

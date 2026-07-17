@@ -98,7 +98,57 @@ def test_connect_initialization_is_thread_safe(tmp_path, monkeypatch):
     assert errors == []
     with kb.connect(board="default") as conn:
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
-    assert "max_retries" in cols
+    assert {"max_retries", "work_contract_id", "work_item_kind"} <= cols
+
+
+def test_qualification_schema_is_additive_and_matches_fresh_init(tmp_path, monkeypatch):
+    db_path = _setup_home(tmp_path, monkeypatch)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(kb.SCHEMA_SQL)
+    conn.executescript(
+        """
+        DROP INDEX IF EXISTS idx_tasks_work_contract;
+        DROP TRIGGER IF EXISTS work_contracts_no_update;
+        DROP TRIGGER IF EXISTS work_contracts_no_delete;
+        DROP TRIGGER IF EXISTS qualification_decisions_no_update;
+        DROP TRIGGER IF EXISTS qualification_decisions_no_delete;
+        DROP TABLE IF EXISTS qualification_intake_decisions;
+        DROP TABLE IF EXISTS work_contracts;
+        DROP TABLE IF EXISTS epic_memberships;
+        DROP TABLE IF EXISTS qualification_intake;
+        """
+    )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "work_contract_id" in columns:
+        conn.execute("ALTER TABLE tasks DROP COLUMN work_contract_id")
+    if "work_item_kind" in columns:
+        conn.execute("ALTER TABLE tasks DROP COLUMN work_item_kind")
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('legacy', 'Legacy task', 'done', 1000)"
+    )
+    conn.commit()
+    conn.close()
+
+    with kb.connect(db_path) as migrated:
+        columns = {row["name"]: row for row in migrated.execute("PRAGMA table_info(tasks)")}
+        tables = {
+            row["name"]
+            for row in migrated.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        legacy = migrated.execute(
+            "SELECT title, work_contract_id, work_item_kind FROM tasks WHERE id = 'legacy'"
+        ).fetchone()
+
+    assert legacy["title"] == "Legacy task"
+    assert legacy["work_contract_id"] is None
+    assert legacy["work_item_kind"] == "card"
+    assert columns["work_item_kind"]["dflt_value"] == "'card'"
+    assert {
+        "qualification_intake",
+        "qualification_intake_decisions",
+        "work_contracts",
+        "epic_memberships",
+    } <= tables
 
 
 def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkeypatch):

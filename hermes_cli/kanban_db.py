@@ -52,8 +52,8 @@ worker subprocess env so workers converge on the exact DB the
 dispatcher used to claim their task — even under unusual symlink or
 Docker layouts.
 
-Schema is intentionally small: tasks, task_links, task_comments,
-task_events.  The ``workspace_kind`` field decouples coordination from git
+Schema is intentionally compact: task coordination plus qualification intake,
+signed Work Contracts, and explicit Epic membership. The ``workspace_kind`` field decouples coordination from git
 worktrees so that research / ops / digital-twin workloads work alongside
 coding workloads.  See ``docs/hermes-kanban-v1-spec.pdf`` for the full
 design specification.
@@ -90,6 +90,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Protocol, Tuple
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.kanban_intake import DEFAULT_POLICY_VERSION
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -176,6 +177,22 @@ PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES: dict[str, str] = {
     "developer": "developer",
     "tester": "tester",
     "reviewer": "reviewer",
+}
+PRODUCT_QUALIFICATION_DEFAULTS: dict[str, Any] = {
+    # Task 9 activates this only after existing executable cards are backfilled.
+    "required": False,
+    "contract_version": 1,
+    "policy_version": DEFAULT_POLICY_VERSION,
+    # Break-glass override is introduced separately and is never a normal path.
+    "paths": ["po", "hermes"],
+    "phase_assignees": {
+        "backlog": "productowner",
+        "architecture": "architect",
+        "development": "developer",
+        "test": "tester",
+        "review": "reviewer",
+        "release_measure": None,
+    },
 }
 DEFAULT_PRODUCT_WORKFLOW: dict[str, Any] = {
     "handoff_v2": True,
@@ -852,6 +869,11 @@ def product_workflow_defaults_for_board(board: Optional[str] = None) -> dict:
             "deployment_policy": "manual",
             "assignees": dict(PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES),
         },
+        "qualification": {
+            **PRODUCT_QUALIFICATION_DEFAULTS,
+            "paths": list(PRODUCT_QUALIFICATION_DEFAULTS["paths"]),
+            "phase_assignees": dict(PRODUCT_QUALIFICATION_DEFAULTS["phase_assignees"]),
+        },
         **({"slug": slug} if slug else {}),
     }
 
@@ -915,6 +937,26 @@ def ensure_product_board_defaults(
     assignees.update({str(k): str(v) for k, v in existing_assignees.items() if str(v).strip()})
     wf["assignees"] = assignees
     meta["product_workflow"] = wf
+    existing_qualification = (
+        meta.get("qualification") if isinstance(meta.get("qualification"), dict) else {}
+    )
+    qualification = {
+        **PRODUCT_QUALIFICATION_DEFAULTS,
+        **existing_qualification,
+    }
+    configured_phase_assignees = existing_qualification.get("phase_assignees")
+    qualification["phase_assignees"] = {
+        **PRODUCT_QUALIFICATION_DEFAULTS["phase_assignees"],
+        **(
+            configured_phase_assignees
+            if isinstance(configured_phase_assignees, dict)
+            else {}
+        ),
+    }
+    qualification["paths"] = list(
+        existing_qualification.get("paths", PRODUCT_QUALIFICATION_DEFAULTS["paths"])
+    )
+    meta["qualification"] = qualification
     meta["preset"] = "product"
     meta["columns"] = defaults["columns"]
     if not meta.get("created_at"):
@@ -2789,6 +2831,8 @@ class Task:
     current_run_id: Optional[int] = None
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
+    work_contract_id: Optional[str] = None
+    work_item_kind: str = "card"
     # Force-loaded skills for the worker on this task (passed via
     # --skills). Stored as a JSON array of skill names. None = use only
     # the defaults; empty list = explicitly no extra skills.
@@ -2895,6 +2939,14 @@ class Task:
             ),
             current_step_key=(
                 row["current_step_key"] if "current_step_key" in keys else None
+            ),
+            work_contract_id=(
+                row["work_contract_id"] if "work_contract_id" in keys else None
+            ),
+            work_item_kind=(
+                row["work_item_kind"]
+                if "work_item_kind" in keys and row["work_item_kind"]
+                else "card"
             ),
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
@@ -3061,6 +3113,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- them; the dispatcher doesn't consult them for routing yet.
     workflow_template_id TEXT,
     current_step_key     TEXT,
+    -- Signed qualification provenance. NULL keeps legacy and generic-board
+    -- rows valid; strict product-board materialization fills this in.
+    work_contract_id     TEXT,
+    work_item_kind       TEXT NOT NULL DEFAULT 'card',
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
@@ -3117,6 +3173,48 @@ CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
     PRIMARY KEY (parent_id, child_id)
+);
+
+CREATE TABLE IF NOT EXISTS qualification_intake (
+    id               TEXT PRIMARY KEY,
+    raw_request      TEXT NOT NULL,
+    source           TEXT NOT NULL,
+    session_id       TEXT,
+    attachments_json TEXT NOT NULL DEFAULT '[]',
+    status           TEXT NOT NULL DEFAULT 'pending'
+                         CHECK (status IN ('pending', 'qualified', 'rejected', 'overridden')),
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS work_contracts (
+    id               TEXT PRIMARY KEY,
+    request_id       TEXT NOT NULL,
+    canonical_json   TEXT NOT NULL,
+    digest           TEXT NOT NULL UNIQUE,
+    signature        TEXT NOT NULL,
+    issuer_profile   TEXT NOT NULL,
+    issuer_run_id    INTEGER,
+    policy_version   TEXT NOT NULL,
+    created_at       INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS qualification_intake_decisions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    intake_id        TEXT NOT NULL,
+    decision         TEXT NOT NULL
+                         CHECK (decision IN ('qualified', 'rejected', 'overridden')),
+    actor_profile    TEXT NOT NULL,
+    reason           TEXT,
+    contract_id      TEXT,
+    created_at       INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS epic_memberships (
+    epic_id          TEXT NOT NULL,
+    task_id          TEXT NOT NULL UNIQUE,
+    created_at       INTEGER NOT NULL,
+    PRIMARY KEY (epic_id, task_id)
 );
 
 CREATE TABLE IF NOT EXISTS task_comments (
@@ -3198,7 +3296,9 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
+-- idx_tasks_assignee_status lives in _migrate_add_optional_columns: minimal
+-- legacy boards lack the assignee column, and a CREATE INDEX over a missing
+-- column would abort executescript before the additive migration runs.
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -3208,6 +3308,55 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_qualification_intake_status
+    ON qualification_intake(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_work_contracts_digest ON work_contracts(digest);
+CREATE INDEX IF NOT EXISTS idx_qualification_decisions_intake
+    ON qualification_intake_decisions(intake_id, id);
+CREATE INDEX IF NOT EXISTS idx_epic_memberships_epic ON epic_memberships(epic_id, created_at);
+
+CREATE TRIGGER IF NOT EXISTS work_contracts_no_update
+BEFORE UPDATE ON work_contracts BEGIN
+    SELECT RAISE(ABORT, 'work_contracts are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS work_contracts_no_delete
+BEFORE DELETE ON work_contracts BEGIN
+    SELECT RAISE(ABORT, 'work_contracts are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS qualification_decisions_no_update
+BEFORE UPDATE ON qualification_intake_decisions BEGIN
+    SELECT RAISE(ABORT, 'qualification decisions are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS qualification_decisions_no_delete
+BEFORE DELETE ON qualification_intake_decisions BEGIN
+    SELECT RAISE(ABORT, 'qualification decisions are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS qualification_intake_immutable_fields
+BEFORE UPDATE ON qualification_intake
+WHEN NEW.id IS NOT OLD.id
+  OR NEW.raw_request IS NOT OLD.raw_request
+  OR NEW.source IS NOT OLD.source
+  OR NEW.session_id IS NOT OLD.session_id
+  OR NEW.attachments_json IS NOT OLD.attachments_json
+  OR NEW.created_at IS NOT OLD.created_at
+BEGIN
+    SELECT RAISE(ABORT, 'qualification intake provenance is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS qualification_intake_no_delete
+BEFORE DELETE ON qualification_intake BEGIN
+    SELECT RAISE(ABORT, 'qualification intake provenance is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS qualification_intake_status_requires_decision
+BEFORE UPDATE OF status ON qualification_intake
+WHEN NEW.status IS NOT OLD.status
+ AND COALESCE(
+     (SELECT decision FROM qualification_intake_decisions
+      WHERE intake_id = OLD.id ORDER BY id DESC LIMIT 1),
+     ''
+ ) != NEW.status
+BEGIN
+    SELECT RAISE(ABORT, 'qualification status requires an append-only decision');
+END;
 """
 
 
@@ -3866,6 +4015,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "current_step_key", "current_step_key TEXT"
         )
+    if "work_contract_id" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "work_contract_id", "work_contract_id TEXT"
+        )
+    if "work_item_kind" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "work_item_kind",
+            "work_item_kind TEXT NOT NULL DEFAULT 'card'",
+        )
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
         # worker via --skills. NULL is fine for existing rows.
@@ -3954,6 +4114,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+    # ``assignee`` is part of the modern base schema but is not one of the
+    # additive columns, so a minimal legacy board may never gain it; skip the
+    # index there instead of aborting initialization.
+    if "assignee" in cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status"
+            " ON tasks(assignee, status)"
+        )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -3991,7 +4159,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     runs_exist = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
-    if runs_exist:
+    # Minimal legacy tasks tables (id/title/status/created_at only) never had
+    # claim state, so there is nothing to backfill and the SELECT below would
+    # crash on the missing base-schema columns.
+    has_claim_cols = {"assignee", "claim_lock", "claim_expires", "started_at"} <= {
+        row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+    }
+    if runs_exist and has_claim_cols:
         with write_txn(conn):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
@@ -4435,6 +4609,284 @@ def _new_task_id() -> str:
     :func:`create_task` rather than rely on id uniqueness.
     """
     return "t_" + secrets.token_hex(4)
+
+
+def _new_qualification_intake_id() -> str:
+    return "qi_" + secrets.token_hex(8)
+
+
+def create_qualification_intake(
+    conn: sqlite3.Connection,
+    *,
+    raw_request: str,
+    source: str,
+    session_id: Optional[str] = None,
+    attachments: Iterable[dict[str, Any]] = (),
+    created_at: Optional[int] = None,
+) -> str:
+    """Persist an inert request without creating an executable task."""
+
+    if not isinstance(raw_request, str) or not raw_request:
+        raise ValueError("raw_request is required")
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("source is required")
+    attachments_json = json.dumps(
+        list(attachments), ensure_ascii=False, separators=(",", ":")
+    )
+    now = int(time.time()) if created_at is None else int(created_at)
+    for attempt in range(2):
+        intake_id = _new_qualification_intake_id()
+        try:
+            with write_txn(conn):
+                conn.execute(
+                    """
+                    INSERT INTO qualification_intake (
+                        id, raw_request, source, session_id, attachments_json,
+                        status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                    """,
+                    (
+                        intake_id,
+                        raw_request,
+                        source.strip(),
+                        session_id,
+                        attachments_json,
+                        now,
+                        now,
+                    ),
+                )
+            return intake_id
+        except sqlite3.IntegrityError:
+            if attempt:
+                raise
+    raise RuntimeError("unreachable")
+
+
+def _qualification_intake_dict(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        attachments = json.loads(row["attachments_json"] or "[]")
+    except (TypeError, json.JSONDecodeError):
+        attachments = []
+    return {
+        "id": row["id"],
+        "raw_request": row["raw_request"],
+        "source": row["source"],
+        "session_id": row["session_id"],
+        "attachments": attachments,
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def get_qualification_intake(
+    conn: sqlite3.Connection, intake_id: str
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT * FROM qualification_intake WHERE id = ?", (intake_id,)
+    ).fetchone()
+    return _qualification_intake_dict(row) if row else None
+
+
+def list_qualification_intakes(
+    conn: sqlite3.Connection, *, status: Optional[str] = None
+) -> list[dict[str, Any]]:
+    if status is None:
+        rows = conn.execute(
+            "SELECT * FROM qualification_intake ORDER BY created_at, id"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM qualification_intake WHERE status = ? ORDER BY created_at, id",
+            (status,),
+        ).fetchall()
+    return [_qualification_intake_dict(row) for row in rows]
+
+
+def record_qualification_decision(
+    conn: sqlite3.Connection,
+    *,
+    intake_id: str,
+    decision: str,
+    actor_profile: str,
+    reason: Optional[str] = None,
+    contract_id: Optional[str] = None,
+    created_at: Optional[int] = None,
+) -> int:
+    """Append an audit decision and update the intake's current disposition."""
+
+    if decision not in {"qualified", "rejected", "overridden"}:
+        raise ValueError("decision must be qualified, rejected, or overridden")
+    if not actor_profile or not actor_profile.strip():
+        raise ValueError("actor_profile is required")
+    now = int(time.time()) if created_at is None else int(created_at)
+    with write_txn(conn):
+        exists = conn.execute(
+            "SELECT 1 FROM qualification_intake WHERE id = ?", (intake_id,)
+        ).fetchone()
+        if not exists:
+            raise ValueError(f"unknown qualification intake: {intake_id}")
+        if decision in {"qualified", "overridden"}:
+            if not contract_id:
+                raise ValueError(
+                    f"{decision} decision requires the matching Work Contract"
+                )
+            contract_row = conn.execute(
+                "SELECT request_id FROM work_contracts WHERE id = ?", (contract_id,)
+            ).fetchone()
+            if not contract_row:
+                raise ValueError(f"unknown Work Contract: {contract_id}")
+            if contract_row["request_id"] != intake_id:
+                raise ValueError(
+                    f"Work Contract {contract_id} does not belong to intake {intake_id}"
+                )
+        elif contract_id is not None:
+            raise ValueError("rejected decisions cannot attach a Work Contract")
+        cursor = conn.execute(
+            """
+            INSERT INTO qualification_intake_decisions (
+                intake_id, decision, actor_profile, reason, contract_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                intake_id,
+                decision,
+                actor_profile.strip(),
+                reason,
+                contract_id,
+                now,
+            ),
+        )
+        conn.execute(
+            "UPDATE qualification_intake SET status = ?, updated_at = ? WHERE id = ?",
+            (decision, now, intake_id),
+        )
+    return int(cursor.lastrowid)
+
+
+def list_qualification_decisions(
+    conn: sqlite3.Connection, intake_id: str
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM qualification_intake_decisions WHERE intake_id = ? ORDER BY id",
+        (intake_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def store_work_contract(
+    conn: sqlite3.Connection,
+    signed_contract: dict[str, Any],
+    *,
+    secret: Optional[bytes] = None,
+    hermes_home: Optional[Path] = None,
+    created_at: Optional[int] = None,
+) -> str:
+    """Verify and append an immutable service-signed Work Contract."""
+
+    from hermes_cli import kanban_intake
+
+    if not kanban_intake.verify_work_contract(
+        signed_contract, secret=secret, hermes_home=hermes_home
+    ):
+        raise ValueError("refusing to store an invalid Work Contract")
+    contract = signed_contract["contract"]
+    digest = signed_contract["digest"]
+    contract_id = "wc_" + digest[:24]
+    issuer = contract["issuer"]
+    now = int(time.time()) if created_at is None else int(created_at)
+    with write_txn(conn):
+        intake_row = conn.execute(
+            "SELECT id FROM qualification_intake WHERE id = ?",
+            (contract["request_id"],),
+        ).fetchone()
+        if not intake_row:
+            raise ValueError(
+                f"unknown qualification intake: {contract['request_id']}"
+            )
+        existing = conn.execute(
+            "SELECT id, canonical_json, signature FROM work_contracts WHERE digest = ?",
+            (digest,),
+        ).fetchone()
+        if existing:
+            if (
+                existing["canonical_json"] != signed_contract["canonical_json"]
+                or existing["signature"] != signed_contract["signature"]
+            ):
+                raise ValueError(
+                    "stored Work Contract digest conflicts with signed payload"
+                )
+            return existing["id"]
+        conn.execute(
+            """
+            INSERT INTO work_contracts (
+                id, request_id, canonical_json, digest, signature,
+                issuer_profile, issuer_run_id, policy_version, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                contract_id,
+                contract["request_id"],
+                signed_contract["canonical_json"],
+                digest,
+                signed_contract["signature"],
+                issuer["profile"],
+                issuer["run_id"],
+                contract["policy_version"],
+                now,
+            ),
+        )
+    return contract_id
+
+
+def get_work_contract(
+    conn: sqlite3.Connection, contract_id: str
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT * FROM work_contracts WHERE id = ?", (contract_id,)
+    ).fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["contract"] = json.loads(result["canonical_json"])
+    return result
+
+
+def add_epic_membership(
+    conn: sqlite3.Connection,
+    *,
+    epic_id: str,
+    task_id: str,
+    created_at: Optional[int] = None,
+) -> None:
+    now = int(time.time()) if created_at is None else int(created_at)
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT id, work_item_kind FROM tasks WHERE id IN (?, ?)",
+            (epic_id, task_id),
+        ).fetchall()
+        by_id = {row["id"]: row["work_item_kind"] for row in rows}
+        missing = [item for item in (epic_id, task_id) if item not in by_id]
+        if missing:
+            raise ValueError(f"unknown task(s): {', '.join(missing)}")
+        if by_id[epic_id] != "epic":
+            raise ValueError(f"epic task {epic_id} is not work_item_kind=epic")
+        if by_id[task_id] == "epic":
+            raise ValueError("an Epic cannot be a child Epic membership")
+        conn.execute(
+            "INSERT INTO epic_memberships (epic_id, task_id, created_at) VALUES (?, ?, ?)",
+            (epic_id, task_id, now),
+        )
+
+
+def list_epic_members(conn: sqlite3.Connection, epic_id: str) -> list[str]:
+    return [
+        row["task_id"]
+        for row in conn.execute(
+            "SELECT task_id FROM epic_memberships WHERE epic_id = ? ORDER BY created_at, task_id",
+            (epic_id,),
+        ).fetchall()
+    ]
 
 
 def _claimer_id() -> str:
