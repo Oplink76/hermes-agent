@@ -95,6 +95,10 @@ from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
 
+_GOVERNANCE_WRITE_AUTHORIZED: ContextVar[bool] = ContextVar(
+    "kanban_governance_write_authorized", default=False
+)
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -185,6 +189,7 @@ PRODUCT_QUALIFICATION_DEFAULTS: dict[str, Any] = {
     "policy_version": DEFAULT_POLICY_VERSION,
     # Break-glass override is introduced separately and is never a normal path.
     "paths": ["po", "hermes"],
+    "work_types": ["story", "bug", "maintenance", "ops", "spike"],
     "phase_assignees": {
         "backlog": "productowner",
         "architecture": "architect",
@@ -1038,8 +1043,8 @@ def _handoff_v2_enabled(board_meta: Optional[dict]) -> bool:
     return wf.get("handoff_v2") is True
 
 
-def _board_slug_for_connection(conn: sqlite3.Connection) -> str:
-    """Best-effort board slug for an open kanban DB connection.
+def _known_board_slug_for_connection(conn: sqlite3.Connection) -> Optional[str]:
+    """Return the slug when an open connection points at a managed board DB.
 
     Most lifecycle helpers receive only a sqlite connection. Resolve the board
     from SQLite's ``main`` database path so board-level workflow policy still
@@ -1061,7 +1066,13 @@ def _board_slug_for_connection(conn: sqlite3.Connection) -> str:
                     return slug
     except Exception:
         pass
-    return get_current_board()
+    return None
+
+
+def _board_slug_for_connection(conn: sqlite3.Connection) -> str:
+    """Best-effort board slug for lifecycle helpers, with active-board fallback."""
+
+    return _known_board_slug_for_connection(conn) or get_current_board()
 
 
 def _product_release_measure_unblocks_dependents(meta: Optional[dict]) -> bool:
@@ -1544,7 +1555,7 @@ def set_phase(
     if meta is None or not _handoff_v2_enabled(meta):
         return False
     _validate_product_workflow_state(PRODUCT_WORKFLOW_TEMPLATE_ID, phase)
-    with write_txn(conn):
+    with authorized_governance_write(), write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET current_step_key = ? WHERE id = ?",
             (phase, task_id),
@@ -2051,7 +2062,7 @@ def _complete_product_workflow_step(
             conn, task_id, pre_step, metadata, meta,
         )
 
-    with write_txn(conn):
+    with authorized_governance_write(), write_txn(conn):
         row = conn.execute(
             "SELECT status, assignee, workflow_template_id, current_step_key "
             "FROM tasks WHERE id = ?",
@@ -2309,7 +2320,7 @@ def resolve_product_preflight(
     if meta is None:
         raise ValueError("Resolver decisions require a product board")
 
-    with write_txn(conn):
+    with authorized_governance_write(), write_txn(conn):
         row = conn.execute(
             "SELECT status, assignee, project_id, workflow_template_id, "
             "current_step_key, workspace_kind, workspace_path, branch_name, "
@@ -3217,6 +3228,13 @@ CREATE TABLE IF NOT EXISTS epic_memberships (
     PRIMARY KEY (epic_id, task_id)
 );
 
+CREATE TABLE IF NOT EXISTS board_governance (
+    id                     INTEGER PRIMARY KEY CHECK (id = 1),
+    qualification_required INTEGER NOT NULL DEFAULT 0
+                               CHECK (qualification_required IN (0, 1))
+);
+INSERT OR IGNORE INTO board_governance (id, qualification_required) VALUES (1, 0);
+
 CREATE TABLE IF NOT EXISTS task_comments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id    TEXT NOT NULL,
@@ -3357,6 +3375,22 @@ WHEN NEW.status IS NOT OLD.status
 BEGIN
     SELECT RAISE(ABORT, 'qualification status requires an append-only decision');
 END;
+CREATE TRIGGER IF NOT EXISTS board_governance_no_direct_update
+BEFORE UPDATE ON board_governance
+WHEN hermes_governance_write_authorized() != 1
+BEGIN
+    SELECT RAISE(ABORT, 'board governance is service-owned');
+END;
+CREATE TRIGGER IF NOT EXISTS board_governance_no_delete
+BEFORE DELETE ON board_governance BEGIN
+    SELECT RAISE(ABORT, 'board governance is service-owned');
+END;
+CREATE TRIGGER IF NOT EXISTS work_contracts_service_insert
+BEFORE INSERT ON work_contracts
+WHEN hermes_governance_write_authorized() != 1
+BEGIN
+    SELECT RAISE(ABORT, 'Work Contracts are service-owned');
+END;
 """
 
 
@@ -3408,7 +3442,23 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     # the PRAGMA explicitly so it is observable and survives future wrapper
     # changes. Parameter binding is not supported for PRAGMA assignments.
     conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    conn.create_function(
+        "hermes_governance_write_authorized",
+        0,
+        lambda: 1 if _GOVERNANCE_WRITE_AUTHORIZED.get() else 0,
+    )
     return conn
+
+
+@contextlib.contextmanager
+def authorized_governance_write():
+    """Authorize one service-owned governance write in the current context."""
+
+    token = _GOVERNANCE_WRITE_AUTHORIZED.set(True)
+    try:
+        yield
+    finally:
+        _GOVERNANCE_WRITE_AUTHORIZED.reset(token)
 
 
 @contextlib.contextmanager
@@ -3785,10 +3835,14 @@ def connect(
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
     """
+    governance_board: Optional[str] = None
     if db_path is not None:
         path = db_path
     else:
         path = kanban_db_path(board=board)
+        governance_board = (
+            _normalize_board_slug(board) if board is not None else get_current_board()
+        ) or DEFAULT_BOARD
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -3817,6 +3871,9 @@ def connect(
         except Exception:
             conn.close()
             raise
+        _sync_board_governance(
+            conn, _known_board_slug_for_connection(conn) or governance_board
+        )
         return conn
 
     with _cross_process_init_lock(path):
@@ -3865,7 +3922,35 @@ def connect(
         except Exception:
             conn.close()
             raise
+    _sync_board_governance(
+        conn, _known_board_slug_for_connection(conn) or governance_board
+    )
     return conn
+
+
+def _sync_board_governance(
+    conn: sqlite3.Connection, board: Optional[str]
+) -> None:
+    """Mirror the board's qualification gate into its SQLite write boundary."""
+
+    if board is None:
+        return
+    metadata = read_board_metadata(board)
+    qualification = metadata.get("qualification")
+    required = int(
+        isinstance(qualification, dict) and qualification.get("required") is True
+    )
+    row = conn.execute(
+        "SELECT qualification_required FROM board_governance WHERE id = 1"
+    ).fetchone()
+    if row is not None and int(row["qualification_required"]) == required:
+        return
+    with authorized_governance_write():
+        conn.execute(
+            "INSERT INTO board_governance (id, qualification_required) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET qualification_required = excluded.qualification_required",
+            (required,),
+        )
 
 
 @contextlib.contextmanager
@@ -4225,7 +4310,120 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             (new, old),
         )
 
+    _ensure_qualification_boundary_objects(conn)
     _rebuild_drifted_tables(conn)
+
+
+def _ensure_qualification_boundary_objects(conn: sqlite3.Connection) -> None:
+    """Install strict-write objects only after legacy task columns exist."""
+
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_work_contract_unique "
+        "ON tasks(work_contract_id) WHERE work_contract_id IS NOT NULL"
+    )
+    required_tables = {
+        "board_governance",
+        "work_contracts",
+        "qualification_intake_decisions",
+        "task_links",
+        "epic_memberships",
+    }
+    present_tables = {
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if not required_tables <= present_tables:
+        return
+    conn.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS strict_tasks_require_qualification
+        BEFORE INSERT ON tasks
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND (
+             NEW.work_contract_id IS NULL
+             OR NOT EXISTS (
+                 SELECT 1
+                 FROM work_contracts wc
+                 JOIN qualification_intake_decisions qd
+                   ON qd.contract_id = wc.id
+                  AND qd.intake_id = wc.request_id
+                 WHERE wc.id = NEW.work_contract_id
+                   AND qd.decision IN ('qualified', 'overridden')
+                   AND qd.id = (
+                       SELECT MAX(latest.id)
+                       FROM qualification_intake_decisions latest
+                       WHERE latest.intake_id = wc.request_id
+                   )
+             )
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'qualification required before task materialization');
+        END;
+        CREATE TRIGGER IF NOT EXISTS strict_task_links_service_insert
+        BEFORE INSERT ON task_links
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND hermes_governance_write_authorized() != 1
+        BEGIN
+            SELECT RAISE(ABORT, 'strict-board dependencies are Work Contract-owned');
+        END;
+        CREATE TRIGGER IF NOT EXISTS strict_tasks_service_delete
+        BEFORE DELETE ON tasks
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND hermes_governance_write_authorized() != 1
+        BEGIN
+            SELECT RAISE(ABORT, 'strict-board task deletion requires Hermes service authority');
+        END;
+        CREATE TRIGGER IF NOT EXISTS strict_tasks_service_archive
+        BEFORE UPDATE OF status ON tasks
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND OLD.work_contract_id IS NOT NULL
+         AND NEW.status = 'archived'
+         AND OLD.status IS NOT NEW.status
+         AND hermes_governance_write_authorized() != 1
+        BEGIN
+            SELECT RAISE(ABORT, 'strict-board archival requires Hermes service authority');
+        END;
+        CREATE TRIGGER IF NOT EXISTS strict_task_routing_service_update
+        BEFORE UPDATE OF assignee, workflow_template_id, current_step_key,
+                         work_contract_id, work_item_kind ON tasks
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND OLD.work_contract_id IS NOT NULL
+         AND hermes_governance_write_authorized() != 1
+         AND (
+             NEW.assignee IS NOT OLD.assignee
+             OR NEW.workflow_template_id IS NOT OLD.workflow_template_id
+             OR NEW.current_step_key IS NOT OLD.current_step_key
+             OR NEW.work_contract_id IS NOT OLD.work_contract_id
+             OR NEW.work_item_kind IS NOT OLD.work_item_kind
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'strict-board routing is Work Contract-owned');
+        END;
+        CREATE TRIGGER IF NOT EXISTS strict_task_links_service_delete
+        BEFORE DELETE ON task_links
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND hermes_governance_write_authorized() != 1
+        BEGIN
+            SELECT RAISE(ABORT, 'strict-board dependencies are Work Contract-owned');
+        END;
+        CREATE TRIGGER IF NOT EXISTS strict_epic_memberships_service_insert
+        BEFORE INSERT ON epic_memberships
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND hermes_governance_write_authorized() != 1
+        BEGIN
+            SELECT RAISE(ABORT, 'strict-board Epic membership is Work Contract-owned');
+        END;
+        CREATE TRIGGER IF NOT EXISTS strict_epic_memberships_service_delete
+        BEFORE DELETE ON epic_memberships
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND hermes_governance_write_authorized() != 1
+        BEGIN
+            SELECT RAISE(ABORT, 'strict-board Epic membership is Work Contract-owned');
+        END;
+        """
+    )
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -4795,47 +4993,48 @@ def store_work_contract(
     contract_id = "wc_" + digest[:24]
     issuer = contract["issuer"]
     now = int(time.time()) if created_at is None else int(created_at)
-    with write_txn(conn):
-        intake_row = conn.execute(
-            "SELECT id FROM qualification_intake WHERE id = ?",
-            (contract["request_id"],),
-        ).fetchone()
-        if not intake_row:
-            raise ValueError(
-                f"unknown qualification intake: {contract['request_id']}"
-            )
-        existing = conn.execute(
-            "SELECT id, canonical_json, signature FROM work_contracts WHERE digest = ?",
-            (digest,),
-        ).fetchone()
-        if existing:
-            if (
-                existing["canonical_json"] != signed_contract["canonical_json"]
-                or existing["signature"] != signed_contract["signature"]
-            ):
+    with authorized_governance_write():
+        with write_txn(conn):
+            intake_row = conn.execute(
+                "SELECT id FROM qualification_intake WHERE id = ?",
+                (contract["request_id"],),
+            ).fetchone()
+            if not intake_row:
                 raise ValueError(
-                    "stored Work Contract digest conflicts with signed payload"
+                    f"unknown qualification intake: {contract['request_id']}"
                 )
-            return existing["id"]
-        conn.execute(
-            """
-            INSERT INTO work_contracts (
-                id, request_id, canonical_json, digest, signature,
-                issuer_profile, issuer_run_id, policy_version, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                contract_id,
-                contract["request_id"],
-                signed_contract["canonical_json"],
-                digest,
-                signed_contract["signature"],
-                issuer["profile"],
-                issuer["run_id"],
-                contract["policy_version"],
-                now,
-            ),
-        )
+            existing = conn.execute(
+                "SELECT id, canonical_json, signature FROM work_contracts WHERE digest = ?",
+                (digest,),
+            ).fetchone()
+            if existing:
+                if (
+                    existing["canonical_json"] != signed_contract["canonical_json"]
+                    or existing["signature"] != signed_contract["signature"]
+                ):
+                    raise ValueError(
+                        "stored Work Contract digest conflicts with signed payload"
+                    )
+                return existing["id"]
+            conn.execute(
+                """
+                INSERT INTO work_contracts (
+                    id, request_id, canonical_json, digest, signature,
+                    issuer_profile, issuer_run_id, policy_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    contract_id,
+                    contract["request_id"],
+                    signed_contract["canonical_json"],
+                    digest,
+                    signed_contract["signature"],
+                    issuer["profile"],
+                    issuer["run_id"],
+                    contract["policy_version"],
+                    now,
+                ),
+            )
     return contract_id
 
 
@@ -4889,6 +5088,52 @@ def list_epic_members(conn: sqlite3.Connection, epic_id: str) -> list[str]:
     ]
 
 
+def epic_id_for_task(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the card's explicit Epic membership, if any."""
+
+    row = conn.execute(
+        "SELECT epic_id FROM epic_memberships WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    return str(row["epic_id"]) if row is not None else None
+
+
+def epic_progress(conn: sqlite3.Connection, epic_id: str) -> dict[str, Any]:
+    """Return member-derived progress and the Epic release state."""
+
+    if not _is_epic_task(conn, epic_id):
+        raise ValueError(f"task {epic_id} is not an Epic")
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS total,
+               COALESCE(SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END), 0) AS done
+          FROM epic_memberships em
+          JOIN tasks t ON t.id = em.task_id
+         WHERE em.epic_id = ?
+        """,
+        (epic_id,),
+    ).fetchone()
+    epic = get_task(conn, epic_id)
+    if epic is not None and epic.status == "done":
+        release_state = "released"
+    elif any(event.kind == "epic_merged" for event in list_events(conn, epic_id)):
+        release_state = "merged"
+    else:
+        release_state = "pending"
+    return {
+        "done": int(row["done"]),
+        "total": int(row["total"]),
+        "release_state": release_state,
+    }
+
+
+def release_scope_for_task(conn: sqlite3.Connection, task_id: str) -> str:
+    """Classify release routing without consulting dependency links."""
+
+    if _is_epic_task(conn, task_id):
+        return "epic"
+    return "epic_member" if epic_id_for_task(conn, task_id) else "standalone"
+
+
 def _claimer_id() -> str:
     """Return a ``host:pid`` string that identifies this claimer."""
     import socket
@@ -4938,6 +5183,8 @@ def create_task(
     project_id: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
+    work_contract_id: Optional[str] = None,
+    work_item_kind: str = "card",
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -4978,6 +5225,14 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    if work_item_kind not in {"card", "epic"}:
+        raise ValueError("work_item_kind must be card or epic")
+    if work_item_kind == "epic" and (
+        assignee is not None
+        or workflow_template_id is not None
+        or current_step_key is not None
+    ):
+        raise ValueError("Epic work items cannot have an assignee or workflow phase")
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -5065,7 +5320,11 @@ def create_task(
         _normalize_board_slug(board) if board is not None
         else _board_slug_for_connection(conn)
     )
-    if workflow_template_id == PRODUCT_WORKFLOW_TEMPLATE_ID and not current_step_key:
+    if (
+        work_item_kind == "card"
+        and workflow_template_id == PRODUCT_WORKFLOW_TEMPLATE_ID
+        and not current_step_key
+    ):
         _inferred_step = _infer_product_step(
             title=title,
             assignee=assignee,
@@ -5075,7 +5334,8 @@ def create_task(
         if _inferred_step:
             current_step_key = _inferred_step
     elif (
-        workflow_template_id is None
+        work_item_kind == "card"
+        and workflow_template_id is None
         and _is_product_board_metadata(_wf_board_meta)
         and current_step_key is None
     ):
@@ -5211,6 +5471,8 @@ def create_task(
                     missing = _find_missing_parents(conn, parents)
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                if work_item_kind == "epic":
+                    task_status = "todo"
 
                 # Project-linked worktree: a fresh worktree dir under the repo
                 # plus a deterministic branch (project slug + task id). Together
@@ -5238,8 +5500,9 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
-                        workflow_template_id, current_step_key
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        workflow_template_id, current_step_key,
+                        work_contract_id, work_item_kind
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -5264,6 +5527,8 @@ def create_task(
                         session_id,
                         workflow_template_id,
                         current_step_key,
+                        work_contract_id,
+                        work_item_kind,
                     ),
                 )
                 for pid in parents:
@@ -6033,6 +6298,11 @@ def claim_task(
     board_meta = product_board_metadata(_board_slug)
     release_measure_unblocks = _product_release_measure_unblocks_dependents(board_meta)
     with write_txn(conn):
+        candidate = conn.execute(
+            "SELECT work_item_kind FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if candidate is not None and candidate["work_item_kind"] == "epic":
+            return None
         # Enforcement preflight: repair a plain/legacy role card missing its
         # product workflow metadata before it claims, so it dispatches on the
         # correct step instead of masquerading (re-applied from f55580879).
@@ -6093,6 +6363,7 @@ def claim_task(
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
                AND status = 'ready'
+               AND work_item_kind = 'card'
                AND claim_lock IS NULL
             """,
             (lock, expires, now, task_id),
@@ -6753,7 +7024,7 @@ def _route_product_rework_if_requested(
     except (TypeError, ValueError):
         max_cycles = 3
     max_cycles = max(1, max_cycles)
-    with write_txn(conn):
+    with authorized_governance_write(), write_txn(conn):
         row = conn.execute(
             "SELECT title, assignee, status, current_step_key, "
             "current_run_id, rework_count FROM tasks WHERE id = ?",
@@ -6911,6 +7182,23 @@ def complete_task(
     board = board or _board_slug_for_connection(conn)
     now = int(time.time())
 
+    task_kind_row = conn.execute(
+        "SELECT work_item_kind FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if (
+        task_kind_row is not None
+        and task_kind_row["work_item_kind"] == "epic"
+        and _release_evidence is None
+    ):
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_epic_release",
+                {"reason": "Epic completion requires the release contract"},
+            )
+        return False
+
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
     # tiny dedicated txn, then raise. The caller is responsible for
@@ -7038,7 +7326,7 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    with write_txn(conn):
+    with authorized_governance_write(), write_txn(conn):
         terminal_row = conn.execute(
             "SELECT current_step_key FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -8616,6 +8904,8 @@ def decompose_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    if _strict_destructive_write_forbidden(conn):
+        raise PermissionError("strict-board archival requires Hermes service authority")
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -8649,6 +8939,8 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     tasks must be explicitly archived first so accidental data loss requires a
     second deliberate action.
     """
+    if _strict_destructive_write_forbidden(conn):
+        raise PermissionError("strict-board task deletion requires Hermes service authority")
     with write_txn(conn):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
@@ -8678,6 +8970,8 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     Returns ``True`` if the task existed and was deleted, ``False``
     if the task was not found.
     """
+    if _strict_destructive_write_forbidden(conn):
+        raise PermissionError("strict-board task deletion requires Hermes service authority")
     with write_txn(conn):
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
@@ -8689,6 +8983,17 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
+
+
+def _strict_destructive_write_forbidden(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT qualification_required FROM board_governance WHERE id = 1"
+    ).fetchone()
+    return bool(
+        row is not None
+        and int(row["qualification_required"]) == 1
+        and not _GOVERNANCE_WRITE_AUTHORIZED.get()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -8863,37 +9168,24 @@ def _story_base_branch(
     """The base branch a v2 story's worktree should branch off, or ``None``.
 
     ``None`` (legacy behavior, base defaults to ``HEAD``) unless the board has
-    opted into ``handoff_v2`` AND the task has an epic parent. A story has one
-    epic in the intended model; if multiple parents are linked, the first
-    (lowest ``parent_id``, per :func:`parent_ids`'s deterministic ordering) wins.
+    opted into ``handoff_v2`` AND the task has explicit Epic membership.
     """
     meta = product_board_metadata(board)
     if not _handoff_v2_enabled(meta):
         return None
-    epic_id = _epic_parent_id(conn, task_id)
+    epic_id = epic_id_for_task(conn, task_id)
     if epic_id is None:
         return None
     return epic_branch_for(epic_id)
 
 
 def _is_epic_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Identify an epic from immutable Review evidence, with legacy title fallback."""
-    reviewed = _latest_approved_review_candidate(conn, task_id)
-    if reviewed is not None:
-        return reviewed[0] == epic_branch_for(task_id)
-    task = get_task(conn, task_id)
-    return bool(task and task.title.strip().lower().startswith("epic"))
+    """Identify an Epic only from its explicit persisted kind."""
 
-
-def _epic_parent_id(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    return next(
-        (
-            parent_id
-            for parent_id in parent_ids(conn, task_id)
-            if _is_epic_task(conn, parent_id)
-        ),
-        None,
-    )
+    row = conn.execute(
+        "SELECT work_item_kind FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    return bool(row is not None and row["work_item_kind"] == "epic")
 
 
 def _ensure_git_worktree(
@@ -9331,7 +9623,9 @@ def epic_ready(
     meta = product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return False
-    children = child_ids(conn, epic_id)
+    if not _is_epic_task(conn, epic_id):
+        return False
+    children = list_epic_members(conn, epic_id)
     if not children:
         return False
     for child_id in children:
@@ -9565,7 +9859,9 @@ def integrate_story_to_epic(
         return None
     _validate_stored_product_workflow_state(conn, story_id)
 
-    epic_id = _epic_parent_id(conn, story_id)
+    if _is_epic_task(conn, story_id):
+        return None
+    epic_id = epic_id_for_task(conn, story_id)
     if epic_id is None:
         return None
 
@@ -9767,7 +10063,7 @@ def _merge_standalone_story_to_main(
         return None
     _validate_stored_product_workflow_state(conn, story_id)
     # A story WITH an epic goes through integrate_story_to_epic + merge_epic_to_main.
-    if _epic_parent_id(conn, story_id) is not None:
+    if _is_epic_task(conn, story_id) or epic_id_for_task(conn, story_id) is not None:
         return None
     story = get_task(conn, story_id)
     if story is None or (
@@ -10156,11 +10452,12 @@ def release_product_task(
     board = board or _board_slug_for_connection(conn)
     task = get_task(conn, task_id)
     meta = product_board_metadata(board)
+    is_epic_task = bool(task is not None and task.work_item_kind == "epic")
     if (
         task is None
         or meta is None
         or not _handoff_v2_enabled(meta)
-        or task.current_step_key != "release_measure"
+        or (not is_epic_task and task.current_step_key != "release_measure")
     ):
         raise ReleaseEvidenceError(task_id, ["release_measure_state"])
     if not _release_run_is_current(conn, task_id, expected_run_id):
@@ -10171,7 +10468,7 @@ def release_product_task(
 
     repo_value = str(meta.get("default_workdir") or task.workspace_path or "").strip()
     repo_root = _git_toplevel(Path(repo_value).expanduser()) if repo_value else None
-    children = child_ids(conn, task_id)
+    children = list_epic_members(conn, task_id) if _is_epic_task(conn, task_id) else []
     reviewed_candidate = _latest_approved_review_candidate(conn, task_id)
     branch = (
         reviewed_candidate[0]
@@ -10191,8 +10488,8 @@ def release_product_task(
     if not note:
         raise ReleaseEvidenceError(task_id, ["measurement_note"])
 
-    is_epic = bool(children and branch == epic_branch_for(task_id))
-    epic_parent_id = _epic_parent_id(conn, task_id)
+    is_epic = _is_epic_task(conn, task_id)
+    epic_id = epic_id_for_task(conn, task_id)
     if is_epic:
         target_branch = epic_branch_for(task_id)
         integrated_children = all(
@@ -10218,7 +10515,7 @@ def release_product_task(
             before_apply_fn=before_apply_fn,
         )
         integration_kinds = {"epic_merged"}
-    elif epic_parent_id is not None:
+    elif epic_id is not None:
         integration_status = integrate_story_to_epic(
             conn,
             task_id,
@@ -10493,7 +10790,7 @@ def notify_operations(
     epic = get_task(conn, epic_id)
     epic_title = epic.title if epic is not None else epic_id
     stories = []
-    for child_id in child_ids(conn, epic_id):
+    for child_id in list_epic_members(conn, epic_id):
         child = get_task(conn, child_id)
         stories.append({"id": child_id, "title": child.title if child is not None else None})
 
@@ -10873,7 +11170,7 @@ def handoff(
     next_assignee = _product_role_assignee(meta, next_role)
 
     try:
-        with write_txn(conn):
+        with authorized_governance_write(), write_txn(conn):
             sql = (
             # Release the completing worker's claim as part of the atomic advance:
             # the card is being handed to a NEW assignee, so the old claim is dead.
@@ -11259,14 +11556,14 @@ def reconcile(
         if outcome == "integrated":
             result.integrated.append(story_id)
             if merge_after_green:
-                epic_id = _epic_parent_id(conn, story_id)
+                epic_id = epic_id_for_task(conn, story_id)
                 if epic_id and epic_ready(conn, epic_id, board=board):
                     if merge_epic_to_main(conn, epic_id, board=board) == "merged":
                         result.merged_to_main.append(epic_id)
             break
         if merge_after_green:
             if outcome == "already_integrated":
-                epic_id = _epic_parent_id(conn, story_id)
+                epic_id = epic_id_for_task(conn, story_id)
                 if epic_id and epic_ready(conn, epic_id, board=board):
                     if merge_epic_to_main(conn, epic_id, board=board) == "merged":
                         result.merged_to_main.append(epic_id)

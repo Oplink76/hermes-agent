@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -37,6 +38,22 @@ def _signed_contract(request_id: str = "qi_example"):
                 "assignee": "developer",
                 "epic_id": None,
                 "dependencies": [],
+            },
+            "entry_assessment": {
+                "reason": "Earlier phases are already satisfied",
+                "skipped_phases": [
+                    {
+                        "phase": "backlog",
+                        "reason": "backlog evidence exists",
+                        "evidence": ["backlog-artifact"],
+                    },
+                    {
+                        "phase": "architecture",
+                        "reason": "architecture evidence exists",
+                        "evidence": ["architecture-artifact"],
+                    },
+                ],
+                "evidence": ["backlog-artifact", "architecture-artifact"],
             },
             "handover": {
                 "deliverables": [],
@@ -200,3 +217,305 @@ def test_epic_membership_has_one_parent_per_child(conn):
 
     with pytest.raises(sqlite3.IntegrityError):
         kb.add_epic_membership(conn, epic_id=epic_b, task_id=child)
+
+
+def test_strict_board_rejects_direct_task_insert_and_materializes_atomically(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.ensure_product_board_defaults("strict")
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    path_connection = kb.connect(db_path=kb.kanban_db_path(board="strict"))
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="qualification"):
+            kb.create_task(path_connection, title="explicit path bypass")
+    finally:
+        path_connection.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board="strict")))
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    env_connection = kb.connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="qualification"):
+            kb.create_task(env_connection, title="environment path bypass")
+    finally:
+        env_connection.close()
+
+    connection = kb.connect(board="strict")
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="qualification"):
+            connection.execute(
+                "INSERT INTO tasks (id, title, status, created_at) "
+                "VALUES ('t_direct', 'bypass', 'ready', 1)"
+            )
+
+        request_id = kb.create_qualification_intake(
+            connection,
+            raw_request="qualified request",
+            source="hermes",
+            attachments=[
+                {"name": "backlog-artifact"},
+                {"name": "architecture-artifact"},
+            ],
+        )
+        signed = _signed_contract(request_id)
+        task_id = intake.materialize_contract(
+            connection,
+            board="strict",
+            signed_contract=signed,
+            secret=b"test-only-secret",
+        )
+        task = kb.get_task(connection, task_id)
+
+        assert task is not None
+        assert task.work_contract_id is not None
+        assert task.work_item_kind == "card"
+        assert task.workflow_template_id == "product"
+        assert task.current_step_key == "development"
+        assert task.assignee == "developer"
+        assert kb.get_qualification_intake(connection, request_id)["status"] == "qualified"
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+        with pytest.raises(sqlite3.IntegrityError, match="Work Contract-owned"):
+            connection.execute(
+                "UPDATE tasks SET assignee = 'reviewer', current_step_key = 'review' "
+                "WHERE id = ?",
+                (task_id,),
+            )
+        assert kb.set_phase(connection, task_id, "test", board="strict")
+        assert kb.get_task(connection, task_id).current_step_key == "test"
+        with pytest.raises(sqlite3.IntegrityError, match="Work Contract-owned"):
+            connection.execute(
+                "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (task_id, task_id),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="Work Contract-owned"):
+            connection.execute(
+                "INSERT INTO epic_memberships (epic_id, task_id, created_at) "
+                "VALUES (?, ?, 1)",
+                (task_id, task_id),
+            )
+        assert (
+            intake.materialize_contract(
+                connection,
+                board="strict",
+                signed_contract=signed,
+                secret=b"test-only-secret",
+            )
+            == task_id
+        )
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+        with pytest.raises(PermissionError, match="strict-board"):
+            kb.delete_task(connection, task_id)
+        with pytest.raises(sqlite3.IntegrityError, match="strict-board"):
+            connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        with pytest.raises(PermissionError, match="strict-board"):
+            kb.archive_task(connection, task_id)
+        with pytest.raises(sqlite3.IntegrityError, match="strict-board"):
+            connection.execute(
+                "UPDATE tasks SET status = 'archived' WHERE id = ?", (task_id,)
+            )
+        with kb.authorized_governance_write():
+            assert kb.archive_task(connection, task_id)
+        with pytest.raises(PermissionError, match="strict-board"):
+            kb.delete_archived_task(connection, task_id)
+    finally:
+        connection.close()
+
+
+def test_epic_contract_materializes_as_non_executable_container(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.ensure_product_board_defaults("strict")
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    connection = kb.connect(board="strict")
+    try:
+        request_id = kb.create_qualification_intake(
+            connection, raw_request="epic outcome", source="hermes"
+        )
+        contract = _signed_contract(request_id)["contract"]
+        contract["work"]["item_kind"] = "epic"
+        contract["work"]["title"] = "Epic: qualification outcome"
+        contract["routing"] = {
+            "entry_phase": None,
+            "assignee": None,
+            "epic_id": None,
+            "dependencies": [],
+        }
+        signed = intake.sign_work_contract(contract, secret=b"test-only-secret")
+
+        epic_id = intake.materialize_contract(
+            connection,
+            board="strict",
+            signed_contract=signed,
+            secret=b"test-only-secret",
+        )
+        epic = kb.get_task(connection, epic_id)
+
+        assert epic.work_item_kind == "epic"
+        assert epic.status == "todo"
+        assert epic.assignee is None
+        assert epic.workflow_template_id is None
+        assert epic.current_step_key is None
+        assert kb.claim_task(connection, epic_id, board="strict") is None
+        assert kb.list_runs(connection, epic_id) == []
+    finally:
+        connection.close()
+
+
+def test_materialization_rolls_back_contract_and_decision_on_invalid_relationship(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.ensure_product_board_defaults("strict")
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    connection = kb.connect(board="strict")
+    try:
+        request_id = kb.create_qualification_intake(
+            connection,
+            raw_request="bad dependency",
+            source="hermes",
+            attachments=[
+                {"name": "backlog-artifact"},
+                {"name": "architecture-artifact"},
+            ],
+        )
+        contract = _signed_contract(request_id)["contract"]
+        contract["routing"]["dependencies"] = ["t_missing"]
+        signed = intake.sign_work_contract(contract, secret=b"test-only-secret")
+
+        with pytest.raises(ValueError, match="unknown parent"):
+            intake.materialize_contract(
+                connection,
+                board="strict",
+                signed_contract=signed,
+                secret=b"test-only-secret",
+            )
+
+        assert kb.get_qualification_intake(connection, request_id)["status"] == "pending"
+        assert kb.list_qualification_decisions(connection, request_id) == []
+        assert connection.execute("SELECT COUNT(*) FROM work_contracts").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_materialization_revalidates_late_entry_evidence_before_writing(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.ensure_product_board_defaults("strict")
+    with kb.connect(board="strict") as legacy_connection:
+        unrelated = kb.create_task(
+            legacy_connection, title="Unrelated evidence holder"
+        )
+        legacy_connection.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'tester', 'backlog-artifact architecture-artifact', 1)",
+            (unrelated,),
+        )
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    connection = kb.connect(board="strict")
+    try:
+        request_id = kb.create_qualification_intake(
+            connection, raw_request="late entry", source="hermes"
+        )
+        contract = _signed_contract(request_id)["contract"]
+        contract["entry_assessment"] = {
+            "reason": "Earlier phases are claimed complete",
+            "skipped_phases": [
+                {
+                    "phase": "backlog",
+                    "reason": "claimed evidence",
+                    "evidence": ["backlog-artifact"],
+                },
+                {
+                    "phase": "architecture",
+                    "reason": "claimed evidence",
+                    "evidence": ["architecture-artifact"],
+                },
+            ],
+            "evidence": ["backlog-artifact", "architecture-artifact"],
+        }
+        signed = intake.sign_work_contract(contract, secret=b"test-only-secret")
+
+        with pytest.raises(intake.WorkContractError, match="not grounded"):
+            intake.materialize_contract(
+                connection,
+                board="strict",
+                signed_contract=signed,
+                secret=b"test-only-secret",
+            )
+
+        assert kb.get_qualification_intake(connection, request_id)["status"] == "pending"
+        assert connection.execute("SELECT COUNT(*) FROM work_contracts").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_materialization_revalidates_product_owner_evidence_for_epics(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.ensure_product_board_defaults("strict")
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    connection = kb.connect(board="strict")
+    try:
+        request_id = kb.create_qualification_intake(
+            connection, raw_request="PO Epic", source="productowner"
+        )
+        contract = _signed_contract(request_id)["contract"]
+        contract["qualification_path"] = "po"
+        contract["work"]["item_kind"] = "epic"
+        contract["routing"] = {
+            "entry_phase": None,
+            "assignee": None,
+            "epic_id": None,
+            "dependencies": [],
+        }
+        contract["handover"]["next_phase"] = None
+        contract["handover"]["next_role"] = None
+        contract["po_evidence"] = {"run_id": 999, "artifact": "brief.md"}
+        signed = intake.sign_work_contract(contract, secret=b"test-only-secret")
+
+        with pytest.raises(intake.WorkContractError, match="Product Owner run"):
+            intake.materialize_contract(
+                connection,
+                board="strict",
+                signed_contract=signed,
+                secret=b"test-only-secret",
+            )
+
+        assert connection.execute("SELECT COUNT(*) FROM work_contracts").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        connection.close()

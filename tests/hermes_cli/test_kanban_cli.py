@@ -167,6 +167,33 @@ def test_run_slash_json_output(kanban_home):
     assert payload["status"] == "ready"
 
 
+def test_strict_board_create_returns_inert_intake_receipt(kanban_home):
+    kb.ensure_product_board_defaults("strict", switch=True)
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    payload = json.loads(
+        kc.run_slash(
+            "create 'unqualified request' --assignee developer "
+            "--parent t_missing --json"
+        )
+    )
+
+    assert payload == {
+        "status": "qualification_required",
+        "intake_id": payload["intake_id"],
+        "intake_status": "pending",
+    }
+    assert payload["intake_id"].startswith("qi_")
+    with kb.connect(board="strict") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        record = kb.get_qualification_intake(conn, payload["intake_id"])
+    assert "unqualified request" in record["raw_request"]
+    assert '"parents":["t_missing"]' in record["raw_request"]
+
+
 def test_run_slash_dispatch_dry_run_counts(kanban_home):
     kc.run_slash("create 'a' --assignee alice")
     kc.run_slash("create 'b' --assignee bob")

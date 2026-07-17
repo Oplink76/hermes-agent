@@ -215,6 +215,13 @@ def test_product_board_defaults_declare_policy_without_activating_it():
     assert defaults["qualification"] == kb.PRODUCT_QUALIFICATION_DEFAULTS
     assert defaults["qualification"]["required"] is False
     assert defaults["qualification"]["paths"] == ["po", "hermes"]
+    assert defaults["qualification"]["work_types"] == [
+        "story",
+        "bug",
+        "maintenance",
+        "ops",
+        "spike",
+    ]
 
 
 def test_profile_quick_snapshot_captures_and_restores_shared_signing_key(

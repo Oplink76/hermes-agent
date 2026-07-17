@@ -48,9 +48,10 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_cli import kanban_db
+from hermes_cli import kanban_intake
 from hermes_cli import kanban_diagnostics as kd
 
 log = logging.getLogger(__name__)
@@ -255,6 +256,7 @@ def _task_dict(
     ai_provenance: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
+    d["workItemKind"] = task.work_item_kind
     # Add derived age metrics so the UI can colour stale cards without
     # computing deltas client-side.
     try:
@@ -466,6 +468,139 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
     return {"parents": parents, "children": children}
 
 
+def _epic_summary_for_task(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[dict[str, str]]:
+    epic_id = kanban_db.epic_id_for_task(conn, task_id)
+    if epic_id is None:
+        return None
+    epic = kanban_db.get_task(conn, epic_id)
+    return {
+        "id": epic_id,
+        "title": epic.title if epic is not None else epic_id,
+    }
+
+
+def _work_contract_summary(
+    conn: sqlite3.Connection, contract_id: Optional[str]
+) -> Optional[dict[str, Any]]:
+    """Return the public contract view without canonical/signing material."""
+
+    if not contract_id:
+        return None
+    stored = kanban_db.get_work_contract(conn, contract_id)
+    if stored is None:
+        return None
+    contract = stored["contract"]
+    return {
+        "id": contract_id,
+        "digest": stored["digest"],
+        "version": contract["version"],
+        "policy_version": contract["policy_version"],
+        "qualification_path": contract["qualification_path"],
+        "request_id": contract["request_id"],
+        "work": contract["work"],
+        "routing": contract["routing"],
+        "entry_assessment": contract.get("entry_assessment"),
+        "handover": contract["handover"],
+        "rules": contract["rules"],
+        "classification": contract["classification"],
+        "issuer": contract["issuer"],
+    }
+
+
+class IntakeBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request: dict[str, Any]
+    session_id: Optional[str] = None
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+
+
+@router.post("/intake", status_code=202)
+def submit_intake(payload: IntakeBody, board: Optional[str] = Query(None)):
+    """Persist one inert request through Hermes' official intake boundary."""
+
+    board = _resolve_board(board)
+    metadata = kanban_db.read_board_metadata(board)
+    if not kanban_intake.qualification_required(metadata):
+        raise HTTPException(
+            status_code=409,
+            detail="This board does not require qualified intake",
+        )
+    conn = _conn(board=board)
+    try:
+        return kanban_intake.submit_intake(
+            conn,
+            request=payload.request,
+            source="dashboard-api",
+            session_id=payload.session_id,
+            attachments=tuple(payload.attachments),
+        )
+    finally:
+        conn.close()
+
+
+@router.get("/intake")
+def list_intake(
+    board: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),
+):
+    """Return the filtered, durable qualification inbox."""
+
+    if status is not None and status not in {
+        "pending",
+        "qualified",
+        "rejected",
+        "overridden",
+    }:
+        raise HTTPException(status_code=400, detail="unknown intake status")
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        items = kanban_db.list_qualification_intakes(conn, status=status)
+        if source is not None:
+            items = [item for item in items if item["source"] == source]
+        return {"items": items, "count": len(items)}
+    finally:
+        conn.close()
+
+
+@router.get("/intake/{intake_id}")
+def get_intake(intake_id: str, board: Optional[str] = Query(None)):
+    """Return intake, latest decision, safe contract summary, and work item."""
+
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        record = kanban_db.get_qualification_intake(conn, intake_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"intake {intake_id} not found")
+        decisions = kanban_db.list_qualification_decisions(conn, intake_id)
+        decision = decisions[-1] if decisions else None
+        contract_id = decision.get("contract_id") if decision else None
+        contract_summary = _work_contract_summary(conn, contract_id)
+        materialized_item = None
+        if contract_id:
+            row = conn.execute(
+                "SELECT id FROM tasks WHERE work_contract_id = ?", (contract_id,)
+            ).fetchone()
+            if row is not None:
+                task = kanban_db.get_task(conn, row["id"])
+                if task is not None:
+                    materialized_item = _task_dict(task)
+        return {
+            "intake": record,
+            "decision": decision,
+            "decisions": decisions,
+            "contract_summary": contract_summary,
+            "materialized_item": materialized_item,
+        }
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # GET /board
 # ---------------------------------------------------------------------------
@@ -503,8 +638,10 @@ def get_board(
         )
         # Pre-fetch link counts per task (cheap: one query).
         link_counts: dict[str, dict[str, int]] = {}
+        dependencies_by_task: dict[str, list[str]] = {}
+        dependents_by_task: dict[str, list[str]] = {}
         for row in conn.execute(
-            "SELECT parent_id, child_id FROM task_links"
+            "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
         ).fetchall():
             link_counts.setdefault(row["parent_id"], {"parents": 0, "children": 0})[
                 "children"
@@ -512,6 +649,19 @@ def get_board(
             link_counts.setdefault(row["child_id"], {"parents": 0, "children": 0})[
                 "parents"
             ] += 1
+            dependencies_by_task.setdefault(row["child_id"], []).append(row["parent_id"])
+            dependents_by_task.setdefault(row["parent_id"], []).append(row["child_id"])
+
+        epic_by_task = {
+            row["task_id"]: {"id": row["epic_id"], "title": row["title"]}
+            for row in conn.execute(
+                """
+                SELECT em.task_id, em.epic_id, e.title
+                  FROM epic_memberships em
+                  JOIN tasks e ON e.id = em.epic_id
+                """
+            ).fetchall()
+        }
 
         # Comment + event counts (both cheap aggregates).
         comment_counts: dict[str, int] = {
@@ -556,7 +706,18 @@ def get_board(
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
         provenance_map = kanban_db.latest_ai_provenance_by_task(conn, [t.id for t in tasks])
 
+        epics: list[dict[str, Any]] = []
         for t in tasks:
+            if t.work_item_kind == "epic":
+                epics.append(
+                    {
+                        "id": t.id,
+                        "title": t.title,
+                        "workItemKind": "epic",
+                        "progress": kanban_db.epic_progress(conn, t.id),
+                    }
+                )
+                continue
             full = summary_map.get(t.id)
             preview = (
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
@@ -567,6 +728,9 @@ def get_board(
                 ai_provenance=provenance_map.get(t.id),
             )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
+            d["epic"] = epic_by_task.get(t.id)
+            d["dependencies"] = dependencies_by_task.get(t.id, [])
+            d["dependents"] = dependents_by_task.get(t.id, [])
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
             diags = diagnostics_per_task.get(t.id)
@@ -608,6 +772,7 @@ def get_board(
 
         return {
             "columns": output_columns,
+            "epics": epics,
             "tenants": tenants,
             "assignees": assignees,
             "latest_event_id": int(latest_event_id),
@@ -682,12 +847,19 @@ def get_task(
         if diag_list:
             task_d["diagnostics"] = diag_list
             task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
-        return {
+        relations = {
+            "epic": _epic_summary_for_task(conn, task_id),
+            "dependencies": links["parents"],
+            "dependents": links["children"],
+        }
+        response = {
             "task": task_d,
+            "work_contract": _work_contract_summary(conn, task.work_contract_id),
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
             "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)],
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
             "links": links,
+            "relations": relations,
             "child_results": child_results,
             "runs": [
                 _run_dict(r)
@@ -699,6 +871,25 @@ def get_task(
                 )
             ],
         }
+        if task.work_item_kind == "epic":
+            members = kanban_db.list_epic_members(conn, task_id)
+            progress = kanban_db.epic_progress(conn, task_id)
+            response["members"] = members
+            response["progress"] = progress
+            contract = response["work_contract"] or {}
+            work = contract.get("work") or {}
+            handover = contract.get("handover") or {}
+            rules = contract.get("rules") or {}
+            response["epic_detail"] = {
+                "outcome": work.get("outcome") or task.body,
+                "scope": work.get("scope") or [],
+                "constraints": rules.get("forbidden") or [],
+                "definition_of_done": handover.get("done_when") or [],
+                "members": members,
+                "progress": progress,
+                "release_state": progress["release_state"],
+            }
+        return response
     finally:
         conn.close()
 
@@ -726,6 +917,8 @@ class _DeferredExpectedTaskSnapshotBody(BaseModel):
 
 
 class CreateTaskBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     title: str
     body: Optional[str] = None
     assignee: Optional[str] = None
@@ -750,6 +943,32 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        metadata = kanban_db.read_board_metadata(board)
+        if kanban_intake.qualification_required(metadata):
+            receipt = kanban_intake.submit_intake(
+                conn,
+                request={
+                    "title": payload.title,
+                    "body": payload.body,
+                    "assignee": payload.assignee,
+                    "tenant": payload.tenant,
+                    "priority": payload.priority,
+                    "workspace_kind": payload.workspace_kind,
+                    "workspace_path": payload.workspace_path,
+                    "parents": list(payload.parents),
+                    "triage": payload.triage,
+                    "idempotency_key": payload.idempotency_key,
+                    "max_runtime_seconds": payload.max_runtime_seconds,
+                    "skills": list(payload.skills or []),
+                    "goal_mode": payload.goal_mode,
+                    "goal_max_turns": payload.goal_max_turns,
+                    "project_id": payload.project_id,
+                    "workflow_template_id": payload.workflow_template_id,
+                    "current_step_key": payload.current_step_key,
+                },
+                source="dashboard",
+            )
+            return JSONResponse(status_code=202, content=receipt)
         task_id = kanban_db.create_task(
             conn,
             title=payload.title,
@@ -1030,6 +1249,31 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        if (
+            kanban_intake.qualification_required(
+                kanban_db.read_board_metadata(board)
+            )
+            and (
+                payload.status is not None
+                or payload.assignee is not None
+                or payload.priority is not None
+                or payload.title is not None
+                or payload.body is not None
+                or payload.result is not None
+                or payload.block_reason is not None
+                or payload.workflow_template_id is not None
+                or payload.current_step_key is not None
+                or payload.summary is not None
+                or payload.metadata is not None
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Strict-board card mutation is owned by the Work Contract "
+                    "and run-scoped engine handoff; submit a reassessment request instead"
+                ),
+            )
         try:
             updated = _patch_task(conn, task_id, payload, board=board)
         except _TaskSnapshotConflict as exc:
@@ -1058,6 +1302,16 @@ def delete_task(
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
+    if kanban_intake.qualification_required(
+        kanban_db.read_board_metadata(board)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Strict-board card lifecycle is owned by the Work Contract; "
+                "submit a reassessment request instead"
+            ),
+        )
     conn = _conn(board=board)
     try:
         try:
@@ -1694,6 +1948,11 @@ class DeleteLinkBody(_ExpectedTaskSnapshotBody):
 @router.post("/links")
 def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
+    if kanban_intake.qualification_required(kanban_db.read_board_metadata(board)):
+        raise HTTPException(
+            status_code=409,
+            detail="Strict-board dependencies are owned by the Work Contract",
+        )
     if payload.expected_task_id not in {payload.parent_id, payload.child_id}:
         raise HTTPException(status_code=400, detail="expected_task_id must be part of the link")
     conn = _conn(board=board)
@@ -1723,6 +1982,11 @@ def delete_link(
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
+    if kanban_intake.qualification_required(kanban_db.read_board_metadata(board)):
+        raise HTTPException(
+            status_code=409,
+            detail="Strict-board dependencies are owned by the Work Contract",
+        )
     if payload.expected_task_id not in {parent_id, child_id}:
         raise HTTPException(status_code=400, detail="expected_task_id must be part of the link")
     conn = _conn(board=board)
@@ -1777,6 +2041,15 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
         )
     results: list[dict] = []
     board = _resolve_board(board)
+    if kanban_intake.qualification_required(kanban_db.read_board_metadata(board)):
+        if payload.status is not None or payload.archive or payload.assignee is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Strict-board routing is Work Contract-owned and completion "
+                    "is run-scoped"
+                ),
+            )
     conn = _conn(board=board)
     conditional_txn = None
     try:

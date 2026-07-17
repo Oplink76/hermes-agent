@@ -32,7 +32,8 @@ def test_project_create_slash_sets_agent_seed_and_informative_ack(capsys):
     assert queued is not None
     assert "/project-create workflow request" in queued
     assert "Acme Intake" in queued
-    assert "Do not do project work that is not represented on the Kanban board" in queued
+    assert "Submit all executable work through qualification intake" in queued
+    assert "Do not submit trusted phase" in queued
     assert "Product Brief" in queued
     assert "MVP Brief" in queued
     assert "Product Owner work must run through the `productowner`" in queued
@@ -124,12 +125,11 @@ def test_project_create_seed_requires_product_v2_board_and_backlog_po_card():
     assert "expected product columns" in queued
     assert "hermes project create <project-name>" in queued
     assert "--board <slug>" in queued
-    assert "hermes kanban --board <slug> create" in queued
-    assert '"Wayfinder discovery: <project-name>"' in queued
-    assert "--workflow-template-id product" in queued
-    assert "--step-key backlog" in queued
-    assert 'workflow_template_id == "product"' in queued
-    assert 'current_step_key == "backlog"' in queued
+    assert "Submit the initial Wayfinder discovery request through qualification" in queued
+    assert "not through direct task/routing writes" in queued
+    assert "signed Work Contract" in queued
+    assert "backlog card" in queued
+    assert "hermes kanban --board <slug> create" not in queued
     assert ".worktrees/" in queued
     assert "decomposed WORK cards" in queued
     assert "CREATION" in queued
@@ -146,6 +146,8 @@ def test_project_import_seed_stays_dry_run_and_mentions_v2_apply_contract():
     assert "DRY RUN ONLY" in queued
     assert "Do not run --apply" in queued
     assert "--preset product" in queued
-    assert "--workflow-template-id product" in queued
-    assert "--step-key backlog" in queued
+    assert "qualification intake with Product Owner evidence" in queued
+    assert "must not write workflow/assignee routing directly" in queued
+    assert "--workflow-template-id product" not in queued
+    assert "--step-key backlog" not in queued
     assert "handoff_v2" in queued

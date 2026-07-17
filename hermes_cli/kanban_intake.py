@@ -12,15 +12,20 @@ import getpass
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from hermes_constants import get_default_hermes_root
+
+
+logger = logging.getLogger(__name__)
 
 
 CONTRACT_VERSION = 1
@@ -55,10 +60,36 @@ _REQUIRED_NESTED_FIELDS = {
 }
 _QUALIFICATION_PATHS = {"po", "hermes", "override"}
 _WORK_ITEM_KINDS = {"card", "epic"}
+_INTAKE_WAKERS: set[Callable[[], None]] = set()
+_INTAKE_WAKERS_LOCK = threading.Lock()
 
 
 class WorkContractError(ValueError):
     """The Work Contract is missing, invalid, or violates board policy."""
+
+
+def _register_intake_waker(callback: Callable[[], None]) -> None:
+    with _INTAKE_WAKERS_LOCK:
+        _INTAKE_WAKERS.add(callback)
+
+
+def _unregister_intake_waker(callback: Callable[[], None]) -> None:
+    with _INTAKE_WAKERS_LOCK:
+        _INTAKE_WAKERS.discard(callback)
+
+
+def _wake_intake_qualifier() -> None:
+    with _INTAKE_WAKERS_LOCK:
+        callbacks = tuple(_INTAKE_WAKERS)
+    for callback in callbacks:
+        try:
+            callback()
+        except Exception:
+            logger.warning(
+                "intake qualifier wake callback failed",
+                exc_info=True,
+            )
+            continue
 
 
 def _unsigned_contract(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -88,6 +119,18 @@ def _validate_contract_shape(contract: Mapping[str, Any]) -> None:
         raise WorkContractError("policy_version is required")
     if contract.get("qualification_path") not in _QUALIFICATION_PATHS:
         raise WorkContractError("qualification_path must be po, hermes, or override")
+    override_authority = contract.get("override_authority")
+    if contract.get("qualification_path") == "override":
+        if not isinstance(override_authority, Mapping) or not all(
+            isinstance(override_authority.get(field), str)
+            and override_authority.get(field).strip()
+            for field in ("reason", "source_session", "instruction_ref")
+        ):
+            raise WorkContractError(
+                "override contract requires reason, source session, and instruction reference"
+            )
+    elif override_authority is not None:
+        raise WorkContractError("override authority is only valid on override contracts")
     if not isinstance(contract.get("request_id"), str) or not contract["request_id"].strip():
         raise WorkContractError("request_id is required")
 
@@ -307,12 +350,37 @@ def materialization_fields(
     allowed_paths = policy.get("paths")
     if not isinstance(allowed_paths, (list, tuple)) or not allowed_paths:
         raise WorkContractError("strict board policy requires allowed qualification paths")
-    if contract.get("qualification_path") not in allowed_paths:
+    path = contract.get("qualification_path")
+    if path != "override" and path not in allowed_paths:
         raise WorkContractError(
-            f"qualification_path {contract.get('qualification_path')!r} is not allowed by board policy"
+            f"qualification_path {path!r} is not allowed by board policy"
         )
 
     routing = contract["routing"]
+    work = contract["work"]
+    if work["item_kind"] == "epic":
+        if routing["entry_phase"] is not None or routing["assignee"] is not None:
+            raise WorkContractError("Epic contracts cannot declare a phase or assignee")
+        if routing["epic_id"] is not None or routing["dependencies"]:
+            raise WorkContractError(
+                "Epic contracts cannot declare membership or dependencies"
+            )
+        fields.update(
+            {
+                "title": work["title"],
+                "body": work["outcome"],
+                "assignee": None,
+                "workflow_template_id": None,
+                "current_step_key": None,
+                "work_item_kind": "epic",
+                "epic_id": None,
+                "parents": [],
+                "classification": copy.deepcopy(contract["classification"]),
+                "contract_digest": signed_contract["digest"],
+            }
+        )
+        return fields
+
     phase = routing["entry_phase"]
     assignee = routing["assignee"]
     phase_assignees = policy.get("phase_assignees")
@@ -323,7 +391,6 @@ def materialization_fields(
             f"phase {phase!r} and assignee {assignee!r} are not an allowed phase/assignee pair"
         )
 
-    work = contract["work"]
     fields.update(
         {
             "title": work["title"],
@@ -339,3 +406,167 @@ def materialization_fields(
         }
     )
     return fields
+
+
+def qualification_required(board_metadata: Mapping[str, Any]) -> bool:
+    """Return whether executable work on this board requires qualification."""
+
+    policy = board_metadata.get("qualification")
+    return isinstance(policy, Mapping) and policy.get("required") is True
+
+
+def submit_intake(
+    conn: Any,
+    *,
+    request: Mapping[str, Any],
+    source: str,
+    session_id: Optional[str] = None,
+    attachments: tuple[dict[str, Any], ...] = (),
+) -> dict[str, Any]:
+    """Persist one untrusted create request and return a stable receipt."""
+
+    from hermes_cli import kanban_db
+
+    raw_request = json.dumps(
+        {"kind": "task_create", "request": copy.deepcopy(dict(request))},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+    intake_id = kanban_db.create_qualification_intake(
+        conn,
+        raw_request=raw_request,
+        source=source,
+        session_id=session_id,
+        attachments=attachments,
+    )
+    # Same-process gateway submissions wake the embedded qualifier now. Other
+    # processes are recovered by its normal bounded sweep.
+    _wake_intake_qualifier()
+    return {
+        "status": "qualification_required",
+        "intake_id": intake_id,
+        "intake_status": "pending",
+    }
+
+
+def materialize_contract(
+    conn: Any,
+    *,
+    board: str,
+    signed_contract: Mapping[str, Any],
+    secret: Optional[bytes] = None,
+    hermes_home: Optional[Path] = None,
+) -> str:
+    """Atomically turn one valid Work Contract into exactly one work item."""
+
+    from hermes_cli import kanban_db
+
+    metadata = kanban_db.read_board_metadata(board)
+    if not qualification_required(metadata):
+        raise WorkContractError("contract materialization requires a strict board")
+    fields = materialization_fields(
+        metadata,
+        signed_contract=signed_contract,
+        secret=secret,
+        hermes_home=hermes_home,
+    )
+    contract = signed_contract["contract"]
+    request_id = contract["request_id"]
+
+    with kanban_db.write_txn(conn):
+        existing = conn.execute(
+            """
+            SELECT tasks.id
+            FROM tasks
+            JOIN work_contracts ON work_contracts.id = tasks.work_contract_id
+            WHERE work_contracts.digest = ?
+            """,
+            (signed_contract["digest"],),
+        ).fetchone()
+        if existing:
+            return str(existing["id"])
+
+        intake_record = kanban_db.get_qualification_intake(conn, request_id)
+        if intake_record is None:
+            raise WorkContractError(f"unknown qualification intake: {request_id}")
+        allowed_intake_statuses = (
+            {"pending", "rejected"}
+            if contract["qualification_path"] == "override"
+            else {"pending"}
+        )
+        if intake_record["status"] not in allowed_intake_statuses:
+            raise WorkContractError(
+                f"qualification intake {request_id} is already {intake_record['status']}"
+            )
+
+        from hermes_cli import kanban_qualifier
+
+        try:
+            kanban_qualifier.revalidate_contract_evidence(
+                conn,
+                board_metadata=metadata,
+                intake=intake_record,
+                contract=contract,
+            )
+        except kanban_qualifier.QualificationValidationError as exc:
+            raise WorkContractError(str(exc)) from exc
+
+        contract_id = kanban_db.store_work_contract(
+            conn,
+            dict(signed_contract),
+            secret=secret,
+            hermes_home=hermes_home,
+        )
+
+        is_override = contract["qualification_path"] == "override"
+        override_authority = contract.get("override_authority") or {}
+        decision_reason = "Work Contract validated and materialized"
+        if is_override:
+            decision_reason = (
+                "Authenticated Ole-to-Hermes override; "
+                f"session={override_authority['source_session']}; "
+                f"instruction={override_authority['instruction_ref']}; "
+                f"reason={override_authority['reason']}"
+            )
+        kanban_db.record_qualification_decision(
+            conn,
+            intake_id=request_id,
+            decision="overridden" if is_override else "qualified",
+            actor_profile=str(contract["issuer"]["profile"]),
+            reason=decision_reason,
+            contract_id=contract_id,
+        )
+        with kanban_db.authorized_governance_write():
+            task_id = kanban_db.create_task(
+                conn,
+                title=str(fields["title"]),
+                body=str(fields["body"]),
+                assignee=fields["assignee"],
+                created_by="hermes-qualification",
+                parents=tuple(fields["parents"]),
+                board=board,
+                workflow_template_id=fields["workflow_template_id"],
+                current_step_key=fields["current_step_key"],
+                work_contract_id=contract_id,
+                work_item_kind=fields["work_item_kind"],
+            )
+            epic_id = fields.get("epic_id")
+            if epic_id:
+                kanban_db.add_epic_membership(
+                    conn, epic_id=str(epic_id), task_id=task_id
+                )
+        kanban_db._append_event(
+            conn,
+            task_id,
+            "contract_materialized",
+            {
+                "request_id": request_id,
+                "work_contract_id": contract_id,
+                "contract_digest": fields["contract_digest"],
+                "qualification_path": contract["qualification_path"],
+                "classification": fields["classification"],
+            },
+        )
+    return task_id

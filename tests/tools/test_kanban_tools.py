@@ -247,6 +247,28 @@ def test_show_explicit_task_id(worker_env):
     assert d["task"]["id"] == other
 
 
+def test_show_separates_epic_membership_from_dependencies(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        epic = kb.create_task(conn, title="Outcome", work_item_kind="epic")
+        dependency = kb.create_task(conn, title="Dependency")
+        card = kb.create_task(conn, title="Member")
+        kb.add_epic_membership(conn, epic_id=epic, task_id=card)
+        kb.link_tasks(conn, dependency, card)
+
+    shown = json.loads(kt._handle_show({"task_id": card}))
+    assert shown["task"]["work_item_kind"] == "card"
+    assert shown["epic"] == {"id": epic, "title": "Outcome"}
+    assert shown["dependencies"] == [dependency]
+    assert shown["dependents"] == []
+
+    epic_shown = json.loads(kt._handle_show({"task_id": epic}))
+    assert epic_shown["task"]["work_item_kind"] == "epic"
+    assert epic_shown["members"] == [card]
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
@@ -2312,6 +2334,44 @@ def test_board_param_routes_create_to_alt_board(multi_board_env):
     # Does NOT land on default board.
     with kb.connect() as conn:
         assert kb.get_task(conn, new_tid) is None
+
+
+def test_strict_board_worker_create_returns_inert_intake(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    kb.ensure_product_board_defaults("strict")
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    result = json.loads(
+        kt._handle_create(
+            {
+                "title": "worker-proposed fix",
+                "assignee": "developer",
+                "parents": ["t_worker"],
+                "board": "strict",
+                "current_step_key": "review",
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "qualification_required"
+    assert result["intake_status"] == "pending"
+    assert result["intake_id"].startswith("qi_")
+    assert "task_id" not in result
+    with kb.connect(board="strict") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        record = kb.get_qualification_intake(conn, result["intake_id"])
+    assert "worker-proposed fix" in record["raw_request"]
 
 
 def test_board_param_routes_list_to_alt_board(multi_board_env):

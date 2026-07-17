@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_intake
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.profiles import get_active_profile_name
 
@@ -1356,7 +1357,45 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect_closing() as conn:
+    board = getattr(args, "board", None)
+    with kb.connect_closing(board=board) as conn:
+        metadata = kb.read_board_metadata(board or kb.get_current_board())
+        if kanban_intake.qualification_required(metadata):
+            receipt = kanban_intake.submit_intake(
+                conn,
+                request={
+                    "title": args.title,
+                    "body": args.body,
+                    "assignee": args.assignee,
+                    "workspace_kind": ws_kind,
+                    "workspace_path": ws_path,
+                    "branch_name": branch_name,
+                    "project_id": getattr(args, "project", None),
+                    "tenant": args.tenant,
+                    "priority": args.priority,
+                    "parents": list(args.parent or ()),
+                    "triage": bool(getattr(args, "triage", False)),
+                    "idempotency_key": getattr(args, "idempotency_key", None),
+                    "max_runtime_seconds": max_runtime,
+                    "skills": getattr(args, "skills", None) or [],
+                    "max_retries": max_retries,
+                    "goal_mode": bool(getattr(args, "goal_mode", False)),
+                    "goal_max_turns": getattr(args, "goal_max_turns", None),
+                    "initial_status": getattr(args, "initial_status", "running"),
+                    "workflow_template_id": getattr(args, "workflow_template_id", None),
+                    "current_step_key": getattr(args, "current_step_key", None),
+                },
+                source="cli",
+                session_id=os.environ.get("HERMES_SESSION_ID"),
+            )
+            if getattr(args, "json", False):
+                print(json.dumps(receipt, indent=2, ensure_ascii=False))
+            else:
+                print(
+                    "Qualification required; request stored as "
+                    f"{receipt['intake_id']} (pending)."
+                )
+            return 0
         try:
             task_id = kb.create_task(
                 conn,
@@ -1379,7 +1418,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 initial_status=getattr(args, "initial_status", "running"),
-                board=getattr(args, "board", None),
+                board=board,
                 workflow_template_id=getattr(args, "workflow_template_id", None),
                 current_step_key=getattr(args, "current_step_key", None),
             )
@@ -1656,6 +1695,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
     with kb.connect_closing() as conn:
+        if kanban_intake.qualification_required(
+            kb.read_board_metadata(kb.get_current_board())
+        ):
+            print(
+                "kanban: strict-board assignees are owned by the Work Contract",
+                file=sys.stderr,
+            )
+            return 2
         ok = kb.assign_task(conn, args.task_id, profile)
     if not ok:
         print(f"no such task: {args.task_id}", file=sys.stderr)
@@ -1683,6 +1730,14 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
     with kb.connect_closing() as conn:
+        if kanban_intake.qualification_required(
+            kb.read_board_metadata(kb.get_current_board())
+        ):
+            print(
+                "kanban: strict-board assignees are owned by the Work Contract",
+                file=sys.stderr,
+            )
+            return 2
         ok = kb.reassign_task(
             conn, args.task_id, profile,
             reclaim_first=bool(getattr(args, "reclaim", False)),
@@ -1836,6 +1891,14 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
 def _cmd_link(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
+        if kanban_intake.qualification_required(
+            kb.read_board_metadata(kb.get_current_board())
+        ):
+            print(
+                "kanban: strict-board dependencies are owned by the Work Contract",
+                file=sys.stderr,
+            )
+            return 2
         kb.link_tasks(conn, args.parent_id, args.child_id)
     print(f"Linked {args.parent_id} -> {args.child_id}")
     return 0
@@ -1843,6 +1906,14 @@ def _cmd_link(args: argparse.Namespace) -> int:
 
 def _cmd_unlink(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
+        if kanban_intake.qualification_required(
+            kb.read_board_metadata(kb.get_current_board())
+        ):
+            print(
+                "kanban: strict-board dependencies are owned by the Work Contract",
+                file=sys.stderr,
+            )
+            return 2
         ok = kb.unlink_tasks(conn, args.parent_id, args.child_id)
     if not ok:
         print(f"No such link: {args.parent_id} -> {args.child_id}", file=sys.stderr)
