@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
@@ -18,6 +20,64 @@ from hermes_cli import kanban_db, kanban_intake
 
 DEFAULT_WORK_TYPES = ("story", "bug", "maintenance", "ops", "spike")
 _TERMINAL_RUN_STATUSES = {"done", "released"}
+_GATEWAY_OVERRIDE_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class _GatewayOverrideAuthority:
+    intake_id: str
+    reason: str
+    source_session: str
+    instruction_ref: str
+    instruction_text: str
+    token: object
+
+
+def _new_gateway_override_authority(
+    *,
+    intake_id: str,
+    instruction_text: str,
+    reason: str,
+    source_session: str,
+    instruction_ref: str,
+) -> _GatewayOverrideAuthority:
+    """Mint the in-process capability used only by the authenticated gateway."""
+
+    values = (intake_id, instruction_text, reason, source_session, instruction_ref)
+    if not all(isinstance(value, str) and value.strip() for value in values):
+        raise kanban_intake.WorkContractError(
+            "override requires an authenticated Ole-to-Hermes instruction"
+        )
+    if not re.search(r"\boverride\b", instruction_text, re.IGNORECASE):
+        raise kanban_intake.WorkContractError(
+            "override requires an authenticated Ole-to-Hermes instruction"
+        )
+    if intake_id.lower() not in instruction_text.lower():
+        raise kanban_intake.WorkContractError(
+            "override instruction must name the target intake"
+        )
+    return _GatewayOverrideAuthority(
+        intake_id=intake_id,
+        reason=reason.strip(),
+        source_session=source_session.strip(),
+        instruction_ref=instruction_ref.strip(),
+        instruction_text=instruction_text.strip(),
+        token=_GATEWAY_OVERRIDE_TOKEN,
+    )
+
+
+def _validated_override_authority(
+    authority: object, *, intake_id: str
+) -> _GatewayOverrideAuthority:
+    if (
+        not isinstance(authority, _GatewayOverrideAuthority)
+        or authority.token is not _GATEWAY_OVERRIDE_TOKEN
+        or authority.intake_id != intake_id
+    ):
+        raise kanban_intake.WorkContractError(
+            "override requires an authenticated Ole-to-Hermes instruction"
+        )
+    return authority
 
 
 class QualificationValidationError(ValueError):
@@ -445,9 +505,15 @@ def qualify_intake(
     secret: Optional[bytes] = None,
     hermes_home: Optional[Path] = None,
     issued_at: Optional[int] = None,
+    _override_authority: Optional[object] = None,
 ) -> dict[str, Any]:
     """Qualify one pending intake, retrying one invalid model proposal once."""
 
+    override_authority = (
+        _validated_override_authority(_override_authority, intake_id=intake_id)
+        if _override_authority is not None
+        else None
+    )
     intake_record = kanban_db.get_qualification_intake(conn, intake_id)
     if intake_record is None:
         raise ValueError(f"unknown qualification intake: {intake_id}")
@@ -464,8 +530,19 @@ def qualify_intake(
             intake=intake_record,
             validation_errors=validation_errors,
         )
+        if override_authority is not None:
+            prompt += (
+                "\n\nAUTHENTICATED BREAK-GLASS INSTRUCTION:\n"
+                + override_authority.instruction_text
+                + "\nThe founder requires this intake to proceed. Propose a legal Hermes-path "
+                "contract using only real evidence. Do not claim Test, Review, Done, "
+                "merge, or release evidence that is not in the authoritative input."
+            )
         try:
             proposed = _parse_model_result(caller(prompt))
+            if override_authority is not None and proposed.get("qualification_path") == "override":
+                proposed = copy.deepcopy(dict(proposed))
+                proposed["qualification_path"] = "hermes"
             decision = validate_decision(
                 conn,
                 board_metadata=metadata,
@@ -476,7 +553,11 @@ def qualify_intake(
             validation_errors = exc.errors
             continue
 
-        qualification_path = str(decision["qualification_path"])
+        qualification_path = (
+            "override"
+            if override_authority is not None
+            else str(decision["qualification_path"])
+        )
         po_evidence = decision.get("po_evidence")
         if qualification_path == "po" and isinstance(po_evidence, Mapping):
             run_id = int(po_evidence["run_id"])
@@ -511,6 +592,12 @@ def qualify_intake(
         }
         if qualification_path == "po":
             contract["po_evidence"] = copy.deepcopy(decision["po_evidence"])
+        if override_authority is not None:
+            contract["override_authority"] = {
+                "reason": override_authority.reason,
+                "source_session": override_authority.source_session,
+                "instruction_ref": override_authority.instruction_ref,
+            }
         try:
             signed = kanban_intake.sign_work_contract(
                 contract, secret=secret, hermes_home=hermes_home
@@ -526,7 +613,7 @@ def qualify_intake(
             hermes_home=hermes_home,
         )
         return {
-            "status": "qualified",
+            "status": "overridden" if override_authority is not None else "qualified",
             "intake_id": intake_id,
             "task_id": task_id,
             "contract_digest": signed["digest"],
@@ -541,3 +628,30 @@ def qualify_intake(
         reason=reason,
     )
     return {"status": "rejected", "intake_id": intake_id, "reason": reason}
+
+
+def override_intake(
+    conn: Any,
+    *,
+    board: str,
+    intake_id: str,
+    authority: object,
+    model_call: Optional[Callable[[str], Any]] = None,
+    secret: Optional[bytes] = None,
+    hermes_home: Optional[Path] = None,
+    issued_at: Optional[int] = None,
+) -> dict[str, Any]:
+    """Apply one authenticated Ole-to-Hermes break-glass instruction."""
+
+    _validated_override_authority(authority, intake_id=intake_id)
+    return qualify_intake(
+        conn,
+        board=board,
+        intake_id=intake_id,
+        model_call=model_call,
+        actor_profile="hermes",
+        secret=secret,
+        hermes_home=hermes_home,
+        issued_at=issued_at,
+        _override_authority=authority,
+    )

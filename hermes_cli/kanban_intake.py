@@ -88,6 +88,18 @@ def _validate_contract_shape(contract: Mapping[str, Any]) -> None:
         raise WorkContractError("policy_version is required")
     if contract.get("qualification_path") not in _QUALIFICATION_PATHS:
         raise WorkContractError("qualification_path must be po, hermes, or override")
+    override_authority = contract.get("override_authority")
+    if contract.get("qualification_path") == "override":
+        if not isinstance(override_authority, Mapping) or not all(
+            isinstance(override_authority.get(field), str)
+            and override_authority.get(field).strip()
+            for field in ("reason", "source_session", "instruction_ref")
+        ):
+            raise WorkContractError(
+                "override contract requires reason, source session, and instruction reference"
+            )
+    elif override_authority is not None:
+        raise WorkContractError("override authority is only valid on override contracts")
     if not isinstance(contract.get("request_id"), str) or not contract["request_id"].strip():
         raise WorkContractError("request_id is required")
 
@@ -307,9 +319,10 @@ def materialization_fields(
     allowed_paths = policy.get("paths")
     if not isinstance(allowed_paths, (list, tuple)) or not allowed_paths:
         raise WorkContractError("strict board policy requires allowed qualification paths")
-    if contract.get("qualification_path") not in allowed_paths:
+    path = contract.get("qualification_path")
+    if path != "override" and path not in allowed_paths:
         raise WorkContractError(
-            f"qualification_path {contract.get('qualification_path')!r} is not allowed by board policy"
+            f"qualification_path {path!r} is not allowed by board policy"
         )
 
     routing = contract["routing"]
@@ -449,12 +462,22 @@ def materialize_contract(
                 f"qualification intake {request_id} is already {intake_record['status']}"
             )
 
+        is_override = contract["qualification_path"] == "override"
+        override_authority = contract.get("override_authority") or {}
+        decision_reason = "Work Contract validated and materialized"
+        if is_override:
+            decision_reason = (
+                "Authenticated Ole-to-Hermes override; "
+                f"session={override_authority['source_session']}; "
+                f"instruction={override_authority['instruction_ref']}; "
+                f"reason={override_authority['reason']}"
+            )
         kanban_db.record_qualification_decision(
             conn,
             intake_id=request_id,
-            decision="qualified",
+            decision="overridden" if is_override else "qualified",
             actor_profile=str(contract["issuer"]["profile"]),
-            reason="Work Contract validated and materialized",
+            reason=decision_reason,
             contract_id=contract_id,
         )
         with kanban_db.authorized_governance_write():

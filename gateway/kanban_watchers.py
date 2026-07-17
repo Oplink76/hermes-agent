@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -23,6 +24,67 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+
+def _process_pending_qualification_intakes(
+    _kb,
+    conn,
+    *,
+    board: str,
+    per_tick: int,
+    qualify=None,
+) -> dict[str, int]:
+    """Process a bounded pending-intake batch before normal dispatch."""
+
+    if qualify is None:
+        from hermes_cli.kanban_qualifier import qualify_intake as qualify
+
+    limit = max(1, int(per_tick))
+    pending = _kb.list_qualification_intakes(conn, status="pending")[:limit]
+    counts = {"attempted": 0, "qualified": 0, "rejected": 0, "failed": 0}
+    for intake in pending:
+        intake_id = str(intake["id"])
+        counts["attempted"] += 1
+        try:
+            result = qualify(conn, board=board, intake_id=intake_id)
+        except Exception:
+            counts["failed"] += 1
+            logger.exception(
+                "kanban qualification [%s]: infrastructure failure for %s; "
+                "leaving intake pending for the next sweep",
+                board,
+                intake_id,
+            )
+            continue
+        status = str(result.get("status") or "")
+        if status in {"qualified", "overridden"}:
+            counts["qualified"] += 1
+        elif status == "rejected":
+            counts["rejected"] += 1
+    return counts
+
+
+def _qualify_then_dispatch(
+    _kb,
+    conn,
+    slug: str,
+    *,
+    qualification_per_tick: int,
+    qualify=None,
+    **dispatch_kwargs,
+):
+    """Materialize governed intake before the board can dispatch it."""
+
+    _process_pending_qualification_intakes(
+        _kb,
+        conn,
+        board=slug,
+        per_tick=qualification_per_tick,
+        qualify=qualify,
+    )
+    return _dispatch_once_then_reconcile(
+        _kb, conn, slug, **dispatch_kwargs
+    )
 
 
 def _resolve_auto_decompose_settings(
@@ -160,6 +222,102 @@ def _release_singleton_lock(handle) -> None:
 
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
+
+    async def _kanban_override_instruction(
+        self, event: Any, session_key: str
+    ) -> Optional[str]:
+        """Apply a direct, authenticated home-channel override instruction.
+
+        This is deliberately a gateway-only capability.  It is not registered
+        as a model tool and has no CLI or HTTP route.
+        """
+
+        text = str(getattr(event, "text", "") or "").strip()
+        intake_match = re.search(r"\bqi_[0-9a-f]{16}\b", text, re.IGNORECASE)
+        if not intake_match or not re.search(r"\boverride\b", text, re.IGNORECASE):
+            return None
+
+        source = getattr(event, "source", None)
+        if (
+            source is None
+            or bool(getattr(event, "internal", False))
+            or getattr(source, "chat_type", None) != "dm"
+        ):
+            return None
+        home = self.config.get_home_channel(source.platform)
+        if home is None or str(home.chat_id) != str(source.chat_id):
+            return None
+        if home.thread_id and str(home.thread_id) != str(source.thread_id or ""):
+            return None
+
+        instruction_ref = str(
+            getattr(event, "message_id", None)
+            or getattr(source, "message_id", None)
+            or ""
+        ).strip()
+        if not instruction_ref:
+            return "Override denied: the source message has no auditable instruction reference."
+
+        intake_id = intake_match.group(0).lower()
+        reason = re.sub(r"\boverride\b", "", text, count=1, flags=re.IGNORECASE)
+        reason = reason.replace(intake_match.group(0), "", 1).strip(" \t:-—")
+        reason = re.sub(r"^(because|reason)\s*[:=-]?\s*", "", reason, flags=re.IGNORECASE)
+        if not reason:
+            return f"Override {intake_id} needs a reason in the same direct instruction."
+
+        source_session = ""
+        session_store = getattr(self, "session_store", None)
+        if session_store is not None:
+            try:
+                source_session = session_store.peek_session_id(session_key) or ""
+            except Exception:
+                source_session = ""
+        source_session = str(source_session or session_key).strip()
+
+        def _apply() -> dict[str, Any]:
+            from hermes_cli import kanban_db as _kb
+            from hermes_cli import kanban_qualifier as _qualifier
+
+            try:
+                boards = _kb.list_boards(include_archived=False)
+            except Exception:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            for board_meta in boards:
+                slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                conn = _kb.connect(board=slug)
+                try:
+                    if _kb.get_qualification_intake(conn, intake_id) is None:
+                        continue
+                    authority = _qualifier._new_gateway_override_authority(
+                        intake_id=intake_id,
+                        instruction_text=text,
+                        reason=reason,
+                        source_session=source_session,
+                        instruction_ref=instruction_ref,
+                    )
+                    return _qualifier.override_intake(
+                        conn,
+                        board=slug,
+                        intake_id=intake_id,
+                        authority=authority,
+                    )
+                finally:
+                    conn.close()
+            return {"status": "not_found", "intake_id": intake_id}
+
+        try:
+            result = await asyncio.to_thread(_apply)
+        except Exception as exc:
+            logger.exception("kanban override failed for %s", intake_id)
+            return f"Override was not applied to {intake_id}: {exc}"
+        if result.get("status") == "overridden":
+            return (
+                f"Override applied to {intake_id}. Governed task "
+                f"{result.get('task_id')} was materialized."
+            )
+        if result.get("status") == "not_found":
+            return f"Override was not applied: intake {intake_id} was not found."
+        return f"Override was not applied to {intake_id}: {result.get('reason') or result.get('status')}"
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
@@ -890,6 +1048,14 @@ class GatewayKanbanWatchersMixin:
             interval = 60.0
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
+        try:
+            qualification_per_tick = int(
+                kanban_cfg.get("qualification_per_tick", 3) or 3
+            )
+        except (TypeError, ValueError):
+            qualification_per_tick = 3
+        qualification_per_tick = max(1, qualification_per_tick)
+
         # Read max_spawn config to limit concurrent kanban tasks
         max_spawn = kanban_cfg.get("max_spawn", None)
         if max_spawn is not None:
@@ -1077,10 +1243,11 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
-                return _dispatch_once_then_reconcile(
+                return _qualify_then_dispatch(
                     _kb,
                     conn,
                     slug,
+                    qualification_per_tick=qualification_per_tick,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
