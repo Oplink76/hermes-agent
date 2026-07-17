@@ -165,8 +165,8 @@ class GatewayKanbanWatchersMixin:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
-        stored cursor with kind in the terminal set (``completed``,
-        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``). Sends one
+        stored cursor with a subscribed notification kind (terminal state
+        changes plus the non-terminal ``needs_ole`` repair audit). Sends one
         message per new event to ``(platform, chat_id, thread_id)``,
         then advances the cursor. When a task reaches a terminal state
         (``completed`` / ``archived``), the subscription is removed.
@@ -213,7 +213,10 @@ class GatewayKanbanWatchersMixin:
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+        TERMINAL_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "status", "archived", "unblocked", "needs_ole",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -445,6 +448,18 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("status"):
                                 new_status = str(ev.payload["status"])
                             msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
+                        elif kind == "needs_ole":
+                            payload = ev.payload or {}
+                            resolver = str(
+                                payload.get("resolver_profile") or "resolver"
+                            )[:80]
+                            diagnosis = str(
+                                payload.get("diagnosis") or "Resolver repair applied"
+                            )[:240]
+                            msg = (
+                                f"⚠️ {board_tag}Kanban {sub['task_id']} Resolver audit"
+                                f" — {title}\nResolver: {resolver}\nDiagnosis: {diagnosis}"
+                            )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
                             # (so the cursor advances past them and they can't
