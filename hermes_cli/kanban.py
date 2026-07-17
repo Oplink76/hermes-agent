@@ -228,6 +228,26 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- init ---
     sub.add_parser("init", help="Create kanban.db if missing (idempotent)")
 
+    # --- qualification-migrate ---
+    p_qualification_migrate = sub.add_parser(
+        "qualification-migrate",
+        help="Audit or migrate a legacy product board into strict qualification",
+    )
+    qualification_mode = p_qualification_migrate.add_mutually_exclusive_group()
+    qualification_mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Snapshot, backfill safe legacy work, and enable strict qualification",
+    )
+    qualification_mode.add_argument(
+        "--rollback",
+        metavar="<receipt.json>",
+        help="Restore a migration's immutable pre-apply snapshot",
+    )
+    p_qualification_migrate.add_argument(
+        "--json", action="store_true", help="Emit the full machine-readable result"
+    )
+
     # --- boards (new in v2: multi-project support) ---
     p_boards = sub.add_parser(
         "boards",
@@ -957,6 +977,7 @@ def kanban_command(args: argparse.Namespace) -> int:
 
         handlers = {
             "init":     _cmd_init,
+            "qualification-migrate": _cmd_qualification_migrate,
             "create":   _cmd_create,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
@@ -1297,6 +1318,41 @@ def _cmd_init(args: argparse.Namespace) -> int:
         "by default (config: kanban.dispatch_interval_seconds). Without a\n"
         "running gateway, tasks stay in 'ready' forever."
     )
+    return 0
+
+
+def _cmd_qualification_migrate(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_qualification_migrate as migration
+
+    if args.rollback:
+        result = migration.rollback_receipt(Path(args.rollback))
+    else:
+        board = kb.get_current_board()
+        result = (
+            migration.apply_board(board)
+            if args.apply
+            else migration.audit_board(board)
+        )
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    elif args.rollback:
+        print(
+            f"Restored {result['board']!r} from {result['source_receipt']}. "
+            f"Rollback receipt: {result['rollback_receipt']}"
+        )
+    elif args.apply:
+        print(
+            f"Migrated {result['board']!r}: {result['changed']} item(s) backfilled; "
+            f"strict qualification enabled. Receipt: {result['receipt_path']}"
+        )
+    else:
+        counts = result["counts"]
+        print(
+            f"Qualification dry-run for {result['board']!r}: "
+            f"{counts['items']} item(s), {counts['safe']} safe, "
+            f"{counts['running']} running, {counts['ambiguous']} ambiguous."
+        )
+        print("Ready to apply." if result["strict_ready"] else "Not safe to apply.")
     return 0
 
 
