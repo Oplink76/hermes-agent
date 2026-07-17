@@ -408,7 +408,8 @@ def test_resolve_schema_is_strict_and_bounded():
 
     params = kt.KANBAN_RESOLVE_SCHEMA["parameters"]
     assert params["required"] == [
-        "decision", "fault_domain", "diagnosis", "reason", "expected",
+        "task_id", "decision", "fault_domain", "diagnosis", "reason",
+        "expected",
     ]
     assert params["additionalProperties"] is False
     assert params["properties"]["decision"]["enum"] == [
@@ -1673,6 +1674,7 @@ def test_resolver_tool_resumes_release_preflight(
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resolver.current_run_id))
 
     out = json.loads(kt._handle_resolve({
+        "task_id": tid,
         "decision": "resume",
         "fault_domain": "task_state",
         "diagnosis": "The release confirmation already exists.",

@@ -1730,7 +1730,8 @@ KANBAN_RESOLVE_SCHEMA = {
             "fix_task_id": {"type": "string"},
         },
         "required": [
-            "decision", "fault_domain", "diagnosis", "reason", "expected",
+            "task_id", "decision", "fault_domain", "diagnosis", "reason",
+            "expected",
         ],
         "additionalProperties": False,
     },
