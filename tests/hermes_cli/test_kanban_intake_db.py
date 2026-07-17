@@ -215,6 +215,13 @@ def test_strict_board_rejects_direct_task_insert_and_materializes_atomically(
     metadata["qualification"]["required"] = True
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
+    path_connection = kb.connect(db_path=kb.kanban_db_path(board="strict"))
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="qualification"):
+            kb.create_task(path_connection, title="explicit path bypass")
+    finally:
+        path_connection.close()
+
     connection = kb.connect(board="strict")
     try:
         with pytest.raises(sqlite3.IntegrityError, match="qualification"):
@@ -272,6 +279,51 @@ def test_strict_board_rejects_direct_task_insert_and_materializes_atomically(
             == task_id
         )
         assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_epic_contract_materializes_as_non_executable_container(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.ensure_product_board_defaults("strict")
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    connection = kb.connect(board="strict")
+    try:
+        request_id = kb.create_qualification_intake(
+            connection, raw_request="epic outcome", source="hermes"
+        )
+        contract = _signed_contract(request_id)["contract"]
+        contract["work"]["item_kind"] = "epic"
+        contract["work"]["title"] = "Epic: qualification outcome"
+        contract["routing"] = {
+            "entry_phase": None,
+            "assignee": None,
+            "epic_id": None,
+            "dependencies": [],
+        }
+        signed = intake.sign_work_contract(contract, secret=b"test-only-secret")
+
+        epic_id = intake.materialize_contract(
+            connection,
+            board="strict",
+            signed_contract=signed,
+            secret=b"test-only-secret",
+        )
+        epic = kb.get_task(connection, epic_id)
+
+        assert epic.work_item_kind == "epic"
+        assert epic.status == "todo"
+        assert epic.assignee is None
+        assert epic.workflow_template_id is None
+        assert epic.current_step_key is None
+        assert kb.claim_task(connection, epic_id, board="strict") is None
+        assert kb.list_runs(connection, epic_id) == []
     finally:
         connection.close()
 

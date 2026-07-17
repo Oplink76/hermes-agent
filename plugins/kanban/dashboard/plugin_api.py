@@ -1059,25 +1059,29 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        lifecycle_statuses = {
-            None, "done", "blocked", "scheduled", "ready", "archived", "running"
-        }
         if (
             kanban_intake.qualification_required(
                 kanban_db.read_board_metadata(board)
             )
             and (
-                payload.assignee is not None
+                payload.status is not None
+                or payload.assignee is not None
+                or payload.priority is not None
+                or payload.title is not None
+                or payload.body is not None
+                or payload.result is not None
+                or payload.block_reason is not None
                 or payload.workflow_template_id is not None
                 or payload.current_step_key is not None
-                or payload.status not in lifecycle_statuses
+                or payload.summary is not None
+                or payload.metadata is not None
             )
         ):
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    "Strict-board routing is owned by the Work Contract; "
-                    "submit a reassessment request instead"
+                    "Strict-board card mutation is owned by the Work Contract "
+                    "and run-scoped engine handoff; submit a reassessment request instead"
                 ),
             )
         try:

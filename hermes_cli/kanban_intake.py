@@ -313,6 +313,30 @@ def materialization_fields(
         )
 
     routing = contract["routing"]
+    work = contract["work"]
+    if work["item_kind"] == "epic":
+        if routing["entry_phase"] is not None or routing["assignee"] is not None:
+            raise WorkContractError("Epic contracts cannot declare a phase or assignee")
+        if routing["epic_id"] is not None or routing["dependencies"]:
+            raise WorkContractError(
+                "Epic contracts cannot declare membership or dependencies"
+            )
+        fields.update(
+            {
+                "title": work["title"],
+                "body": work["outcome"],
+                "assignee": None,
+                "workflow_template_id": None,
+                "current_step_key": None,
+                "work_item_kind": "epic",
+                "epic_id": None,
+                "parents": [],
+                "classification": copy.deepcopy(contract["classification"]),
+                "contract_digest": signed_contract["digest"],
+            }
+        )
+        return fields
+
     phase = routing["entry_phase"]
     assignee = routing["assignee"]
     phase_assignees = policy.get("phase_assignees")
@@ -323,7 +347,6 @@ def materialization_fields(
             f"phase {phase!r} and assignee {assignee!r} are not an allowed phase/assignee pair"
         )
 
-    work = contract["work"]
     fields.update(
         {
             "title": work["title"],

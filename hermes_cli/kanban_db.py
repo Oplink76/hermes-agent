@@ -1042,8 +1042,8 @@ def _handoff_v2_enabled(board_meta: Optional[dict]) -> bool:
     return wf.get("handoff_v2") is True
 
 
-def _board_slug_for_connection(conn: sqlite3.Connection) -> str:
-    """Best-effort board slug for an open kanban DB connection.
+def _known_board_slug_for_connection(conn: sqlite3.Connection) -> Optional[str]:
+    """Return the slug when an open connection points at a managed board DB.
 
     Most lifecycle helpers receive only a sqlite connection. Resolve the board
     from SQLite's ``main`` database path so board-level workflow policy still
@@ -1065,7 +1065,13 @@ def _board_slug_for_connection(conn: sqlite3.Connection) -> str:
                     return slug
     except Exception:
         pass
-    return get_current_board()
+    return None
+
+
+def _board_slug_for_connection(conn: sqlite3.Connection) -> str:
+    """Best-effort board slug for lifecycle helpers, with active-board fallback."""
+
+    return _known_board_slug_for_connection(conn) or get_current_board()
 
 
 def _product_release_measure_unblocks_dependents(meta: Optional[dict]) -> bool:
@@ -3864,7 +3870,9 @@ def connect(
         except Exception:
             conn.close()
             raise
-        _sync_board_governance(conn, governance_board)
+        _sync_board_governance(
+            conn, governance_board or _known_board_slug_for_connection(conn)
+        )
         return conn
 
     with _cross_process_init_lock(path):
@@ -3913,7 +3921,9 @@ def connect(
         except Exception:
             conn.close()
             raise
-    _sync_board_governance(conn, governance_board)
+    _sync_board_governance(
+        conn, governance_board or _known_board_slug_for_connection(conn)
+    )
     return conn
 
 
@@ -5153,6 +5163,12 @@ def create_task(
         raise ValueError("branch_name is only valid for worktree workspaces")
     if work_item_kind not in {"card", "epic"}:
         raise ValueError("work_item_kind must be card or epic")
+    if work_item_kind == "epic" and (
+        assignee is not None
+        or workflow_template_id is not None
+        or current_step_key is not None
+    ):
+        raise ValueError("Epic work items cannot have an assignee or workflow phase")
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -5240,7 +5256,11 @@ def create_task(
         _normalize_board_slug(board) if board is not None
         else _board_slug_for_connection(conn)
     )
-    if workflow_template_id == PRODUCT_WORKFLOW_TEMPLATE_ID and not current_step_key:
+    if (
+        work_item_kind == "card"
+        and workflow_template_id == PRODUCT_WORKFLOW_TEMPLATE_ID
+        and not current_step_key
+    ):
         _inferred_step = _infer_product_step(
             title=title,
             assignee=assignee,
@@ -5250,7 +5270,8 @@ def create_task(
         if _inferred_step:
             current_step_key = _inferred_step
     elif (
-        workflow_template_id is None
+        work_item_kind == "card"
+        and workflow_template_id is None
         and _is_product_board_metadata(_wf_board_meta)
         and current_step_key is None
     ):
@@ -5386,6 +5407,8 @@ def create_task(
                     missing = _find_missing_parents(conn, parents)
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                if work_item_kind == "epic":
+                    task_status = "todo"
 
                 # Project-linked worktree: a fresh worktree dir under the repo
                 # plus a deterministic branch (project slug + task id). Together
@@ -6211,6 +6234,11 @@ def claim_task(
     board_meta = product_board_metadata(_board_slug)
     release_measure_unblocks = _product_release_measure_unblocks_dependents(board_meta)
     with write_txn(conn):
+        candidate = conn.execute(
+            "SELECT work_item_kind FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if candidate is not None and candidate["work_item_kind"] == "epic":
+            return None
         # Enforcement preflight: repair a plain/legacy role card missing its
         # product workflow metadata before it claims, so it dispatches on the
         # correct step instead of masquerading (re-applied from f55580879).
@@ -6271,6 +6299,7 @@ def claim_task(
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
                AND status = 'ready'
+               AND work_item_kind = 'card'
                AND claim_lock IS NULL
             """,
             (lock, expires, now, task_id),
