@@ -143,7 +143,8 @@ def _restrict_signing_key_permissions(path: Path) -> None:
         username = getpass.getuser().strip()
         if not username:
             raise WorkContractError("cannot secure Work Contract signing key: user is unknown")
-        result = subprocess.run(
+        commands = (
+            [icacls, str(path), "/reset"],
             [
                 icacls,
                 str(path),
@@ -151,12 +152,18 @@ def _restrict_signing_key_permissions(path: Path) -> None:
                 "/grant:r",
                 f"{username}:F",
             ],
-            capture_output=True,
-            text=True,
-            check=False,
         )
-        if result.returncode != 0:
-            raise WorkContractError("cannot secure Work Contract signing key with Windows ACLs")
+        for command in commands:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise WorkContractError(
+                    "cannot secure Work Contract signing key with Windows ACLs"
+                )
         return
     os.chmod(path, 0o600)
 
@@ -297,6 +304,13 @@ def materialization_fields(
     expected_policy = policy.get("policy_version")
     if expected_policy and contract.get("policy_version") != expected_policy:
         raise WorkContractError("Work Contract policy version does not match board policy")
+    allowed_paths = policy.get("paths")
+    if not isinstance(allowed_paths, (list, tuple)) or not allowed_paths:
+        raise WorkContractError("strict board policy requires allowed qualification paths")
+    if contract.get("qualification_path") not in allowed_paths:
+        raise WorkContractError(
+            f"qualification_path {contract.get('qualification_path')!r} is not allowed by board policy"
+        )
 
     routing = contract["routing"]
     phase = routing["entry_phase"]

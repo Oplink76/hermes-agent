@@ -183,7 +183,8 @@ PRODUCT_QUALIFICATION_DEFAULTS: dict[str, Any] = {
     "required": False,
     "contract_version": 1,
     "policy_version": DEFAULT_POLICY_VERSION,
-    "paths": ["po", "hermes", "override"],
+    # Break-glass override is introduced separately and is never a normal path.
+    "paths": ["po", "hermes"],
     "phase_assignees": {
         "backlog": "productowner",
         "architecture": "architect",

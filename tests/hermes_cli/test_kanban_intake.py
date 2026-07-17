@@ -125,6 +125,11 @@ def test_signing_secret_uses_owner_only_acl_on_windows(tmp_path, monkeypatch):
     assert calls[0][0] == [
         "C:/Windows/System32/icacls.exe",
         str(path),
+        "/reset",
+    ]
+    assert calls[1][0] == [
+        "C:/Windows/System32/icacls.exe",
+        str(path),
         "/inheritance:r",
         "/grant:r",
         "Hermes User:F",
@@ -138,6 +143,7 @@ def test_strict_board_requires_valid_contract_and_enforces_phase_role_mapping():
         "qualification": {
             "required": True,
             "contract_version": 1,
+            "paths": ["po", "hermes"],
             "phase_assignees": {"development": "developer", "review": "reviewer"},
         },
     }
@@ -167,7 +173,27 @@ def test_strict_board_fails_closed_without_a_phase_role_mapping():
 
     with pytest.raises(intake.WorkContractError, match="phase_assignees"):
         intake.materialization_fields(
-            {"preset": "product", "qualification": {"required": True}},
+            {
+                "preset": "product",
+                "qualification": {"required": True, "paths": ["hermes"]},
+            },
+            signed_contract=signed,
+            secret=b"test-only-secret",
+        )
+
+
+def test_strict_board_rejects_a_signed_contract_from_a_disallowed_path():
+    signed = intake.sign_work_contract(_contract(), secret=b"test-only-secret")
+
+    with pytest.raises(intake.WorkContractError, match="qualification_path"):
+        intake.materialization_fields(
+            {
+                "qualification": {
+                    "required": True,
+                    "paths": ["po"],
+                    "phase_assignees": {"development": "developer"},
+                }
+            },
             signed_contract=signed,
             secret=b"test-only-secret",
         )
@@ -188,3 +214,33 @@ def test_product_board_defaults_declare_policy_without_activating_it():
 
     assert defaults["qualification"] == kb.PRODUCT_QUALIFICATION_DEFAULTS
     assert defaults["qualification"]["required"] is False
+    assert defaults["qualification"]["paths"] == ["po", "hermes"]
+
+
+def test_profile_quick_snapshot_captures_and_restores_shared_signing_key(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / ".hermes"
+    profile_home = root / "profiles" / "reviewer"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    intake.sign_work_contract(_contract(), hermes_home=root)
+    key_path = root / intake.SIGNING_KEY_RELATIVE_PATH
+    original = key_path.read_bytes()
+
+    snapshot_id = backup.create_quick_snapshot(
+        label="contract-key", hermes_home=profile_home
+    )
+    manifest_path = (
+        profile_home / "state-snapshots" / snapshot_id / "manifest.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert intake.SIGNING_KEY_RELATIVE_PATH in manifest["files"]
+
+    key_path.unlink()
+    assert backup.restore_quick_snapshot(
+        snapshot_id, hermes_home=profile_home
+    )
+    assert key_path.read_bytes() == original
+    assert not (profile_home / intake.SIGNING_KEY_RELATIVE_PATH).exists()
