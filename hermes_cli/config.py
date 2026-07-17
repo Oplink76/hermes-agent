@@ -2763,6 +2763,10 @@ DEFAULT_CONFIG = {
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Maximum pending qualification receipts processed before each
+        # dispatch pass. New receipts also wake the in-process watcher; the
+        # interval remains the restart/cross-process recovery path.
+        "qualification_per_tick": 3,
         # Auto-block after this many consecutive non-success attempts for the
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.

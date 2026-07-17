@@ -11,6 +11,7 @@ from gateway.kanban_watchers import (
 )
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_intake
+from hermes_cli.config import DEFAULT_CONFIG
 
 
 class _Kb:
@@ -118,6 +119,31 @@ def test_new_intake_emits_process_local_wake_after_durable_write(tmp_path):
         conn.close()
 
     assert observed[0][0]["id"] == receipt["intake_id"]
+
+
+def test_qualification_batch_size_is_declared_in_default_config():
+    assert DEFAULT_CONFIG["kanban"]["qualification_per_tick"] == 3
+
+
+def test_failed_intake_waker_is_logged_and_does_not_block_other_wakers(caplog):
+    observed = []
+
+    def broken_waker():
+        raise RuntimeError("wake failed")
+
+    def healthy_waker():
+        observed.append("woken")
+
+    kanban_intake._register_intake_waker(broken_waker)
+    kanban_intake._register_intake_waker(healthy_waker)
+    try:
+        kanban_intake._wake_intake_qualifier()
+    finally:
+        kanban_intake._unregister_intake_waker(broken_waker)
+        kanban_intake._unregister_intake_waker(healthy_waker)
+
+    assert observed == ["woken"]
+    assert "intake qualifier wake callback failed" in caplog.text
 
 
 class _OverrideRunner(GatewayKanbanWatchersMixin):

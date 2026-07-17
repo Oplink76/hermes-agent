@@ -12,6 +12,7 @@ import getpass
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import shutil
@@ -22,6 +23,9 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 from hermes_constants import get_default_hermes_root
+
+
+logger = logging.getLogger(__name__)
 
 
 CONTRACT_VERSION = 1
@@ -81,6 +85,10 @@ def _wake_intake_qualifier() -> None:
         try:
             callback()
         except Exception:
+            logger.warning(
+                "intake qualifier wake callback failed",
+                exc_info=True,
+            )
             continue
 
 
