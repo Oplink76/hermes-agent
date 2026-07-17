@@ -8,6 +8,7 @@ task, so task ids and operational history remain intact.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -443,10 +444,28 @@ def _make_read_only(root: Path) -> None:
             path.chmod(stat.S_IRUSR | stat.S_IXUSR)
 
 
+@contextlib.contextmanager
+def _quiescent_board(board: str):
+    with kb._dispatch_tick_lock(kb.kanban_db_path(board)) as held:
+        if not held:
+            raise MigrationBlocked(
+                f"board {board!r} has an active dispatch tick; retry migration"
+            )
+        yield
+
+
 def apply_board(
     board: str, *, recovery_root: Optional[Path] = None
 ) -> dict[str, Any]:
     """Backfill one quiescent product board and atomically enable strict mode."""
+
+    with _quiescent_board(board):
+        return _apply_board_quiescent(board, recovery_root=recovery_root)
+
+
+def _apply_board_quiescent(
+    board: str, *, recovery_root: Optional[Path] = None
+) -> dict[str, Any]:
 
     audit = audit_board(board)
     if audit["active_running"]:
@@ -650,18 +669,24 @@ def rollback_receipt(receipt_path: Path) -> dict[str, Any]:
     path = Path(receipt_path).expanduser().resolve()
     receipt = json.loads(path.read_text(encoding="utf-8"))
     board = str(receipt["board"])
+    with _quiescent_board(board):
+        return _rollback_receipt_quiescent(path, receipt)
+
+
+def _rollback_receipt_quiescent(
+    path: Path, receipt: Mapping[str, Any]
+) -> dict[str, Any]:
+    board = str(receipt["board"])
     live = receipt["live"]
     snapshot = receipt["snapshot"]
     current = audit_board(board)
     if current["active_running"]:
         raise MigrationBlocked("cannot rollback while board work is running")
 
-    for sidecar in ("-wal", "-shm"):
-        try:
-            Path(str(live["db"]) + sidecar).unlink()
-        except FileNotFoundError:
-            pass
-    shutil.copy2(snapshot["db"], live["db"])
+    snapshot_uri = f"file:{Path(snapshot['db'])}?mode=ro&immutable=1"
+    with sqlite3.connect(snapshot_uri, uri=True) as source:
+        with sqlite3.connect(str(live["db"])) as target:
+            source.backup(target)
 
     metadata_live = Path(live["metadata"])
     if snapshot.get("metadata"):
@@ -681,6 +706,14 @@ def rollback_receipt(receipt_path: Path) -> dict[str, Any]:
         key_live.chmod(0o600)
     elif not _other_boards_have_contracts(board):
         key_live.unlink(missing_ok=True)
+
+    # Re-open after metadata restoration so the mirrored DB gate matches the
+    # restored policy. SQLite's backup API coordinates with any open WAL
+    # connections instead of replacing files underneath them.
+    with kb.connect_closing(board=board) as restored:
+        integrity = str(restored.execute("PRAGMA integrity_check").fetchone()[0])
+    if integrity != "ok":
+        raise MigrationBlocked(f"rollback integrity check failed: {integrity}")
 
     rollback = {
         "version": 1,

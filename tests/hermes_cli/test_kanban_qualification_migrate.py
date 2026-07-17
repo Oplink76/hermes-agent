@@ -301,3 +301,14 @@ def test_rollback_restores_snapshot_and_keeps_immutable_receipt(product_board, t
         assert conn.execute(
             "SELECT qualification_required FROM board_governance WHERE id = 1"
         ).fetchone()[0] == 0
+
+
+def test_rollback_refuses_while_dispatcher_owns_board_lock(product_board, tmp_path):
+    _home, board = product_board
+    _create_legacy_fixture(board)
+    result = migrate.apply_board(board, recovery_root=tmp_path / "recovery")
+
+    with kb._dispatch_tick_lock(kb.kanban_db_path(board)) as held:
+        assert held is True
+        with pytest.raises(migrate.MigrationBlocked, match="dispatch"):
+            migrate.rollback_receipt(Path(result["receipt_path"]))
