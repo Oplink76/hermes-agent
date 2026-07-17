@@ -4375,6 +4375,16 @@ def _ensure_qualification_boundary_objects(conn: sqlite3.Connection) -> None:
         BEGIN
             SELECT RAISE(ABORT, 'strict-board task deletion requires Hermes service authority');
         END;
+        CREATE TRIGGER IF NOT EXISTS strict_tasks_service_archive
+        BEFORE UPDATE OF status ON tasks
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND OLD.work_contract_id IS NOT NULL
+         AND NEW.status = 'archived'
+         AND OLD.status IS NOT NEW.status
+         AND hermes_governance_write_authorized() != 1
+        BEGIN
+            SELECT RAISE(ABORT, 'strict-board archival requires Hermes service authority');
+        END;
         CREATE TRIGGER IF NOT EXISTS strict_task_routing_service_update
         BEFORE UPDATE OF assignee, workflow_template_id, current_step_key,
                          work_contract_id, work_item_kind ON tasks

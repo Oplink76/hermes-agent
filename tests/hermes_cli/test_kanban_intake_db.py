@@ -294,6 +294,10 @@ def test_strict_board_rejects_direct_task_insert_and_materializes_atomically(
             connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         with pytest.raises(PermissionError, match="strict-board"):
             kb.archive_task(connection, task_id)
+        with pytest.raises(sqlite3.IntegrityError, match="strict-board"):
+            connection.execute(
+                "UPDATE tasks SET status = 'archived' WHERE id = ?", (task_id,)
+            )
         with kb.authorized_governance_write():
             assert kb.archive_task(connection, task_id)
         with pytest.raises(PermissionError, match="strict-board"):
