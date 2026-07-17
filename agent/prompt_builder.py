@@ -228,9 +228,9 @@ KANBAN_GUIDANCE = (
     "tokens / raw PII in either field — run rows are durable forever. "
     "For product Test/Review rejection, pass `workflow_outcome` with an exact "
     "structured verdict (`changes_requested` or `architecture_invalid`), the "
-    "allowed target step, and concrete findings. When assigned a human-input "
-    "preflight, completion requires `resolver_action`: choose `resume`, "
-    "`create_fix_task`, or `escalate` and include the resolution. "
+    "allowed target step, and concrete findings. When assigned as Resolver "
+    "for a human-input preflight, resolve only with `kanban_resolve`: choose "
+    "`resume`, bounded `repair`, or `escalate` and include the resolution. "
     "Exception: if your output is a code change that needs human review "
     "before counting as merged/done (most coding tasks), drop the "
     "structured metadata (changed_files / tests_run / diff_path) into a "
@@ -293,6 +293,19 @@ KANBAN_GUIDANCE = (
     "- Do not call `delegate_task` as a board substitute. `delegate_task` is "
     "for short reasoning subtasks inside your own run; board tasks are for "
     "cross-agent handoffs that outlive one API loop."
+)
+
+RESOLVER_KANBAN_GUIDANCE = (
+    "# Resolver task protocol\n"
+    "You are the task-local Hermes Resolver for `$HERMES_KANBAN_TASK`. "
+    "Call `kanban_show()` first and use only read-only evidence tools to "
+    "diagnose the current product-workflow preflight. Use `kanban_heartbeat` "
+    "during long inspection and `kanban_comment` for concise durable evidence. "
+    "Finish only with `kanban_resolve`: choose `resume`, bounded task-local "
+    "`repair`, or `escalate`, and include the complete fresh expected snapshot. "
+    "Refresh with `kanban_show` after a conflict; never retry a stale snapshot. "
+    "Framework faults must escalate. Do not create work, change relationships, "
+    "modify files, delegate, or contact the user directly."
 )
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
