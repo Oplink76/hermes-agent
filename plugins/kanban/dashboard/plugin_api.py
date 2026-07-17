@@ -1112,6 +1112,16 @@ def delete_task(
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
+    if kanban_intake.qualification_required(
+        kanban_db.read_board_metadata(board)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Strict-board card lifecycle is owned by the Work Contract; "
+                "submit a reassessment request instead"
+            ),
+        )
     conn = _conn(board=board)
     try:
         try:

@@ -479,6 +479,14 @@ def test_strict_board_rejects_client_contract_and_routing_mutations(client):
     assert lifecycle.status_code == 409
     assert "run-scoped" in lifecycle.text
 
+    deletion = client.delete(
+        f"/api/plugins/kanban/tasks/{first}?board=strict",
+    )
+    assert deletion.status_code == 409
+    assert "Work Contract" in deletion.text
+    with kb.connect(board="strict") as conn:
+        assert kb.get_task(conn, first) is not None
+
     dependency = client.post(
         "/api/plugins/kanban/links?board=strict",
         json={"parent_id": first, "child_id": second, "expected_task_id": second},
