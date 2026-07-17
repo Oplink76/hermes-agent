@@ -222,6 +222,15 @@ def test_strict_board_rejects_direct_task_insert_and_materializes_atomically(
     finally:
         path_connection.close()
 
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board="strict")))
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    env_connection = kb.connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="qualification"):
+            kb.create_task(env_connection, title="environment path bypass")
+    finally:
+        env_connection.close()
+
     connection = kb.connect(board="strict")
     try:
         with pytest.raises(sqlite3.IntegrityError, match="qualification"):

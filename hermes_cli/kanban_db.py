@@ -3871,7 +3871,7 @@ def connect(
             conn.close()
             raise
         _sync_board_governance(
-            conn, governance_board or _known_board_slug_for_connection(conn)
+            conn, _known_board_slug_for_connection(conn) or governance_board
         )
         return conn
 
@@ -3922,7 +3922,7 @@ def connect(
             conn.close()
             raise
     _sync_board_governance(
-        conn, governance_board or _known_board_slug_for_connection(conn)
+        conn, _known_board_slug_for_connection(conn) or governance_board
     )
     return conn
 
