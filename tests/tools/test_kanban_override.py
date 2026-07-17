@@ -78,6 +78,13 @@ def test_override_rejects_forged_or_incomplete_authority(tmp_path, monkeypatch):
         raw_request='{"request":{"title":"Recover approved work"}}',
         source="codex",
     )
+    kb.record_qualification_decision(
+        conn,
+        intake_id=intake_id,
+        decision="rejected",
+        actor_profile="hermes-qualifier",
+        reason="Normal qualification could not resolve founder intent",
+    )
     monkeypatch.setattr(kb, "read_board_metadata", lambda board: _policy())
 
     with pytest.raises(WorkContractError, match="authenticated Ole-to-Hermes"):
@@ -99,6 +106,13 @@ def test_authenticated_direct_ole_instruction_can_override_without_fake_evidence
         conn,
         raw_request='{"request":{"title":"Recover approved work"}}',
         source="codex",
+    )
+    kb.record_qualification_decision(
+        conn,
+        intake_id=intake_id,
+        decision="rejected",
+        actor_profile="hermes-qualifier",
+        reason="Normal qualification could not resolve founder intent",
     )
     monkeypatch.setattr(kb, "read_board_metadata", lambda board: _policy())
     authority = qualifier._new_gateway_override_authority(

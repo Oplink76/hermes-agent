@@ -1164,6 +1164,16 @@ class GatewayKanbanWatchersMixin:
         # subscriptions etc.). Matches the notifier watcher's delay.
         await asyncio.sleep(5)
 
+        from hermes_cli import kanban_intake as _kanban_intake
+
+        qualification_wakeup = asyncio.Event()
+        watcher_loop = asyncio.get_running_loop()
+
+        def _wake_qualification() -> None:
+            watcher_loop.call_soon_threadsafe(qualification_wakeup.set)
+
+        _kanban_intake._register_intake_waker(_wake_qualification)
+
         # Health telemetry mirrored from `_cmd_daemon`: warn when ready
         # queue is non-empty but spawns are 0 for N consecutive ticks —
         # usually means broken PATH, missing venv, or credential loss.
@@ -1501,6 +1511,7 @@ class GatewayKanbanWatchersMixin:
                         last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
+                _kanban_intake._unregister_intake_waker(_wake_qualification)
                 _release_singleton_lock(self._kanban_dispatcher_lock_handle)
                 self._kanban_dispatcher_lock_handle = None
                 raise
@@ -1511,8 +1522,22 @@ class GatewayKanbanWatchersMixin:
             # waits up to `interval` seconds for the current sleep to finish.
             slept = 0.0
             while slept < interval and self._running:
-                await asyncio.sleep(min(1.0, interval - slept))
-                slept += 1.0
+                wait_for = min(1.0, interval - slept)
+                try:
+                    await asyncio.wait_for(
+                        qualification_wakeup.wait(), timeout=wait_for
+                    )
+                except asyncio.CancelledError:
+                    _kanban_intake._unregister_intake_waker(_wake_qualification)
+                    _release_singleton_lock(self._kanban_dispatcher_lock_handle)
+                    self._kanban_dispatcher_lock_handle = None
+                    raise
+                except asyncio.TimeoutError:
+                    slept += wait_for
+                    continue
+                qualification_wakeup.clear()
+                break
 
+        _kanban_intake._unregister_intake_waker(_wake_qualification)
         _release_singleton_lock(self._kanban_dispatcher_lock_handle)
         self._kanban_dispatcher_lock_handle = None

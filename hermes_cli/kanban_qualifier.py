@@ -517,7 +517,8 @@ def qualify_intake(
     intake_record = kanban_db.get_qualification_intake(conn, intake_id)
     if intake_record is None:
         raise ValueError(f"unknown qualification intake: {intake_id}")
-    if intake_record["status"] != "pending":
+    allowed_statuses = {"pending", "rejected"} if override_authority else {"pending"}
+    if intake_record["status"] not in allowed_statuses:
         return {"status": intake_record["status"], "intake_id": intake_id}
     metadata = kanban_db.read_board_metadata(board)
     caller = model_call or _call_auxiliary_model

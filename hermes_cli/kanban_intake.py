@@ -17,8 +17,9 @@ import secrets
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from hermes_constants import get_default_hermes_root
 
@@ -55,10 +56,32 @@ _REQUIRED_NESTED_FIELDS = {
 }
 _QUALIFICATION_PATHS = {"po", "hermes", "override"}
 _WORK_ITEM_KINDS = {"card", "epic"}
+_INTAKE_WAKERS: set[Callable[[], None]] = set()
+_INTAKE_WAKERS_LOCK = threading.Lock()
 
 
 class WorkContractError(ValueError):
     """The Work Contract is missing, invalid, or violates board policy."""
+
+
+def _register_intake_waker(callback: Callable[[], None]) -> None:
+    with _INTAKE_WAKERS_LOCK:
+        _INTAKE_WAKERS.add(callback)
+
+
+def _unregister_intake_waker(callback: Callable[[], None]) -> None:
+    with _INTAKE_WAKERS_LOCK:
+        _INTAKE_WAKERS.discard(callback)
+
+
+def _wake_intake_qualifier() -> None:
+    with _INTAKE_WAKERS_LOCK:
+        callbacks = tuple(_INTAKE_WAKERS)
+    for callback in callbacks:
+        try:
+            callback()
+        except Exception:
+            continue
 
 
 def _unsigned_contract(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -410,6 +433,9 @@ def submit_intake(
         session_id=session_id,
         attachments=attachments,
     )
+    # Same-process gateway submissions wake the embedded qualifier now. Other
+    # processes are recovered by its normal bounded sweep.
+    _wake_intake_qualifier()
     return {
         "status": "qualification_required",
         "intake_id": intake_id,
@@ -457,7 +483,12 @@ def materialize_contract(
         intake_record = kanban_db.get_qualification_intake(conn, request_id)
         if intake_record is None:
             raise WorkContractError(f"unknown qualification intake: {request_id}")
-        if intake_record["status"] != "pending":
+        allowed_intake_statuses = (
+            {"pending", "rejected"}
+            if contract["qualification_path"] == "override"
+            else {"pending"}
+        )
+        if intake_record["status"] not in allowed_intake_statuses:
             raise WorkContractError(
                 f"qualification intake {request_id} is already {intake_record['status']}"
             )

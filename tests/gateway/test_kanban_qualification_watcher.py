@@ -9,6 +9,8 @@ from gateway.kanban_watchers import (
     _process_pending_qualification_intakes,
     _qualify_then_dispatch,
 )
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_intake
 
 
 class _Kb:
@@ -95,6 +97,27 @@ def test_rejected_intake_is_counted_without_human_notification_side_effects():
 
     assert result == {"attempted": 1, "qualified": 0, "rejected": 1, "failed": 0}
     assert conn.events == []
+
+
+def test_new_intake_emits_process_local_wake_after_durable_write(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
+    observed = []
+
+    def wake():
+        observed.append(kb.list_qualification_intakes(conn, status="pending"))
+
+    kanban_intake._register_intake_waker(wake)
+    try:
+        receipt = kanban_intake.submit_intake(
+            conn,
+            request={"title": "Wake qualification"},
+            source="gateway",
+        )
+    finally:
+        kanban_intake._unregister_intake_waker(wake)
+        conn.close()
+
+    assert observed[0][0]["id"] == receipt["intake_id"]
 
 
 class _OverrideRunner(GatewayKanbanWatchersMixin):
