@@ -189,6 +189,7 @@ PRODUCT_QUALIFICATION_DEFAULTS: dict[str, Any] = {
     "policy_version": DEFAULT_POLICY_VERSION,
     # Break-glass override is introduced separately and is never a normal path.
     "paths": ["po", "hermes"],
+    "work_types": ["story", "bug", "maintenance", "ops", "spike"],
     "phase_assignees": {
         "backlog": "productowner",
         "architecture": "architect",

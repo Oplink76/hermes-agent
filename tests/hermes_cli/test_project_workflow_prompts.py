@@ -25,6 +25,11 @@ def assert_engineering_operating_rules(prompt: str):
     assert "CLAUDE.md" in prompt
     assert "LLM Wiki" in prompt
     assert "active Kanban ticket scope" in prompt
+    assert "qualification intake" in prompt
+    assert "Hermes qualification path" in prompt
+    assert "do not submit trusted phase or assignee routing" in prompt
+    assert "Break-glass" in prompt
+    assert "direct authenticated instruction to Hermes" in prompt
 
 
 def test_project_create_prompt_enforces_kanban_traceability_and_clickable_po_questions():
@@ -47,9 +52,7 @@ def test_project_create_prompt_enforces_kanban_traceability_and_clickable_po_que
     assert "session" in prompt
     assert "Assign it to the `productowner` Hermes profile" in prompt
     assert "role worker picks it up" in prompt
-    assert "Do not do project work that is not represented on the Kanban board" in prompt
-    assert "unless Ole explicitly overrides that rule" in prompt
-    assert "good reason" in prompt
+    assert "unless Ole explicitly overrides that rule" not in prompt
     assert "Traceability log" in prompt
     assert "Kanban comment" in prompt
     assert "created_by" in prompt
@@ -64,6 +67,7 @@ def test_project_create_prompt_enforces_kanban_traceability_and_clickable_po_que
     assert "ask breakdown questions" in prompt
     assert "one When/Then scenario" in prompt
     assert "less than about two days" in prompt
+    assert "Product Owner run/artifact evidence" in prompt
     assert_engineering_operating_rules(prompt)
 
 
@@ -108,6 +112,7 @@ def test_project_import_prompt_matches_verified_ai_synthesis_flow_and_blocks_app
     assert "broad_product_surface" in prompt
     assert "Traceability log" in prompt
     assert "initial import is read-only/dry-run" in prompt
+    assert "accepted stories through qualification intake" in prompt
     assert_engineering_operating_rules(prompt)
 
 

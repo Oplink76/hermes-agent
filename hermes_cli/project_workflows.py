@@ -69,19 +69,24 @@ def build_project_create_prompt(raw_args: str | None) -> str:
           story breakdown, story refinement, and story-card creation/review
           should be assigned to or launched as `productowner`; record that actor
           in Kanban traceability where supported.
-        - Do not do project work that is not represented on the Kanban board,
-          unless Ole explicitly overrides that rule for a good reason.
-        - If an override is necessary, state the reason before doing the work and
-          add it to the Traceability log.
+        - Submit all executable work through qualification intake. Product Owner
+          discovery output uses the PO path with real Product Owner run/artifact evidence;
+          bugs, maintenance, operations, existing work, and other non-PO requests
+          use the approved Hermes qualification path. Do not submit trusted phase
+          or assignee routing from this workflow.
+        - Break-glass is not available to this client. It requires Ole's direct
+          authenticated instruction to Hermes and remains subject to Test, Review,
+          and release evidence gates.
         - Every meaningful action must be traceable: add a Kanban comment or
           event with who did it, what was done, exact command/tool/artifact, and
           why. Use the active Hermes profile/user as `created_by` where the
           Kanban CLI supports it.
         - Do not silently create implementation/development work before the
           Wayfinder discovery establishes product intent and user stories.
-        - Product/project Kanban boards must contain product work as valid user
-          stories only. Internal setup/ops notes may be comments/log entries,
-          not product-story cards.
+        - Product Owner discovery may promote only valid user stories. Bugs,
+          maintenance, operations, documentation, spikes, and existing work may
+          become cards only through the Hermes qualification path; do not force
+          them to masquerade as user stories.
         - Product Brief, MVP Brief, PO Input Needed, Import Analysis, broad
           dashboard/cockpit/control-plane slices, and "first version" briefs are
           not user-story cards. Keep them in the Wayfinder discovery/product brief
@@ -89,6 +94,13 @@ def build_project_create_prompt(raw_args: str | None) -> str:
           product-story cards.
 
         Engineering operating rules for any later coding/review:
+        - The Hermes qualification path handles work outside verified PO discovery.
+        - Every accepted implementation request must enter through qualification intake.
+          Use the Product Owner path for verified discovery output and the Hermes
+          qualification path for work that arrives elsewhere in the lifecycle;
+          do not submit trusted phase or assignee routing.
+        - Break-glass requires a direct authenticated instruction to Hermes. This
+          slash workflow, Codex, Claude, and ordinary tools cannot mint it.
         - Scope caveat: this workflow fixes CREATION only, not COMPLETION. Do not
           touch or promise the later commit/handoff/merge/integration back-half
           unless Ole separately approves that work.
@@ -152,20 +164,12 @@ def build_project_create_prompt(raw_args: str | None) -> str:
              --board <slug> \
              --use
            ```
-        8. Create the initial Wayfinder discovery card on the project board.
-           Use the project board explicitly, not the default/current board:
-           ```bash
-           hermes kanban --board <slug> create "Wayfinder discovery: <project-name>" \
-             --project <slug> \
-             --workspace dir:<project-folder> \
-             --assignee productowner \
-             --workflow-template-id product \
-             --step-key backlog \
-             --json
-           ```
-           Verify and report that the created PO card has `project_id` set,
-           `workflow_template_id == "product"`, `current_step_key == "backlog"`,
-           and lives on the project board.
+        8. Submit the initial Wayfinder discovery request through qualification
+           intake on the project board, not through direct task/routing writes.
+           Include the project id and requested `dir:<project-folder>` workspace as
+           intent, but do not provide trusted phase or assignee fields. Verify the
+           intake receipt, then verify that Hermes qualification materializes one
+           backlog card on the project board with the signed Work Contract.
            Assign it to the `productowner` Hermes profile so the Relay/Hermes
            role worker picks it up. The current/default session should only
            scaffold the card and record traceability, not conduct the Wayfinder
@@ -239,8 +243,11 @@ def build_project_import_prompt(raw_args: str | None) -> str:
           PO questions, story breakdown, story refinement, and valid story-card
           proposal/application should be assigned to or launched as
           `productowner`; do not impersonate PO from the default session.
-        - Do not do project work that is not represented on the Kanban board,
-          unless Ole explicitly overrides that rule for a good reason.
+        - Submit accepted stories through qualification intake with verifiable
+          Product Owner run/artifact evidence. Non-PO work uses the Hermes
+          qualification path; do not submit trusted phase or assignee routing.
+        - Break-glass is unavailable here and requires Ole's direct authenticated
+          instruction to Hermes.
         - Maintain a Traceability log in the session output: who did what, which
           files were read, which commands/tools ran, artifacts created under
           /tmp, and why each step happened. If live apply is later approved,
@@ -248,6 +255,13 @@ def build_project_import_prompt(raw_args: str | None) -> str:
           available.
 
         Engineering operating rules for any later coding/review:
+        - The Hermes qualification path handles work outside verified PO discovery.
+        - Every accepted implementation request must enter through qualification intake.
+          Use the Product Owner path for verified discovery output and the Hermes
+          qualification path for work that arrives elsewhere in the lifecycle;
+          do not submit trusted phase or assignee routing.
+        - Break-glass requires a direct authenticated instruction to Hermes. This
+          slash workflow, Codex, Claude, and ordinary tools cannot mint it.
         - The initial import is read-only/dry-run and does not authorize code
           edits. If Ole later approves implementation of an imported story,
           all coding work must follow Ole's branch -> commit -> review -> merge
@@ -329,10 +343,10 @@ def build_project_import_prompt(raw_args: str | None) -> str:
               --synthesis-file "/tmp/<SYNTHESIS>.json"
             The importer apply plan must stay V2-only: board creation uses
             `hermes kanban boards create <slug> --preset product` (which must
-            produce `product_workflow.handoff_v2 == true`), and every live
-            user-story card uses `--workflow-template-id product --step-key backlog`.
-            Dry-run must not execute those commands; live `--apply` requires Ole's
-            explicit later approval.
+            produce `product_workflow.handoff_v2 == true`), then sends accepted
+            stories through qualification intake with Product Owner evidence.
+            It must not write workflow/assignee routing directly. Dry-run must not
+            execute those commands; live `--apply` requires Ole's explicit later approval.
         12. Report whether apply is safe or blocked. Apply is blocked if Product
             Owner questions remain, markdown understanding is incomplete, or no
             valid user-story cards exist.

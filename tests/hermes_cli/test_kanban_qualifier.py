@@ -1,0 +1,348 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_qualifier as qualifier
+
+
+@pytest.fixture
+def conn(tmp_path):
+    connection = kb.connect(tmp_path / "kanban.db")
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+@pytest.fixture
+def policy():
+    return {
+        "preset": "product",
+        "qualification": {
+            "required": True,
+            "contract_version": 1,
+            "policy_version": "product-handoff-v2+qualification-v1",
+            "paths": ["po", "hermes"],
+            "work_types": ["story", "bug", "maintenance", "ops", "spike"],
+            "phase_assignees": {
+                "backlog": "productowner",
+                "architecture": "architect",
+                "development": "developer",
+                "test": "tester",
+                "review": "reviewer",
+                "release_measure": None,
+            },
+        },
+    }
+
+
+def _intake(conn, *, attachments=()):
+    intake_id = kb.create_qualification_intake(
+        conn,
+        raw_request=json.dumps(
+            {
+                "kind": "task_create",
+                "request": {
+                    "title": "Ship qualified work",
+                    "body": "Make the governed flow visible",
+                },
+            }
+        ),
+        source="codex",
+        attachments=attachments,
+    )
+    return kb.get_qualification_intake(conn, intake_id)
+
+
+def _decision(**overrides):
+    decision = {
+        "qualification_path": "hermes",
+        "work": {
+            "item_kind": "card",
+            "work_type": "maintenance",
+            "title": "Ship qualified work",
+            "outcome": "Only governed work reaches execution",
+            "scope": ["Hermes"],
+            "out_of_scope": ["Cockpit"],
+        },
+        "routing": {
+            "entry_phase": "backlog",
+            "assignee": "productowner",
+            "epic_id": None,
+            "dependencies": [],
+        },
+        "entry_assessment": {
+            "reason": "New work starts at backlog",
+            "skipped_phases": [],
+            "evidence": [],
+        },
+        "handover": {
+            "deliverables": ["implementation"],
+            "required_evidence": ["tests"],
+            "done_when": ["green"],
+            "next_phase": "architecture",
+            "next_role": "architect",
+        },
+        "rules": {
+            "allowed": ["edit the scoped repository"],
+            "forbidden": ["bypass review"],
+        },
+        "classification": ["framework:maintenance", "path:hermes"],
+    }
+    for key, value in overrides.items():
+        decision[key] = value
+    return decision
+
+
+def _late_assessment(*phases, provenance=None):
+    value = {
+        "reason": "Earlier phases are already satisfied",
+        "skipped_phases": [
+            {
+                "phase": phase,
+                "reason": f"{phase} evidence exists",
+                "evidence": [f"{phase}-artifact"],
+            }
+            for phase in phases
+        ],
+        "evidence": [f"{phase}-artifact" for phase in phases],
+    }
+    if provenance is not None:
+        value["provenance"] = provenance
+    return value
+
+
+def test_hermes_path_validates_without_product_owner_evidence(conn, policy):
+    validated = qualifier.validate_decision(
+        conn,
+        board_metadata=policy,
+        intake=_intake(conn),
+        decision=_decision(),
+    )
+
+    assert validated["qualification_path"] == "hermes"
+    assert "po_evidence" not in validated
+
+
+def test_po_path_requires_real_completed_product_owner_run_and_artifact(conn, policy):
+    intake = _intake(conn, attachments=[{"name": "brief.md", "path": "/tmp/brief.md"}])
+    with pytest.raises(qualifier.QualificationValidationError, match="Product Owner run"):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=intake,
+            decision=_decision(
+                qualification_path="po",
+                po_evidence={"run_id": 999, "artifact": "/tmp/brief.md"},
+            ),
+        )
+
+    task_id = kb.create_task(conn, title="PO discovery")
+    cursor = conn.execute(
+        """
+        INSERT INTO task_runs (
+            task_id, profile, step_key, status, started_at, ended_at, summary
+        ) VALUES (?, 'productowner', 'backlog', 'done', 1, 2, ?)
+        """,
+        (task_id, "Product brief: /tmp/brief.md"),
+    )
+    run_id = int(cursor.lastrowid)
+
+    validated = qualifier.validate_decision(
+        conn,
+        board_metadata=policy,
+        intake=intake,
+        decision=_decision(
+            qualification_path="po",
+            po_evidence={"run_id": run_id, "artifact": "/tmp/brief.md"},
+        ),
+    )
+
+    assert validated["po_evidence"]["run_id"] == run_id
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ({"work_type": "project"}, "work type"),
+        ({"entry_phase": "qa"}, "entry phase"),
+        ({"entry_phase": "development", "assignee": "default"}, "assignee"),
+    ],
+)
+def test_finite_work_type_phase_and_role_are_enforced(conn, policy, mutation, message):
+    decision = _decision()
+    if "work_type" in mutation:
+        decision["work"]["work_type"] = mutation["work_type"]
+    else:
+        decision["routing"].update(mutation)
+
+    with pytest.raises(qualifier.QualificationValidationError, match=message):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=_intake(conn),
+            decision=decision,
+        )
+
+
+def test_dependencies_and_epic_membership_are_separate_and_explicit(conn, policy):
+    dependency = kb.create_task(conn, title="Dependency")
+    epic = kb.create_task(conn, title="Outcome Epic", work_item_kind="epic")
+    decision = _decision()
+    decision["routing"].update(
+        {"dependencies": [dependency], "epic_id": epic}
+    )
+
+    validated = qualifier.validate_decision(
+        conn,
+        board_metadata=policy,
+        intake=_intake(conn),
+        decision=decision,
+    )
+    assert validated["routing"]["dependencies"] == [dependency]
+    assert validated["routing"]["epic_id"] == epic
+
+    decision["routing"]["dependencies"] = [epic]
+    with pytest.raises(qualifier.QualificationValidationError, match="dependency.*card"):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=_intake(conn),
+            decision=decision,
+        )
+
+
+def test_late_entry_requires_reasons_and_evidence_for_every_skipped_phase(conn, policy):
+    decision = _decision()
+    decision["routing"].update(
+        {"entry_phase": "development", "assignee": "developer"}
+    )
+
+    with pytest.raises(qualifier.QualificationValidationError, match="skipped phases"):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=_intake(conn),
+            decision=decision,
+        )
+
+    decision["entry_assessment"] = _late_assessment("backlog", "architecture")
+    assert qualifier.validate_decision(
+        conn,
+        board_metadata=policy,
+        intake=_intake(conn),
+        decision=decision,
+    )["routing"]["entry_phase"] == "development"
+
+
+def test_review_entry_requires_independent_writer_and_test_provenance(conn, policy):
+    decision = _decision()
+    decision["routing"].update({"entry_phase": "review", "assignee": "reviewer"})
+    decision["entry_assessment"] = _late_assessment(
+        "backlog",
+        "architecture",
+        "development",
+        "test",
+        provenance={
+            "writer": {"profile": "developer", "artifact": "commit:abc"},
+            "tester": {"profile": "developer", "artifact": "tests:green"},
+        },
+    )
+
+    with pytest.raises(qualifier.QualificationValidationError, match="independent"):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=_intake(conn),
+            decision=decision,
+        )
+
+    decision["entry_assessment"]["provenance"]["tester"]["profile"] = "tester"
+    assert qualifier.validate_decision(
+        conn,
+        board_metadata=policy,
+        intake=_intake(conn),
+        decision=decision,
+    )["entry_assessment"]["provenance"]["tester"]["profile"] == "tester"
+
+
+def test_release_measure_cannot_be_assigned_to_an_ordinary_worker(conn, policy):
+    decision = _decision()
+    decision["routing"].update(
+        {"entry_phase": "release_measure", "assignee": "developer"}
+    )
+    decision["entry_assessment"] = _late_assessment(
+        "backlog", "architecture", "development", "test", "review"
+    )
+
+    with pytest.raises(qualifier.QualificationValidationError, match="release_measure.*unassigned"):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=_intake(conn),
+            decision=decision,
+        )
+
+
+def test_standalone_work_is_valid_without_a_synthetic_epic(conn, policy):
+    validated = qualifier.validate_decision(
+        conn,
+        board_metadata=policy,
+        intake=_intake(conn),
+        decision=_decision(),
+    )
+
+    assert validated["routing"]["epic_id"] is None
+
+
+def test_invalid_model_decision_retries_once_then_stores_rejection_without_card(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    board = "strict"
+    kb.ensure_product_board_defaults(board)
+    metadata = kb.read_board_metadata(board)
+    metadata["qualification"]["required"] = True
+    metadata["qualification"]["work_types"] = [
+        "story", "bug", "maintenance", "ops", "spike"
+    ]
+    kb.board_metadata_path(board).write_text(json.dumps(metadata), encoding="utf-8")
+
+    with kb.connect(board=board) as connection:
+        receipt = qualifier.submit_request(
+            connection,
+            request={"title": "Ambiguous request"},
+            source="codex",
+        )
+        calls = []
+
+        def invalid_model(prompt):
+            calls.append(prompt)
+            return _decision(
+                routing={
+                    "entry_phase": "development",
+                    "assignee": "default",
+                    "epic_id": None,
+                    "dependencies": [],
+                }
+            )
+
+        result = qualifier.qualify_intake(
+            connection,
+            board=board,
+            intake_id=receipt["intake_id"],
+            model_call=invalid_model,
+            secret=b"test-only-secret",
+            issued_at=100,
+        )
+
+        assert result["status"] == "rejected"
+        assert len(calls) == 2
+        assert "assignee" in calls[1]
+        assert kb.get_qualification_intake(connection, receipt["intake_id"])["status"] == "rejected"
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
