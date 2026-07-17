@@ -134,6 +134,31 @@ chars, must start with alphanumeric. Uppercase input is auto-downcased.
 Anything else (slashes, spaces, dots, `..`) is rejected at the CLI layer
 so path-traversal tricks can't name a board.
 
+### Migrating a legacy product board to qualification
+
+Product boards can reject direct task materialization and require every work
+item to enter through Product Owner evidence or Hermes qualification. Migrate
+an existing product board with one command surface:
+
+```bash
+# Read-only audit. This is the default and changes no bytes.
+hermes kanban --board my-product qualification-migrate --json
+
+# Snapshot the board, backfill evidence-derived Work Contracts, and enable
+# strict qualification. Running or ambiguous work stops the migration.
+hermes kanban --board my-product qualification-migrate --apply --json
+
+# Restore the immutable pre-apply snapshot if operational verification fails.
+hermes kanban qualification-migrate --rollback \
+  ~/.hermes/recovery/qualification-migrations/<receipt>/receipt.json --json
+```
+
+Apply preserves task IDs, comments, runs, events, branches, attachments,
+timestamps, project links, and ordinary dependency edges. Only tasks explicitly
+labelled as Epics are converted to non-executable Epics. Every apply creates a
+verified recovery snapshot and receipt before changing the board; repeated
+apply calls are safe.
+
 ### Managing boards from the dashboard
 
 `hermes dashboard` → Kanban tab shows a board switcher at the top as soon
