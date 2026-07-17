@@ -122,7 +122,7 @@ _IMPORT_SKIP_NAMES = {
 }
 
 # zipfile.open() drops Unix mode bits on extract; restore tightens these to 0600.
-_SECRET_FILE_NAMES = {".env", "auth.json", "state.db"}
+_SECRET_FILE_NAMES = {".env", "auth.json", "state.db", "work_contract_signing.key"}
 
 # Reserved archive subtree for provider state that lives OUTSIDE HERMES_HOME
 # (e.g. ~/.honcho, ~/.hindsight). The active memory provider declares these via
@@ -757,6 +757,9 @@ _QUICK_STATE_FILES = (
     "config.yaml",
     ".env",
     "auth.json",
+    # Same literal as kanban_intake.SIGNING_KEY_RELATIVE_PATH (kept inline to
+    # avoid an import cycle).
+    "kanban/work_contract_signing.key",
     "cron/jobs.json",
     "gateway_state.json",
     "channel_directory.json",
