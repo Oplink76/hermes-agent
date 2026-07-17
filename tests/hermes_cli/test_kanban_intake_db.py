@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -200,3 +201,113 @@ def test_epic_membership_has_one_parent_per_child(conn):
 
     with pytest.raises(sqlite3.IntegrityError):
         kb.add_epic_membership(conn, epic_id=epic_b, task_id=child)
+
+
+def test_strict_board_rejects_direct_task_insert_and_materializes_atomically(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.ensure_product_board_defaults("strict")
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    connection = kb.connect(board="strict")
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="qualification"):
+            connection.execute(
+                "INSERT INTO tasks (id, title, status, created_at) "
+                "VALUES ('t_direct', 'bypass', 'ready', 1)"
+            )
+
+        request_id = kb.create_qualification_intake(
+            connection, raw_request="qualified request", source="hermes"
+        )
+        signed = _signed_contract(request_id)
+        task_id = intake.materialize_contract(
+            connection,
+            board="strict",
+            signed_contract=signed,
+            secret=b"test-only-secret",
+        )
+        task = kb.get_task(connection, task_id)
+
+        assert task is not None
+        assert task.work_contract_id is not None
+        assert task.work_item_kind == "card"
+        assert task.workflow_template_id == "product"
+        assert task.current_step_key == "development"
+        assert task.assignee == "developer"
+        assert kb.get_qualification_intake(connection, request_id)["status"] == "qualified"
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+        with pytest.raises(sqlite3.IntegrityError, match="Work Contract-owned"):
+            connection.execute(
+                "UPDATE tasks SET assignee = 'reviewer', current_step_key = 'review' "
+                "WHERE id = ?",
+                (task_id,),
+            )
+        assert kb.set_phase(connection, task_id, "test", board="strict")
+        assert kb.get_task(connection, task_id).current_step_key == "test"
+        with pytest.raises(sqlite3.IntegrityError, match="Work Contract-owned"):
+            connection.execute(
+                "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (task_id, task_id),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="Work Contract-owned"):
+            connection.execute(
+                "INSERT INTO epic_memberships (epic_id, task_id, created_at) "
+                "VALUES (?, ?, 1)",
+                (task_id, task_id),
+            )
+        assert (
+            intake.materialize_contract(
+                connection,
+                board="strict",
+                signed_contract=signed,
+                secret=b"test-only-secret",
+            )
+            == task_id
+        )
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_materialization_rolls_back_contract_and_decision_on_invalid_relationship(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.ensure_product_board_defaults("strict")
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    connection = kb.connect(board="strict")
+    try:
+        request_id = kb.create_qualification_intake(
+            connection, raw_request="bad dependency", source="hermes"
+        )
+        contract = _signed_contract(request_id)["contract"]
+        contract["routing"]["dependencies"] = ["t_missing"]
+        signed = intake.sign_work_contract(contract, secret=b"test-only-secret")
+
+        with pytest.raises(ValueError, match="unknown parent"):
+            intake.materialize_contract(
+                connection,
+                board="strict",
+                signed_contract=signed,
+                secret=b"test-only-secret",
+            )
+
+        assert kb.get_qualification_intake(connection, request_id)["status"] == "pending"
+        assert kb.list_qualification_decisions(connection, request_id) == []
+        assert connection.execute("SELECT COUNT(*) FROM work_contracts").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        connection.close()

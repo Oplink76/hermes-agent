@@ -48,9 +48,10 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_cli import kanban_db
+from hermes_cli import kanban_intake
 from hermes_cli import kanban_diagnostics as kd
 
 log = logging.getLogger(__name__)
@@ -726,6 +727,8 @@ class _DeferredExpectedTaskSnapshotBody(BaseModel):
 
 
 class CreateTaskBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     title: str
     body: Optional[str] = None
     assignee: Optional[str] = None
@@ -750,6 +753,32 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        metadata = kanban_db.read_board_metadata(board)
+        if kanban_intake.qualification_required(metadata):
+            receipt = kanban_intake.submit_intake(
+                conn,
+                request={
+                    "title": payload.title,
+                    "body": payload.body,
+                    "assignee": payload.assignee,
+                    "tenant": payload.tenant,
+                    "priority": payload.priority,
+                    "workspace_kind": payload.workspace_kind,
+                    "workspace_path": payload.workspace_path,
+                    "parents": list(payload.parents),
+                    "triage": payload.triage,
+                    "idempotency_key": payload.idempotency_key,
+                    "max_runtime_seconds": payload.max_runtime_seconds,
+                    "skills": list(payload.skills or []),
+                    "goal_mode": payload.goal_mode,
+                    "goal_max_turns": payload.goal_max_turns,
+                    "project_id": payload.project_id,
+                    "workflow_template_id": payload.workflow_template_id,
+                    "current_step_key": payload.current_step_key,
+                },
+                source="dashboard",
+            )
+            return JSONResponse(status_code=202, content=receipt)
         task_id = kanban_db.create_task(
             conn,
             title=payload.title,
@@ -1030,6 +1059,27 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        lifecycle_statuses = {
+            None, "done", "blocked", "scheduled", "ready", "archived", "running"
+        }
+        if (
+            kanban_intake.qualification_required(
+                kanban_db.read_board_metadata(board)
+            )
+            and (
+                payload.assignee is not None
+                or payload.workflow_template_id is not None
+                or payload.current_step_key is not None
+                or payload.status not in lifecycle_statuses
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Strict-board routing is owned by the Work Contract; "
+                    "submit a reassessment request instead"
+                ),
+            )
         try:
             updated = _patch_task(conn, task_id, payload, board=board)
         except _TaskSnapshotConflict as exc:
@@ -1694,6 +1744,11 @@ class DeleteLinkBody(_ExpectedTaskSnapshotBody):
 @router.post("/links")
 def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
+    if kanban_intake.qualification_required(kanban_db.read_board_metadata(board)):
+        raise HTTPException(
+            status_code=409,
+            detail="Strict-board dependencies are owned by the Work Contract",
+        )
     if payload.expected_task_id not in {payload.parent_id, payload.child_id}:
         raise HTTPException(status_code=400, detail="expected_task_id must be part of the link")
     conn = _conn(board=board)
@@ -1723,6 +1778,11 @@ def delete_link(
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
+    if kanban_intake.qualification_required(kanban_db.read_board_metadata(board)):
+        raise HTTPException(
+            status_code=409,
+            detail="Strict-board dependencies are owned by the Work Contract",
+        )
     if payload.expected_task_id not in {parent_id, child_id}:
         raise HTTPException(status_code=400, detail="expected_task_id must be part of the link")
     conn = _conn(board=board)

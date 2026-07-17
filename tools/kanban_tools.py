@@ -1194,6 +1194,38 @@ def _handle_create(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            from hermes_cli import kanban_intake
+
+            metadata = kb.read_board_metadata(
+                board or kb._board_slug_for_connection(conn)
+            )
+            if kanban_intake.qualification_required(metadata):
+                receipt = kanban_intake.submit_intake(
+                    conn,
+                    request={
+                        "title": str(title).strip(),
+                        "body": body,
+                        "assignee": str(assignee),
+                        "parents": list(parents),
+                        "tenant": tenant,
+                        "priority": int(priority) if priority is not None else 0,
+                        "workspace_kind": str(workspace_kind),
+                        "workspace_path": workspace_path,
+                        "project_id": project_id,
+                        "triage": triage,
+                        "idempotency_key": idempotency_key,
+                        "max_runtime_seconds": max_runtime_seconds,
+                        "skills": list(skills) if skills is not None else [],
+                        "goal_mode": goal_mode,
+                        "goal_max_turns": goal_max_turns,
+                        "initial_status": str(initial_status),
+                        "workflow_template_id": workflow_template_id,
+                        "current_step_key": current_step_key,
+                    },
+                    source="worker",
+                    session_id=session_id,
+                )
+                return _ok(**receipt)
             # Inherit the spawning worker's own task workspace when the
             # caller didn't specify one (see resolution note above).
             if _inherit_workspace:
@@ -1407,6 +1439,14 @@ def _handle_link(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            from hermes_cli import kanban_intake
+
+            if kanban_intake.qualification_required(
+                kb.read_board_metadata(board or kb._board_slug_for_connection(conn))
+            ):
+                return tool_error(
+                    "kanban_link: strict-board dependencies are owned by the Work Contract"
+                )
             kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
             return _ok(parent_id=parent_id, child_id=child_id)
         finally:

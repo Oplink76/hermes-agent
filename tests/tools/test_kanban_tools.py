@@ -2314,6 +2314,44 @@ def test_board_param_routes_create_to_alt_board(multi_board_env):
         assert kb.get_task(conn, new_tid) is None
 
 
+def test_strict_board_worker_create_returns_inert_intake(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    kb.ensure_product_board_defaults("strict")
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    result = json.loads(
+        kt._handle_create(
+            {
+                "title": "worker-proposed fix",
+                "assignee": "developer",
+                "parents": ["t_worker"],
+                "board": "strict",
+                "current_step_key": "review",
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "qualification_required"
+    assert result["intake_status"] == "pending"
+    assert result["intake_id"].startswith("qi_")
+    assert "task_id" not in result
+    with kb.connect(board="strict") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        record = kb.get_qualification_intake(conn, result["intake_id"])
+    assert "worker-proposed fix" in record["raw_request"]
+
+
 def test_board_param_routes_list_to_alt_board(multi_board_env):
     """kanban_list filters by the board parameter, not env-active."""
     from tools import kanban_tools as kt

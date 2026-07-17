@@ -339,3 +339,130 @@ def materialization_fields(
         }
     )
     return fields
+
+
+def qualification_required(board_metadata: Mapping[str, Any]) -> bool:
+    """Return whether executable work on this board requires qualification."""
+
+    policy = board_metadata.get("qualification")
+    return isinstance(policy, Mapping) and policy.get("required") is True
+
+
+def submit_intake(
+    conn: Any,
+    *,
+    request: Mapping[str, Any],
+    source: str,
+    session_id: Optional[str] = None,
+    attachments: tuple[dict[str, Any], ...] = (),
+) -> dict[str, Any]:
+    """Persist one untrusted create request and return a stable receipt."""
+
+    from hermes_cli import kanban_db
+
+    raw_request = json.dumps(
+        {"kind": "task_create", "request": copy.deepcopy(dict(request))},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+    intake_id = kanban_db.create_qualification_intake(
+        conn,
+        raw_request=raw_request,
+        source=source,
+        session_id=session_id,
+        attachments=attachments,
+    )
+    return {
+        "status": "qualification_required",
+        "intake_id": intake_id,
+        "intake_status": "pending",
+    }
+
+
+def materialize_contract(
+    conn: Any,
+    *,
+    board: str,
+    signed_contract: Mapping[str, Any],
+    secret: Optional[bytes] = None,
+    hermes_home: Optional[Path] = None,
+) -> str:
+    """Atomically turn one valid Work Contract into exactly one work item."""
+
+    from hermes_cli import kanban_db
+
+    metadata = kanban_db.read_board_metadata(board)
+    if not qualification_required(metadata):
+        raise WorkContractError("contract materialization requires a strict board")
+    fields = materialization_fields(
+        metadata,
+        signed_contract=signed_contract,
+        secret=secret,
+        hermes_home=hermes_home,
+    )
+    contract = signed_contract["contract"]
+    request_id = contract["request_id"]
+
+    with kanban_db.write_txn(conn):
+        contract_id = kanban_db.store_work_contract(
+            conn,
+            dict(signed_contract),
+            secret=secret,
+            hermes_home=hermes_home,
+        )
+        existing = conn.execute(
+            "SELECT id FROM tasks WHERE work_contract_id = ?", (contract_id,)
+        ).fetchone()
+        if existing:
+            return str(existing["id"])
+
+        intake_record = kanban_db.get_qualification_intake(conn, request_id)
+        if intake_record is None:
+            raise WorkContractError(f"unknown qualification intake: {request_id}")
+        if intake_record["status"] != "pending":
+            raise WorkContractError(
+                f"qualification intake {request_id} is already {intake_record['status']}"
+            )
+
+        kanban_db.record_qualification_decision(
+            conn,
+            intake_id=request_id,
+            decision="qualified",
+            actor_profile=str(contract["issuer"]["profile"]),
+            reason="Work Contract validated and materialized",
+            contract_id=contract_id,
+        )
+        with kanban_db.authorized_governance_write():
+            task_id = kanban_db.create_task(
+                conn,
+                title=str(fields["title"]),
+                body=str(fields["body"]),
+                assignee=fields["assignee"],
+                created_by="hermes-qualification",
+                parents=tuple(fields["parents"]),
+                board=board,
+                workflow_template_id=fields["workflow_template_id"],
+                current_step_key=fields["current_step_key"],
+                work_contract_id=contract_id,
+                work_item_kind=fields["work_item_kind"],
+            )
+            epic_id = fields.get("epic_id")
+            if epic_id:
+                kanban_db.add_epic_membership(
+                    conn, epic_id=str(epic_id), task_id=task_id
+                )
+        kanban_db._append_event(
+            conn,
+            task_id,
+            "contract_materialized",
+            {
+                "request_id": request_id,
+                "work_contract_id": contract_id,
+                "contract_digest": fields["contract_digest"],
+                "qualification_path": contract["qualification_path"],
+                "classification": fields["classification"],
+            },
+        )
+    return task_id

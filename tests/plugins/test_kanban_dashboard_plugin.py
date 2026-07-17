@@ -420,6 +420,72 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_strict_board_post_tasks_returns_intake_without_task(client):
+    kb.ensure_product_board_defaults("strict")
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    response = client.post(
+        "/api/plugins/kanban/tasks?board=strict",
+        json={
+            "title": "dashboard request",
+            "assignee": "reviewer",
+            "current_step_key": "review",
+            "parents": ["t_missing"],
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["status"] == "qualification_required"
+    assert body["intake_status"] == "pending"
+    assert body["intake_id"].startswith("qi_")
+    assert "task" not in body
+    with kb.connect(board="strict") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        record = kb.get_qualification_intake(conn, body["intake_id"])
+    assert "dashboard request" in record["raw_request"]
+
+
+def test_strict_board_rejects_client_contract_and_routing_mutations(client):
+    kb.ensure_product_board_defaults("strict")
+    with kb.connect(board="strict") as conn:
+        first = kb.create_task(conn, title="Legacy first", assignee="developer")
+        second = kb.create_task(conn, title="Legacy second", assignee="developer")
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    forbidden_create = client.post(
+        "/api/plugins/kanban/tasks?board=strict",
+        json={"title": "bypass", "contract": {"signature": "caller"}},
+    )
+    assert forbidden_create.status_code == 422
+
+    routing = client.patch(
+        f"/api/plugins/kanban/tasks/{first}?board=strict",
+        json={"assignee": "reviewer", "current_step_key": "review"},
+    )
+    assert routing.status_code == 409
+    assert "Work Contract" in routing.text
+
+    dependency = client.post(
+        "/api/plugins/kanban/links?board=strict",
+        json={"parent_id": first, "child_id": second, "expected_task_id": second},
+    )
+    assert dependency.status_code == 409
+    assert "Work Contract" in dependency.text
+
+    comment = client.post(
+        f"/api/plugins/kanban/tasks/{first}/comments?board=strict",
+        json={"author": "tester", "body": "Evidence remains writable"},
+    )
+    assert comment.status_code == 200
+
+
 def test_board_list_recommends_persistent_workspace_for_configured_workdir(
     client, tmp_path
 ):

@@ -95,6 +95,10 @@ from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
 
+_GOVERNANCE_WRITE_AUTHORIZED: ContextVar[bool] = ContextVar(
+    "kanban_governance_write_authorized", default=False
+)
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1544,7 +1548,7 @@ def set_phase(
     if meta is None or not _handoff_v2_enabled(meta):
         return False
     _validate_product_workflow_state(PRODUCT_WORKFLOW_TEMPLATE_ID, phase)
-    with write_txn(conn):
+    with authorized_governance_write(), write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET current_step_key = ? WHERE id = ?",
             (phase, task_id),
@@ -2051,7 +2055,7 @@ def _complete_product_workflow_step(
             conn, task_id, pre_step, metadata, meta,
         )
 
-    with write_txn(conn):
+    with authorized_governance_write(), write_txn(conn):
         row = conn.execute(
             "SELECT status, assignee, workflow_template_id, current_step_key "
             "FROM tasks WHERE id = ?",
@@ -2309,7 +2313,7 @@ def resolve_product_preflight(
     if meta is None:
         raise ValueError("Resolver decisions require a product board")
 
-    with write_txn(conn):
+    with authorized_governance_write(), write_txn(conn):
         row = conn.execute(
             "SELECT status, assignee, project_id, workflow_template_id, "
             "current_step_key, workspace_kind, workspace_path, branch_name, "
@@ -3217,6 +3221,13 @@ CREATE TABLE IF NOT EXISTS epic_memberships (
     PRIMARY KEY (epic_id, task_id)
 );
 
+CREATE TABLE IF NOT EXISTS board_governance (
+    id                     INTEGER PRIMARY KEY CHECK (id = 1),
+    qualification_required INTEGER NOT NULL DEFAULT 0
+                               CHECK (qualification_required IN (0, 1))
+);
+INSERT OR IGNORE INTO board_governance (id, qualification_required) VALUES (1, 0);
+
 CREATE TABLE IF NOT EXISTS task_comments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id    TEXT NOT NULL,
@@ -3357,6 +3368,22 @@ WHEN NEW.status IS NOT OLD.status
 BEGIN
     SELECT RAISE(ABORT, 'qualification status requires an append-only decision');
 END;
+CREATE TRIGGER IF NOT EXISTS board_governance_no_direct_update
+BEFORE UPDATE ON board_governance
+WHEN hermes_governance_write_authorized() != 1
+BEGIN
+    SELECT RAISE(ABORT, 'board governance is service-owned');
+END;
+CREATE TRIGGER IF NOT EXISTS board_governance_no_delete
+BEFORE DELETE ON board_governance BEGIN
+    SELECT RAISE(ABORT, 'board governance is service-owned');
+END;
+CREATE TRIGGER IF NOT EXISTS work_contracts_service_insert
+BEFORE INSERT ON work_contracts
+WHEN hermes_governance_write_authorized() != 1
+BEGIN
+    SELECT RAISE(ABORT, 'Work Contracts are service-owned');
+END;
 """
 
 
@@ -3408,7 +3435,23 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     # the PRAGMA explicitly so it is observable and survives future wrapper
     # changes. Parameter binding is not supported for PRAGMA assignments.
     conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    conn.create_function(
+        "hermes_governance_write_authorized",
+        0,
+        lambda: 1 if _GOVERNANCE_WRITE_AUTHORIZED.get() else 0,
+    )
     return conn
+
+
+@contextlib.contextmanager
+def authorized_governance_write():
+    """Authorize one service-owned governance write in the current context."""
+
+    token = _GOVERNANCE_WRITE_AUTHORIZED.set(True)
+    try:
+        yield
+    finally:
+        _GOVERNANCE_WRITE_AUTHORIZED.reset(token)
 
 
 @contextlib.contextmanager
@@ -3785,10 +3828,14 @@ def connect(
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
     """
+    governance_board: Optional[str] = None
     if db_path is not None:
         path = db_path
     else:
         path = kanban_db_path(board=board)
+        governance_board = (
+            _normalize_board_slug(board) if board is not None else get_current_board()
+        ) or DEFAULT_BOARD
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -3817,6 +3864,7 @@ def connect(
         except Exception:
             conn.close()
             raise
+        _sync_board_governance(conn, governance_board)
         return conn
 
     with _cross_process_init_lock(path):
@@ -3865,7 +3913,33 @@ def connect(
         except Exception:
             conn.close()
             raise
+    _sync_board_governance(conn, governance_board)
     return conn
+
+
+def _sync_board_governance(
+    conn: sqlite3.Connection, board: Optional[str]
+) -> None:
+    """Mirror the board's qualification gate into its SQLite write boundary."""
+
+    if board is None:
+        return
+    metadata = read_board_metadata(board)
+    qualification = metadata.get("qualification")
+    required = int(
+        isinstance(qualification, dict) and qualification.get("required") is True
+    )
+    row = conn.execute(
+        "SELECT qualification_required FROM board_governance WHERE id = 1"
+    ).fetchone()
+    if row is not None and int(row["qualification_required"]) == required:
+        return
+    with authorized_governance_write():
+        conn.execute(
+            "INSERT INTO board_governance (id, qualification_required) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET qualification_required = excluded.qualification_required",
+            (required,),
+        )
 
 
 @contextlib.contextmanager
@@ -4225,7 +4299,103 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             (new, old),
         )
 
+    _ensure_qualification_boundary_objects(conn)
     _rebuild_drifted_tables(conn)
+
+
+def _ensure_qualification_boundary_objects(conn: sqlite3.Connection) -> None:
+    """Install strict-write objects only after legacy task columns exist."""
+
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_work_contract_unique "
+        "ON tasks(work_contract_id) WHERE work_contract_id IS NOT NULL"
+    )
+    required_tables = {
+        "board_governance",
+        "work_contracts",
+        "qualification_intake_decisions",
+        "task_links",
+        "epic_memberships",
+    }
+    present_tables = {
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if not required_tables <= present_tables:
+        return
+    conn.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS strict_tasks_require_qualification
+        BEFORE INSERT ON tasks
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND (
+             NEW.work_contract_id IS NULL
+             OR NOT EXISTS (
+                 SELECT 1
+                 FROM work_contracts wc
+                 JOIN qualification_intake_decisions qd
+                   ON qd.contract_id = wc.id
+                  AND qd.intake_id = wc.request_id
+                 WHERE wc.id = NEW.work_contract_id
+                   AND qd.decision IN ('qualified', 'overridden')
+                   AND qd.id = (
+                       SELECT MAX(latest.id)
+                       FROM qualification_intake_decisions latest
+                       WHERE latest.intake_id = wc.request_id
+                   )
+             )
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'qualification required before task materialization');
+        END;
+        CREATE TRIGGER IF NOT EXISTS strict_task_links_service_insert
+        BEFORE INSERT ON task_links
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND hermes_governance_write_authorized() != 1
+        BEGIN
+            SELECT RAISE(ABORT, 'strict-board dependencies are Work Contract-owned');
+        END;
+        CREATE TRIGGER IF NOT EXISTS strict_task_routing_service_update
+        BEFORE UPDATE OF assignee, workflow_template_id, current_step_key,
+                         work_contract_id, work_item_kind ON tasks
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND OLD.work_contract_id IS NOT NULL
+         AND hermes_governance_write_authorized() != 1
+         AND (
+             NEW.assignee IS NOT OLD.assignee
+             OR NEW.workflow_template_id IS NOT OLD.workflow_template_id
+             OR NEW.current_step_key IS NOT OLD.current_step_key
+             OR NEW.work_contract_id IS NOT OLD.work_contract_id
+             OR NEW.work_item_kind IS NOT OLD.work_item_kind
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'strict-board routing is Work Contract-owned');
+        END;
+        CREATE TRIGGER IF NOT EXISTS strict_task_links_service_delete
+        BEFORE DELETE ON task_links
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND hermes_governance_write_authorized() != 1
+        BEGIN
+            SELECT RAISE(ABORT, 'strict-board dependencies are Work Contract-owned');
+        END;
+        CREATE TRIGGER IF NOT EXISTS strict_epic_memberships_service_insert
+        BEFORE INSERT ON epic_memberships
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND hermes_governance_write_authorized() != 1
+        BEGIN
+            SELECT RAISE(ABORT, 'strict-board Epic membership is Work Contract-owned');
+        END;
+        CREATE TRIGGER IF NOT EXISTS strict_epic_memberships_service_delete
+        BEFORE DELETE ON epic_memberships
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND hermes_governance_write_authorized() != 1
+        BEGIN
+            SELECT RAISE(ABORT, 'strict-board Epic membership is Work Contract-owned');
+        END;
+        """
+    )
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -4795,47 +4965,48 @@ def store_work_contract(
     contract_id = "wc_" + digest[:24]
     issuer = contract["issuer"]
     now = int(time.time()) if created_at is None else int(created_at)
-    with write_txn(conn):
-        intake_row = conn.execute(
-            "SELECT id FROM qualification_intake WHERE id = ?",
-            (contract["request_id"],),
-        ).fetchone()
-        if not intake_row:
-            raise ValueError(
-                f"unknown qualification intake: {contract['request_id']}"
-            )
-        existing = conn.execute(
-            "SELECT id, canonical_json, signature FROM work_contracts WHERE digest = ?",
-            (digest,),
-        ).fetchone()
-        if existing:
-            if (
-                existing["canonical_json"] != signed_contract["canonical_json"]
-                or existing["signature"] != signed_contract["signature"]
-            ):
+    with authorized_governance_write():
+        with write_txn(conn):
+            intake_row = conn.execute(
+                "SELECT id FROM qualification_intake WHERE id = ?",
+                (contract["request_id"],),
+            ).fetchone()
+            if not intake_row:
                 raise ValueError(
-                    "stored Work Contract digest conflicts with signed payload"
+                    f"unknown qualification intake: {contract['request_id']}"
                 )
-            return existing["id"]
-        conn.execute(
-            """
-            INSERT INTO work_contracts (
-                id, request_id, canonical_json, digest, signature,
-                issuer_profile, issuer_run_id, policy_version, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                contract_id,
-                contract["request_id"],
-                signed_contract["canonical_json"],
-                digest,
-                signed_contract["signature"],
-                issuer["profile"],
-                issuer["run_id"],
-                contract["policy_version"],
-                now,
-            ),
-        )
+            existing = conn.execute(
+                "SELECT id, canonical_json, signature FROM work_contracts WHERE digest = ?",
+                (digest,),
+            ).fetchone()
+            if existing:
+                if (
+                    existing["canonical_json"] != signed_contract["canonical_json"]
+                    or existing["signature"] != signed_contract["signature"]
+                ):
+                    raise ValueError(
+                        "stored Work Contract digest conflicts with signed payload"
+                    )
+                return existing["id"]
+            conn.execute(
+                """
+                INSERT INTO work_contracts (
+                    id, request_id, canonical_json, digest, signature,
+                    issuer_profile, issuer_run_id, policy_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    contract_id,
+                    contract["request_id"],
+                    signed_contract["canonical_json"],
+                    digest,
+                    signed_contract["signature"],
+                    issuer["profile"],
+                    issuer["run_id"],
+                    contract["policy_version"],
+                    now,
+                ),
+            )
     return contract_id
 
 
@@ -4938,6 +5109,8 @@ def create_task(
     project_id: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
+    work_contract_id: Optional[str] = None,
+    work_item_kind: str = "card",
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -4978,6 +5151,8 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    if work_item_kind not in {"card", "epic"}:
+        raise ValueError("work_item_kind must be card or epic")
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -5238,8 +5413,9 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
-                        workflow_template_id, current_step_key
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        workflow_template_id, current_step_key,
+                        work_contract_id, work_item_kind
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -5264,6 +5440,8 @@ def create_task(
                         session_id,
                         workflow_template_id,
                         current_step_key,
+                        work_contract_id,
+                        work_item_kind,
                     ),
                 )
                 for pid in parents:
@@ -6753,7 +6931,7 @@ def _route_product_rework_if_requested(
     except (TypeError, ValueError):
         max_cycles = 3
     max_cycles = max(1, max_cycles)
-    with write_txn(conn):
+    with authorized_governance_write(), write_txn(conn):
         row = conn.execute(
             "SELECT title, assignee, status, current_step_key, "
             "current_run_id, rework_count FROM tasks WHERE id = ?",
@@ -7038,7 +7216,7 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    with write_txn(conn):
+    with authorized_governance_write(), write_txn(conn):
         terminal_row = conn.execute(
             "SELECT current_step_key FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -10873,7 +11051,7 @@ def handoff(
     next_assignee = _product_role_assignee(meta, next_role)
 
     try:
-        with write_txn(conn):
+        with authorized_governance_write(), write_txn(conn):
             sql = (
             # Release the completing worker's claim as part of the atomic advance:
             # the card is being handed to a NEW assignee, so the old claim is dead.
