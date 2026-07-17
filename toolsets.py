@@ -281,6 +281,7 @@ TOOLSETS = {
         "description": "Minimal read-only evidence surface for Hermes Resolver.",
         "tools": ["read_file", "search_files", "web_search", "web_extract"],
         "includes": [],
+        "posture": True,
     },
 
     "discord": {
