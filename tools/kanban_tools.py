@@ -93,6 +93,18 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _check_resolver_mode() -> bool:
+    """Expose the Resolver mutation only to a task-scoped Resolver run."""
+    return bool(os.environ.get("HERMES_KANBAN_TASK")) and (
+        os.environ.get("HERMES_PROFILE") == "resolver"
+    )
+
+
+def _check_ordinary_worker_mode() -> bool:
+    """Normal lifecycle exits are unavailable to the privileged Resolver."""
+    return _check_kanban_mode() and not _check_resolver_mode()
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -225,7 +237,20 @@ def _product_role_assignees_from_config() -> dict[str, str]:
     return {str(k): str(v) for k, v in raw.items() if str(v).strip()}
 
 
-def _product_human_escalation_profile() -> str:
+def _product_human_escalation_profile(board: Optional[str] = None) -> str:
+    """Prefer the active product board's routing policy over local config."""
+    try:
+        from hermes_cli import kanban_db as kb
+
+        active_board = board or os.environ.get("HERMES_KANBAN_BOARD")
+        meta = kb.product_board_metadata(active_board)
+        workflow = meta.get("product_workflow") if isinstance(meta, dict) else None
+        if isinstance(workflow, dict):
+            profile = str(workflow.get("human_escalation_profile") or "").strip()
+            if profile:
+                return profile
+    except Exception:
+        logger.debug("could not read product-board escalation profile", exc_info=True)
     cfg = _product_workflow_cfg()
     return str(cfg.get("human_escalation_profile") or "default").strip() or "default"
 
@@ -498,6 +523,12 @@ def _handle_show(args: dict, **kw) -> str:
                     "result": t.result,
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
+                    "project_id": t.project_id,
+                    "branch_name": t.branch_name,
+                    "workflow_template_id": t.workflow_template_id,
+                    "current_step_key": t.current_step_key,
+                    "running": t.running,
+                    "blocked": t.blocked,
                 }
 
             def _run_dict(r):
@@ -519,7 +550,7 @@ def _handle_show(args: dict, **kw) -> str:
                     for c in comments
                 ],
                 "events": [
-                    {"kind": e.kind, "payload": e.payload,
+                    {"id": e.id, "kind": e.kind, "payload": e.payload,
                      "created_at": e.created_at, "run_id": e.run_id}
                     for e in events[-50:]   # cap; full log via CLI
                 ],
@@ -614,7 +645,7 @@ def _handle_complete(args: dict, **kw) -> str:
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
-    for field in ("workflow_outcome", "resolver_action"):
+    for field in ("workflow_outcome",):
         value = args.get(field)
         if value is None:
             continue
@@ -831,6 +862,60 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(f"kanban_complete: {e}")
 
 
+def _handle_resolve(args: dict, **kw) -> str:
+    """Apply one audited Resolver decision to the current preflight."""
+    from hermes_cli import kanban_db as kb_module
+
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    resolver_profile = os.environ.get("HERMES_PROFILE") or ""
+    if resolver_profile != "resolver":
+        return tool_error("kanban_resolve is restricted to the resolver profile")
+
+    board = args.get("board")
+    request_fields = (
+        "decision", "fault_domain", "diagnosis", "reason", "expected",
+        "repair", "fix_task_id",
+    )
+    request = {field: args[field] for field in request_fields if field in args}
+    resolver_model = (
+        os.environ.get("HERMES_INFERENCE_MODEL")
+        or os.environ.get("HERMES_MODEL")
+        or None
+    )
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.resolve_product_preflight(
+                conn,
+                tid,
+                board=board or os.environ.get("HERMES_KANBAN_BOARD"),
+                request=request,
+                resolver_profile=resolver_profile,
+                resolver_model=resolver_model,
+            )
+            if not ok:
+                return tool_error(f"could not resolve preflight for {tid}")
+            return _ok(task_id=tid, decision=request.get("decision"))
+        finally:
+            conn.close()
+    except kb_module.TaskSnapshotConflict:
+        return tool_error(
+            "kanban_resolve conflict: task changed; refresh with kanban_show"
+        )
+    except ValueError as e:
+        return tool_error(f"kanban_resolve: {e}")
+    except Exception as e:
+        logger.exception("kanban_resolve failed")
+        return tool_error(f"kanban_resolve: {e}")
+
+
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
     tid = _default_task_id(args.get("task_id"))
@@ -908,7 +993,7 @@ def _handle_block(args: dict, **kw) -> str:
                 attempted_resolutions=attempted_resolutions,
                 expected_run_id=_worker_run_id(tid),
                 board=board,
-                human_escalation_assignee=_product_human_escalation_profile(),
+                human_escalation_assignee=_product_human_escalation_profile(board),
             )
             if not ok:
                 return tool_error(
@@ -1517,20 +1602,6 @@ KANBAN_COMPLETE_SCHEMA = {
                     },
                 ],
             },
-            "resolver_action": {
-                "type": "object",
-                "description": "Required when resolving a product human-input preflight.",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["resume", "create_fix_task", "escalate"],
-                    },
-                    "resolution": {"type": "string"},
-                    "fix_task_id": {"type": ["string", "null"]},
-                },
-                "required": ["action", "resolution", "fix_task_id"],
-                "additionalProperties": False,
-            },
             "result": {
                 "type": "string",
                 "description": (
@@ -1580,6 +1651,89 @@ KANBAN_COMPLETE_SCHEMA = {
             "board": _board_schema_prop(),
         },
         "required": [],
+    },
+}
+
+KANBAN_RESOLVE_SCHEMA = {
+    "name": "kanban_resolve",
+    "description": (
+        "Resolve the current Hermes product-workflow preflight using one "
+        "audited, compare-and-swap decision. Resolver-only. Read the task "
+        "with kanban_show immediately before calling and copy the complete "
+        "task/preflight snapshot into expected. Conflicts never retry "
+        "automatically."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "board": _board_schema_prop(),
+            "decision": {
+                "type": "string",
+                "enum": ["resume", "repair", "create_fix_task", "escalate"],
+            },
+            "fault_domain": {
+                "type": "string",
+                "enum": ["task_state", "framework"],
+            },
+            "diagnosis": {"type": "string"},
+            "reason": {"type": "string"},
+            "expected": {
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "integer"},
+                    "preflight_event_id": {"type": "integer"},
+                    "status": {"type": "string"},
+                    "phase": {"type": ["string", "null"]},
+                    "assignee": {"type": ["string", "null"]},
+                    "project_id": {"type": ["string", "null"]},
+                    "workflow_template_id": {"type": ["string", "null"]},
+                    "workspace_kind": {"type": "string"},
+                    "workspace_path": {"type": ["string", "null"]},
+                    "branch_name": {"type": ["string", "null"]},
+                    "running": {"type": "boolean"},
+                    "blocked": {"type": "boolean"},
+                },
+                "required": [
+                    "run_id", "preflight_event_id", "status", "phase",
+                    "assignee", "project_id", "workflow_template_id",
+                    "workspace_kind", "workspace_path", "branch_name",
+                    "running", "blocked",
+                ],
+                "additionalProperties": False,
+            },
+            "repair": {
+                "type": "object",
+                "properties": {
+                    "workflow": {
+                        "type": "object",
+                        "properties": {
+                            "phase": {
+                                "type": "string",
+                                "enum": [
+                                    "backlog", "architecture", "development",
+                                    "test", "review",
+                                ],
+                            },
+                            "assignee": {"type": "string"},
+                            "project_id": {"type": "string"},
+                        },
+                        "additionalProperties": False,
+                    },
+                    "adopt_handoff_sha": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+            "fix_task_id": {"type": "string"},
+        },
+        "required": [
+            "task_id", "decision", "fault_domain", "diagnosis", "reason",
+            "expected",
+        ],
+        "additionalProperties": False,
     },
 }
 
@@ -1938,8 +2092,17 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_COMPLETE_SCHEMA,
     handler=_handle_complete,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_ordinary_worker_mode,
     emoji="✔",
+)
+
+registry.register(
+    name="kanban_resolve",
+    toolset="kanban",
+    schema=KANBAN_RESOLVE_SCHEMA,
+    handler=_handle_resolve,
+    check_fn=_check_resolver_mode,
+    emoji="🧭",
 )
 
 registry.register(
@@ -1947,7 +2110,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_BLOCK_SCHEMA,
     handler=_handle_block,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_ordinary_worker_mode,
     emoji="⏸",
 )
 

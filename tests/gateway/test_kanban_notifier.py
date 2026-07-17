@@ -54,6 +54,86 @@ def _create_completed_subscription(summary="done once"):
         conn.close()
 
 
+def _create_needs_ole_subscription():
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="repair audit", assignee="developer")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(
+            conn,
+            tid,
+            kind="needs_ole",
+            payload={
+                "reason": "resolver_repair",
+                "diagnosis": "Recovered malformed workflow routing",
+                "resolver_profile": "resolver",
+            },
+        )
+        return tid
+    finally:
+        conn.close()
+
+
+def _unseen_needs_ole_events(tid):
+    conn = kb.connect()
+    try:
+        _, events = kb.unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            kinds=["needs_ole"],
+        )
+        return events
+    finally:
+        conn.close()
+
+
+def test_kanban_notifier_delivers_needs_ole_repair_audit(tmp_path, monkeypatch):
+    db_path = tmp_path / "needs-ole.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_needs_ole_subscription()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    message = adapter.sent[0]["text"]
+    assert tid in message
+    assert "repair audit" in message
+    assert "resolver" in message
+    assert "Recovered malformed workflow routing" in message
+
+
+def test_kanban_notifier_retries_needs_ole_after_send_failure(tmp_path, monkeypatch):
+    db_path = tmp_path / "needs-ole-retry.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_needs_ole_subscription()
+
+    adapter = FailingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert adapter.attempts == 1
+    assert [event.kind for event in _unseen_needs_ole_events(tid)] == ["needs_ole"]
+
+
+def test_needs_ole_does_not_unsubscribe_nonterminal_task(tmp_path, monkeypatch):
+    db_path = tmp_path / "needs-ole-subscription.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_needs_ole_subscription()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(RecordingAdapter())))
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        subs = kb.list_notify_subs(conn, tid)
+    assert task.status not in {"done", "archived"}
+    assert len(subs) == 1
+
+
 def _unseen_terminal_events(tid):
     conn = kb.connect()
     try:
