@@ -684,8 +684,8 @@ def _rollback_receipt_quiescent(
         raise MigrationBlocked("cannot rollback while board work is running")
 
     snapshot_uri = f"file:{Path(snapshot['db'])}?mode=ro&immutable=1"
-    with sqlite3.connect(snapshot_uri, uri=True) as source:
-        with sqlite3.connect(str(live["db"])) as target:
+    with contextlib.closing(sqlite3.connect(snapshot_uri, uri=True)) as source:
+        with contextlib.closing(sqlite3.connect(str(live["db"]))) as target:
             source.backup(target)
 
     metadata_live = Path(live["metadata"])
