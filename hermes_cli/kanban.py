@@ -969,11 +969,15 @@ def kanban_command(args: argparse.Namespace) -> int:
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
     with board_scope:
-        try:
-            kb.init_db()
-        except Exception as exc:
-            print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
-            return 1
+        # Qualification migration owns its full safety boundary: dry-run must
+        # be byte-for-byte read-only, while apply must snapshot before any
+        # schema migration. Its implementation opens the board itself.
+        if action != "qualification-migrate":
+            try:
+                kb.init_db()
+            except Exception as exc:
+                print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
+                return 1
 
         handlers = {
             "init":     _cmd_init,

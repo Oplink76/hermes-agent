@@ -96,9 +96,18 @@ def test_dry_run_is_read_only_and_reports_safe_routes(product_board):
     assert report["strict_ready"] is True
 
 
-def test_cli_exposes_json_dry_run_for_scoped_product_board(product_board):
+def test_cli_exposes_json_dry_run_without_initializing_board(
+    product_board, monkeypatch
+):
     _home, board = product_board
     _create_legacy_fixture(board)
+    monkeypatch.setattr(
+        kb,
+        "init_db",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("dry-run must not initialize or migrate the board")
+        ),
+    )
 
     payload = json.loads(
         kc.run_slash(f"--board {board} qualification-migrate --json")
