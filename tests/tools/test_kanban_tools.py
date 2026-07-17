@@ -247,6 +247,28 @@ def test_show_explicit_task_id(worker_env):
     assert d["task"]["id"] == other
 
 
+def test_show_separates_epic_membership_from_dependencies(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        epic = kb.create_task(conn, title="Outcome", work_item_kind="epic")
+        dependency = kb.create_task(conn, title="Dependency")
+        card = kb.create_task(conn, title="Member")
+        kb.add_epic_membership(conn, epic_id=epic, task_id=card)
+        kb.link_tasks(conn, dependency, card)
+
+    shown = json.loads(kt._handle_show({"task_id": card}))
+    assert shown["task"]["work_item_kind"] == "card"
+    assert shown["epic"] == {"id": epic, "title": "Outcome"}
+    assert shown["dependencies"] == [dependency]
+    assert shown["dependents"] == []
+
+    epic_shown = json.loads(kt._handle_show({"task_id": epic}))
+    assert epic_shown["task"]["work_item_kind"] == "epic"
+    assert epic_shown["members"] == [card]
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

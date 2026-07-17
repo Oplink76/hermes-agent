@@ -462,6 +462,8 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     """Compact task shape for board-listing tools."""
     parents = kb.parent_ids(conn, task.id)
     children = kb.child_ids(conn, task.id)
+    epic_id = kb.epic_id_for_task(conn, task.id)
+    epic = kb.get_task(conn, epic_id) if epic_id else None
     return {
         "id": task.id,
         "title": task.title,
@@ -478,6 +480,14 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
+        "work_item_kind": task.work_item_kind,
+        "epic": (
+            {"id": epic_id, "title": epic.title if epic is not None else epic_id}
+            if epic_id
+            else None
+        ),
+        "dependencies": parents,
+        "dependents": children,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -509,6 +519,8 @@ def _handle_show(args: dict, **kw) -> str:
             runs = kb.list_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
+            epic_id = kb.epic_id_for_task(conn, tid)
+            epic = kb.get_task(conn, epic_id) if epic_id else None
 
             def _task_dict(t):
                 return {
@@ -529,6 +541,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_step_key": t.current_step_key,
                     "running": t.running,
                     "blocked": t.blocked,
+                    "work_item_kind": t.work_item_kind,
                 }
 
             def _run_dict(r):
@@ -540,8 +553,18 @@ def _handle_show(args: dict, **kw) -> str:
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
-            return json.dumps({
+            response = {
                 "task": _task_dict(task),
+                "epic": (
+                    {
+                        "id": epic_id,
+                        "title": epic.title if epic is not None else epic_id,
+                    }
+                    if epic_id
+                    else None
+                ),
+                "dependencies": parents,
+                "dependents": children,
                 "parents": parents,
                 "children": children,
                 "comments": [
@@ -560,7 +583,11 @@ def _handle_show(args: dict, **kw) -> str:
                 # the same string build_worker_context returns to the
                 # dispatcher at spawn time.
                 "worker_context": kb.build_worker_context(conn, tid),
-            })
+            }
+            if task.work_item_kind == "epic":
+                response["members"] = kb.list_epic_members(conn, tid)
+                response["progress"] = kb.epic_progress(conn, tid)
+            return json.dumps(response)
         finally:
             conn.close()
     except ValueError as e:

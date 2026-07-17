@@ -73,18 +73,23 @@ def _release_task(
     *,
     title: str = "Story: release evidence",
     parents: list[str] | None = None,
+    work_item_kind: str = "card",
 ) -> str:
-    return kb.create_task(
-        conn,
-        title=title,
-        board=board,
-        parents=parents or (),
-        workspace_kind="worktree",
-        workspace_path=str(repo),
-        branch_name=branch,
-        workflow_template_id="product",
-        current_step_key="release_measure",
-    )
+    fields = {
+        "title": title,
+        "board": board,
+        "parents": parents or (),
+        "workspace_kind": "worktree",
+        "workspace_path": str(repo),
+        "branch_name": branch,
+        "work_item_kind": work_item_kind,
+    }
+    if work_item_kind == "card":
+        fields.update(
+            workflow_template_id="product",
+            current_step_key="release_measure",
+        )
+    return kb.create_task(conn, **fields)
 
 
 def _seed_structured_evidence(
@@ -771,8 +776,9 @@ def test_epic_child_integrates_before_child_done(release_home, tmp_path, monkeyp
     board = "release-epic-child"
     _release_board(board, repo)
     with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board)
-        story = _release_task(conn, board, repo, branch, parents=[epic])
+        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
+        story = _release_task(conn, board, repo, branch)
+        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
         _seed_structured_evidence(conn, story, branch, source_sha)
 
         def integrate_before_done(inner_conn, story_id, **_kwargs):
@@ -868,10 +874,11 @@ def test_epic_child_failed_candidate_verification_preserves_epic_and_release_sta
     board = "release-epic-child-verify-fails"
     _release_board(board, repo)
     with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board)
+        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         epic_branch = kb.epic_branch_for(epic)
         _git(repo, "branch", epic_branch, "main")
-        story = _release_task(conn, board, repo, branch, parents=[epic])
+        story = _release_task(conn, board, repo, branch)
+        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
         _seed_structured_evidence(conn, story, branch, source_sha)
         epic_before = _git(repo, "rev-parse", epic_branch)
         status_before = kb.get_task(conn, story).status
@@ -911,10 +918,11 @@ def test_epic_child_verified_candidate_fast_forwards_before_done(
     board = "release-epic-child-verified"
     _release_board(board, repo)
     with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board)
+        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         epic_branch = kb.epic_branch_for(epic)
         _git(repo, "branch", epic_branch, "main")
-        story = _release_task(conn, board, repo, branch, parents=[epic])
+        story = _release_task(conn, board, repo, branch)
+        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
         _seed_structured_evidence(conn, story, branch, source_sha)
         observed: list[str] = []
 
@@ -947,8 +955,16 @@ def test_epic_release_requires_every_child_done_and_integrated(
     board = "release-epic"
     _release_board(board, repo)
     with kb.connect(board=board) as conn:
-        epic = _release_task(conn, board, repo, branch, title="Epic: release")
-        child = kb.create_task(conn, title="Story: child", board=board, parents=[epic])
+        epic = _release_task(
+            conn,
+            board,
+            repo,
+            branch,
+            title="Epic: release",
+            work_item_kind="epic",
+        )
+        child = kb.create_task(conn, title="Story: child", board=board)
+        kb.add_epic_membership(conn, epic_id=epic, task_id=child)
         epic_branch = kb.epic_branch_for(epic)
         _git(repo, "branch", epic_branch, branch)
         with kb.write_txn(conn):
@@ -1012,14 +1028,19 @@ def test_epic_release_evidence_binds_to_derived_integration_branch(
     _release_board(board, repo)
     with kb.connect(board=board) as conn:
         epic = _release_task(
-            conn, board, repo, task_branch, title="Epic: reviewed integration"
+            conn,
+            board,
+            repo,
+            task_branch,
+            title="Epic: reviewed integration",
+            work_item_kind="epic",
         )
         child = kb.create_task(
             conn,
             title="Story: integrated child",
             board=board,
-            parents=[epic],
         )
+        kb.add_epic_membership(conn, epic_id=epic, task_id=child)
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET status='done', current_step_key='done' WHERE id=?",

@@ -256,6 +256,7 @@ def _task_dict(
     ai_provenance: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
+    d["workItemKind"] = task.work_item_kind
     # Add derived age metrics so the UI can colour stale cards without
     # computing deltas client-side.
     try:
@@ -467,6 +468,19 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
     return {"parents": parents, "children": children}
 
 
+def _epic_summary_for_task(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[dict[str, str]]:
+    epic_id = kanban_db.epic_id_for_task(conn, task_id)
+    if epic_id is None:
+        return None
+    epic = kanban_db.get_task(conn, epic_id)
+    return {
+        "id": epic_id,
+        "title": epic.title if epic is not None else epic_id,
+    }
+
+
 # ---------------------------------------------------------------------------
 # GET /board
 # ---------------------------------------------------------------------------
@@ -504,8 +518,10 @@ def get_board(
         )
         # Pre-fetch link counts per task (cheap: one query).
         link_counts: dict[str, dict[str, int]] = {}
+        dependencies_by_task: dict[str, list[str]] = {}
+        dependents_by_task: dict[str, list[str]] = {}
         for row in conn.execute(
-            "SELECT parent_id, child_id FROM task_links"
+            "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
         ).fetchall():
             link_counts.setdefault(row["parent_id"], {"parents": 0, "children": 0})[
                 "children"
@@ -513,6 +529,19 @@ def get_board(
             link_counts.setdefault(row["child_id"], {"parents": 0, "children": 0})[
                 "parents"
             ] += 1
+            dependencies_by_task.setdefault(row["child_id"], []).append(row["parent_id"])
+            dependents_by_task.setdefault(row["parent_id"], []).append(row["child_id"])
+
+        epic_by_task = {
+            row["task_id"]: {"id": row["epic_id"], "title": row["title"]}
+            for row in conn.execute(
+                """
+                SELECT em.task_id, em.epic_id, e.title
+                  FROM epic_memberships em
+                  JOIN tasks e ON e.id = em.epic_id
+                """
+            ).fetchall()
+        }
 
         # Comment + event counts (both cheap aggregates).
         comment_counts: dict[str, int] = {
@@ -557,7 +586,18 @@ def get_board(
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
         provenance_map = kanban_db.latest_ai_provenance_by_task(conn, [t.id for t in tasks])
 
+        epics: list[dict[str, Any]] = []
         for t in tasks:
+            if t.work_item_kind == "epic":
+                epics.append(
+                    {
+                        "id": t.id,
+                        "title": t.title,
+                        "workItemKind": "epic",
+                        "progress": kanban_db.epic_progress(conn, t.id),
+                    }
+                )
+                continue
             full = summary_map.get(t.id)
             preview = (
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
@@ -568,6 +608,9 @@ def get_board(
                 ai_provenance=provenance_map.get(t.id),
             )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
+            d["epic"] = epic_by_task.get(t.id)
+            d["dependencies"] = dependencies_by_task.get(t.id, [])
+            d["dependents"] = dependents_by_task.get(t.id, [])
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
             diags = diagnostics_per_task.get(t.id)
@@ -609,6 +652,7 @@ def get_board(
 
         return {
             "columns": output_columns,
+            "epics": epics,
             "tenants": tenants,
             "assignees": assignees,
             "latest_event_id": int(latest_event_id),
@@ -683,12 +727,18 @@ def get_task(
         if diag_list:
             task_d["diagnostics"] = diag_list
             task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
-        return {
+        relations = {
+            "epic": _epic_summary_for_task(conn, task_id),
+            "dependencies": links["parents"],
+            "dependents": links["children"],
+        }
+        response = {
             "task": task_d,
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
             "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)],
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
             "links": links,
+            "relations": relations,
             "child_results": child_results,
             "runs": [
                 _run_dict(r)
@@ -700,6 +750,10 @@ def get_task(
                 )
             ],
         }
+        if task.work_item_kind == "epic":
+            response["members"] = kanban_db.list_epic_members(conn, task_id)
+            response["progress"] = kanban_db.epic_progress(conn, task_id)
+        return response
     finally:
         conn.close()
 

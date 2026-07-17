@@ -4368,6 +4368,13 @@ def _ensure_qualification_boundary_objects(conn: sqlite3.Connection) -> None:
         BEGIN
             SELECT RAISE(ABORT, 'strict-board dependencies are Work Contract-owned');
         END;
+        CREATE TRIGGER IF NOT EXISTS strict_tasks_service_delete
+        BEFORE DELETE ON tasks
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND hermes_governance_write_authorized() != 1
+        BEGIN
+            SELECT RAISE(ABORT, 'strict-board task deletion requires Hermes service authority');
+        END;
         CREATE TRIGGER IF NOT EXISTS strict_task_routing_service_update
         BEFORE UPDATE OF assignee, workflow_template_id, current_step_key,
                          work_contract_id, work_item_kind ON tasks
@@ -5069,6 +5076,52 @@ def list_epic_members(conn: sqlite3.Connection, epic_id: str) -> list[str]:
             (epic_id,),
         ).fetchall()
     ]
+
+
+def epic_id_for_task(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the card's explicit Epic membership, if any."""
+
+    row = conn.execute(
+        "SELECT epic_id FROM epic_memberships WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    return str(row["epic_id"]) if row is not None else None
+
+
+def epic_progress(conn: sqlite3.Connection, epic_id: str) -> dict[str, Any]:
+    """Return member-derived progress and the Epic release state."""
+
+    if not _is_epic_task(conn, epic_id):
+        raise ValueError(f"task {epic_id} is not an Epic")
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS total,
+               COALESCE(SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END), 0) AS done
+          FROM epic_memberships em
+          JOIN tasks t ON t.id = em.task_id
+         WHERE em.epic_id = ?
+        """,
+        (epic_id,),
+    ).fetchone()
+    epic = get_task(conn, epic_id)
+    if epic is not None and epic.status == "done":
+        release_state = "released"
+    elif any(event.kind == "epic_merged" for event in list_events(conn, epic_id)):
+        release_state = "merged"
+    else:
+        release_state = "pending"
+    return {
+        "done": int(row["done"]),
+        "total": int(row["total"]),
+        "release_state": release_state,
+    }
+
+
+def release_scope_for_task(conn: sqlite3.Connection, task_id: str) -> str:
+    """Classify release routing without consulting dependency links."""
+
+    if _is_epic_task(conn, task_id):
+        return "epic"
+    return "epic_member" if epic_id_for_task(conn, task_id) else "standalone"
 
 
 def _claimer_id() -> str:
@@ -7119,6 +7172,23 @@ def complete_task(
     board = board or _board_slug_for_connection(conn)
     now = int(time.time())
 
+    task_kind_row = conn.execute(
+        "SELECT work_item_kind FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if (
+        task_kind_row is not None
+        and task_kind_row["work_item_kind"] == "epic"
+        and _release_evidence is None
+    ):
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_epic_release",
+                {"reason": "Epic completion requires the release contract"},
+            )
+        return False
+
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
     # tiny dedicated txn, then raise. The caller is responsible for
@@ -8824,6 +8894,8 @@ def decompose_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    if _strict_destructive_write_forbidden(conn):
+        raise PermissionError("strict-board archival requires Hermes service authority")
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -8857,6 +8929,8 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     tasks must be explicitly archived first so accidental data loss requires a
     second deliberate action.
     """
+    if _strict_destructive_write_forbidden(conn):
+        raise PermissionError("strict-board task deletion requires Hermes service authority")
     with write_txn(conn):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
@@ -8886,6 +8960,8 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     Returns ``True`` if the task existed and was deleted, ``False``
     if the task was not found.
     """
+    if _strict_destructive_write_forbidden(conn):
+        raise PermissionError("strict-board task deletion requires Hermes service authority")
     with write_txn(conn):
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
@@ -8897,6 +8973,17 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
+
+
+def _strict_destructive_write_forbidden(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT qualification_required FROM board_governance WHERE id = 1"
+    ).fetchone()
+    return bool(
+        row is not None
+        and int(row["qualification_required"]) == 1
+        and not _GOVERNANCE_WRITE_AUTHORIZED.get()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -9071,37 +9158,24 @@ def _story_base_branch(
     """The base branch a v2 story's worktree should branch off, or ``None``.
 
     ``None`` (legacy behavior, base defaults to ``HEAD``) unless the board has
-    opted into ``handoff_v2`` AND the task has an epic parent. A story has one
-    epic in the intended model; if multiple parents are linked, the first
-    (lowest ``parent_id``, per :func:`parent_ids`'s deterministic ordering) wins.
+    opted into ``handoff_v2`` AND the task has explicit Epic membership.
     """
     meta = product_board_metadata(board)
     if not _handoff_v2_enabled(meta):
         return None
-    epic_id = _epic_parent_id(conn, task_id)
+    epic_id = epic_id_for_task(conn, task_id)
     if epic_id is None:
         return None
     return epic_branch_for(epic_id)
 
 
 def _is_epic_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Identify an epic from immutable Review evidence, with legacy title fallback."""
-    reviewed = _latest_approved_review_candidate(conn, task_id)
-    if reviewed is not None:
-        return reviewed[0] == epic_branch_for(task_id)
-    task = get_task(conn, task_id)
-    return bool(task and task.title.strip().lower().startswith("epic"))
+    """Identify an Epic only from its explicit persisted kind."""
 
-
-def _epic_parent_id(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    return next(
-        (
-            parent_id
-            for parent_id in parent_ids(conn, task_id)
-            if _is_epic_task(conn, parent_id)
-        ),
-        None,
-    )
+    row = conn.execute(
+        "SELECT work_item_kind FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    return bool(row is not None and row["work_item_kind"] == "epic")
 
 
 def _ensure_git_worktree(
@@ -9539,7 +9613,9 @@ def epic_ready(
     meta = product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return False
-    children = child_ids(conn, epic_id)
+    if not _is_epic_task(conn, epic_id):
+        return False
+    children = list_epic_members(conn, epic_id)
     if not children:
         return False
     for child_id in children:
@@ -9773,7 +9849,9 @@ def integrate_story_to_epic(
         return None
     _validate_stored_product_workflow_state(conn, story_id)
 
-    epic_id = _epic_parent_id(conn, story_id)
+    if _is_epic_task(conn, story_id):
+        return None
+    epic_id = epic_id_for_task(conn, story_id)
     if epic_id is None:
         return None
 
@@ -9975,7 +10053,7 @@ def _merge_standalone_story_to_main(
         return None
     _validate_stored_product_workflow_state(conn, story_id)
     # A story WITH an epic goes through integrate_story_to_epic + merge_epic_to_main.
-    if _epic_parent_id(conn, story_id) is not None:
+    if _is_epic_task(conn, story_id) or epic_id_for_task(conn, story_id) is not None:
         return None
     story = get_task(conn, story_id)
     if story is None or (
@@ -10364,11 +10442,12 @@ def release_product_task(
     board = board or _board_slug_for_connection(conn)
     task = get_task(conn, task_id)
     meta = product_board_metadata(board)
+    is_epic_task = bool(task is not None and task.work_item_kind == "epic")
     if (
         task is None
         or meta is None
         or not _handoff_v2_enabled(meta)
-        or task.current_step_key != "release_measure"
+        or (not is_epic_task and task.current_step_key != "release_measure")
     ):
         raise ReleaseEvidenceError(task_id, ["release_measure_state"])
     if not _release_run_is_current(conn, task_id, expected_run_id):
@@ -10379,7 +10458,7 @@ def release_product_task(
 
     repo_value = str(meta.get("default_workdir") or task.workspace_path or "").strip()
     repo_root = _git_toplevel(Path(repo_value).expanduser()) if repo_value else None
-    children = child_ids(conn, task_id)
+    children = list_epic_members(conn, task_id) if _is_epic_task(conn, task_id) else []
     reviewed_candidate = _latest_approved_review_candidate(conn, task_id)
     branch = (
         reviewed_candidate[0]
@@ -10399,8 +10478,8 @@ def release_product_task(
     if not note:
         raise ReleaseEvidenceError(task_id, ["measurement_note"])
 
-    is_epic = bool(children and branch == epic_branch_for(task_id))
-    epic_parent_id = _epic_parent_id(conn, task_id)
+    is_epic = _is_epic_task(conn, task_id)
+    epic_id = epic_id_for_task(conn, task_id)
     if is_epic:
         target_branch = epic_branch_for(task_id)
         integrated_children = all(
@@ -10426,7 +10505,7 @@ def release_product_task(
             before_apply_fn=before_apply_fn,
         )
         integration_kinds = {"epic_merged"}
-    elif epic_parent_id is not None:
+    elif epic_id is not None:
         integration_status = integrate_story_to_epic(
             conn,
             task_id,
@@ -10701,7 +10780,7 @@ def notify_operations(
     epic = get_task(conn, epic_id)
     epic_title = epic.title if epic is not None else epic_id
     stories = []
-    for child_id in child_ids(conn, epic_id):
+    for child_id in list_epic_members(conn, epic_id):
         child = get_task(conn, child_id)
         stories.append({"id": child_id, "title": child.title if child is not None else None})
 
@@ -11467,14 +11546,14 @@ def reconcile(
         if outcome == "integrated":
             result.integrated.append(story_id)
             if merge_after_green:
-                epic_id = _epic_parent_id(conn, story_id)
+                epic_id = epic_id_for_task(conn, story_id)
                 if epic_id and epic_ready(conn, epic_id, board=board):
                     if merge_epic_to_main(conn, epic_id, board=board) == "merged":
                         result.merged_to_main.append(epic_id)
             break
         if merge_after_green:
             if outcome == "already_integrated":
-                epic_id = _epic_parent_id(conn, story_id)
+                epic_id = epic_id_for_task(conn, story_id)
                 if epic_id and epic_ready(conn, epic_id, board=board):
                     if merge_epic_to_main(conn, epic_id, board=board) == "merged":
                         result.merged_to_main.append(epic_id)

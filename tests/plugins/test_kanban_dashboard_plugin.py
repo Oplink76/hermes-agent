@@ -420,6 +420,52 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_board_and_detail_keep_epics_separate_from_dependency_relations(client):
+    with kb.connect() as conn:
+        epic_id = kb.create_task(
+            conn, title="Portfolio outcome", work_item_kind="epic"
+        )
+        dependency_id = kb.create_task(conn, title="Acceptance dependency")
+        member_id = kb.create_task(conn, title="Qualified member")
+        kb.add_epic_membership(conn, epic_id=epic_id, task_id=member_id)
+        kb.link_tasks(conn, dependency_id, member_id)
+
+    board = client.get("/api/plugins/kanban/board").json()
+    column_tasks = [
+        task for column in board["columns"] for task in column["tasks"]
+    ]
+    assert epic_id not in {task["id"] for task in column_tasks}
+    assert board["epics"] == [
+        {
+            "id": epic_id,
+            "title": "Portfolio outcome",
+            "workItemKind": "epic",
+            "progress": {"done": 0, "total": 1, "release_state": "pending"},
+        }
+    ]
+    member = next(task for task in column_tasks if task["id"] == member_id)
+    assert member["workItemKind"] == "card"
+    assert member["epic"] == {"id": epic_id, "title": "Portfolio outcome"}
+    assert member["dependencies"] == [dependency_id]
+    assert member["dependents"] == []
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{member_id}").json()
+    assert detail["relations"] == {
+        "epic": {"id": epic_id, "title": "Portfolio outcome"},
+        "dependencies": [dependency_id],
+        "dependents": [],
+    }
+
+    epic_detail = client.get(f"/api/plugins/kanban/tasks/{epic_id}").json()
+    assert epic_detail["task"]["workItemKind"] == "epic"
+    assert epic_detail["members"] == [member_id]
+    assert epic_detail["progress"] == {
+        "done": 0,
+        "total": 1,
+        "release_state": "pending",
+    }
+
+
 def test_strict_board_post_tasks_returns_intake_without_task(client):
     kb.ensure_product_board_defaults("strict")
     metadata_path = kb.board_metadata_path("strict")

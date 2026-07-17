@@ -4378,8 +4378,9 @@ def test_story_base_branch_v2_story_with_epic_parent_returns_epic_branch(kanban_
     board = "v2-story-base-branch"
     _v2_product_board(board)
     with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board)
-        story = kb.create_task(conn, title="Story", board=board, parents=[epic])
+        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
+        story = kb.create_task(conn, title="Story", board=board)
+        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
         result = kb._story_base_branch(conn, story, board=board)
     assert result == kb.epic_branch_for(epic)
 
@@ -4397,8 +4398,9 @@ def test_story_base_branch_non_v2_board_returns_none(kanban_home):
     board = "legacy-story-base-branch"
     kb.create_board(board, name="Legacy Board", preset="product")
     with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board)
-        story = kb.create_task(conn, title="Story", board=board, parents=[epic])
+        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
+        story = kb.create_task(conn, title="Story", board=board)
+        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
         result = kb._story_base_branch(conn, story, board=board)
     assert result is None
 
@@ -4430,7 +4432,7 @@ def test_story_worktree_branches_off_epic_branch_contains_upstream_commit(kanban
     _init_git_repo(repo)
 
     with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board)
+        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         epic_branch = kb.epic_branch_for(epic)
 
     # Simulate an upstream story's integrated commit landing on the epic branch.
@@ -4441,9 +4443,10 @@ def test_story_worktree_branches_off_epic_branch_contains_upstream_commit(kanban
 
     with kb.connect(board=board) as conn:
         story = kb.create_task(
-            conn, title="Story", board=board, parents=[epic],
+            conn, title="Story", board=board,
             workspace_kind="worktree", workspace_path=str(repo),
         )
+        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
         task = kb.get_task(conn, story)
         assert task is not None
         ws, _branch = kb._resolve_worktree_workspace(
@@ -4470,9 +4473,8 @@ def test_spawn_one_v2_wires_story_base_branch_to_epic(kanban_home, tmp_path, mon
     monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
 
     with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board)
+        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         epic_branch = kb.epic_branch_for(epic)
-        kb.complete_task(conn, epic, result="epic scaffold", board=board)
 
     kb._ensure_epic_branch(repo, epic_branch)
     subprocess.run(["git", "-C", str(repo), "checkout", epic_branch], check=True, capture_output=True, text=True)
@@ -4487,9 +4489,10 @@ def test_spawn_one_v2_wires_story_base_branch_to_epic(kanban_home, tmp_path, mon
 
     with kb.connect(board=board) as conn:
         story = kb.create_task(
-            conn, title="Story", board=board, parents=[epic],
+            conn, title="Story", board=board,
             assignee="developer", workspace_kind="worktree", workspace_path=str(repo),
         )
+        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
         task = kb.get_task(conn, story)
         assert task is not None and task.status == "ready", (
             "story with a done epic parent should be immediately ready"
@@ -10528,11 +10531,12 @@ def test_archive_task_legacy_board_flags_unchanged(kanban_home):
 
 def _make_epic_with_children(board: str, *, n_children: int = 2) -> tuple[str, list[str]]:
     with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board)
-        children = [
-            kb.create_task(conn, title=f"Story {i}", board=board, parents=[epic])
-            for i in range(n_children)
-        ]
+        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
+        children = []
+        for i in range(n_children):
+            child = kb.create_task(conn, title=f"Story {i}", board=board)
+            kb.add_epic_membership(conn, epic_id=epic, task_id=child)
+            children.append(child)
     return epic, children
 
 
@@ -10585,7 +10589,9 @@ def test_epic_ready_no_children_returns_false_verify_not_called(kanban_home):
     board = "v2-epic-ready-no-children"
     _v2_product_board(board)
     with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Lonely Epic", board=board)
+        epic = kb.create_task(
+            conn, title="Lonely Epic", board=board, work_item_kind="epic"
+        )
         verify = unittest.mock.Mock(return_value=True)
         result = kb.epic_ready(conn, epic, board=board, verify_fn=verify)
 
@@ -10597,8 +10603,9 @@ def test_epic_ready_non_v2_board_returns_false_verify_not_called(kanban_home):
     board = "legacy-epic-ready"
     kb.create_board(board, name="Legacy Board", preset="product")
     with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board)
-        kb.create_task(conn, title="Story", board=board, parents=[epic])
+        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
+        story = kb.create_task(conn, title="Story", board=board)
+        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
         _set_task_status(conn, epic, "done")
         verify = unittest.mock.Mock(return_value=True)
         result = kb.epic_ready(conn, epic, board=board, verify_fn=verify)
@@ -11168,8 +11175,9 @@ def test_merge_epic_to_main_non_v2_board_returns_none(kanban_home, tmp_path, mon
     board = "legacy-merge-board"
     kb.create_board(board, name="Legacy Board", default_workdir=str(repo))
     with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board)
-        kb.create_task(conn, title="Story", board=board, parents=[epic])
+        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
+        story = kb.create_task(conn, title="Story", board=board)
+        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
 
     calls = _record_git_calls(monkeypatch)
     notify = unittest.mock.Mock()
@@ -11213,7 +11221,7 @@ def _make_epic_and_done_story(board: str, repo: Path) -> tuple[str, str, str, st
     Returns ``(epic, story, epic_branch, story_sha)``.
     """
     with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board)
+        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
     epic_branch = kb.epic_branch_for(epic)
     _make_epic_branch(repo, epic_branch)
 
@@ -11225,10 +11233,11 @@ def _make_epic_and_done_story(board: str, repo: Path) -> tuple[str, str, str, st
 
     with kb.connect(board=board) as conn:
         story = kb.create_task(
-            conn, title="Story", board=board, parents=[epic],
+            conn, title="Story", board=board,
             workspace_kind="worktree", workspace_path=str(repo),
             branch_name=story_branch,
         )
+        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
         _set_task_status(conn, story, "done")
     return epic, story, epic_branch, story_sha
 
@@ -11293,7 +11302,7 @@ def test_integrate_story_to_epic_conflict_aborts_blocks_story_and_never_pushes(
     _v2_product_board_with_repo(board, repo)
 
     with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board)
+        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
     epic_branch = kb.epic_branch_for(epic)
     _make_epic_branch(repo, epic_branch)
 
@@ -11320,10 +11329,11 @@ def test_integrate_story_to_epic_conflict_aborts_blocks_story_and_never_pushes(
 
     with kb.connect(board=board) as conn:
         story = kb.create_task(
-            conn, title="Story", board=board, parents=[epic],
+            conn, title="Story", board=board,
             workspace_kind="worktree", workspace_path=str(repo),
             branch_name=story_branch,
         )
+        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
         _set_task_status(conn, story, "done")
 
     calls = _record_git_calls(monkeypatch)
@@ -11359,12 +11369,13 @@ def test_integrate_story_to_epic_non_v2_board_returns_none(kanban_home, tmp_path
     board = "legacy-integrate-board"
     kb.create_board(board, name="Legacy Board", default_workdir=str(repo))
     with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board)
+        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         story = kb.create_task(
-            conn, title="Story", board=board, parents=[epic],
+            conn, title="Story", board=board,
             workspace_kind="worktree", workspace_path=str(repo),
             branch_name="story/s1",
         )
+        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
         _set_task_status(conn, story, "done")
 
     calls = _record_git_calls(monkeypatch)
@@ -11640,8 +11651,9 @@ def test_deploy_epic_non_v2_board_returns_none(kanban_home, tmp_path, monkeypatc
     board = "legacy-deploy-board"
     kb.create_board(board, name="Legacy Board", default_workdir=str(repo))
     with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board)
-        kb.create_task(conn, title="Story", board=board, parents=[epic])
+        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
+        story = kb.create_task(conn, title="Story", board=board)
+        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
 
     ops = _RecordingOpsClient()
     notify = unittest.mock.Mock()
@@ -12216,11 +12228,12 @@ def test_merge_standalone_story_with_epic_returns_none(kanban_home, tmp_path):
     board = "v2-standalone-has-epic"
     _v2_product_board_with_repo(board, repo)
     with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board)
+        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         story = kb.create_task(
-            conn, title="Story", board=board, parents=[epic],
+            conn, title="Story", board=board,
             branch_name="wt/s", workspace_kind="worktree", workspace_path=str(repo),
         )
+        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
         _set_task_status(conn, story, "done")
         result = kb._merge_standalone_story_to_main(conn, story, board=board, verify_fn=lambda b: True)
     assert result is None  # epic'd stories go through the epic path, not here
