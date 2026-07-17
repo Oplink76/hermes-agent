@@ -8,11 +8,15 @@ through this module until the strict write boundary is enabled separately.
 from __future__ import annotations
 
 import copy
+import getpass
 import hashlib
 import hmac
 import json
 import os
 import secrets
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -129,43 +133,79 @@ def _signing_key_path(hermes_home: Optional[Path] = None) -> Path:
     return root / SIGNING_KEY_RELATIVE_PATH
 
 
-def _load_or_create_signing_secret(hermes_home: Optional[Path] = None) -> bytes:
+def _restrict_signing_key_permissions(path: Path) -> None:
+    """Restrict the service key to the current account on every platform."""
+
+    if sys.platform == "win32":
+        icacls = shutil.which("icacls")
+        if not icacls:
+            raise WorkContractError("cannot secure Work Contract signing key: icacls not found")
+        username = getpass.getuser().strip()
+        if not username:
+            raise WorkContractError("cannot secure Work Contract signing key: user is unknown")
+        result = subprocess.run(
+            [
+                icacls,
+                str(path),
+                "/inheritance:r",
+                "/grant:r",
+                f"{username}:F",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise WorkContractError("cannot secure Work Contract signing key with Windows ACLs")
+        return
+    os.chmod(path, 0o600)
+
+
+def _load_signing_secret(
+    hermes_home: Optional[Path] = None, *, create: bool
+) -> bytes:
     """Load the service key, atomically creating it with mode 0600 once."""
 
     path = _signing_key_path(hermes_home)
+    if path.is_symlink():
+        raise WorkContractError("Work Contract signing key cannot be a symlink")
+    if not create and not path.is_file():
+        raise WorkContractError("Work Contract signing key is missing")
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        pass
-    else:
+    if create:
         try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(secrets.token_bytes(32))
-                handle.flush()
-                os.fsync(handle.fileno())
-        except Exception:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
             try:
-                path.unlink()
-            except OSError:
-                pass
-            raise
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(secrets.token_bytes(32))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except Exception:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                raise
+    if path.is_symlink() or not path.is_file():
+        raise WorkContractError("Work Contract signing key is not a regular file")
+    _restrict_signing_key_permissions(path)
     value = path.read_bytes()
     if len(value) < 32:
         raise WorkContractError("Work Contract signing key is invalid")
     return value
 
 
-def _service_secret(*, secret: Optional[bytes], hermes_home: Optional[Path]) -> bytes:
+def _service_secret(
+    *, secret: Optional[bytes], hermes_home: Optional[Path], create: bool
+) -> bytes:
     if secret is not None:
         if not isinstance(secret, bytes) or not secret:
             raise WorkContractError("signing secret must be non-empty bytes")
         return secret
-    return _load_or_create_signing_secret(hermes_home)
+    return _load_signing_secret(hermes_home, create=create)
 
 
 def sign_work_contract(
@@ -179,7 +219,7 @@ def sign_work_contract(
     unsigned = _unsigned_contract(contract)
     canonical = canonical_contract_json(unsigned)
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    key = _service_secret(secret=secret, hermes_home=hermes_home)
+    key = _service_secret(secret=secret, hermes_home=hermes_home, create=True)
     signature = hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
     return {
         "contract": unsigned,
@@ -218,7 +258,7 @@ def verify_work_contract(
         digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         if not hmac.compare_digest(digest, supplied_digest):
             return False
-        key = _service_secret(secret=secret, hermes_home=hermes_home)
+        key = _service_secret(secret=secret, hermes_home=hermes_home, create=False)
         expected = hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
         return hmac.compare_digest(expected, supplied_signature)
     except (OSError, TypeError, ValueError, WorkContractError):
@@ -262,11 +302,12 @@ def materialization_fields(
     phase = routing["entry_phase"]
     assignee = routing["assignee"]
     phase_assignees = policy.get("phase_assignees")
-    if isinstance(phase_assignees, Mapping):
-        if phase not in phase_assignees or phase_assignees.get(phase) != assignee:
-            raise WorkContractError(
-                f"phase {phase!r} and assignee {assignee!r} are not an allowed phase/assignee pair"
-            )
+    if not isinstance(phase_assignees, Mapping):
+        raise WorkContractError("strict board policy requires a phase_assignees mapping")
+    if phase not in phase_assignees or phase_assignees.get(phase) != assignee:
+        raise WorkContractError(
+            f"phase {phase!r} and assignee {assignee!r} are not an allowed phase/assignee pair"
+        )
 
     work = contract["work"]
     fields.update(

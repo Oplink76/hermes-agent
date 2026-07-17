@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import stat
+import subprocess
+import sys
 
 import pytest
 
@@ -91,6 +93,7 @@ def test_missing_or_unknown_contract_versions_fail_closed(version):
         intake.sign_work_contract(contract, secret=b"test-only-secret")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits do not apply on NTFS")
 def test_signing_secret_is_service_owned_private_and_in_quick_backup_manifest(tmp_path):
     signed = intake.sign_work_contract(_contract(), hermes_home=tmp_path)
     secret_path = tmp_path / intake.SIGNING_KEY_RELATIVE_PATH
@@ -100,6 +103,32 @@ def test_signing_secret_is_service_owned_private_and_in_quick_backup_manifest(tm
     assert stat.S_IMODE(secret_path.stat().st_mode) == 0o600
     assert intake.SIGNING_KEY_RELATIVE_PATH in backup._QUICK_STATE_FILES
     assert secret_path.name in backup._SECRET_FILE_NAMES
+
+
+def test_signing_secret_uses_owner_only_acl_on_windows(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(intake.sys, "platform", "win32")
+    monkeypatch.setattr(intake.shutil, "which", lambda name: "C:/Windows/System32/icacls.exe")
+    monkeypatch.setattr(intake.getpass, "getuser", lambda: "Hermes User")
+
+    def _run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "processed", "")
+
+    monkeypatch.setattr(intake.subprocess, "run", _run)
+
+    path = tmp_path / intake.SIGNING_KEY_RELATIVE_PATH
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"x" * 32)
+    intake._restrict_signing_key_permissions(path)
+
+    assert calls[0][0] == [
+        "C:/Windows/System32/icacls.exe",
+        str(path),
+        "/inheritance:r",
+        "/grant:r",
+        "Hermes User:F",
+    ]
 
 
 def test_strict_board_requires_valid_contract_and_enforces_phase_role_mapping():
@@ -133,6 +162,17 @@ def test_strict_board_requires_valid_contract_and_enforces_phase_role_mapping():
         intake.materialization_fields(board, signed_contract=signed, secret=secret)
 
 
+def test_strict_board_fails_closed_without_a_phase_role_mapping():
+    signed = intake.sign_work_contract(_contract(), secret=b"test-only-secret")
+
+    with pytest.raises(intake.WorkContractError, match="phase_assignees"):
+        intake.materialization_fields(
+            {"preset": "product", "qualification": {"required": True}},
+            signed_contract=signed,
+            secret=b"test-only-secret",
+        )
+
+
 def test_generic_board_preserves_caller_fields_without_contract():
     fields = intake.materialization_fields(
         {"preset": "generic"},
@@ -143,7 +183,8 @@ def test_generic_board_preserves_caller_fields_without_contract():
     assert fields == {"title": "Standalone work", "assignee": "default"}
 
 
-def test_product_board_defaults_declare_the_strict_qualification_policy():
+def test_product_board_defaults_declare_policy_without_activating_it():
     defaults = kb.product_workflow_defaults_for_board("product")
 
     assert defaults["qualification"] == kb.PRODUCT_QUALIFICATION_DEFAULTS
+    assert defaults["qualification"]["required"] is False

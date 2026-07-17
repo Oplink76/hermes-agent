@@ -85,12 +85,21 @@ def test_terminal_intake_records_remain_queryable_with_append_only_audit(conn, d
         conn, raw_request="do work", source="chat", created_at=100
     )
 
+    contract_id = None
+    if decision != "rejected":
+        contract_id = kb.store_work_contract(
+            conn,
+            _signed_contract(intake_id),
+            secret=b"test-only-secret",
+            created_at=105,
+        )
     kb.record_qualification_decision(
         conn,
         intake_id=intake_id,
         decision=decision,
         actor_profile="hermes",
         reason="policy applied",
+        contract_id=contract_id,
         created_at=110,
     )
 
@@ -105,6 +114,58 @@ def test_terminal_intake_records_remain_queryable_with_append_only_audit(conn, d
         conn.execute("UPDATE qualification_intake_decisions SET reason = 'rewritten'")
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         conn.execute("DELETE FROM qualification_intake_decisions")
+
+
+def test_qualified_decision_requires_the_matching_contract(conn):
+    intake_id = kb.create_qualification_intake(conn, raw_request="one", source="chat")
+    other_id = kb.create_qualification_intake(conn, raw_request="two", source="chat")
+    other_contract = kb.store_work_contract(
+        conn,
+        _signed_contract(other_id),
+        secret=b"test-only-secret",
+    )
+
+    with pytest.raises(ValueError, match="matching Work Contract"):
+        kb.record_qualification_decision(
+            conn,
+            intake_id=intake_id,
+            decision="qualified",
+            actor_profile="hermes",
+        )
+    with pytest.raises(ValueError, match="does not belong"):
+        kb.record_qualification_decision(
+            conn,
+            intake_id=intake_id,
+            decision="overridden",
+            actor_profile="hermes",
+            contract_id=other_contract,
+        )
+
+
+def test_work_contract_must_reference_an_existing_intake(conn):
+    with pytest.raises(ValueError, match="unknown qualification intake"):
+        kb.store_work_contract(
+            conn,
+            _signed_contract("qi_missing"),
+            secret=b"test-only-secret",
+        )
+
+
+def test_raw_intake_and_attachments_are_immutable(conn):
+    intake_id = kb.create_qualification_intake(
+        conn,
+        raw_request="original",
+        source="chat",
+        attachments=[{"name": "brief.pdf"}],
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        conn.execute(
+            "UPDATE qualification_intake SET raw_request = 'rewritten' WHERE id = ?",
+            (intake_id,),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        conn.execute("DELETE FROM qualification_intake WHERE id = ?", (intake_id,))
 
 
 def test_work_contract_storage_is_immutable_and_queryable(conn):

@@ -90,6 +90,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Protocol, Tuple
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.kanban_intake import DEFAULT_POLICY_VERSION
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -178,9 +179,10 @@ PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES: dict[str, str] = {
     "reviewer": "reviewer",
 }
 PRODUCT_QUALIFICATION_DEFAULTS: dict[str, Any] = {
-    "required": True,
+    # Task 9 activates this only after existing executable cards are backfilled.
+    "required": False,
     "contract_version": 1,
-    "policy_version": "product-handoff-v2+qualification-v1",
+    "policy_version": DEFAULT_POLICY_VERSION,
     "paths": ["po", "hermes", "override"],
     "phase_assignees": {
         "backlog": "productowner",
@@ -3328,6 +3330,32 @@ CREATE TRIGGER IF NOT EXISTS qualification_decisions_no_delete
 BEFORE DELETE ON qualification_intake_decisions BEGIN
     SELECT RAISE(ABORT, 'qualification decisions are append-only');
 END;
+CREATE TRIGGER IF NOT EXISTS qualification_intake_immutable_fields
+BEFORE UPDATE ON qualification_intake
+WHEN NEW.id IS NOT OLD.id
+  OR NEW.raw_request IS NOT OLD.raw_request
+  OR NEW.source IS NOT OLD.source
+  OR NEW.session_id IS NOT OLD.session_id
+  OR NEW.attachments_json IS NOT OLD.attachments_json
+  OR NEW.created_at IS NOT OLD.created_at
+BEGIN
+    SELECT RAISE(ABORT, 'qualification intake provenance is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS qualification_intake_no_delete
+BEFORE DELETE ON qualification_intake BEGIN
+    SELECT RAISE(ABORT, 'qualification intake provenance is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS qualification_intake_status_requires_decision
+BEFORE UPDATE OF status ON qualification_intake
+WHEN NEW.status IS NOT OLD.status
+ AND COALESCE(
+     (SELECT decision FROM qualification_intake_decisions
+      WHERE intake_id = OLD.id ORDER BY id DESC LIMIT 1),
+     ''
+ ) != NEW.status
+BEGIN
+    SELECT RAISE(ABORT, 'qualification status requires an append-only decision');
+END;
 """
 
 
@@ -4697,6 +4725,22 @@ def record_qualification_decision(
         ).fetchone()
         if not exists:
             raise ValueError(f"unknown qualification intake: {intake_id}")
+        if decision in {"qualified", "overridden"}:
+            if not contract_id:
+                raise ValueError(
+                    f"{decision} decision requires the matching Work Contract"
+                )
+            contract_row = conn.execute(
+                "SELECT request_id FROM work_contracts WHERE id = ?", (contract_id,)
+            ).fetchone()
+            if not contract_row:
+                raise ValueError(f"unknown Work Contract: {contract_id}")
+            if contract_row["request_id"] != intake_id:
+                raise ValueError(
+                    f"Work Contract {contract_id} does not belong to intake {intake_id}"
+                )
+        elif contract_id is not None:
+            raise ValueError("rejected decisions cannot attach a Work Contract")
         cursor = conn.execute(
             """
             INSERT INTO qualification_intake_decisions (
@@ -4748,20 +4792,30 @@ def store_work_contract(
     contract = signed_contract["contract"]
     digest = signed_contract["digest"]
     contract_id = "wc_" + digest[:24]
-    existing = conn.execute(
-        "SELECT id, canonical_json, signature FROM work_contracts WHERE digest = ?",
-        (digest,),
-    ).fetchone()
-    if existing:
-        if (
-            existing["canonical_json"] != signed_contract["canonical_json"]
-            or existing["signature"] != signed_contract["signature"]
-        ):
-            raise ValueError("stored Work Contract digest conflicts with signed payload")
-        return existing["id"]
     issuer = contract["issuer"]
     now = int(time.time()) if created_at is None else int(created_at)
     with write_txn(conn):
+        intake_row = conn.execute(
+            "SELECT id FROM qualification_intake WHERE id = ?",
+            (contract["request_id"],),
+        ).fetchone()
+        if not intake_row:
+            raise ValueError(
+                f"unknown qualification intake: {contract['request_id']}"
+            )
+        existing = conn.execute(
+            "SELECT id, canonical_json, signature FROM work_contracts WHERE digest = ?",
+            (digest,),
+        ).fetchone()
+        if existing:
+            if (
+                existing["canonical_json"] != signed_contract["canonical_json"]
+                or existing["signature"] != signed_contract["signature"]
+            ):
+                raise ValueError(
+                    "stored Work Contract digest conflicts with signed payload"
+                )
+            return existing["id"]
         conn.execute(
             """
             INSERT INTO work_contracts (
