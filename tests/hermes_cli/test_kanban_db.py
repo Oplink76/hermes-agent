@@ -1334,6 +1334,261 @@ def test_successful_repair_appends_audit_and_needs_ole_events(kanban_home):
     assert attention.payload["reason"] == "resolver_repair"
 
 
+@pytest.mark.parametrize(
+    "forbidden",
+    [
+        {"task_links": []},
+        {"epic_memberships": []},
+        {"work_contract": {"phase": "development"}},
+    ],
+)
+def test_resolver_cannot_change_epic_membership_or_dependencies(
+    kanban_home, forbidden,
+):
+    board = "resolver-immutable-relations"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        parent = kb.create_task(conn, title="Dependency", board=board)
+        kb.link_tasks(conn, parent, tid)
+        assert kb.parent_ids(conn, tid) == [parent]
+        before = _resolver_state(conn, tid)
+        request = _resolver_request(
+            _resolver_expected(conn, tid, run_id),
+            decision="repair",
+            repair={"workflow": {"phase": "development"}},
+        )
+        request.update(forbidden)
+        with pytest.raises(ValueError, match="unexpected"):
+            kb.resolve_product_preflight(
+                conn,
+                tid,
+                board=board,
+                request=request,
+                resolver_profile="resolver",
+                resolver_model=None,
+            )
+        assert _resolver_state(conn, tid) == before
+
+
+def test_resolver_cannot_override_release_classification(kanban_home):
+    board = "resolver-immutable-release"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        before = _resolver_state(conn, tid)
+        request = _resolver_request(
+            _resolver_expected(conn, tid, run_id),
+            decision="repair",
+            repair={"workflow": {"phase": "development"}},
+            release_path="standalone",
+        )
+        with pytest.raises(ValueError, match="unexpected"):
+            kb.resolve_product_preflight(
+                conn,
+                tid,
+                board=board,
+                request=request,
+                resolver_profile="resolver",
+                resolver_model=None,
+            )
+        assert _resolver_state(conn, tid) == before
+
+
+def _route_project_task_with_audited_handoff(
+    conn, board: str, repo: Path, project_id: str,
+) -> tuple[str, int, Path, str]:
+    tid = kb.create_task(
+        conn,
+        title="Story: adopted handoff",
+        assignee="developer",
+        workflow_template_id="product",
+        current_step_key="development",
+        project_id=project_id,
+        board=board,
+    )
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    workspace = kb.resolve_workspace(task, board=board)
+    kb.set_workspace_path(conn, tid, workspace)
+    task = kb.get_task(conn, tid)
+    assert task is not None and task.branch_name
+    sha = _commit_file(workspace, "feature.py", "value = 1\n", "feature")
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn,
+            tid,
+            "handoff",
+            {
+                "from_step": "development",
+                "to_step": "test",
+                "sha": sha,
+                "assignee": "tester",
+                "summary": "Previously committed Development work",
+            },
+        )
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None and claimed.current_run_id is not None
+    assert kb.block_task(
+        conn,
+        tid,
+        reason="The committed handoff was not adopted",
+        kind="needs_input",
+        attempted_resolutions=["verified task branch"],
+        expected_run_id=claimed.current_run_id,
+        board=board,
+        human_escalation_assignee="resolver",
+    )
+    resolver = kb.claim_task(conn, tid)
+    assert resolver is not None and resolver.current_run_id is not None
+    return tid, resolver.current_run_id, workspace, sha
+
+
+def _resolver_project_fixture(kanban_home, tmp_path, board: str):
+    from hermes_cli import projects_db as pdb
+
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board(board)
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn,
+            name="Adopted Handoff",
+            primary_path=str(repo),
+            board_slug=board,
+        )
+    return repo, project_id
+
+
+def test_adopt_handoff_sha_requires_same_task_development_handoff_event(
+    kanban_home, tmp_path,
+):
+    board = "resolver-adopt-same-task"
+    repo, project_id = _resolver_project_fixture(kanban_home, tmp_path, board)
+    with kb.connect(board=board) as conn:
+        tid, run_id, _workspace, sha = _route_project_task_with_audited_handoff(
+            conn, board, repo, project_id,
+        )
+        conn.execute(
+            "DELETE FROM task_events WHERE task_id=? AND kind='handoff'", (tid,),
+        )
+        conn.commit()
+        before = _resolver_state(conn, tid)
+        with pytest.raises(ValueError, match="Development handoff"):
+            kb.resolve_product_preflight(
+                conn,
+                tid,
+                board=board,
+                request=_resolver_request(
+                    _resolver_expected(conn, tid, run_id),
+                    decision="repair",
+                    repair={"adopt_handoff_sha": sha},
+                ),
+                resolver_profile="resolver",
+                resolver_model=None,
+            )
+        assert _resolver_state(conn, tid) == before
+
+
+def test_adopt_handoff_sha_requires_current_project_branch_head(
+    kanban_home, tmp_path,
+):
+    board = "resolver-adopt-current-head"
+    repo, project_id = _resolver_project_fixture(kanban_home, tmp_path, board)
+    with kb.connect(board=board) as conn:
+        tid, run_id, workspace, old_sha = _route_project_task_with_audited_handoff(
+            conn, board, repo, project_id,
+        )
+        _commit_file(workspace, "later.py", "value = 2\n", "later")
+        before = _resolver_state(conn, tid)
+        with pytest.raises(ValueError, match="branch HEAD"):
+            kb.resolve_product_preflight(
+                conn,
+                tid,
+                board=board,
+                request=_resolver_request(
+                    _resolver_expected(conn, tid, run_id),
+                    decision="repair",
+                    repair={"adopt_handoff_sha": old_sha},
+                ),
+                resolver_profile="resolver",
+                resolver_model=None,
+            )
+        assert _resolver_state(conn, tid) == before
+
+
+def test_development_handoff_uses_valid_adopted_sha_when_tree_is_clean(
+    kanban_home, tmp_path,
+):
+    board = "resolver-adopt-clean-handoff"
+    repo, project_id = _resolver_project_fixture(kanban_home, tmp_path, board)
+    with kb.connect(board=board) as conn:
+        tid, run_id, workspace, sha = _route_project_task_with_audited_handoff(
+            conn, board, repo, project_id,
+        )
+        assert kb.resolve_product_preflight(
+            conn,
+            tid,
+            board=board,
+            request=_resolver_request(
+                _resolver_expected(conn, tid, run_id),
+                decision="repair",
+                repair={"adopt_handoff_sha": sha},
+            ),
+            resolver_profile="resolver",
+            resolver_model="test-model",
+        )
+        assert subprocess.run(
+            ["git", "-C", str(workspace), "status", "--porcelain"],
+            check=True, capture_output=True, text=True,
+        ).stdout == ""
+        assert kb.handoff(
+            conn,
+            tid,
+            board=board,
+            summary="Adopt the already committed Development handoff",
+            metadata={"ai_provenance": {"writer": {"agent": "hermes"}}},
+        )
+        task = kb.get_task(conn, tid)
+        handoffs = [event for event in kb.list_events(conn, tid) if event.kind == "handoff"]
+    assert task is not None and task.current_step_key == "test"
+    assert handoffs[-1].payload["sha"] == sha
+
+
+def test_invalid_adopted_sha_leaves_task_and_git_untouched(kanban_home, tmp_path):
+    board = "resolver-adopt-invalid-atomic"
+    repo, project_id = _resolver_project_fixture(kanban_home, tmp_path, board)
+    with kb.connect(board=board) as conn:
+        tid, run_id, workspace, _sha = _route_project_task_with_audited_handoff(
+            conn, board, repo, project_id,
+        )
+        before = _resolver_state(conn, tid)
+        head_before = _head_sha(workspace)
+        status_before = subprocess.run(
+            ["git", "-C", str(workspace), "status", "--porcelain"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        with pytest.raises(ValueError, match="Development handoff"):
+            kb.resolve_product_preflight(
+                conn,
+                tid,
+                board=board,
+                request=_resolver_request(
+                    _resolver_expected(conn, tid, run_id),
+                    decision="repair",
+                    repair={"adopt_handoff_sha": "0" * 40},
+                ),
+                resolver_profile="resolver",
+                resolver_model=None,
+            )
+        assert _resolver_state(conn, tid) == before
+        assert _head_sha(workspace) == head_before
+        assert subprocess.run(
+            ["git", "-C", str(workspace), "status", "--porcelain"],
+            check=True, capture_output=True, text=True,
+        ).stdout == status_before
+
+
 @pytest.mark.parametrize("step", ["test", "review"])
 def test_product_preflight_resolver_validation_precedes_rework(
     kanban_home, step

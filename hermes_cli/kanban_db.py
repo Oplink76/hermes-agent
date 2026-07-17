@@ -2117,6 +2117,95 @@ _RESOLVER_EXPECTED_KEYS = frozenset({
 })
 
 
+def _validate_adopted_handoff_sha(
+    conn: sqlite3.Connection,
+    task_id: str,
+    sha: str,
+) -> str:
+    """Validate an evidence-preserving Development handoff adoption."""
+    normalized_sha = str(sha or "").strip()
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='handoff' "
+        "ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    matched = False
+    for event_row in rows:
+        try:
+            payload = json.loads(event_row["payload"]) if event_row["payload"] else {}
+        except Exception:
+            payload = {}
+        if (
+            isinstance(payload, dict)
+            and payload.get("from_step") == "development"
+            and str(payload.get("sha") or "").strip() == normalized_sha
+        ):
+            matched = True
+            break
+    if not matched:
+        raise ValueError(
+            "adopt_handoff_sha requires a same-task Development handoff event"
+        )
+
+    task = conn.execute(
+        "SELECT project_id, workspace_kind, workspace_path, branch_name "
+        "FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if (
+        task is None
+        or not task["project_id"]
+        or task["workspace_kind"] != "worktree"
+        or not task["workspace_path"]
+        or not task["branch_name"]
+    ):
+        raise ValueError("adopt_handoff_sha requires a project-bound task worktree")
+    workspace = Path(task["workspace_path"])
+    repo_root = _git_toplevel(workspace)
+    if repo_root is None:
+        raise ValueError("adopt_handoff_sha task worktree is not a git repository")
+
+    def git_output(*args: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ValueError("adopt_handoff_sha git validation failed")
+        return (result.stdout or "").strip()
+
+    if git_output("status", "--porcelain"):
+        raise ValueError("adopt_handoff_sha requires a clean task worktree")
+    git_output("cat-file", "-e", f"{normalized_sha}^{{commit}}")
+    branch_head = git_output("rev-parse", str(task["branch_name"]))
+    checked_out_head = git_output("rev-parse", "HEAD")
+    if normalized_sha != branch_head or normalized_sha != checked_out_head:
+        raise ValueError("adopt_handoff_sha must equal the current task branch HEAD")
+    return normalized_sha
+
+
+def _latest_resolver_repair_payload(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id=? AND kind='resolver_repair_applied' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def resolve_product_preflight(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2255,6 +2344,11 @@ def resolve_product_preflight(
         if decision == "repair":
             workflow_repair = repair.get("workflow") if isinstance(repair, dict) else None
             workflow_repair = workflow_repair if isinstance(workflow_repair, dict) else {}
+            adopted_sha = repair.get("adopt_handoff_sha") if isinstance(repair, dict) else None
+            if adopted_sha is not None:
+                adopted_sha = _validate_adopted_handoff_sha(
+                    conn, task_id, str(adopted_sha),
+                )
             phase = str(
                 workflow_repair.get("phase") or preflight.get("step_key")
                 or row["current_step_key"] or "backlog"
@@ -2343,11 +2437,10 @@ def resolve_product_preflight(
                     }.items() if value is not None
                 }
             }
-            adopted_sha = repair.get("adopt_handoff_sha") if isinstance(repair, dict) else None
             if adopted_sha is not None:
-                normalized_repair["adopt_handoff_sha"] = str(adopted_sha).strip()
+                normalized_repair["adopt_handoff_sha"] = adopted_sha
                 repair_before["adopt_handoff_sha"] = None
-                repair_after["adopt_handoff_sha"] = str(adopted_sha).strip()
+                repair_after["adopt_handoff_sha"] = adopted_sha
             cur = conn.execute(
                 "UPDATE tasks SET status=?, assignee=?, project_id=?, "
                 "workspace_kind=?, workspace_path=?, branch_name=?, "
@@ -10340,6 +10433,21 @@ def handoff(
     _validate_product_ai_provenance(conn, task_id, step, metadata, meta)
 
     sha = _commit_worker_diff(conn, task_id)
+    if sha is None and str(step or "") == "development":
+        repair_payload = _latest_resolver_repair_payload(conn, task_id) or {}
+        repair = repair_payload.get("repair")
+        adopted_sha = (
+            repair.get("adopt_handoff_sha")
+            if isinstance(repair, dict)
+            else None
+        )
+        if adopted_sha:
+            try:
+                sha = _validate_adopted_handoff_sha(
+                    conn, task_id, str(adopted_sha),
+                )
+            except ValueError:
+                return False
     if sha is None and str(step or "") in _PRODUCT_COMMIT_REQUIRED_STEPS:
         return False
 
