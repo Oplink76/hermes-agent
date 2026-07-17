@@ -676,6 +676,19 @@ def test_strict_board_rejects_client_contract_and_routing_mutations(client):
     assert lifecycle.status_code == 409
     assert "run-scoped" in lifecycle.text
 
+    bulk_lifecycle = client.post(
+        "/api/plugins/kanban/tasks/bulk?board=strict",
+        json={
+            "ids": [first],
+            "status": "done",
+            "summary": "bulk-forged completion",
+        },
+    )
+    assert bulk_lifecycle.status_code == 409
+    assert "run-scoped" in bulk_lifecycle.text
+    with kb.connect(board="strict") as conn:
+        assert kb.get_task(conn, first).status != "done"
+
     deletion = client.delete(
         f"/api/plugins/kanban/tasks/{first}?board=strict",
     )

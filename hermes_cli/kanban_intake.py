@@ -476,14 +476,14 @@ def materialize_contract(
     request_id = contract["request_id"]
 
     with kanban_db.write_txn(conn):
-        contract_id = kanban_db.store_work_contract(
-            conn,
-            dict(signed_contract),
-            secret=secret,
-            hermes_home=hermes_home,
-        )
         existing = conn.execute(
-            "SELECT id FROM tasks WHERE work_contract_id = ?", (contract_id,)
+            """
+            SELECT tasks.id
+            FROM tasks
+            JOIN work_contracts ON work_contracts.id = tasks.work_contract_id
+            WHERE work_contracts.digest = ?
+            """,
+            (signed_contract["digest"],),
         ).fetchone()
         if existing:
             return str(existing["id"])
@@ -500,6 +500,25 @@ def materialize_contract(
             raise WorkContractError(
                 f"qualification intake {request_id} is already {intake_record['status']}"
             )
+
+        from hermes_cli import kanban_qualifier
+
+        try:
+            kanban_qualifier.revalidate_contract_evidence(
+                conn,
+                board_metadata=metadata,
+                intake=intake_record,
+                contract=contract,
+            )
+        except kanban_qualifier.QualificationValidationError as exc:
+            raise WorkContractError(str(exc)) from exc
+
+        contract_id = kanban_db.store_work_contract(
+            conn,
+            dict(signed_contract),
+            secret=secret,
+            hermes_home=hermes_home,
+        )
 
         is_override = contract["qualification_path"] == "override"
         override_authority = contract.get("override_authority") or {}

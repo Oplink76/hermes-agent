@@ -274,6 +274,29 @@ def test_late_entry_rejects_non_object_and_unsubmitted_evidence(conn, policy):
         )
 
 
+def test_late_entry_cannot_reuse_evidence_from_an_unrelated_card(conn, policy):
+    unrelated = kb.create_task(conn, title="Unrelated completed work")
+    conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES (?, 'tester', 'backlog-artifact architecture-artifact', 1)",
+        (unrelated,),
+    )
+    decision = _decision()
+    decision["routing"].update(
+        {"entry_phase": "development", "assignee": "developer"}
+    )
+    decision["handover"].update(next_phase="test", next_role="tester")
+    decision["entry_assessment"] = _late_assessment("backlog", "architecture")
+
+    with pytest.raises(qualifier.QualificationValidationError, match="not grounded"):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=_intake(conn),
+            decision=decision,
+        )
+
+
 def test_review_entry_requires_independent_writer_and_test_provenance(conn, policy):
     decision = _decision()
     decision["routing"].update({"entry_phase": "review", "assignee": "reviewer"})

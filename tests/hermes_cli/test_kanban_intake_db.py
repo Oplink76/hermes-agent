@@ -39,6 +39,22 @@ def _signed_contract(request_id: str = "qi_example"):
                 "epic_id": None,
                 "dependencies": [],
             },
+            "entry_assessment": {
+                "reason": "Earlier phases are already satisfied",
+                "skipped_phases": [
+                    {
+                        "phase": "backlog",
+                        "reason": "backlog evidence exists",
+                        "evidence": ["backlog-artifact"],
+                    },
+                    {
+                        "phase": "architecture",
+                        "reason": "architecture evidence exists",
+                        "evidence": ["architecture-artifact"],
+                    },
+                ],
+                "evidence": ["backlog-artifact", "architecture-artifact"],
+            },
             "handover": {
                 "deliverables": [],
                 "required_evidence": [],
@@ -240,7 +256,13 @@ def test_strict_board_rejects_direct_task_insert_and_materializes_atomically(
             )
 
         request_id = kb.create_qualification_intake(
-            connection, raw_request="qualified request", source="hermes"
+            connection,
+            raw_request="qualified request",
+            source="hermes",
+            attachments=[
+                {"name": "backlog-artifact"},
+                {"name": "architecture-artifact"},
+            ],
         )
         signed = _signed_contract(request_id)
         task_id = intake.materialize_contract(
@@ -366,7 +388,13 @@ def test_materialization_rolls_back_contract_and_decision_on_invalid_relationshi
     connection = kb.connect(board="strict")
     try:
         request_id = kb.create_qualification_intake(
-            connection, raw_request="bad dependency", source="hermes"
+            connection,
+            raw_request="bad dependency",
+            source="hermes",
+            attachments=[
+                {"name": "backlog-artifact"},
+                {"name": "architecture-artifact"},
+            ],
         )
         contract = _signed_contract(request_id)["contract"]
         contract["routing"]["dependencies"] = ["t_missing"]
@@ -384,5 +412,65 @@ def test_materialization_rolls_back_contract_and_decision_on_invalid_relationshi
         assert kb.list_qualification_decisions(connection, request_id) == []
         assert connection.execute("SELECT COUNT(*) FROM work_contracts").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_materialization_revalidates_late_entry_evidence_before_writing(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.ensure_product_board_defaults("strict")
+    with kb.connect(board="strict") as legacy_connection:
+        unrelated = kb.create_task(
+            legacy_connection, title="Unrelated evidence holder"
+        )
+        legacy_connection.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'tester', 'backlog-artifact architecture-artifact', 1)",
+            (unrelated,),
+        )
+    metadata_path = kb.board_metadata_path("strict")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    connection = kb.connect(board="strict")
+    try:
+        request_id = kb.create_qualification_intake(
+            connection, raw_request="late entry", source="hermes"
+        )
+        contract = _signed_contract(request_id)["contract"]
+        contract["entry_assessment"] = {
+            "reason": "Earlier phases are claimed complete",
+            "skipped_phases": [
+                {
+                    "phase": "backlog",
+                    "reason": "claimed evidence",
+                    "evidence": ["backlog-artifact"],
+                },
+                {
+                    "phase": "architecture",
+                    "reason": "claimed evidence",
+                    "evidence": ["architecture-artifact"],
+                },
+            ],
+            "evidence": ["backlog-artifact", "architecture-artifact"],
+        }
+        signed = intake.sign_work_contract(contract, secret=b"test-only-secret")
+
+        with pytest.raises(intake.WorkContractError, match="not grounded"):
+            intake.materialize_contract(
+                connection,
+                board="strict",
+                signed_contract=signed,
+                secret=b"test-only-secret",
+            )
+
+        assert kb.get_qualification_intake(connection, request_id)["status"] == "pending"
+        assert connection.execute("SELECT COUNT(*) FROM work_contracts").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
     finally:
         connection.close()

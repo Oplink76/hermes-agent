@@ -156,22 +156,15 @@ def _validate_po_evidence(
         errors.append("Product Owner artifact is not referenced by the run or intake")
 
 
-def _evidence_corpus(conn: Any, intake: Mapping[str, Any]) -> str:
+def _evidence_corpus(intake: Mapping[str, Any]) -> str:
+    """Return only evidence submitted with this intake."""
+
     parts = [str(intake.get("raw_request") or "")]
     parts.append(json.dumps(intake.get("attachments") or [], default=str))
-    for row in conn.execute(
-        "SELECT summary, metadata, error FROM task_runs"
-    ).fetchall():
-        parts.extend(str(row[key] or "") for key in ("summary", "metadata", "error"))
-    for row in conn.execute("SELECT payload FROM task_events").fetchall():
-        parts.append(str(row["payload"] or ""))
-    for row in conn.execute("SELECT body FROM task_comments").fetchall():
-        parts.append(str(row["body"] or ""))
     return "\n".join(parts)
 
 
 def _validate_late_entry(
-    conn: Any,
     decision: Mapping[str, Any],
     *,
     intake: Mapping[str, Any],
@@ -197,7 +190,7 @@ def _validate_late_entry(
             "skipped phases must exactly match the phases before " + entry_phase
         )
         return
-    evidence_corpus = _evidence_corpus(conn, intake)
+    evidence_corpus = _evidence_corpus(intake)
     for item in skipped:
         reason = item.get("reason")
         evidence = item.get("evidence")
@@ -242,6 +235,54 @@ def _validate_late_entry(
                 "Review provenance is not grounded in submitted or existing evidence: "
                 + ", ".join(ungrounded)
             )
+
+
+def revalidate_contract_evidence(
+    conn: Any,
+    *,
+    board_metadata: Mapping[str, Any],
+    intake: Mapping[str, Any],
+    contract: Mapping[str, Any],
+) -> None:
+    """Recheck late-entry and PO evidence immediately before materialization."""
+
+    work = contract.get("work")
+    routing = contract.get("routing")
+    if not isinstance(work, Mapping) or not isinstance(routing, Mapping):
+        raise QualificationValidationError(["work and routing are required"])
+    if work.get("item_kind") == "epic":
+        return
+
+    policy_value = board_metadata.get("qualification")
+    policy = policy_value if isinstance(policy_value, Mapping) else {}
+    phase_assignees_value = policy.get("phase_assignees")
+    phase_assignees = (
+        phase_assignees_value
+        if isinstance(phase_assignees_value, Mapping)
+        else {}
+    )
+    entry_phase = routing.get("entry_phase")
+    errors: list[str] = []
+    if entry_phase not in phase_assignees:
+        errors.append("entry phase is not defined by board policy")
+    else:
+        _validate_late_entry(
+            contract,
+            intake=intake,
+            phases=list(phase_assignees),
+            entry_phase=str(entry_phase),
+            errors=errors,
+        )
+    if contract.get("qualification_path") == "po":
+        _validate_po_evidence(
+            conn,
+            intake=intake,
+            decision=contract,
+            product_owner_profile=phase_assignees.get("backlog"),
+            errors=errors,
+        )
+    if errors:
+        raise QualificationValidationError(errors)
 
 
 def validate_decision(
@@ -316,7 +357,6 @@ def validate_decision(
                 else:
                     errors.append("assignee does not match the entry phase role")
             _validate_late_entry(
-                conn,
                 normalized,
                 intake=intake,
                 phases=phases,

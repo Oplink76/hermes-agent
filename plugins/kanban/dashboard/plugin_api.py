@@ -2041,6 +2041,15 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
         )
     results: list[dict] = []
     board = _resolve_board(board)
+    if kanban_intake.qualification_required(kanban_db.read_board_metadata(board)):
+        if payload.status is not None or payload.archive or payload.assignee is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Strict-board routing is Work Contract-owned and completion "
+                    "is run-scoped"
+                ),
+            )
     conn = _conn(board=board)
     conditional_txn = None
     try:
