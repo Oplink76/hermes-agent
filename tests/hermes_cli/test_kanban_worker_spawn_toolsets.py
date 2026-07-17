@@ -89,6 +89,70 @@ agent:
         assert required in pinned
 
 
+def test_default_spawn_forces_resolver_readonly_toolset(monkeypatch, tmp_path):
+    """Resolver workers are pinned to the minimal read-only surface.
+
+    Even when the resolver profile's config would resolve to a broad CLI
+    toolset list, the spawned resolver must get an explicit
+    ``--toolsets resolver_readonly`` pin — the resolver is a task-local
+    repair/preflight resolver, never a general worker with terminal/file
+    mutation tools.
+    """
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "resolver"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        """
+platform_toolsets:
+  cli:
+    - clarify
+    - code_execution
+    - delegation
+    - file
+    - memory
+    - session_search
+    - skills
+    - terminal
+    - web
+toolsets:
+  - hermes-cli
+agent:
+  disabled_toolsets: []
+""".lstrip(),
+        encoding="utf-8",
+    )
+    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+
+    captured = {}
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs.get("env") or {})
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    pid = kb._default_spawn(_make_task(kb, assignee="resolver"), str(workspace))
+
+    assert pid == 4245
+    assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
+    assert "--toolsets" in captured["cmd"]
+    pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
+    assert pinned == ["resolver_readonly"], (
+        f"resolver spawn must pin exactly resolver_readonly, got {pinned}"
+    )
+
+
 def test_default_spawn_never_boots_the_tui(monkeypatch, tmp_path):
     """Workers are headless: an inherited HERMES_TUI=1 (or a TUI-default
     config) must not send the quiet chat run into the Ink TUI, whose no-TTY

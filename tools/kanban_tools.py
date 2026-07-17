@@ -878,10 +878,20 @@ def _handle_resolve(args: dict, **kw) -> str:
     if resolver_profile != "resolver":
         return tool_error("kanban_resolve is restricted to the resolver profile")
 
+    allowed_fields = {
+        "task_id", "board", "decision", "fault_domain", "diagnosis",
+        "reason", "expected", "repair",
+    }
+    unexpected = sorted(set(args) - allowed_fields)
+    if unexpected:
+        return tool_error(
+            "kanban_resolve: unexpected fields: " + ", ".join(unexpected)
+        )
+
     board = args.get("board")
     request_fields = (
         "decision", "fault_domain", "diagnosis", "reason", "expected",
-        "repair", "fix_task_id",
+        "repair",
     )
     request = {field: args[field] for field in request_fields if field in args}
     resolver_model = (
@@ -1673,7 +1683,7 @@ KANBAN_RESOLVE_SCHEMA = {
             "board": _board_schema_prop(),
             "decision": {
                 "type": "string",
-                "enum": ["resume", "repair", "create_fix_task", "escalate"],
+                "enum": ["resume", "repair", "escalate"],
             },
             "fault_domain": {
                 "type": "string",
@@ -1727,7 +1737,6 @@ KANBAN_RESOLVE_SCHEMA = {
                 },
                 "additionalProperties": False,
             },
-            "fix_task_id": {"type": "string"},
         },
         "required": [
             "task_id", "decision", "fault_domain", "diagnosis", "reason",
@@ -2137,7 +2146,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
     handler=_handle_create,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_ordinary_worker_mode,
     emoji="➕",
 )
 
@@ -2155,6 +2164,6 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_LINK_SCHEMA,
     handler=_handle_link,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_ordinary_worker_mode,
     emoji="🔗",
 )

@@ -2222,14 +2222,12 @@ def resolve_product_preflight(
     allowed_keys = {
         "decision", "fault_domain", "diagnosis", "reason", "expected",
     }
-    if decision == "create_fix_task":
-        allowed_keys.add("fix_task_id")
-    elif decision == "repair":
+    if decision not in {"resume", "repair", "escalate"}:
+        raise ValueError("decision must be resume, repair, or escalate")
+    if decision == "repair":
         allowed_keys.add("repair")
     if set(request) != allowed_keys:
         raise ValueError("resolver request contains missing or unexpected fields")
-    if decision not in {"resume", "repair", "create_fix_task", "escalate"}:
-        raise ValueError("decision must be resume, repair, create_fix_task, or escalate")
     fault_domain = request.get("fault_domain")
     if fault_domain not in {"task_state", "framework"}:
         raise ValueError("fault_domain must be task_state or framework")
@@ -2244,11 +2242,6 @@ def resolve_product_preflight(
     expected = request.get("expected")
     if not isinstance(expected, dict) or set(expected) != _RESOLVER_EXPECTED_KEYS:
         raise ValueError("expected must contain the complete Resolver snapshot")
-    fix_task_id = request.get("fix_task_id")
-    if decision == "create_fix_task":
-        if not isinstance(fix_task_id, str) or not fix_task_id.strip():
-            raise ValueError("fix_task_id is required for create_fix_task")
-        fix_task_id = fix_task_id.strip()
     repair = request.get("repair")
     if decision == "repair":
         if not isinstance(repair, dict) or not repair:
@@ -2454,32 +2447,6 @@ def resolve_product_preflight(
                 ),
             )
             outcome = "preflight_repaired"
-        elif decision == "create_fix_task":
-            if fix_task_id not in child_ids(conn, task_id):
-                raise ValueError("fix_task_id must name a real linked task")
-            verified, phantom = _verify_created_cards(conn, task_id, [fix_task_id])
-            if phantom or verified != [fix_task_id]:
-                raise ValueError("fix_task_id must name a real linked task")
-            if fix_task_id not in child_ids(conn, task_id):
-                raise ValueError("fix_task_id must name a real linked task")
-            conn.execute(
-                "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
-                (task_id, fix_task_id),
-            )
-            if _would_cycle(conn, fix_task_id, task_id):
-                raise ValueError(f"linking {fix_task_id} -> {task_id} would create a cycle")
-            conn.execute(
-                "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-                (fix_task_id, task_id),
-            )
-            cur = conn.execute(
-                "UPDATE tasks SET status='todo', assignee=?, running=0, blocked=0, "
-                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
-                "WHERE id=? AND current_run_id=?",
-                (original_assignee, task_id, int(run_id)),
-            )
-            outcome = "preflight_fix_task_created"
-            next_status = "todo"
         elif decision == "escalate":
             cur = conn.execute(
                 "UPDATE tasks SET status='blocked', assignee='default', running=0, "
@@ -2524,8 +2491,6 @@ def resolve_product_preflight(
             "resolver_profile": resolver_profile,
             "resolver_model": resolver_model,
         }
-        if fix_task_id is not None:
-            resolved_payload["fix_task_id"] = fix_task_id
         if decision == "resume":
             resolved_payload["assignee"] = original_assignee
         if decision == "repair":
@@ -13408,7 +13373,11 @@ def _default_spawn(
                 cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    worker_toolsets = (
+        ["resolver_readonly"]
+        if profile_arg == "resolver"
+        else _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    )
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
@@ -13608,7 +13577,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         )
         lines.append(
             "Resolve only with kanban_resolve: decision must be resume, repair, "
-            "create_fix_task, or escalate; diagnosis, reason, fault_domain, and "
+            "or escalate; diagnosis, reason, fault_domain, and "
             "the complete expected snapshot are required."
         )
         lines.append("")

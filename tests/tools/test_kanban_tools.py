@@ -67,23 +67,47 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
-def test_resolver_worker_gets_resolve_not_complete_or_block(monkeypatch, tmp_path):
+def test_resolver_worker_gets_only_readonly_surface_and_resolve(monkeypatch, tmp_path):
+    """Resolver is a task-local repair/preflight resolver only.
+
+    Its tool surface is the read-only evidence set plus exactly the kanban
+    tools needed to inspect, heartbeat, comment, and resolve — never the
+    create/link/complete/block mutation surface, and never arbitrary
+    mutation tools (terminal, write_file, delegation, ...).
+    """
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_resolver")
     monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    # Light up web_search / web_extract deterministically (conftest scrubs
+    # all web backend keys from the environment).
+    monkeypatch.setenv("EXA_API_KEY", "test-key")
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
 
     import tools.kanban_tools  # ensure registered
-    from tools.registry import invalidate_check_fn_cache, registry
-    from toolsets import resolve_toolset
+    from model_tools import _clear_tool_defs_cache, get_tool_definitions
+    from tools.registry import invalidate_check_fn_cache
 
     invalidate_check_fn_cache()
-    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    _clear_tool_defs_cache()
+    schema = get_tool_definitions(
+        enabled_toolsets=["resolver_readonly"],
+        quiet_mode=True,
+    )
     names = {s["function"].get("name") for s in schema if "function" in s}
-    assert "kanban_resolve" in names
-    assert "kanban_complete" not in names
-    assert "kanban_block" not in names
+    kanban = {n for n in names if n and n.startswith("kanban_")}
+    assert kanban == {
+        "kanban_show", "kanban_heartbeat", "kanban_comment", "kanban_resolve",
+    }, f"resolver kanban surface must be inspect/heartbeat/comment/resolve, got {kanban}"
+    for readonly in ("read_file", "search_files", "web_search", "web_extract"):
+        assert readonly in names, f"resolver evidence tool missing: {readonly}"
+    forbidden = {
+        "kanban_create", "kanban_link", "kanban_complete", "kanban_block",
+        "terminal", "process", "write_file", "patch", "execute_code",
+        "delegate_task", "memory", "todo", "cronjob",
+    }
+    leaked = forbidden & names
+    assert not leaked, f"mutation tools leaked into resolver surface: {leaked}"
 
 
 def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_path):
@@ -413,16 +437,17 @@ def test_resolve_schema_is_strict_and_bounded():
     ]
     assert params["additionalProperties"] is False
     assert params["properties"]["decision"]["enum"] == [
-        "resume", "repair", "create_fix_task", "escalate",
+        "resume", "repair", "escalate",
     ]
     repair = params["properties"]["repair"]
     workflow = repair["properties"]["workflow"]
     assert repair["additionalProperties"] is False
     assert workflow["additionalProperties"] is False
     assert set(workflow["properties"]) == {"phase", "assignee", "project_id"}
+    assert "fix_task_id" not in params["properties"]
     assert set(params["properties"]) == {
         "task_id", "board", "decision", "fault_domain", "diagnosis",
-        "reason", "expected", "repair", "fix_task_id",
+        "reason", "expected", "repair",
     }
 
 
@@ -1708,6 +1733,30 @@ def test_resolver_tool_rejects_foreign_task(monkeypatch):
     assert "scoped to task t_owned" in out["error"]
 
 
+def test_resolver_tool_rejects_legacy_fields_before_database_call(monkeypatch):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_owned")
+    monkeypatch.setattr(
+        kt,
+        "_connect",
+        lambda **_kwargs: pytest.fail("legacy request reached the database"),
+    )
+
+    out = json.loads(kt._handle_resolve({
+        "task_id": "t_owned",
+        "decision": "resume",
+        "fault_domain": "task_state",
+        "diagnosis": "recoverable",
+        "reason": "resume",
+        "expected": {},
+        "fix_task_id": "t_legacy",
+    }))
+
+    assert "unexpected fields: fix_task_id" in out["error"]
+
+
 def test_product_block_prefers_board_resolver_profile(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -1875,6 +1924,38 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "kanban_create" in prompt
     # Anti-shell guidance
     assert "Do not shell out" in prompt or "tools — they work" in prompt
+
+
+def test_resolver_prompt_contains_only_resolver_lifecycle_guidance(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_resolver")
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _P
+    monkeypatch.setattr(_P, "home", lambda: tmp_path)
+
+    from tools.registry import invalidate_check_fn_cache
+    from model_tools import _clear_tool_defs_cache
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+
+    from run_agent import AIAgent
+    agent = AIAgent(
+        api_key="test",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        enabled_toolsets=["resolver_readonly"],
+    )
+    prompt = agent._build_system_prompt()
+
+    assert "Resolver task protocol" in prompt
+    assert "kanban_resolve" in prompt
+    assert "kanban_complete" not in prompt
+    assert "kanban_block" not in prompt
+    assert "kanban_create" not in prompt
 
 
 def test_kanban_guidance_states_commit_first_handoff_contract():

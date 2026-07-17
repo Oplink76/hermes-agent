@@ -890,7 +890,6 @@ def _resolve_preflight(
     decision: str = "resume",
     reason: str = "Use the configured recovery path",
     fault_domain: str = "task_state",
-    fix_task_id: str | None = None,
 ) -> bool:
     request = _resolver_request(
         _resolver_expected(conn, task_id, run_id),
@@ -898,8 +897,6 @@ def _resolve_preflight(
         fault_domain=fault_domain,
         reason=reason,
     )
-    if fix_task_id is not None:
-        request["fix_task_id"] = fix_task_id
     task = kb.get_task(conn, task_id)
     assert task is not None and task.assignee
     return kb.resolve_product_preflight(
@@ -932,6 +929,30 @@ def _resolver_state(conn, task_id: str) -> dict:
                 (task_id, task_id),
             ).fetchall()
         ],
+    }
+
+
+def _full_tables_state(conn) -> dict:
+    """Deterministic full-table snapshot of every kanban graph table.
+
+    Unlike ``_resolver_state`` this is not scoped to one task id, so it
+    proves a rejected request mutated *nothing* board-wide (no stray fix
+    task, run, event, or link anywhere).
+    """
+    order_by = {
+        "tasks": "id",
+        "task_runs": "id",
+        "task_events": "id",
+        "task_links": "parent_id, child_id",
+    }
+    return {
+        table: [
+            tuple(row)
+            for row in conn.execute(
+                f"SELECT * FROM {table} ORDER BY {order}"  # noqa: S608 — fixed identifiers
+            ).fetchall()
+        ]
+        for table, order in order_by.items()
     }
 
 
@@ -977,8 +998,16 @@ def test_resolve_product_preflight_resume_uses_complete_snapshot(kanban_home):
     assert events[-1].kind == "human_input_preflight_resolved"
 
 
-def test_resolve_product_preflight_create_fix_task_preserves_graph_contract(kanban_home):
-    board = "resolver-entry-fix"
+def test_resolve_product_preflight_rejects_legacy_fix_task_shape_without_mutation(kanban_home):
+    """The legacy create_fix_task resolver shape is dead: reject, zero mutation.
+
+    Resolver is a task-local repair/preflight resolver only — it cannot
+    create or link work. Even a well-formed legacy request (a real fix task
+    already linked as a child, exactly the shape the old contract accepted)
+    must be rejected, leaving tasks / task_runs / task_events / task_links
+    byte-for-byte unchanged.
+    """
+    board = "resolver-legacy-fix-shape"
     _v2_product_board(board)
     with kb.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
@@ -995,18 +1024,20 @@ def test_resolve_product_preflight_create_fix_task_preserves_graph_contract(kanb
             decision="create_fix_task",
             fix_task_id=fix_id,
         )
-        assert kb.resolve_product_preflight(
-            conn,
-            tid,
-            board=board,
-            request=request,
-            resolver_profile="resolver",
-            resolver_model=None,
-        )
-        task = kb.get_task(conn, tid)
-        assert kb.parent_ids(conn, tid) == [fix_id]
-        assert tid not in kb.parent_ids(conn, fix_id)
-    assert task is not None and task.status == "todo"
+        before = _full_tables_state(conn)
+        with pytest.raises(
+            ValueError,
+            match="decision must be resume, repair, or escalate",
+        ):
+            kb.resolve_product_preflight(
+                conn,
+                tid,
+                board=board,
+                request=request,
+                resolver_profile="resolver",
+                resolver_model=None,
+            )
+        assert _full_tables_state(conn) == before
 
 
 def test_resolve_product_preflight_escalates_without_completion_gate(kanban_home):
@@ -1723,178 +1754,6 @@ def test_product_preflight_resume_restores_original_step(kanban_home):
     assert task.status == "ready"
     assert task.running is False
     assert task.blocked is False
-
-
-def test_product_preflight_create_fix_task_waits_on_real_child(kanban_home):
-    board = "resolver-fix"
-    _v2_product_board(board)
-    with kb.connect(board=board) as conn:
-        tid, run_id = _route_task_to_resolver(conn, board)
-        fix_id = kb.create_task(
-            conn,
-            title="Fix dependency",
-            assignee="developer",
-            created_by="resolver",
-            parents=[tid],
-            board=board,
-        )
-        assert _resolve_preflight(
-            conn, tid, run_id, board,
-            decision="create_fix_task",
-            reason="Dependency needs a dedicated fix",
-            fix_task_id=fix_id,
-        )
-        task = kb.get_task(conn, tid)
-        original_parents = kb.parent_ids(conn, tid)
-        fix_parents = kb.parent_ids(conn, fix_id)
-    assert task is not None and task.status == "todo"
-    assert original_parents == [fix_id]
-    assert tid not in fix_parents
-
-
-def test_product_preflight_rejects_unlinked_fix_task(kanban_home):
-    board = "resolver-fix-unlinked"
-    _v2_product_board(board)
-    with kb.connect(board=board) as conn:
-        tid, run_id = _route_task_to_resolver(conn, board)
-        fix_id = kb.create_task(
-            conn,
-            title="Unrelated task from the same profile",
-            assignee="developer",
-            created_by="resolver",
-            board=board,
-        )
-
-        with pytest.raises(ValueError, match="linked"):
-            _resolve_preflight(
-                conn, tid, run_id, board,
-                decision="create_fix_task",
-                reason="Use this existing task",
-                fix_task_id=fix_id,
-            )
-
-        task = kb.get_task(conn, tid)
-        assert task is not None and task.status == "running"
-        assert kb.parent_ids(conn, tid) == []
-        assert kb.parent_ids(conn, fix_id) == []
-
-
-def test_product_preflight_revalidates_fix_link_inside_write_transaction(
-    kanban_home, monkeypatch,
-):
-    board = "resolver-fix-concurrent-unlink"
-    _v2_product_board(board)
-    with kb.connect(board=board) as conn:
-        tid, run_id = _route_task_to_resolver(conn, board)
-        fix_id = kb.create_task(
-            conn,
-            title="Fix removed during resolver validation",
-            assignee="developer",
-            created_by="resolver",
-            parents=[tid],
-            board=board,
-        )
-        verify_created_cards = kb._verify_created_cards
-
-        def unlink_after_preflight(*args, **kwargs):
-            verified = verify_created_cards(*args, **kwargs)
-            assert kb.unlink_tasks(conn, tid, fix_id)
-            return verified
-
-        monkeypatch.setattr(kb, "_verify_created_cards", unlink_after_preflight)
-
-        with pytest.raises(ValueError, match="linked"):
-            _resolve_preflight(
-                conn, tid, run_id, board,
-                decision="create_fix_task",
-                reason="Use the prelinked fix task",
-                fix_task_id=fix_id,
-            )
-
-        task = kb.get_task(conn, tid)
-        assert task is not None and task.status == "running"
-        assert task.current_run_id == run_id
-        assert kb.parent_ids(conn, tid) == []
-        assert kb.parent_ids(conn, fix_id) == [tid]
-
-
-def test_product_preflight_fix_cycle_rolls_back_state_and_graph(kanban_home):
-    board = "resolver-fix-cycle"
-    _v2_product_board(board)
-    with kb.connect(board=board) as conn:
-        tid, run_id = _route_task_to_resolver(conn, board)
-        middle_id = kb.create_task(
-            conn,
-            title="Intermediate dependency",
-            assignee="developer",
-            created_by="resolver",
-            parents=[tid],
-            board=board,
-        )
-        fix_id = kb.create_task(
-            conn,
-            title="Fix dependency",
-            assignee="developer",
-            created_by="resolver",
-            parents=[tid, middle_id],
-            board=board,
-        )
-        before_task = kb.get_task(conn, tid)
-        before_links = conn.execute(
-            "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
-        ).fetchall()
-
-        with pytest.raises(ValueError, match="cycle"):
-            _resolve_preflight(
-                conn, tid, run_id, board,
-                decision="create_fix_task",
-                reason="Dependency needs a dedicated fix",
-                fix_task_id=fix_id,
-            )
-        after_task = kb.get_task(conn, tid)
-        after_links = conn.execute(
-            "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
-        ).fetchall()
-    assert after_task is not None and before_task is not None
-    assert after_task.status == before_task.status == "running"
-    assert after_task.current_run_id == before_task.current_run_id == run_id
-    assert [tuple(row) for row in after_links] == [tuple(row) for row in before_links]
-
-
-def test_product_preflight_stale_fix_action_does_not_link_child(kanban_home):
-    board = "resolver-fix-stale"
-    _v2_product_board(board)
-    with kb.connect(board=board) as conn:
-        tid, run_id = _route_task_to_resolver(conn, board)
-        fix_id = kb.create_task(
-            conn,
-            title="Fix dependency",
-            assignee="developer",
-            created_by="resolver",
-            board=board,
-        )
-        request = _resolver_request(
-            _resolver_expected(conn, tid, run_id),
-            decision="create_fix_task",
-            fix_task_id=fix_id,
-        )
-        request["expected"]["run_id"] = run_id + 1
-        with pytest.raises(kb.TaskSnapshotConflict):
-            kb.resolve_product_preflight(
-                conn,
-                tid,
-                board=board,
-                request=request,
-                resolver_profile="resolver",
-                resolver_model=None,
-            )
-        link = conn.execute(
-            "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
-            (fix_id, tid),
-        ).fetchone()
-        task = kb.get_task(conn, tid)
-    assert link is None
-    assert task is not None and task.status == "running"
 
 
 def test_product_preflight_escalate_enters_human_block(kanban_home):
