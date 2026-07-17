@@ -1093,6 +1093,247 @@ def test_resolve_product_preflight_rejects_wrong_run_profile(kanban_home):
         assert _resolver_state(conn, tid) == before
 
 
+def test_resolver_workflow_repair_is_atomic_and_returns_to_ordinary_role(kanban_home):
+    board = "resolver-workflow-repair"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        request = _resolver_request(
+            _resolver_expected(conn, tid, run_id),
+            decision="repair",
+            repair={"workflow": {"phase": "test", "assignee": "tester"}},
+        )
+        assert kb.resolve_product_preflight(
+            conn,
+            tid,
+            board=board,
+            request=request,
+            resolver_profile="resolver",
+            resolver_model="test-model",
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.current_step_key == "test"
+    assert task.assignee == "tester"
+    assert task.status == "ready"
+    assert not task.running and not task.blocked
+    assert task.current_run_id is None
+
+
+def test_resolver_repair_requires_at_least_one_semantic_field(kanban_home):
+    board = "resolver-empty-repair"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        before = _resolver_state(conn, tid)
+        with pytest.raises(ValueError, match="repair"):
+            kb.resolve_product_preflight(
+                conn,
+                tid,
+                board=board,
+                request=_resolver_request(
+                    _resolver_expected(conn, tid, run_id),
+                    decision="repair",
+                    repair={},
+                ),
+                resolver_profile="resolver",
+                resolver_model=None,
+            )
+        assert _resolver_state(conn, tid) == before
+
+
+def test_resolver_repair_rejects_unknown_project(kanban_home):
+    board = "resolver-unknown-project"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        before = _resolver_state(conn, tid)
+        with pytest.raises(ValueError, match="unknown project"):
+            kb.resolve_product_preflight(
+                conn,
+                tid,
+                board=board,
+                request=_resolver_request(
+                    _resolver_expected(conn, tid, run_id),
+                    decision="repair",
+                    repair={"workflow": {"project_id": "missing-project"}},
+                ),
+                resolver_profile="resolver",
+                resolver_model=None,
+            )
+        assert _resolver_state(conn, tid) == before
+
+
+def test_resolver_repair_derives_project_worktree_and_branch(kanban_home, tmp_path):
+    from hermes_cli import projects_db as pdb
+
+    board = "resolver-project-repair"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board(board)
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn,
+            name="Resolver Project",
+            primary_path=str(repo),
+            board_slug=board,
+        )
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        request = _resolver_request(
+            _resolver_expected(conn, tid, run_id),
+            decision="repair",
+            repair={"workflow": {"project_id": project_id}},
+        )
+        assert kb.resolve_product_preflight(
+            conn,
+            tid,
+            board=board,
+            request=request,
+            resolver_profile="resolver",
+            resolver_model=None,
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.project_id == project_id
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == str(repo / ".worktrees" / tid)
+    assert task.branch_name.startswith("resolver-project/")
+
+
+def test_resolver_repair_rejects_phase_assignee_mismatch(kanban_home):
+    board = "resolver-role-mismatch"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        before = _resolver_state(conn, tid)
+        with pytest.raises(ValueError, match="assignee"):
+            kb.resolve_product_preflight(
+                conn,
+                tid,
+                board=board,
+                request=_resolver_request(
+                    _resolver_expected(conn, tid, run_id),
+                    decision="repair",
+                    repair={"workflow": {"phase": "test", "assignee": "developer"}},
+                ),
+                resolver_profile="resolver",
+                resolver_model=None,
+            )
+        assert _resolver_state(conn, tid) == before
+
+
+@pytest.mark.parametrize("phase", ["release_measure", "done", "archived"])
+def test_resolver_repair_cannot_target_release_done_or_archived(kanban_home, phase):
+    board = f"resolver-terminal-{phase}"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        before = _resolver_state(conn, tid)
+        with pytest.raises(ValueError, match="phase"):
+            kb.resolve_product_preflight(
+                conn,
+                tid,
+                board=board,
+                request=_resolver_request(
+                    _resolver_expected(conn, tid, run_id),
+                    decision="repair",
+                    repair={"workflow": {"phase": phase}},
+                ),
+                resolver_profile="resolver",
+                resolver_model=None,
+            )
+        assert _resolver_state(conn, tid) == before
+
+
+def test_framework_fault_can_only_escalate(kanban_home):
+    board = "resolver-framework-only-escalate"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        with pytest.raises(ValueError, match="must escalate"):
+            kb.resolve_product_preflight(
+                conn,
+                tid,
+                board=board,
+                request=_resolver_request(
+                    _resolver_expected(conn, tid, run_id),
+                    decision="repair",
+                    fault_domain="framework",
+                    repair={"workflow": {"phase": "development"}},
+                ),
+                resolver_profile="resolver",
+                resolver_model=None,
+            )
+
+
+def test_resolver_repair_does_not_change_test_or_review_runs(kanban_home):
+    board = "resolver-preserve-runs"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board, step="test")
+        prior_before = [
+            tuple(row) for row in conn.execute(
+                "SELECT * FROM task_runs WHERE task_id=? AND id<>? ORDER BY id",
+                (tid, run_id),
+            ).fetchall()
+        ]
+        request = _resolver_request(
+            _resolver_expected(conn, tid, run_id),
+            decision="repair",
+            repair={"workflow": {"phase": "review", "assignee": "reviewer"}},
+        )
+        assert kb.resolve_product_preflight(
+            conn,
+            tid,
+            board=board,
+            request=request,
+            resolver_profile="resolver",
+            resolver_model=None,
+        )
+        prior_after = [
+            tuple(row) for row in conn.execute(
+                "SELECT * FROM task_runs WHERE task_id=? AND id<>? ORDER BY id",
+                (tid, run_id),
+            ).fetchall()
+        ]
+    assert prior_after == prior_before
+
+
+def test_successful_repair_appends_audit_and_needs_ole_events(kanban_home):
+    board = "resolver-repair-audit"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board)
+        request = _resolver_request(
+            _resolver_expected(conn, tid, run_id),
+            decision="repair",
+            repair={"workflow": {"phase": "architecture", "assignee": "architect"}},
+        )
+        assert kb.resolve_product_preflight(
+            conn,
+            tid,
+            board=board,
+            request=request,
+            resolver_profile="resolver",
+            resolver_model="test-model",
+        )
+        events = kb.list_events(conn, tid)
+    audit = [event for event in events if event.kind == "resolver_repair_applied"][-1]
+    attention = [event for event in events if event.kind == "needs_ole"][-1]
+    assert audit.payload["fault_domain"] == "task_state"
+    assert audit.payload["resolver"] == {
+        "profile": "resolver",
+        "model": "test-model",
+        "run_id": run_id,
+    }
+    assert set(audit.payload["before"]) <= {
+        "phase", "assignee", "project_id", "status", "workspace_kind",
+        "workspace_path", "branch_name", "adopt_handoff_sha",
+    }
+    assert attention.payload["reason"] == "resolver_repair"
+
+
 @pytest.mark.parametrize("step", ["test", "review"])
 def test_product_preflight_resolver_validation_precedes_rework(
     kanban_home, step

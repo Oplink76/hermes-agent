@@ -2135,10 +2135,12 @@ def resolve_product_preflight(
     }
     if decision == "create_fix_task":
         allowed_keys.add("fix_task_id")
+    elif decision == "repair":
+        allowed_keys.add("repair")
     if set(request) != allowed_keys:
         raise ValueError("resolver request contains missing or unexpected fields")
-    if decision not in {"resume", "create_fix_task", "escalate"}:
-        raise ValueError("decision must be resume, create_fix_task, or escalate")
+    if decision not in {"resume", "repair", "create_fix_task", "escalate"}:
+        raise ValueError("decision must be resume, repair, create_fix_task, or escalate")
     fault_domain = request.get("fault_domain")
     if fault_domain not in {"task_state", "framework"}:
         raise ValueError("fault_domain must be task_state or framework")
@@ -2158,6 +2160,25 @@ def resolve_product_preflight(
         if not isinstance(fix_task_id, str) or not fix_task_id.strip():
             raise ValueError("fix_task_id is required for create_fix_task")
         fix_task_id = fix_task_id.strip()
+    repair = request.get("repair")
+    if decision == "repair":
+        if not isinstance(repair, dict) or not repair:
+            raise ValueError("repair must contain workflow, adopt_handoff_sha, or both")
+        if not set(repair) <= {"workflow", "adopt_handoff_sha"}:
+            raise ValueError("repair contains unexpected fields")
+        workflow_repair = repair.get("workflow")
+        if workflow_repair is not None:
+            if not isinstance(workflow_repair, dict) or not workflow_repair:
+                raise ValueError("repair.workflow must contain at least one field")
+            if not set(workflow_repair) <= {"phase", "assignee", "project_id"}:
+                raise ValueError("repair.workflow contains unexpected fields")
+        adopted_sha = repair.get("adopt_handoff_sha")
+        if adopted_sha is not None and (
+            not isinstance(adopted_sha, str) or not adopted_sha.strip()
+        ):
+            raise ValueError("repair.adopt_handoff_sha must be a non-empty string")
+        if workflow_repair is None and adopted_sha is None:
+            raise ValueError("repair must contain at least one semantic field")
 
     board = board or _board_slug_for_connection(conn)
     meta = product_board_metadata(board)
@@ -2168,7 +2189,7 @@ def resolve_product_preflight(
         row = conn.execute(
             "SELECT status, assignee, project_id, workflow_template_id, "
             "current_step_key, workspace_kind, workspace_path, branch_name, "
-            "running, blocked, current_run_id FROM tasks WHERE id=?",
+            "running, blocked, current_run_id, title FROM tasks WHERE id=?",
             (task_id,),
         ).fetchone()
         preflight_entry = _latest_unresolved_product_preflight(conn, task_id)
@@ -2227,8 +2248,120 @@ def resolve_product_preflight(
             "diagnosis": diagnosis.strip(),
             "reason": reason.strip(),
         }
+        repair_before: Optional[dict[str, Any]] = None
+        repair_after: Optional[dict[str, Any]] = None
+        normalized_repair: Optional[dict[str, Any]] = None
 
-        if decision == "create_fix_task":
+        if decision == "repair":
+            workflow_repair = repair.get("workflow") if isinstance(repair, dict) else None
+            workflow_repair = workflow_repair if isinstance(workflow_repair, dict) else {}
+            phase = str(
+                workflow_repair.get("phase") or preflight.get("step_key")
+                or row["current_step_key"] or "backlog"
+            ).strip()
+            allowed_phases = {"backlog", "architecture", "development", "test", "review"}
+            if phase not in allowed_phases:
+                raise ValueError("repair.workflow.phase must be a non-terminal product phase")
+            phase_roles = {
+                "backlog": "productowner",
+                "architecture": "architect",
+                "development": "developer",
+                "test": "tester",
+                "review": "reviewer",
+            }
+            ordinary_assignee = _product_role_assignee(meta, phase_roles[phase])
+            if ordinary_assignee is None and phase == str(preflight.get("step_key") or ""):
+                ordinary_assignee = original_assignee
+            supplied_assignee = workflow_repair.get("assignee")
+            if supplied_assignee is not None:
+                supplied_assignee = str(supplied_assignee).strip()
+                if supplied_assignee != ordinary_assignee:
+                    raise ValueError("repair.workflow.assignee does not match board phase role")
+            if ordinary_assignee is None:
+                raise ValueError("board has no assignee for repaired phase")
+
+            project_id = workflow_repair.get("project_id", row["project_id"])
+            if project_id is not None:
+                project_id = str(project_id).strip() or None
+            workspace_kind = row["workspace_kind"]
+            workspace_path = row["workspace_path"]
+            branch_name = row["branch_name"]
+            if project_id:
+                from hermes_cli import projects_db as _pdb
+
+                with _pdb.connect_closing() as project_conn:
+                    project = _pdb.get_project(project_conn, project_id)
+                if project is None:
+                    raise ValueError(f"unknown project: {project_id}")
+                if (
+                    not project.board_slug
+                    or _normalize_board_slug(project.board_slug)
+                    != _normalize_board_slug(board)
+                ):
+                    raise ValueError("repair project is not bound to the active board")
+                project_id = project.id
+                if project_id != row["project_id"]:
+                    if not project.primary_path:
+                        raise ValueError("repair project has no primary path")
+                    workspace_kind = "worktree"
+                    workspace_path = os.path.join(
+                        project.primary_path, ".worktrees", task_id,
+                    )
+                    branch_name = _pdb.branch_name_for(
+                        project, task_id, title=row["title"],
+                    )
+
+            next_status = _column_status_for_step(meta, phase)
+            if next_status not in VALID_STATUSES or next_status in {
+                "running", "blocked", "done", "archived",
+            }:
+                next_status = "ready"
+            repair_before = {
+                "phase": row["current_step_key"],
+                "assignee": row["assignee"],
+                "project_id": row["project_id"],
+                "status": row["status"],
+                "workspace_kind": row["workspace_kind"],
+                "workspace_path": row["workspace_path"],
+                "branch_name": row["branch_name"],
+            }
+            repair_after = {
+                "phase": phase,
+                "assignee": ordinary_assignee,
+                "project_id": project_id,
+                "status": next_status,
+                "workspace_kind": workspace_kind,
+                "workspace_path": workspace_path,
+                "branch_name": branch_name,
+            }
+            normalized_repair = {
+                "workflow": {
+                    key: value for key, value in {
+                        "phase": phase,
+                        "assignee": ordinary_assignee,
+                        "project_id": project_id,
+                    }.items() if value is not None
+                }
+            }
+            adopted_sha = repair.get("adopt_handoff_sha") if isinstance(repair, dict) else None
+            if adopted_sha is not None:
+                normalized_repair["adopt_handoff_sha"] = str(adopted_sha).strip()
+                repair_before["adopt_handoff_sha"] = None
+                repair_after["adopt_handoff_sha"] = str(adopted_sha).strip()
+            cur = conn.execute(
+                "UPDATE tasks SET status=?, assignee=?, project_id=?, "
+                "workspace_kind=?, workspace_path=?, branch_name=?, "
+                "workflow_template_id='product', current_step_key=?, "
+                "running=0, blocked=0, claim_lock=NULL, claim_expires=NULL, "
+                "worker_pid=NULL, block_kind=NULL, block_recurrences=0 "
+                "WHERE id=? AND current_run_id=?",
+                (
+                    next_status, ordinary_assignee, project_id, workspace_kind,
+                    workspace_path, branch_name, phase, task_id, int(run_id),
+                ),
+            )
+            outcome = "preflight_repaired"
+        elif decision == "create_fix_task":
             if fix_task_id not in child_ids(conn, task_id):
                 raise ValueError("fix_task_id must name a real linked task")
             verified, phantom = _verify_created_cards(conn, task_id, [fix_task_id])
@@ -2302,6 +2435,41 @@ def resolve_product_preflight(
             resolved_payload["fix_task_id"] = fix_task_id
         if decision == "resume":
             resolved_payload["assignee"] = original_assignee
+        if decision == "repair":
+            assert repair_before is not None
+            assert repair_after is not None
+            assert normalized_repair is not None
+            _append_event(
+                conn,
+                task_id,
+                "resolver_repair_applied",
+                {
+                    "schema_version": 1,
+                    "fault_domain": "task_state",
+                    "diagnosis": diagnosis.strip(),
+                    "reason": reason.strip(),
+                    "resolver": {
+                        "profile": resolver_profile,
+                        "model": resolver_model,
+                        "run_id": int(run_id),
+                    },
+                    "before": repair_before,
+                    "after": repair_after,
+                    "repair": normalized_repair,
+                },
+                run_id=ended_run_id,
+            )
+            _append_event(
+                conn,
+                task_id,
+                "needs_ole",
+                {
+                    "reason": "resolver_repair",
+                    "diagnosis": diagnosis.strip(),
+                    "resolver_profile": resolver_profile,
+                },
+                run_id=ended_run_id,
+            )
         _append_event(
             conn,
             task_id,
