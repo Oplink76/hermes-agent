@@ -27,8 +27,8 @@
 - Create: `tests/hermes_cli/test_kanban_inbox_guide.py`
 
 **Interfaces:**
-- Consumes: normalized `board: str`, request `origin: str`, and absolute `guide_url: str`.
-- Produces: `build_inbox_guide(*, board: str, origin: str, guide_url: str) -> dict[str, Any]`.
+- Consumes: normalized `board: str` and request `origin: str`.
+- Produces: `build_inbox_guide(*, board: str, origin: str) -> dict[str, Any]`.
 
 - [ ] **Step 1: Write the failing pure-contract test**
 
@@ -46,7 +46,6 @@ def test_build_inbox_guide_is_copy_ready_and_contains_no_credential():
     body = build_inbox_guide(
         board="strict",
         origin="https://hermes.example",
-        guide_url=guide_url,
     )
 
     assert body["guide_version"] == 1
@@ -96,9 +95,9 @@ def build_inbox_guide(
     *,
     board: str,
     origin: str,
-    guide_url: str,
 ) -> dict[str, Any]:
     query = urlencode({"board": board})
+    guide_url = f"{origin}/.well-known/hermes-inbox?{query}"
     intake_url = f"{origin}/api/plugins/kanban/intake?{query}"
     receipt_url = (
         f"{origin}/api/plugins/kanban/intake/{{intake_id}}?{query}"
@@ -133,6 +132,7 @@ def build_inbox_guide(
         "guide_version": GUIDE_VERSION,
         "name": "Hermes Qualified Work Inbox",
         "board": board,
+        "qualification_required": True,
         "purpose": (
             "Submit intended work for Hermes qualification without creating "
             "or routing Kanban cards directly."
@@ -362,14 +362,9 @@ def get_hermes_inbox_guide(request: Request, board: Optional[str] = None):
             detail="This board does not require qualified intake",
         )
     origin = str(request.base_url).rstrip("/")
-    guide_url = (
-        f"{origin}/.well-known/hermes-inbox?"
-        f"{urllib.parse.urlencode({'board': normalized})}"
-    )
     return build_inbox_guide(
         board=normalized,
         origin=origin,
-        guide_url=guide_url,
     )
 ```
 
@@ -428,4 +423,4 @@ Confirm the diff implements only the guide slice, exposes no sensitive values, r
 
 - [ ] **Step 3: Record the operator prompt**
 
-Return the endpoint's `copy_ready_prompt` verbatim to Ole, with the real deployed guide URL substituted for `guide_url`. If no public Hermes origin is deployed yet, state that explicitly rather than substituting a Cockpit URL.
+Return the endpoint's `copy_ready_prompt` verbatim to Ole. If no public Hermes origin is deployed yet, state that explicitly rather than substituting a Cockpit URL.

@@ -2650,14 +2650,9 @@ def get_hermes_inbox_guide(request: Request, board: Optional[str] = None):
             detail="This board does not require qualified intake",
         )
     origin = str(request.base_url).rstrip("/")
-    guide_url = (
-        f"{origin}/.well-known/hermes-inbox?"
-        f"{urllib.parse.urlencode({'board': normalized})}"
-    )
     return build_inbox_guide(
         board=normalized,
         origin=origin,
-        guide_url=guide_url,
     )
 
 

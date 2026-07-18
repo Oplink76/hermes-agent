@@ -13,11 +13,11 @@ def build_inbox_guide(
     *,
     board: str,
     origin: str,
-    guide_url: str,
 ) -> dict[str, Any]:
     """Build copy-ready instructions without exposing private board state."""
 
     query = urlencode({"board": board})
+    guide_url = f"{origin}/.well-known/hermes-inbox?{query}"
     intake_url = f"{origin}/api/plugins/kanban/intake?{query}"
     receipt_url = f"{origin}/api/plugins/kanban/intake/{{intake_id}}?{query}"
     copy_ready_prompt = (
@@ -50,6 +50,7 @@ def build_inbox_guide(
         "guide_version": GUIDE_VERSION,
         "name": "Hermes Qualified Work Inbox",
         "board": board,
+        "qualification_required": True,
         "purpose": (
             "Submit intended work for Hermes qualification without creating "
             "or routing Kanban cards directly."

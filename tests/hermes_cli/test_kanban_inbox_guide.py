@@ -18,11 +18,11 @@ def test_build_inbox_guide_is_copy_ready_and_contains_no_credential():
     body = build_inbox_guide(
         board="strict",
         origin="https://hermes.example",
-        guide_url=guide_url,
     )
 
     assert body["guide_version"] == 1
     assert body["board"] == "strict"
+    assert body["qualification_required"] is True
     assert body["submission"]["method"] == "POST"
     assert body["submission"]["url"] == (
         "https://hermes.example/api/plugins/kanban/intake?board=strict"
