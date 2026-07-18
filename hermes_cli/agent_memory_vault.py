@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
-from typing import Mapping
+from typing import Any, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
 from agent.redact import redact_sensitive_text
@@ -40,6 +42,8 @@ _REQUIRED_FIELDS = (
     "Open loops",
 )
 _WORD_RE = re.compile(r"[a-z0-9][a-z0-9_-]{1,}")
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -112,6 +116,243 @@ def configured_vault_path(
         return None
     configured_path = str(agent_memory.get("vault_path") or "").strip()
     return Path(configured_path).expanduser() if configured_path else None
+
+
+def remember_kanban_run(
+    conn: Any,
+    *,
+    board: str,
+    task_id: str,
+    run_id: int | None,
+    outcome: str,
+    summary: str | None = None,
+) -> bool:
+    """Append one functionality-first gist from durable Kanban records."""
+    try:
+        vault = configured_vault_path()
+        if vault is None:
+            return False
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task is None:
+            return False
+        run = _kanban_run(conn, task_id, run_id)
+        contract = _kanban_work_contract(conn, task["work_contract_id"])
+        work = _functional_work(task, contract)
+        function_id = _function_id(work)
+        recorded_run_id = int(run["id"]) if run is not None else run_id
+        event = _kanban_event(conn, task_id, recorded_run_id)
+        occurred_at = datetime.fromtimestamp(
+            int(run["ended_at"] or run["started_at"])
+            if run is not None and (run["ended_at"] or run["started_at"])
+            else int(task["completed_at"] or task["started_at"] or task["created_at"])
+        )
+        phase = (
+            str(run["step_key"] or "") if run is not None
+            else str(task["current_step_key"] or "")
+        )
+        summary_text = str(
+            summary
+            or (run["summary"] if run is not None else None)
+            or task["result"]
+            or outcome
+        )
+        gist = SessionGist(
+            gist_id=_kanban_gist_id(board, task_id, recorded_run_id, outcome),
+            occurred_at=occurred_at,
+            agent_id=str(
+                (run["profile"] if run is not None else None)
+                or task["assignee"]
+                or task["created_by"]
+                or "hermes"
+            ),
+            role=phase or "worker",
+            function_id=function_id,
+            title=str(work.get("title") or task["title"]),
+            context=_kanban_context(board, task, recorded_run_id),
+            summary=summary_text,
+            reused="none",
+            result=f"{outcome}; status={task['status']}; phase={task['current_step_key'] or 'none'}",
+            maturity=_kanban_maturity(outcome, phase, str(task["status"])),
+            evidence=_kanban_evidence(task, run, event),
+            behavior="none",
+            decisions="none",
+            open_loops=(
+                "none"
+                if outcome == "completed"
+                else f"Current phase: {task['current_step_key'] or 'none'}; {summary_text}"
+            ),
+        )
+        appended = append_gist(vault, gist)
+        lint_vault(vault)
+        return appended
+    except Exception as exc:
+        _log.warning(
+            "Agent Memory capture failed for board=%s task=%s run=%s: %s",
+            board,
+            task_id,
+            run_id,
+            exc,
+        )
+        return False
+
+
+def recall_for_qualification(raw_request: object) -> list[dict[str, str]]:
+    """Return bounded, JSON-ready historical evidence for qualification."""
+    try:
+        vault = configured_vault_path()
+        if vault is None:
+            return []
+        query = (
+            json.dumps(raw_request, ensure_ascii=False, sort_keys=True, default=str)
+            if not isinstance(raw_request, str)
+            else raw_request
+        )
+        return [
+            {
+                "function_id": match.function_id,
+                "title": match.title,
+                "gist_id": match.gist_id,
+                "evidence": match.evidence,
+                "snippet": match.snippet,
+            }
+            for match in recall(vault, query, limit=5)
+        ]
+    except Exception as exc:
+        _log.warning("Agent Memory qualification recall failed: %s", exc)
+        return []
+
+
+def recall_for_task(title: str, body: str | None) -> list[MemoryMatch]:
+    """Return bounded historical evidence for one worker context."""
+    try:
+        vault = configured_vault_path()
+        if vault is None:
+            return []
+        return recall(vault, " ".join(filter(None, (title, body))), limit=5)
+    except Exception as exc:
+        _log.warning("Agent Memory worker recall failed: %s", exc)
+        return []
+
+
+def _kanban_run(conn: Any, task_id: str, run_id: int | None) -> Any:
+    if run_id is not None:
+        return conn.execute(
+            "SELECT * FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(run_id), task_id),
+        ).fetchone()
+    return conn.execute(
+        "SELECT * FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+
+
+def _kanban_work_contract(conn: Any, contract_id: object) -> dict[str, Any] | None:
+    if not contract_id:
+        return None
+    row = conn.execute(
+        "SELECT canonical_json FROM work_contracts WHERE id = ?", (contract_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    value = json.loads(row["canonical_json"])
+    return value if isinstance(value, dict) else None
+
+
+def _functional_work(task: Any, contract: dict[str, Any] | None) -> dict[str, Any]:
+    work = contract.get("work") if isinstance(contract, dict) else None
+    if isinstance(work, dict):
+        return {
+            key: work.get(key)
+            for key in (
+                "item_kind", "work_type", "title", "outcome", "scope", "out_of_scope"
+            )
+        }
+    return {"title": task["title"], "outcome": task["body"] or task["title"]}
+
+
+def _function_id(work: dict[str, Any]) -> str:
+    functional_boundary = {
+        key: work.get(key)
+        for key in ("item_kind", "work_type", "outcome", "scope", "out_of_scope")
+        if key in work
+    }
+    canonical = json.dumps(
+        functional_boundary,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return "function-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+
+
+def _kanban_event(conn: Any, task_id: str, run_id: int | None) -> Any:
+    if run_id is not None:
+        row = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, int(run_id)),
+        ).fetchone()
+        if row is not None:
+            return row
+    return conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+
+
+def _kanban_gist_id(
+    board: str, task_id: str, run_id: int | None, outcome: str
+) -> str:
+    identity = json.dumps(
+        [board, task_id, run_id, outcome], separators=(",", ":"), ensure_ascii=False
+    )
+    return "kanban-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+
+
+def _kanban_context(board: str, task: Any, run_id: int | None) -> str:
+    values = [f"board={board}", f"card={task['id']}"]
+    for name, value in (
+        ("run", run_id),
+        ("work_contract", task["work_contract_id"]),
+        ("project", task["project_id"]),
+        ("repository", task["workspace_path"]),
+    ):
+        if value:
+            values.append(f"{name}={value}")
+    return "; ".join(values)
+
+
+def _kanban_maturity(outcome: str, phase: str, status: str) -> str:
+    if outcome == "completed" or status == "done":
+        return "released"
+    if outcome == "advanced":
+        return {
+            "development": "code_complete",
+            "test": "tested",
+            "review": "reviewed",
+        }.get(phase, "planned")
+    if phase == "development":
+        return "in_development"
+    return "planned"
+
+
+def _kanban_evidence(task: Any, run: Any, event: Any) -> str:
+    values = []
+    if task["work_contract_id"]:
+        values.append(f"work_contract={task['work_contract_id']}")
+    if run is not None:
+        values.append(f"run={run['id']}")
+        if run["metadata"]:
+            values.append(f"metadata={run['metadata']}")
+    if event is not None:
+        values.append(f"event={event['kind']}:{event['payload'] or '{}'}")
+    if task["branch_name"]:
+        values.append(f"branch={task['branch_name']}")
+    return "; ".join(values) or "none"
 
 
 def initialize_vault(vault: Path) -> None:
