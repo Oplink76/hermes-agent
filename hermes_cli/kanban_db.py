@@ -4361,6 +4361,19 @@ def _ensure_qualification_boundary_objects(conn: sqlite3.Connection) -> None:
         BEGIN
             SELECT RAISE(ABORT, 'qualification required before task materialization');
         END;
+        CREATE TRIGGER IF NOT EXISTS strict_requalification_intake_service_insert
+        BEFORE INSERT ON qualification_intake
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND json_extract(
+                 CASE WHEN json_valid(NEW.raw_request) = 1
+                      THEN NEW.raw_request ELSE '{}'
+                 END,
+                 '$.kind'
+             ) = 'task_requalification'
+         AND hermes_governance_write_authorized() != 1
+        BEGIN
+            SELECT RAISE(ABORT, 'requalification intake requires Hermes service authority');
+        END;
         CREATE TRIGGER IF NOT EXISTS strict_task_links_service_insert
         BEFORE INSERT ON task_links
         WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1

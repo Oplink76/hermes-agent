@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
@@ -413,6 +414,123 @@ def qualification_required(board_metadata: Mapping[str, Any]) -> bool:
 
     policy = board_metadata.get("qualification")
     return isinstance(policy, Mapping) and policy.get("required") is True
+
+
+def intake_payload(intake: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the structured request stored in an intake, or an empty mapping."""
+
+    try:
+        value = json.loads(str(intake.get("raw_request") or ""))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def submit_requalification(
+    conn: Any,
+    *,
+    task_id: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Submit one Hermes-owned, inert requalification request for a parked card."""
+
+    from hermes_cli import kanban_db
+
+    reason = str(reason or "").strip()
+    if not reason:
+        raise WorkContractError("requalification reason is required")
+
+    with kanban_db.authorized_governance_write():
+        with kanban_db.write_txn(conn):
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise WorkContractError(f"unknown requalification task: {task_id}")
+            if row["work_contract_id"] is None:
+                raise WorkContractError("requalification requires a qualified task")
+            if row["status"] != "scheduled":
+                raise WorkContractError(
+                    "automatic requalification requires a scheduled task"
+                )
+            if row["current_run_id"] is not None or row["claim_lock"] is not None:
+                raise WorkContractError("cannot requalify a task with an active worker")
+            if row["current_step_key"] == "release_measure":
+                raise WorkContractError("release_measure follows release evidence policy")
+
+            existing = conn.execute(
+                """
+                SELECT id FROM qualification_intake
+                 WHERE status = 'pending'
+                   AND json_valid(raw_request) = 1
+                   AND json_extract(raw_request, '$.kind') = 'task_requalification'
+                   AND json_extract(raw_request, '$.target_task_id') = ?
+                 ORDER BY created_at, id
+                 LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if existing is not None:
+                intake_id = str(existing["id"])
+                return {
+                    "status": "requalification_required",
+                    "intake_id": intake_id,
+                    "intake_status": "pending",
+                    "task_id": task_id,
+                }
+
+            stored_contract = kanban_db.get_work_contract(
+                conn, str(row["work_contract_id"])
+            )
+            evidence = {
+                "task": kanban_db.task_snapshot_from_row(row),
+                "contract": (
+                    stored_contract.get("contract") if stored_contract else None
+                ),
+                "dependencies": kanban_db.parent_ids(conn, task_id),
+                "epic_id": kanban_db.epic_id_for_task(conn, task_id),
+                "runs": [
+                    asdict(run) for run in kanban_db.list_runs(conn, task_id)[-50:]
+                ],
+                "events": [
+                    asdict(event) for event in kanban_db.list_events(conn, task_id)[-50:]
+                ],
+                "comments": [
+                    asdict(comment)
+                    for comment in kanban_db.list_comments(conn, task_id)[-50:]
+                ],
+            }
+            raw_request = json.dumps(
+                {
+                    "kind": "task_requalification",
+                    "target_task_id": task_id,
+                    "reason": reason,
+                    "evidence": evidence,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=str,
+            )
+            intake_id = kanban_db.create_qualification_intake(
+                conn,
+                raw_request=raw_request,
+                source="hermes-reconcile",
+            )
+            kanban_db._append_event(
+                conn,
+                task_id,
+                "requalification_requested",
+                {"intake_id": intake_id, "reason": reason},
+            )
+
+    _wake_intake_qualifier()
+    return {
+        "status": "requalification_required",
+        "intake_id": intake_id,
+        "intake_status": "pending",
+        "task_id": task_id,
+    }
 
 
 def submit_intake(

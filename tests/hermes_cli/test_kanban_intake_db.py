@@ -70,6 +70,45 @@ def _signed_contract(request_id: str = "qi_example"):
     )
 
 
+def _strict_product_board(tmp_path, monkeypatch, board: str) -> None:
+    home = tmp_path / ".hermes"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb.ensure_product_board_defaults(board)
+    metadata_path = kb.board_metadata_path(board)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+
+def _materialized_scheduled_card(connection, board: str) -> str:
+    request_id = kb.create_qualification_intake(
+        connection,
+        raw_request=json.dumps(
+            {
+                "kind": "task_create",
+                "request": {
+                    "title": "Qualified card",
+                    "evidence": ["backlog-artifact", "architecture-artifact"],
+                },
+            }
+        ),
+        source="hermes",
+        attachments=[
+            {"name": "backlog-artifact"},
+            {"name": "architecture-artifact"},
+        ],
+    )
+    task_id = intake.materialize_contract(
+        connection,
+        board=board,
+        signed_contract=_signed_contract(request_id),
+        secret=b"test-only-secret",
+    )
+    assert kb.schedule_task(connection, task_id, reason="no wake action")
+    return task_id
+
+
 def test_intake_submission_is_durable_and_inert(conn):
     before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
 
@@ -519,3 +558,55 @@ def test_materialization_revalidates_product_owner_evidence_for_epics(
         assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
     finally:
         connection.close()
+
+
+def test_requalification_intake_requires_hermes_service_authority(
+    tmp_path, monkeypatch
+):
+    board = "strict-requalification-authority"
+    _strict_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_scheduled_card(connection, board)
+        raw_request = json.dumps(
+            {"kind": "task_requalification", "target_task_id": task_id}
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="Hermes service authority"):
+            kb.create_qualification_intake(
+                connection,
+                raw_request=raw_request,
+                source="codex",
+            )
+
+
+def test_submit_requalification_is_inert_durable_and_idempotent(
+    tmp_path, monkeypatch
+):
+    board = "strict-requalification-intake"
+    _strict_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_scheduled_card(connection, board)
+
+        first = intake.submit_requalification(
+            connection,
+            task_id=task_id,
+            reason="qualified scheduled work has no wake action",
+        )
+        second = intake.submit_requalification(
+            connection,
+            task_id=task_id,
+            reason="qualified scheduled work has no wake action",
+        )
+
+        assert first == second
+        assert kb.get_task(connection, task_id).status == "scheduled"
+        pending = kb.list_qualification_intakes(connection, status="pending")
+        assert [record["id"] for record in pending] == [first["intake_id"]]
+        payload = intake.intake_payload(
+            kb.get_qualification_intake(connection, first["intake_id"])
+        )
+        assert payload["kind"] == "task_requalification"
+        assert payload["target_task_id"] == task_id
+        assert payload["reason"] == "qualified scheduled work has no wake action"
