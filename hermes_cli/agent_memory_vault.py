@@ -284,17 +284,9 @@ def _redact_http_url_values(match: re.Match[str]) -> str:
             parts.scheme,
             netloc,
             parts.path,
-            _redact_url_parameter_values(parts.query),
-            _redact_url_parameter_values(parts.fragment),
+            "[REDACTED]" if parts.query else "",
+            "[REDACTED]" if parts.fragment else "",
         )
-    )
-
-
-def _redact_url_parameter_values(component: str) -> str:
-    return re.sub(
-        r"(^|[&;])([^&;=]+)=([^&;]*)",
-        lambda match: f"{match.group(1)}{match.group(2)}=«redacted-secret»",
-        component,
     )
 
 

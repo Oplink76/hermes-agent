@@ -113,8 +113,8 @@ def test_append_scrubs_credential_query_values_but_preserves_normal_evidence_url
 
     history = (vault / "memory" / "2026-07-18.md").read_text(encoding="utf-8")
     assert "access_token=top-secret" not in history
-    assert "access_token=«redacted-secret»" in history
-    assert "https://ci.example.test/builds/43?job=«redacted-secret»" in history
+    assert "https://ci.example.test/builds/42?[REDACTED]" in history
+    assert "https://ci.example.test/builds/43?[REDACTED]" in history
 
 
 @pytest.mark.parametrize("query_key", ["refresh_token", "client_secret", "api_key", "signature"])
@@ -127,7 +127,7 @@ def test_append_scrubs_common_credential_query_keys(tmp_path, query_key):
 
     history = (vault / "memory" / "2026-07-18.md").read_text(encoding="utf-8")
     assert f"{query_key}=top-secret" not in history
-    assert f"{query_key}=«redacted-secret»" in history
+    assert "https://ci.example.test/builds/42?[REDACTED]" in history
 
 
 @pytest.mark.parametrize(
@@ -135,11 +135,11 @@ def test_append_scrubs_common_credential_query_keys(tmp_path, query_key):
     [
         (
             "https://ci.example.test/callback?id_token=top-secret&session=active&code=oauth-code",
-            "https://ci.example.test/callback?id_token=«redacted-secret»&session=«redacted-secret»&code=«redacted-secret»",
+            "https://ci.example.test/callback?[REDACTED]",
         ),
         (
             "https://ci.example.test/callback#access_token=top-secret&state=active",
-            "https://ci.example.test/callback#access_token=«redacted-secret»&state=«redacted-secret»",
+            "https://ci.example.test/callback#[REDACTED]",
         ),
         (
             "https://build-user:top-secret@ci.example.test/builds/42",
@@ -150,6 +150,25 @@ def test_append_scrubs_common_credential_query_keys(tmp_path, query_key):
 def test_append_redacts_every_http_url_secret_surface(tmp_path, url, redacted_url):
     vault = tmp_path / "Agent Memory"
     gist = _gist("gist-url-surface")
+    gist.evidence = url
+
+    assert append_gist(vault, gist) is True
+
+    history = (vault / "memory" / "2026-07-18.md").read_text(encoding="utf-8")
+    assert "top-secret" not in history
+    assert redacted_url in history
+
+
+@pytest.mark.parametrize(
+    ("url", "redacted_url"),
+    [
+        ("https://ci.example.test/callback?top-secret", "https://ci.example.test/callback?[REDACTED]"),
+        ("https://ci.example.test/callback#top-secret", "https://ci.example.test/callback#[REDACTED]"),
+    ],
+)
+def test_append_redacts_bare_http_url_query_and_fragment_components(tmp_path, url, redacted_url):
+    vault = tmp_path / "Agent Memory"
+    gist = _gist("gist-bare-url-component")
     gist.evidence = url
 
     assert append_gist(vault, gist) is True
