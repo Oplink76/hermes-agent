@@ -231,6 +231,53 @@ def test_savepoint_rollback_discards_deferred_capture(tmp_path, monkeypatch):
     assert _gist_history(vault) == ""
 
 
+def test_savepoint_rollback_discards_capture_when_event_id_is_reused(
+    tmp_path, monkeypatch
+):
+    vault = tmp_path / "Agent Memory"
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(vault))
+    with kb.connect(tmp_path / "kanban.db") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Rolled-back event identity",
+            idempotency_key="rolled-back-event-identity",
+        )
+        conn.execute("BEGIN")
+        conn.execute("SAVEPOINT caller_work")
+        assert kb.block_task(conn, task_id, kind="transient") is True
+        rolled_back_event_id = kb.list_events(conn, task_id)[-1].id
+
+        conn.execute("ROLLBACK TO SAVEPOINT caller_work")
+        reused_event_id = kb._append_event(
+            conn,
+            task_id,
+            "commented",
+            {"author": "operator", "len": 0},
+        )
+        assert reused_event_id == rolled_back_event_id
+        conn.execute("RELEASE SAVEPOINT caller_work")
+        conn.execute("COMMIT")
+
+    assert _gist_history(vault) == ""
+
+
+def test_nested_savepoint_rollback_discards_only_inner_callbacks(tmp_path):
+    calls = []
+    with kb.connect(tmp_path / "kanban.db") as conn:
+        conn.execute("BEGIN")
+        conn.execute("SAVEPOINT outer_work")
+        conn.add_post_commit_callback(lambda: calls.append("outer"))
+        conn.execute("SAVEPOINT inner_work")
+        conn.add_post_commit_callback(lambda: calls.append("inner"))
+
+        conn.execute("ROLLBACK TO SAVEPOINT inner_work")
+        conn.execute("RELEASE SAVEPOINT inner_work")
+        conn.execute("RELEASE SAVEPOINT outer_work")
+        conn.execute("COMMIT")
+
+    assert calls == ["outer"]
+
+
 def test_two_runless_blocks_use_distinct_transition_event_identity(
     tmp_path, monkeypatch
 ):

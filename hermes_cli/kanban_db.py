@@ -3482,12 +3482,14 @@ class _KanbanConnection(sqlite3.Connection):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._post_commit_callbacks: list[Callable[[], None]] = []
+        self._post_commit_savepoints: list[tuple[str, int]] = []
 
     def add_post_commit_callback(self, callback: Callable[[], None]) -> None:
         self._post_commit_callbacks.append(callback)
 
     def _run_post_commit_callbacks(self) -> None:
         callbacks, self._post_commit_callbacks = self._post_commit_callbacks, []
+        self._post_commit_savepoints.clear()
         for callback in callbacks:
             try:
                 callback()
@@ -3496,14 +3498,39 @@ class _KanbanConnection(sqlite3.Connection):
 
     def _clear_post_commit_callbacks(self) -> None:
         self._post_commit_callbacks.clear()
+        self._post_commit_savepoints.clear()
+
+    def _savepoint_index(self, name: str) -> Optional[int]:
+        normalized = name.strip('"`[]').casefold()
+        for index in range(len(self._post_commit_savepoints) - 1, -1, -1):
+            if self._post_commit_savepoints[index][0] == normalized:
+                return index
+        return None
 
     def execute(self, sql: str, parameters: Iterable[Any] = (), /) -> sqlite3.Cursor:
         cursor = super().execute(sql, parameters)
         boundary = " ".join(sql.strip().rstrip(";").upper().split())
+        tokens = boundary.split()
         if boundary in {"COMMIT", "END", "END TRANSACTION"}:
             self._run_post_commit_callbacks()
         elif boundary in {"ROLLBACK", "ROLLBACK TRANSACTION"}:
             self._clear_post_commit_callbacks()
+        elif len(tokens) == 2 and tokens[0] == "SAVEPOINT":
+            self._post_commit_savepoints.append(
+                (tokens[1].strip('"`[]').casefold(), len(self._post_commit_callbacks))
+            )
+        elif len(tokens) in {3, 4} and tokens[:2] == ["ROLLBACK", "TO"]:
+            name = tokens[3] if tokens[2] == "SAVEPOINT" else tokens[2]
+            index = self._savepoint_index(name)
+            if index is not None:
+                callback_count = self._post_commit_savepoints[index][1]
+                del self._post_commit_callbacks[callback_count:]
+                del self._post_commit_savepoints[index + 1 :]
+        elif len(tokens) in {2, 3} and tokens[0] == "RELEASE":
+            name = tokens[2] if tokens[1] == "SAVEPOINT" else tokens[1]
+            index = self._savepoint_index(name)
+            if index is not None:
+                del self._post_commit_savepoints[index:]
         return cursor
 
     def commit(self) -> None:
