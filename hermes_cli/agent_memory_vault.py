@@ -63,7 +63,12 @@ _COMMIT_RE = re.compile(r"[0-9a-fA-F]{7,64}")
 _PR_RE = re.compile(r"(?i)(?:PR\s*)?#\d+|\d+")
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/#@+\-]{0,199}")
 _UNSAFE_IDENTIFIER_RE = re.compile(
-    r"(?i)chain[_-]?of[_-]?thought|reasoning|deliberation|transcript|user:"
+    r"\bchain(?:[ _-])of(?:[ _-])thought\b"
+    r"|\b(?:private|hidden)\s+reasoning\b"
+    r"|\binternal\s+deliberation\b"
+    r"|\b(?:full|conversation)\s+transcripts?\b"
+    r"|(?<![A-Za-z0-9_])(?:user|assistant|system)\s*:",
+    re.IGNORECASE,
 )
 _EVIDENCE_KEYS = {
     "branch",

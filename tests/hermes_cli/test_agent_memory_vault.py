@@ -219,6 +219,23 @@ def test_every_successful_append_is_lint_valid_and_recallable(tmp_path):
     assert [match.gist_id for match in matches] == [gist.gist_id]
 
 
+def test_writer_allows_ordinary_functional_intent_language(tmp_path):
+    vault = tmp_path / "Agent Memory"
+    gist = _gist(
+        "ordinary-functional-language",
+        title="Improve agent reasoning and Transcript export",
+    )
+    gist.result = "Functional boundary: Do not store transcripts; Deliberation controls."
+
+    assert append_gist(vault, gist) is True
+
+    report = lint_vault(vault)
+    matches = recall(vault, "agent reasoning transcript export deliberation controls")
+    assert report.valid_entries == 1
+    assert report.invalid_entries == 0
+    assert [match.gist_id for match in matches] == [gist.gist_id]
+
+
 def test_append_scrubs_credential_query_values_but_preserves_normal_evidence_urls(tmp_path):
     vault = tmp_path / "Agent Memory"
     initialize_vault(vault)
@@ -382,13 +399,29 @@ def test_manual_malformed_or_secret_bearing_gists_are_invalid(
     assert recall(vault, "manual function release evidence") == []
 
 
-def test_manual_gist_with_transcript_or_private_reasoning_markers_is_invalid(
-    tmp_path,
+@pytest.mark.parametrize(
+    "unsafe_summary",
+    (
+        "chain_of_thought payload",
+        "chain-of-thought payload",
+        "chain of thought payload",
+        "private reasoning payload",
+        "hidden reasoning payload",
+        "internal deliberation payload",
+        "full transcript payload",
+        "conversation transcript payload",
+        "User: private payload",
+        "Assistant: private payload",
+        "System: private payload",
+    ),
+)
+def test_manual_gist_with_private_payload_markers_is_invalid(
+    tmp_path, unsafe_summary
 ):
     vault = tmp_path / "Agent Memory"
     initialize_vault(vault)
     (vault / "memory" / "2026-07-18.md").write_text(
-        _manual_gist(summary="chain_of_thought hidden reasoning transcript"),
+        _manual_gist(summary=unsafe_summary),
         encoding="utf-8",
     )
 
@@ -396,7 +429,7 @@ def test_manual_gist_with_transcript_or_private_reasoning_markers_is_invalid(
 
     assert report.valid_entries == 0
     assert report.invalid_entries >= 1
-    assert recall(vault, "hidden reasoning transcript") == []
+    assert recall(vault, "manual function") == []
 
 
 def test_oversized_manual_history_file_is_invalid_and_not_recalled(tmp_path):
