@@ -109,18 +109,61 @@ def _remember_kanban_run_best_effort(
     outcome: str,
     summary: Optional[str] = None,
 ) -> None:
-    """Keep advisory memory failure outside Kanban transition authority."""
+    """Capture advisory memory only after the enclosing transaction commits."""
     try:
-        from hermes_cli.agent_memory_vault import remember_kanban_run
-
-        remember_kanban_run(
-            conn,
-            board=board,
-            task_id=task_id,
-            run_id=run_id,
-            outcome=outcome,
-            summary=summary,
+        event_kinds = {
+            "completed": ("completed",),
+            "advanced": ("handoff",),
+            "blocked": (
+                "blocked",
+                "dependency_wait",
+                "block_loop_detected",
+                "human_input_preflight",
+            ),
+        }.get(outcome, ())
+        placeholders = ",".join("?" for _ in event_kinds)
+        event = (
+            conn.execute(
+                f"SELECT id FROM task_events WHERE task_id = ? "
+                f"AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+                (task_id, *event_kinds),
+            ).fetchone()
+            if event_kinds
+            else None
         )
+        event_id = int(event["id"]) if event is not None else None
+
+        def capture() -> None:
+            try:
+                from hermes_cli.agent_memory_vault import remember_kanban_run
+
+                remember_kanban_run(
+                    conn,
+                    board=board,
+                    task_id=task_id,
+                    run_id=run_id,
+                    outcome=outcome,
+                    summary=summary,
+                    transition_event_id=event_id,
+                )
+            except Exception as exc:
+                _log.warning(
+                    "Agent Memory capture failed after Kanban transition for %s: %s",
+                    task_id,
+                    exc,
+                )
+
+        if conn.in_transaction:
+            register = getattr(conn, "add_post_commit_callback", None)
+            if register is None:
+                _log.warning(
+                    "Skipping Agent Memory capture for %s: connection cannot defer until commit",
+                    task_id,
+                )
+                return
+            register(capture)
+        else:
+            capture()
     except Exception as exc:
         _log.warning(
             "Agent Memory capture failed after Kanban transition for %s: %s",
@@ -3441,6 +3484,49 @@ _INIT_LOCK_TIMEOUT_SECONDS = 10.0
 _INIT_LOCK_POLL_SECONDS = 0.05
 
 
+class _KanbanConnection(sqlite3.Connection):
+    """SQLite connection with best-effort callbacks at the durable boundary."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._post_commit_callbacks: list[Callable[[], None]] = []
+
+    def add_post_commit_callback(self, callback: Callable[[], None]) -> None:
+        self._post_commit_callbacks.append(callback)
+
+    def _run_post_commit_callbacks(self) -> None:
+        callbacks, self._post_commit_callbacks = self._post_commit_callbacks, []
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception as exc:
+                _log.warning("Post-commit callback failed: %s", exc)
+
+    def _clear_post_commit_callbacks(self) -> None:
+        self._post_commit_callbacks.clear()
+
+    def execute(self, sql: str, parameters: Iterable[Any] = (), /) -> sqlite3.Cursor:
+        cursor = super().execute(sql, parameters)
+        boundary = " ".join(sql.strip().rstrip(";").upper().split())
+        if boundary in {"COMMIT", "END", "END TRANSACTION"}:
+            self._run_post_commit_callbacks()
+        elif boundary in {"ROLLBACK", "ROLLBACK TRANSACTION"}:
+            self._clear_post_commit_callbacks()
+        return cursor
+
+    def commit(self) -> None:
+        super().commit()
+        self._run_post_commit_callbacks()
+
+    def rollback(self) -> None:
+        super().rollback()
+        self._clear_post_commit_callbacks()
+
+    def close(self) -> None:
+        self._clear_post_commit_callbacks()
+        super().close()
+
+
 def _resolve_busy_timeout_ms() -> int:
     """Return the SQLite busy timeout for Kanban connections.
 
@@ -3462,11 +3548,19 @@ def _resolve_busy_timeout_ms() -> int:
 def _sqlite_connect(path: Path) -> sqlite3.Connection:
     """Open a Kanban SQLite connection with consistent lock waiting."""
     busy_timeout_ms = _resolve_busy_timeout_ms()
-    conn = sqlite3.connect(
-        str(path),
-        isolation_level=None,
-        timeout=busy_timeout_ms / 1000.0,
-    )
+    connect_kwargs = {
+        "isolation_level": None,
+        "timeout": busy_timeout_ms / 1000.0,
+    }
+    try:
+        conn = sqlite3.connect(
+            str(path), factory=_KanbanConnection, **connect_kwargs
+        )
+    except TypeError as exc:
+        if "factory" not in str(exc) or "multiple values" not in str(exc):
+            raise
+        # A test or embedding may already inject its own Connection factory.
+        conn = sqlite3.connect(str(path), **connect_kwargs)
     # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
     # the PRAGMA explicitly so it is observable and survives future wrapper
     # changes. Parameter binding is not supported for PRAGMA assignments.

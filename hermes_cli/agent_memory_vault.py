@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+import contextlib
 import hashlib
 import json
 import logging
 import os
 from pathlib import Path
 import re
-from typing import Any, Mapping
+import tempfile
+import time
+from typing import Any, Iterator, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
 from agent.redact import redact_sensitive_text
@@ -21,6 +24,9 @@ _MAX_EVIDENCE_CHARS = 500
 _MAX_RECALL_RESULTS = 20
 _MAX_RECALL_FILES = 31
 _MAX_RECALL_GISTS = 100
+_MAX_GENERATED_SUMMARY_CHARS = 800
+_VAULT_LOCK_TIMEOUT_SECONDS = 5.0
+_VAULT_LOCK_POLL_SECONDS = 0.05
 _SAFE_GIST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}")
 _HTTP_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 _GIST_RE = re.compile(
@@ -42,6 +48,42 @@ _REQUIRED_FIELDS = (
     "Open loops",
 )
 _WORD_RE = re.compile(r"[a-z0-9][a-z0-9_-]{1,}")
+_UNSAFE_SUMMARY_RE = re.compile(
+    r"(?im)(?:^|\n)\s*(?:user|assistant|system|tool|human|ai)\s*:"
+    r"|</?(?:analysis|reasoning|thought)>"
+    r"|\b(?:private reasoning|chain of thought|hidden reasoning|transcript)\b"
+)
+_EVIDENCE_KEYS = {
+    "branch",
+    "branch_name",
+    "candidate_sha",
+    "commit",
+    "commit_sha",
+    "deployment",
+    "deployment_id",
+    "pr",
+    "pull_request",
+    "release",
+    "release_evidence",
+    "repo",
+    "repository",
+    "repository_url",
+    "review",
+    "review_evidence",
+    "reviewed_branch",
+    "reviewed_commit",
+    "rollback_target",
+    "runtime_evidence",
+    "sha",
+    "smoke_result",
+    "source_sha",
+    "test_evidence",
+    "test_result",
+    "tests",
+    "tests_run",
+    "verification",
+    "verification_summary",
+}
 
 _log = logging.getLogger(__name__)
 
@@ -126,6 +168,7 @@ def remember_kanban_run(
     run_id: int | None,
     outcome: str,
     summary: str | None = None,
+    transition_event_id: int | None = None,
 ) -> bool:
     """Append one functionality-first gist from durable Kanban records."""
     try:
@@ -140,9 +183,10 @@ def remember_kanban_run(
         run = _kanban_run(conn, task_id, run_id)
         contract = _kanban_work_contract(conn, task["work_contract_id"])
         work = _functional_work(task, contract)
-        function_id = _function_id(work)
         recorded_run_id = int(run["id"]) if run is not None else run_id
-        event = _kanban_event(conn, task_id, recorded_run_id)
+        event = _kanban_event(
+            conn, task_id, recorded_run_id, transition_event_id
+        )
         occurred_at = datetime.fromtimestamp(
             int(run["ended_at"] or run["started_at"])
             if run is not None and (run["ended_at"] or run["started_at"])
@@ -152,41 +196,71 @@ def remember_kanban_run(
             str(run["step_key"] or "") if run is not None
             else str(task["current_step_key"] or "")
         )
-        summary_text = str(
+        summary_candidate = str(
             summary
             or (run["summary"] if run is not None else None)
             or task["result"]
             or outcome
         )
-        gist = SessionGist(
-            gist_id=_kanban_gist_id(board, task_id, recorded_run_id, outcome),
-            occurred_at=occurred_at,
-            agent_id=str(
-                (run["profile"] if run is not None else None)
-                or task["assignee"]
-                or task["created_by"]
-                or "hermes"
-            ),
-            role=phase or "worker",
-            function_id=function_id,
-            title=str(work.get("title") or task["title"]),
-            context=_kanban_context(board, task, recorded_run_id),
-            summary=summary_text,
-            reused="none",
-            result=f"{outcome}; status={task['status']}; phase={task['current_step_key'] or 'none'}",
-            maturity=_kanban_maturity(outcome, phase, str(task["status"])),
-            evidence=_kanban_evidence(task, run, event),
-            behavior="none",
-            decisions="none",
-            open_loops=(
-                "none"
-                if outcome == "completed"
-                else f"Current phase: {task['current_step_key'] or 'none'}; {summary_text}"
-            ),
+        summary_text = _governed_summary(
+            summary_candidate,
+            outcome=outcome,
+            status=str(task["status"]),
+            phase=phase,
         )
-        appended = append_gist(vault, gist)
-        lint_vault(vault)
-        return appended
+        with _vault_lock(vault):
+            _initialize_vault_unlocked(vault)
+            function_id = _existing_function_id(vault, board, task_id)
+            if function_id is None:
+                if work is None:
+                    _log.warning(
+                        "skipping Agent Memory capture for board=%s task=%s: "
+                        "no stable functional boundary",
+                        board,
+                        task_id,
+                    )
+                    return False
+                function_id = _function_id(work)
+            gist = SessionGist(
+                gist_id=_kanban_gist_id(
+                    board,
+                    task_id,
+                    transition_event_id,
+                    recorded_run_id,
+                    outcome,
+                ),
+                occurred_at=occurred_at,
+                agent_id=str(
+                    (run["profile"] if run is not None else None)
+                    or task["assignee"]
+                    or task["created_by"]
+                    or "hermes"
+                ),
+                role=phase or "worker",
+                function_id=function_id,
+                title=str(
+                    (work or {}).get("title") or task["title"] or function_id
+                ),
+                context=_kanban_context(board, task, recorded_run_id),
+                summary=summary_text,
+                reused="none",
+                result=(
+                    f"{outcome}; status={task['status']}; "
+                    f"phase={task['current_step_key'] or 'none'}"
+                ),
+                maturity=_kanban_maturity(outcome, phase, str(task["status"])),
+                evidence=_kanban_evidence(task, run, event),
+                behavior="none",
+                decisions="none",
+                open_loops=(
+                    "none"
+                    if outcome == "completed"
+                    else f"Current phase: {task['current_step_key'] or 'none'}"
+                ),
+            )
+            appended = _append_gist_unlocked(vault, gist)
+            _lint_vault_unlocked(vault)
+            return appended
     except Exception as exc:
         _log.warning(
             "Agent Memory capture failed for board=%s task=%s run=%s: %s",
@@ -261,22 +335,45 @@ def _kanban_work_contract(conn: Any, contract_id: object) -> dict[str, Any] | No
     return value if isinstance(value, dict) else None
 
 
-def _functional_work(task: Any, contract: dict[str, Any] | None) -> dict[str, Any]:
+def _functional_work(
+    task: Any, contract: dict[str, Any] | None
+) -> dict[str, Any] | None:
     work = contract.get("work") if isinstance(contract, dict) else None
     if isinstance(work, dict):
-        return {
+        candidate = {
             key: work.get(key)
             for key in (
                 "item_kind", "work_type", "title", "outcome", "scope", "out_of_scope"
             )
         }
-    return {"title": task["title"], "outcome": task["body"] or task["title"]}
+        if any(
+            candidate.get(key) not in (None, "", [], {})
+            for key in ("item_kind", "work_type", "outcome", "scope", "out_of_scope")
+        ):
+            return candidate
+    if task["idempotency_key"]:
+        return {
+            "title": task["title"],
+            "idempotency_key": str(task["idempotency_key"]),
+        }
+    if task["body"]:
+        return {"title": task["title"], "outcome": str(task["body"])}
+    if task["result"]:
+        return {"title": task["title"], "outcome": str(task["result"])}
+    return None
 
 
 def _function_id(work: dict[str, Any]) -> str:
     functional_boundary = {
         key: work.get(key)
-        for key in ("item_kind", "work_type", "outcome", "scope", "out_of_scope")
+        for key in (
+            "idempotency_key",
+            "item_kind",
+            "work_type",
+            "outcome",
+            "scope",
+            "out_of_scope",
+        )
         if key in work
     }
     canonical = json.dumps(
@@ -289,26 +386,44 @@ def _function_id(work: dict[str, Any]) -> str:
     return "function-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
 
 
-def _kanban_event(conn: Any, task_id: str, run_id: int | None) -> Any:
+def _kanban_event(
+    conn: Any,
+    task_id: str,
+    run_id: int | None,
+    event_id: int | None,
+) -> Any:
+    if event_id is not None:
+        row = conn.execute(
+            "SELECT id, kind, payload FROM task_events WHERE id = ? AND task_id = ?",
+            (int(event_id), task_id),
+        ).fetchone()
+        if row is not None:
+            return row
     if run_id is not None:
         row = conn.execute(
-            "SELECT kind, payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "SELECT id, kind, payload FROM task_events WHERE task_id = ? AND run_id = ? "
             "ORDER BY id DESC LIMIT 1",
             (task_id, int(run_id)),
         ).fetchone()
         if row is not None:
             return row
     return conn.execute(
-        "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        "SELECT id, kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
 
 
 def _kanban_gist_id(
-    board: str, task_id: str, run_id: int | None, outcome: str
+    board: str,
+    task_id: str,
+    event_id: int | None,
+    run_id: int | None,
+    outcome: str,
 ) -> str:
     identity = json.dumps(
-        [board, task_id, run_id, outcome], separators=(",", ":"), ensure_ascii=False
+        [board, task_id, event_id, run_id, outcome],
+        separators=(",", ":"),
+        ensure_ascii=False,
     )
     return "kanban-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
 
@@ -340,24 +455,93 @@ def _kanban_maturity(outcome: str, phase: str, status: str) -> str:
     return "planned"
 
 
+def _existing_function_id(vault: Path, board: str, task_id: str) -> str | None:
+    expected = {"board": board, "card": task_id}
+    for entry in reversed(_valid_entries(vault)):
+        context = {}
+        for component in entry.fields["Context"].split(";"):
+            key, separator, value = component.strip().partition("=")
+            if separator:
+                context[key] = value
+        if all(context.get(key) == value for key, value in expected.items()):
+            return entry.function_id
+    return None
+
+
+def _governed_summary(
+    candidate: str,
+    *,
+    outcome: str,
+    status: str,
+    phase: str,
+) -> str:
+    normalized = " ".join(candidate.split())
+    if (
+        not normalized
+        or len(normalized) > _MAX_GENERATED_SUMMARY_CHARS
+        or _UNSAFE_SUMMARY_RE.search(candidate)
+    ):
+        return f"Kanban transition {outcome}: status={status}; phase={phase or 'none'}."
+    return normalized
+
+
 def _kanban_evidence(task: Any, run: Any, event: Any) -> str:
-    values = []
-    if task["work_contract_id"]:
-        values.append(f"work_contract={task['work_contract_id']}")
-    if run is not None:
-        values.append(f"run={run['id']}")
-        if run["metadata"]:
-            values.append(f"metadata={run['metadata']}")
-    if event is not None:
-        values.append(f"event={event['kind']}:{event['payload'] or '{}'}")
+    values: list[str] = []
+    if task["workspace_path"]:
+        values.append(f"repository={_recorded_text(task['workspace_path'])}")
     if task["branch_name"]:
-        values.append(f"branch={task['branch_name']}")
-    return "; ".join(values) or "none"
+        values.append(f"branch={_recorded_text(task['branch_name'])}")
+    if run is not None:
+        if run["metadata"]:
+            values.extend(_evidence_values(_json_mapping(run["metadata"])))
+    if event is not None:
+        values.extend(_evidence_values(_json_mapping(event["payload"])))
+    return "; ".join(dict.fromkeys(values)) or "none"
+
+
+def _json_mapping(raw: object) -> Mapping[str, Any]:
+    if not raw:
+        return {}
+    if isinstance(raw, Mapping):
+        return raw
+    try:
+        value = json.loads(str(raw))
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, Mapping) else {}
+
+
+def _evidence_values(mapping: Mapping[str, Any]) -> list[str]:
+    values: list[str] = []
+    for raw_key, value in mapping.items():
+        key = str(raw_key).strip().lower()
+        if key not in _EVIDENCE_KEYS:
+            continue
+        if isinstance(value, Mapping):
+            nested = _evidence_values(value)
+            values.extend(f"{key}.{item}" for item in nested)
+            continue
+        if isinstance(value, (list, tuple)):
+            rendered = ", ".join(
+                _recorded_text(item)
+                for item in value
+                if not isinstance(item, (Mapping, list, tuple))
+            )
+        else:
+            rendered = _recorded_text(value)
+        if rendered:
+            values.append(f"{key}={_clip(rendered, _MAX_EVIDENCE_CHARS)}")
+    return values
 
 
 def initialize_vault(vault: Path) -> None:
     """Create the documented external vault layout without touching other paths."""
     vault = Path(vault)
+    with _vault_lock(vault):
+        _initialize_vault_unlocked(vault)
+
+
+def _initialize_vault_unlocked(vault: Path) -> None:
     for directory in (
         vault,
         vault / "memory",
@@ -381,9 +565,15 @@ def initialize_vault(vault: Path) -> None:
 def append_gist(vault: Path, gist: SessionGist) -> bool:
     """Append one redacted Session Gist, returning false for an existing gist ID."""
     vault = Path(vault)
+    _gist_id(gist.gist_id)
+    with _vault_lock(vault):
+        _initialize_vault_unlocked(vault)
+        return _append_gist_unlocked(vault, gist)
+
+
+def _append_gist_unlocked(vault: Path, gist: SessionGist) -> bool:
     gist_id = _gist_id(gist.gist_id)
     entry = _render_gist(gist, gist_id)
-    initialize_vault(vault)
     if _gist_exists(vault, gist_id):
         return False
 
@@ -432,7 +622,12 @@ def recall(vault: Path, query: str, limit: int = 5) -> list[MemoryMatch]:
 def lint_vault(vault: Path) -> LintReport:
     """Validate append-only history and deterministically rebuild derived views."""
     vault = Path(vault)
-    initialize_vault(vault)
+    with _vault_lock(vault):
+        _initialize_vault_unlocked(vault)
+        return _lint_vault_unlocked(vault)
+
+
+def _lint_vault_unlocked(vault: Path) -> LintReport:
     entries = _valid_entries(vault)
     invalid_entries = _invalid_entry_count(vault, len(entries))
     functions: dict[str, dict[str, str]] = {}
@@ -446,16 +641,81 @@ def lint_vault(vault: Path) -> LintReport:
         }
 
     projection = {"functions": [functions[key] for key in sorted(functions)]}
-    (vault / ".derived" / "functions.json").write_text(
-        json.dumps(projection, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    _atomic_write_text(
+        vault / ".derived" / "functions.json",
+        json.dumps(projection, indent=2, sort_keys=True) + "\n",
     )
-    (vault / "index.md").write_text(_index_markdown(projection["functions"]), encoding="utf-8")
-    (vault / "snapshot.md").write_text(_snapshot_markdown(projection["functions"]), encoding="utf-8")
-    (vault / "log.md").write_text(
+    _atomic_write_text(vault / "index.md", _index_markdown(projection["functions"]))
+    _atomic_write_text(
+        vault / "snapshot.md", _snapshot_markdown(projection["functions"])
+    )
+    _atomic_write_text(
+        vault / "log.md",
         f"# Agent Memory Log\n\n- Lint: {len(entries)} valid, {invalid_entries} invalid Session Gists.\n",
-        encoding="utf-8",
     )
     return LintReport(len(entries), invalid_entries, len(functions))
+
+
+@contextlib.contextmanager
+def _vault_lock(vault: Path) -> Iterator[None]:
+    """Acquire a bounded host-wide lock for one vault mutation."""
+    lock_path = Path(vault).with_name(Path(vault).name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    acquired = False
+    try:
+        deadline = time.monotonic() + _VAULT_LOCK_TIMEOUT_SECONDS
+        while not acquired:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    if os.fstat(handle.fileno()).st_size == 0:
+                        handle.write(b"\0")
+                        handle.flush()
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"timed out acquiring Agent Memory vault lock: {lock_path}"
+                    )
+                time.sleep(_VAULT_LOCK_POLL_SECONDS)
+        yield
+    finally:
+        if acquired:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _write_if_missing(path: Path, content: str) -> None:

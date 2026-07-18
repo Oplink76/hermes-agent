@@ -1,6 +1,7 @@
 """Contracts for the external, append-only Agent Memory vault."""
 
 import json
+import multiprocessing
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +35,27 @@ def _gist(gist_id="gist-1", *, title="Export release evidence"):
         decisions="Use Markdown as the source of truth.",
         open_loops="Review and release remain.",
     )
+
+
+def _concurrent_record(vault_value, index, duplicate, barrier):
+    from hermes_cli.agent_memory_vault import append_gist, lint_vault
+
+    vault = Path(vault_value)
+    gist_id = "shared-idempotent-gist" if duplicate else f"distinct-gist-{index}"
+    function_id = "function-shared" if duplicate else f"function-distinct-{index}"
+    gist = _gist(gist_id, title=f"Concurrent function {function_id}")
+    gist.function_id = function_id
+    barrier.wait(timeout=10)
+    append_gist(vault, gist)
+    lint_vault(vault)
+
+
+def _hold_vault_lock(vault_value, ready, release):
+    from hermes_cli.agent_memory_vault import _vault_lock
+
+    with _vault_lock(Path(vault_value)):
+        ready.set()
+        release.wait(timeout=10)
 
 
 def test_configured_vault_path_prefers_environment_and_requires_enabled_config(tmp_path):
@@ -242,3 +264,66 @@ def test_lint_rebuilds_derived_files_without_rewriting_daily_history(tmp_path):
             "title": "Export release evidence",
         }
     ]
+
+
+def test_concurrent_processes_preserve_distinct_and_idempotent_gists(tmp_path):
+    vault = tmp_path / "Agent Memory"
+    initialize_vault(vault)
+    context = multiprocessing.get_context("spawn")
+    process_count = 16
+    barrier = context.Barrier(process_count)
+    processes = [
+        context.Process(
+            target=_concurrent_record,
+            args=(str(vault), index, index >= 8, barrier),
+        )
+        for index in range(process_count)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=20)
+
+    assert [process.exitcode for process in processes] == [0] * process_count
+    history = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((vault / "memory").glob("*.md"))
+    )
+    assert history.count("<!-- gist_id: shared-idempotent-gist -->") == 1
+    for index in range(8):
+        assert history.count(f"<!-- gist_id: distinct-gist-{index} -->") == 1
+    projection = json.loads(
+        (vault / ".derived" / "functions.json").read_text(encoding="utf-8")
+    )
+    assert {item["function_id"] for item in projection["functions"]} == {
+        "function-shared",
+        *(f"function-distinct-{index}" for index in range(8)),
+    }
+
+
+def test_vault_lock_timeout_is_bounded_and_leaves_history_unchanged(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import agent_memory_vault as memory_vault
+
+    vault = tmp_path / "Agent Memory"
+    initialize_vault(vault)
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=_hold_vault_lock,
+        args=(str(vault), ready, release),
+    )
+    holder.start()
+    assert ready.wait(timeout=10)
+    monkeypatch.setattr(memory_vault, "_VAULT_LOCK_TIMEOUT_SECONDS", 0.1)
+    try:
+        with pytest.raises(TimeoutError, match="Agent Memory vault lock"):
+            append_gist(vault, _gist("timed-out-gist"))
+    finally:
+        release.set()
+        holder.join(timeout=10)
+
+    assert holder.exitcode == 0
+    assert list((vault / "memory").glob("*.md")) == []

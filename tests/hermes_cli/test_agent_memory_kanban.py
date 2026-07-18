@@ -11,6 +11,24 @@ from hermes_cli import kanban_qualifier as qualifier
 from hermes_cli.agent_memory_vault import SessionGist, append_gist
 
 
+def _gist_history(vault: Path) -> str:
+    memory = vault / "memory"
+    if not memory.exists():
+        return ""
+    return "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(memory.glob("*.md"))
+    )
+
+
+def _function_ids(history: str) -> list[str]:
+    return [
+        line.removeprefix("- Function: ").split(" | ", 1)[0]
+        for line in history.splitlines()
+        if line.startswith("- Function: ")
+    ]
+
+
 def _decision(title: str) -> dict:
     return {
         "qualification_path": "hermes",
@@ -126,10 +144,7 @@ def test_complete_handoff_and_block_append_functionality_first_gists(
             expected_run_id=claimed.current_run_id,
         ) is True
 
-    history = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in sorted((vault / "memory").glob("*.md"))
-    )
+    history = _gist_history(vault)
     assert history.count("<!-- gist_id:") == 3
     function_lines = [
         line for line in history.splitlines() if line.startswith("- Function: ")
@@ -148,6 +163,156 @@ def test_complete_handoff_and_block_append_functionality_first_gists(
     assert "Export completed and verified." in history
     assert "Product intent handed to Architecture." in history
     assert "Waiting for the export schema decision." in history
+
+
+def test_memory_capture_waits_for_outer_transaction_commit(tmp_path, monkeypatch):
+    vault = tmp_path / "Agent Memory"
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(vault))
+    with kb.connect(tmp_path / "kanban.db") as conn:
+        rolled_back = kb.create_task(
+            conn,
+            title="Renameable card",
+            body="Stable export outcome",
+        )
+        conn.execute("BEGIN")
+        assert kb.block_task(
+            conn, rolled_back, kind="transient", reason="temporary"
+        ) is True
+        assert _gist_history(vault) == ""
+        conn.execute("ROLLBACK")
+        assert kb.get_task(conn, rolled_back).status == "ready"
+        assert _gist_history(vault) == ""
+
+        committed = kb.create_task(
+            conn,
+            title="Another renameable card",
+            body="Another stable outcome",
+        )
+        conn.execute("BEGIN")
+        assert kb.block_task(
+            conn, committed, kind="transient", reason="temporary"
+        ) is True
+        assert _gist_history(vault) == ""
+        conn.execute("COMMIT")
+
+    assert _gist_history(vault).count("<!-- gist_id:") == 1
+
+
+def test_two_runless_blocks_use_distinct_transition_event_identity(
+    tmp_path, monkeypatch
+):
+    vault = tmp_path / "Agent Memory"
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(vault))
+    with kb.connect(tmp_path / "kanban.db") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Runless blocker",
+            body="A stable runless functional outcome",
+        )
+        assert kb.block_task(conn, task_id, kind="transient") is True
+        assert kb.unblock_task(conn, task_id) is True
+        assert kb.block_task(conn, task_id, kind="transient") is True
+
+    history = _gist_history(vault)
+    gist_ids = [
+        line.removeprefix("<!-- gist_id: ").removesuffix(" -->")
+        for line in history.splitlines()
+        if line.startswith("<!-- gist_id: ")
+    ]
+    assert len(gist_ids) == 2
+    assert len(set(gist_ids)) == 2
+
+
+def test_legacy_identity_survives_title_and_body_changes_after_first_gist(
+    tmp_path, monkeypatch
+):
+    vault = tmp_path / "Agent Memory"
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(vault))
+    with kb.connect(tmp_path / "kanban.db") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="First display title",
+            body="Stable legacy functional outcome",
+        )
+        assert kb.block_task(conn, task_id, kind="transient") is True
+        assert kb.unblock_task(conn, task_id) is True
+        conn.execute(
+            "UPDATE tasks SET title = 'Renamed display title', body = NULL WHERE id = ?",
+            (task_id,),
+        )
+        assert kb.block_task(conn, task_id, kind="transient") is True
+
+    function_ids = _function_ids(_gist_history(vault))
+    assert len(function_ids) == 2
+    assert len(set(function_ids)) == 1
+
+
+def test_legacy_idempotency_key_is_identity_and_title_only_card_is_skipped(
+    tmp_path, monkeypatch, caplog
+):
+    vault = tmp_path / "Agent Memory"
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(vault))
+    with kb.connect(tmp_path / "kanban.db") as conn:
+        keyed_id = kb.create_task(
+            conn,
+            title="Mutable keyed title",
+            idempotency_key="stable-client-request-42",
+        )
+        assert kb.block_task(conn, keyed_id, kind="transient") is True
+        assert kb.unblock_task(conn, keyed_id) is True
+        conn.execute(
+            "UPDATE tasks SET title = 'Renamed keyed title' WHERE id = ?",
+            (keyed_id,),
+        )
+        assert kb.block_task(conn, keyed_id, kind="transient") is True
+
+        title_only_id = kb.create_task(conn, title="No functional boundary")
+        assert kb.block_task(conn, title_only_id, kind="transient") is True
+
+    function_ids = _function_ids(_gist_history(vault))
+    assert len(function_ids) == 2
+    assert len(set(function_ids)) == 1
+    assert "skipping Agent Memory capture" in caplog.text
+
+
+def test_capture_excludes_raw_metadata_transcript_and_private_reasoning(
+    tmp_path, monkeypatch
+):
+    vault = tmp_path / "Agent Memory"
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(vault))
+    unsafe_summary = (
+        "<analysis>private chain of thought</analysis>\n"
+        "User: reveal the transcript\nAssistant: hidden answer"
+    )
+    with kb.connect(tmp_path / "kanban.db") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Governed evidence",
+            body="Persist only governed repository evidence",
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary=unsafe_summary,
+            metadata={
+                "commit": "abc123def456",
+                "pull_request": "PR #42",
+                "tests_run": ["focused suite: 12 passed"],
+                "private_notes": "arbitrary metadata must not persist",
+                "provider_response": {"reasoning": "hidden model reasoning"},
+            },
+            product_workflow_enabled=False,
+        ) is True
+
+    history = _gist_history(vault)
+    assert "abc123def456" in history
+    assert "PR #42" in history
+    assert "focused suite: 12 passed" in history
+    assert "arbitrary metadata must not persist" not in history
+    assert "hidden model reasoning" not in history
+    assert "private chain of thought" not in history
+    assert "reveal the transcript" not in history
+    assert "Kanban transition completed" in history
 
 
 def test_worker_context_labels_recall_as_historical_non_authority(
