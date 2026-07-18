@@ -1,5 +1,6 @@
 """Contracts for the external, append-only Agent Memory vault."""
 
+import hashlib
 import json
 import multiprocessing
 from datetime import datetime
@@ -35,6 +36,29 @@ def _gist(gist_id="gist-1", *, title="Export release evidence"):
         decisions="Use Markdown as the source of truth.",
         open_loops="Review and release remain.",
     )
+
+
+def _manual_gist(
+    *,
+    gist_id="manual-gist",
+    function_id="function-manual",
+    maturity="planned",
+    summary="A bounded manual summary.",
+    evidence="commit abc1234",
+):
+    return f"""## 12:00 | manual | worker
+<!-- gist_id: {gist_id} -->
+- Function: {function_id} | Manual function
+- Context: board=manual; card=1
+- Summary: {summary}
+- Reused: none
+- Result: recorded
+- Maturity: {maturity}
+- Evidence: {evidence}
+- Behavior: none
+- Decisions: none
+- Open loops: none
+"""
 
 
 def _concurrent_record(vault_value, index, duplicate, barrier):
@@ -74,6 +98,17 @@ def test_configured_vault_path_prefers_environment_and_requires_enabled_config(t
     ) == from_environment
 
 
+def test_configured_vault_path_rejects_relative_environment_and_config_paths():
+    assert (
+        configured_vault_path({}, {"HERMES_AGENT_MEMORY_VAULT": "relative/vault"})
+        is None
+    )
+    assert configured_vault_path(
+        {"agent_memory": {"enabled": True, "vault_path": "relative/vault"}},
+        {},
+    ) is None
+
+
 def test_initialize_vault_creates_only_the_documented_external_structure(tmp_path):
     vault = tmp_path / "Agent Memory"
 
@@ -94,6 +129,29 @@ def test_initialize_vault_creates_only_the_documented_external_structure(tmp_pat
         "wiki/learnings",
     }
     assert not vault.with_name(vault.name + ".lock").exists()
+
+
+def test_initialize_vault_twice_preserves_generated_content(tmp_path):
+    vault = tmp_path / "Agent Memory"
+    initialize_vault(vault)
+    before = {
+        path.relative_to(vault).as_posix(): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in vault.rglob("*")
+        if path.is_file()
+    }
+
+    initialize_vault(vault)
+
+    after = {
+        path.relative_to(vault).as_posix(): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in vault.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
 
 
 def test_append_writes_the_structured_gist_once_and_redacts_recorded_text(tmp_path):
@@ -200,6 +258,77 @@ def test_append_redacts_bare_http_url_query_and_fragment_components(tmp_path, ur
     history = (vault / "memory" / "2026-07-18.md").read_text(encoding="utf-8")
     assert "top-secret" not in history
     assert redacted_url in history
+
+
+@pytest.mark.parametrize(
+    ("url", "safe_prefix"),
+    (
+        (
+            "wss://socket-user:top-secret@socket.example/ws?token=hidden#session",
+            "wss://socket-user:",
+        ),
+        (
+            "ftp://ftp-user:top-secret@files.example/archive?token=hidden#part",
+            "ftp://ftp-user:",
+        ),
+        (
+            "postgresql://db-user:top-secret@db.example/app?sslpassword=hidden#dsn",
+            "postgresql://db-user:",
+        ),
+    ),
+)
+def test_append_redacts_url_secrets_across_schemes(tmp_path, url, safe_prefix):
+    vault = tmp_path / "Agent Memory"
+    gist = _gist("gist-cross-scheme-url")
+    gist.evidence = url
+
+    assert append_gist(vault, gist) is True
+
+    history = (vault / "memory" / "2026-07-18.md").read_text(encoding="utf-8")
+    assert "top-secret" not in history
+    assert "hidden" not in history
+    assert safe_prefix in history
+    assert "?[REDACTED]#[REDACTED]" in history
+
+
+@pytest.mark.parametrize(
+    "manual_entry",
+    (
+        _manual_gist(gist_id="malformed/id"),
+        _manual_gist(function_id="malformed function"),
+        _manual_gist(maturity="experimental"),
+        _manual_gist(evidence="wss://user:top-secret@example.test/ws?token=hidden"),
+        _manual_gist(summary="x" * 2_001),
+    ),
+)
+def test_manual_malformed_or_secret_bearing_gists_are_invalid(
+    tmp_path, manual_entry
+):
+    vault = tmp_path / "Agent Memory"
+    initialize_vault(vault)
+    (vault / "memory" / "2026-07-18.md").write_text(
+        manual_entry, encoding="utf-8"
+    )
+
+    report = lint_vault(vault)
+
+    assert report.valid_entries == 0
+    assert report.invalid_entries >= 1
+    assert recall(vault, "manual function release evidence") == []
+
+
+def test_oversized_manual_history_file_is_invalid_and_not_recalled(tmp_path):
+    vault = tmp_path / "Agent Memory"
+    initialize_vault(vault)
+    (vault / "memory" / "2026-07-18.md").write_text(
+        _manual_gist() + ("x" * 1_100_000), encoding="utf-8"
+    )
+
+    report = lint_vault(vault)
+
+    assert report.valid_entries == 0
+    assert report.invalid_entries >= 1
+    assert recall(vault, "manual function") == []
 
 
 def test_recall_returns_related_functionality_with_capped_evidence(tmp_path):

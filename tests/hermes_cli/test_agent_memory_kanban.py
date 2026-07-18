@@ -10,7 +10,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_qualifier as qualifier
-from hermes_cli.agent_memory_vault import SessionGist, append_gist
+from hermes_cli.agent_memory_vault import SessionGist, append_gist, recall
 
 
 def _gist_history(vault: Path) -> str:
@@ -34,6 +34,7 @@ def _function_ids(history: str) -> list[str]:
 def _decision(
     title: str,
     outcome: str = "Operators can export governed release evidence",
+    scope: list[str] | None = None,
 ) -> dict:
     return {
         "qualification_path": "hermes",
@@ -42,7 +43,7 @@ def _decision(
             "work_type": "maintenance",
             "title": title,
             "outcome": outcome,
-            "scope": ["Export the governed evidence bundle"],
+            "scope": scope or ["Export the governed evidence bundle"],
             "out_of_scope": ["Change release authority"],
         },
         "routing": {
@@ -77,6 +78,7 @@ def _qualified_task(
     board: str,
     title: str,
     outcome: str = "Operators can export governed release evidence",
+    scope: list[str] | None = None,
 ) -> str:
     receipt = qualifier.submit_request(
         conn,
@@ -87,7 +89,7 @@ def _qualified_task(
         conn,
         board=board,
         intake_id=receipt["intake_id"],
-        model_call=lambda _prompt: _decision(title, outcome),
+        model_call=lambda _prompt: _decision(title, outcome, scope),
         secret=b"test-only-secret",
         issued_at=100,
     )
@@ -178,6 +180,26 @@ def test_complete_handoff_and_block_append_functionality_first_gists(
     assert "Kanban transition advanced" in history
     assert "Kanban transition blocked" in history
     assert "memory_capture_id" not in history
+
+
+def test_recall_matches_work_contract_outcome_and_scope_not_readable_title(
+    tmp_path, monkeypatch
+):
+    board, vault = _configured_product_board(tmp_path, monkeypatch)
+    with kb.connect(board=board) as conn:
+        task_id = _qualified_task(
+            conn,
+            board=board,
+            title="Adjust dashboard colors",
+            outcome="Astronomers calibrate quasar spectrometers",
+            scope=["Verify cryogenic observatory alignment"],
+        )
+        assert kb.block_task(conn, task_id, kind="dependency", board=board) is True
+
+    matches = recall(vault, "quasar spectrometers cryogenic observatory")
+
+    assert len(matches) == 1
+    assert matches[0].title == "Adjust dashboard colors"
 
 
 def test_memory_capture_waits_for_outer_transaction_commit(tmp_path, monkeypatch):
@@ -277,6 +299,57 @@ def test_savepoint_syntax_cannot_ghost_capture_a_reused_event_id(
         conn.execute("COMMIT")
 
     assert _gist_history(vault) == ""
+
+
+def test_runless_transition_uses_exact_event_time_and_immutable_state(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    vault = tmp_path / "Agent Memory"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_AGENT_MEMORY_VAULT", raising=False)
+    with kb.connect(tmp_path / "kanban.db") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Exact event facts",
+            idempotency_key="exact-event-facts",
+        )
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            kind="transient",
+            reason="old run",
+            expected_run_id=claimed.current_run_id,
+        ) is True
+        assert kb.unblock_task(conn, task_id) is True
+
+        monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(vault))
+        conn.execute("BEGIN")
+        assert kb.block_task(conn, task_id, kind="capability") is True
+        event = kb.list_events(conn, task_id)[-1]
+        assert event.kind == "blocked"
+        assert event.run_id is None
+        conn.execute(
+            "UPDATE task_events SET created_at = ? WHERE id = ?",
+            (946684800, event.id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'review', "
+            "current_step_key = 'later-mutated' WHERE id = ?",
+            (task_id,),
+        )
+        conn.execute("COMMIT")
+
+    history_path = vault / "memory" / "2000-01-01.md"
+    assert history_path.exists()
+    history = history_path.read_text(encoding="utf-8")
+    assert "run=" not in history
+    assert "later-mutated" not in history
+    assert "status=blocked" in history
+    assert "phase=none" in history
 
 
 def test_two_runless_blocks_use_distinct_transition_event_identity(

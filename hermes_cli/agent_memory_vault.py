@@ -21,13 +21,15 @@ from agent.redact import redact_sensitive_text
 
 _MAX_RECORDED_CHARS = 2_000
 _MAX_EVIDENCE_CHARS = 500
+_MAX_HISTORY_FILE_BYTES = 1_000_000
+_MAX_HISTORY_FILE_CHARS = 1_000_000
 _MAX_RECALL_RESULTS = 20
 _MAX_RECALL_FILES = 31
 _MAX_RECALL_GISTS = 100
 _VAULT_LOCK_TIMEOUT_SECONDS = 5.0
 _VAULT_LOCK_POLL_SECONDS = 0.05
 _SAFE_GIST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}")
-_HTTP_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_SCHEME_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"']+")
 _GIST_RE = re.compile(
     r"(?ms)^## (?P<header>[^\n]+)\n"
     r"<!-- gist_id: (?P<gist_id>[^<>\n]+) -->\n"
@@ -45,6 +47,16 @@ _REQUIRED_FIELDS = (
     "Behavior",
     "Decisions",
     "Open loops",
+)
+_ALLOWED_MATURITY = frozenset(
+    {
+        "planned",
+        "in_development",
+        "code_complete",
+        "tested",
+        "reviewed",
+        "released",
+    }
 )
 _WORD_RE = re.compile(r"[a-z0-9][a-z0-9_-]{1,}")
 _COMMIT_RE = re.compile(r"[0-9a-fA-F]{7,64}")
@@ -157,7 +169,7 @@ def configured_vault_path(
     environment = os.environ if environ is None else environ
     environment_path = (environment.get("HERMES_AGENT_MEMORY_VAULT") or "").strip()
     if environment_path:
-        return Path(environment_path).expanduser()
+        return _absolute_configured_path(environment_path)
 
     if config is None:
         from hermes_cli.config import load_config
@@ -167,7 +179,12 @@ def configured_vault_path(
     if not isinstance(agent_memory, dict) or agent_memory.get("enabled") is False:
         return None
     configured_path = str(agent_memory.get("vault_path") or "").strip()
-    return Path(configured_path).expanduser() if configured_path else None
+    return _absolute_configured_path(configured_path) if configured_path else None
+
+
+def _absolute_configured_path(value: str) -> Path | None:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else None
 
 
 def remember_kanban_run(
@@ -190,7 +207,6 @@ def remember_kanban_run(
         ).fetchone()
         if task is None:
             return False
-        run = _kanban_run(conn, task_id, run_id)
         contract = _kanban_work_contract(conn, task["work_contract_id"])
         work = _functional_work(task, contract)
         if work is None:
@@ -209,21 +225,30 @@ def remember_kanban_run(
                 task_id,
             )
             return False
-        function_id = _function_id(work)
-        recorded_run_id = int(run["id"]) if run is not None else run_id
         event = _kanban_event(conn, task_id, transition_event_id)
-        occurred_at = datetime.fromtimestamp(
-            int(run["ended_at"] or run["started_at"])
-            if run is not None and (run["ended_at"] or run["started_at"])
-            else int(task["completed_at"] or task["started_at"] or task["created_at"])
+        if event is None:
+            _log.warning(
+                "skipping Agent Memory capture for board=%s task=%s: "
+                "transition event does not exist",
+                board,
+                task_id,
+            )
+            return False
+        function_id = _function_id(work)
+        recorded_run_id = (
+            int(event["run_id"]) if event["run_id"] is not None else None
         )
-        phase = (
-            str(run["step_key"] or "") if run is not None
-            else str(task["current_step_key"] or "")
+        run = (
+            _kanban_run(conn, task_id, recorded_run_id)
+            if recorded_run_id is not None
+            else None
         )
+        occurred_at = datetime.fromtimestamp(int(event["created_at"]))
+        phase = str(run["step_key"] or "") if run is not None else ""
+        status = _kanban_transition_status(event, run, outcome)
         summary_text = _transition_summary(
             outcome=outcome,
-            status=str(task["status"]),
+            status=status,
             phase=phase,
             event_id=transition_event_id,
         )
@@ -240,8 +265,6 @@ def remember_kanban_run(
                 occurred_at=occurred_at,
                 agent_id=str(
                     (run["profile"] if run is not None else None)
-                    or task["assignee"]
-                    or task["created_by"]
                     or "hermes"
                 ),
                 role=phase or "worker",
@@ -253,17 +276,17 @@ def remember_kanban_run(
                 summary=summary_text,
                 reused="none",
                 result=(
-                    f"{outcome}; status={task['status']}; "
-                    f"phase={task['current_step_key'] or 'none'}"
+                    f"Functional boundary: {_functional_boundary_text(work)}; "
+                    f"transition={outcome}; status={status}; phase={phase or 'none'}"
                 ),
-                maturity=_kanban_maturity(outcome, phase, str(task["status"])),
+                maturity=_kanban_maturity(outcome, phase, status),
                 evidence=_kanban_evidence(task, run, event),
                 behavior="none",
                 decisions="none",
                 open_loops=(
                     "none"
                     if outcome == "completed"
-                    else f"Current phase: {task['current_step_key'] or 'none'}"
+                    else f"Transition phase: {phase or 'none'}"
                 ),
             )
             appended = _append_gist_unlocked(vault, gist)
@@ -318,16 +341,10 @@ def recall_for_task(title: str, body: str | None) -> list[MemoryMatch]:
         return []
 
 
-def _kanban_run(conn: Any, task_id: str, run_id: int | None) -> Any:
-    if run_id is not None:
-        return conn.execute(
-            "SELECT * FROM task_runs WHERE id = ? AND task_id = ?",
-            (int(run_id), task_id),
-        ).fetchone()
+def _kanban_run(conn: Any, task_id: str, run_id: int) -> Any:
     return conn.execute(
-        "SELECT * FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC, id DESC LIMIT 1",
-        (task_id,),
+        "SELECT * FROM task_runs WHERE id = ? AND task_id = ?",
+        (int(run_id), task_id),
     ).fetchone()
 
 
@@ -368,7 +385,18 @@ def _functional_work(
 
 
 def _function_id(work: dict[str, Any]) -> str:
-    functional_boundary = {
+    canonical = json.dumps(
+        _functional_boundary(work),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return "function-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+
+
+def _functional_boundary(work: dict[str, Any]) -> dict[str, Any]:
+    return {
         key: work.get(key)
         for key in (
             "idempotency_key",
@@ -380,14 +408,29 @@ def _function_id(work: dict[str, Any]) -> str:
         )
         if key in work
     }
-    canonical = json.dumps(
-        functional_boundary,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
+
+
+def _functional_boundary_text(work: dict[str, Any]) -> str:
+    lexical_boundary = {
+        key: value
+        for key in (
+            "outcome",
+            "scope",
+            "out_of_scope",
+            "item_kind",
+            "work_type",
+            "idempotency_key",
+        )
+        if (value := work.get(key)) not in (None, "", [], {})
+    }
+    return _recorded_text(
+        json.dumps(
+            lexical_boundary,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
     )
-    return "function-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
 
 
 def _kanban_event(
@@ -396,9 +439,22 @@ def _kanban_event(
     event_id: int,
 ) -> Any:
     return conn.execute(
-        "SELECT id, kind, payload FROM task_events WHERE id = ? AND task_id = ?",
+        "SELECT id, run_id, created_at, kind, payload "
+        "FROM task_events WHERE id = ? AND task_id = ?",
         (int(event_id), task_id),
     ).fetchone()
+
+
+def _kanban_transition_status(event: Any, run: Any, outcome: str) -> str:
+    if run is not None and run["status"]:
+        return str(run["status"])
+    return {
+        "completed": "done",
+        "handoff": "completed",
+        "blocked": "blocked",
+        "dependency_wait": "blocked",
+        "block_loop_detected": "blocked",
+    }.get(str(event["kind"]), outcome)
 
 
 def _kanban_gist_id(
@@ -593,8 +649,15 @@ def _append_gist_unlocked(vault: Path, gist: SessionGist) -> bool:
 
     occurred_on = _occurred_on(gist.occurred_at)
     history_path = vault / "memory" / f"{occurred_on.isoformat()}.md"
+    existing_size = history_path.stat().st_size if history_path.exists() else 0
+    separator_size = 1 if existing_size else 0
+    if (
+        existing_size + separator_size + len(entry.encode("utf-8"))
+        > _MAX_HISTORY_FILE_BYTES
+    ):
+        raise ValueError("daily Agent Memory history file exceeds the size bound")
     with history_path.open("a", encoding="utf-8") as handle:
-        if history_path.stat().st_size:
+        if existing_size:
             handle.write("\n")
         handle.write(entry)
     return True
@@ -614,14 +677,18 @@ def recall(vault: Path, query: str, limit: int = 5) -> list[MemoryMatch]:
         all_text = " ".join((entry.function_id, entry.title, *entry.fields.values()))
         shared_words = query_words & _words(all_text)
         exact_identifier = query_folded in {entry.function_id.lower(), entry.gist_id.lower()}
-        score = (1_000 if exact_identifier else 0) + len(shared_words) + 10 * len(query_words & title_words)
+        score = (
+            (1_000 if exact_identifier else 0)
+            + len(shared_words)
+            + 10 * len(query_words & title_words)
+        )
         if score == 0:
             continue
         summary = entry.fields["Summary"]
         matches.append(
             MemoryMatch(
                 function_id=entry.function_id,
-                title=entry.title,
+                title=_clip(entry.title, _MAX_EVIDENCE_CHARS),
                 gist_id=entry.gist_id,
                 evidence=_clip(entry.fields["Evidence"], _MAX_EVIDENCE_CHARS),
                 snippet=_clip(f"{entry.title}: {summary}", _MAX_EVIDENCE_CHARS),
@@ -743,7 +810,13 @@ def _agents_template() -> str:
 
 def _gist_exists(vault: Path, gist_id: str) -> bool:
     marker = f"<!-- gist_id: {gist_id} -->"
-    return any(marker in path.read_text(encoding="utf-8") for path in (vault / "memory").glob("*.md"))
+    for path in (vault / "memory").glob("*.md"):
+        content = _read_history_file(path)
+        if content is None:
+            raise ValueError(f"daily Agent Memory history file is invalid: {path.name}")
+        if marker in content:
+            return True
+    return False
 
 
 def _render_gist(gist: SessionGist, gist_id: str) -> str:
@@ -771,8 +844,7 @@ def _render_gist(gist: SessionGist, gist_id: str) -> str:
 
 
 def _recorded_text(value: object) -> str:
-    redacted = redact_sensitive_text("" if value is None else str(value), force=True)
-    redacted = _HTTP_URL_RE.sub(_redact_http_url_values, redacted)
+    redacted = _sanitize_sensitive_text("" if value is None else str(value))
     normalized = " ".join(redacted.split())
     return _clip(normalized, _MAX_RECORDED_CHARS)
 
@@ -781,8 +853,13 @@ def _clip(value: str, maximum: int) -> str:
     return value if len(value) <= maximum else value[: maximum - 1] + "…"
 
 
-def _redact_http_url_values(match: re.Match[str]) -> str:
-    """Keep an HTTP(S) URL recognizable without storing any credential value."""
+def _sanitize_sensitive_text(value: str) -> str:
+    redacted = redact_sensitive_text(value, force=True)
+    return _SCHEME_URL_RE.sub(_redact_url_values, redacted)
+
+
+def _redact_url_values(match: re.Match[str]) -> str:
+    """Keep a URL recognizable without storing any credential value."""
     try:
         parts = urlsplit(match.group(0))
     except ValueError:
@@ -827,7 +904,9 @@ def _valid_entries(vault: Path) -> list[_ParsedGist]:
     if not memory_dir.exists():
         return entries
     for path in sorted(memory_dir.glob("*.md")):
-        content = path.read_text(encoding="utf-8")
+        content = _read_history_file(path)
+        if content is None:
+            continue
         for match in _GIST_RE.finditer(content):
             parsed = _parse_gist(match, path)
             if parsed is not None:
@@ -843,7 +922,10 @@ def _recent_valid_entries(vault: Path) -> list[_ParsedGist]:
 
     entries: list[_ParsedGist] = []
     for path in sorted(memory_dir.glob("*.md"), reverse=True)[:_MAX_RECALL_FILES]:
-        matches = list(_GIST_RE.finditer(path.read_text(encoding="utf-8")))
+        content = _read_history_file(path)
+        if content is None:
+            continue
+        matches = list(_GIST_RE.finditer(content))
         for match in reversed(matches):
             parsed = _parse_gist(match, path)
             if parsed is not None:
@@ -854,14 +936,36 @@ def _recent_valid_entries(vault: Path) -> list[_ParsedGist]:
 
 
 def _parse_gist(match: re.Match[str], source: Path) -> _ParsedGist | None:
-    fields = {item.group("name"): item.group("value") for item in _FIELD_RE.finditer(match.group("body"))}
+    if _sanitize_sensitive_text(match.group(0)) != match.group(0):
+        return None
+    if not _valid_external_text(match.group("header")):
+        return None
+    try:
+        gist_id = _gist_id(match.group("gist_id"))
+    except ValueError:
+        return None
+
+    field_items = list(_FIELD_RE.finditer(match.group("body")))
+    field_names = [item.group("name") for item in field_items]
+    if len(field_names) != len(set(field_names)):
+        return None
+    fields = {item.group("name"): item.group("value") for item in field_items}
     if any(name not in fields or not fields[name] for name in _REQUIRED_FIELDS):
+        return None
+    if any(
+        not _valid_external_text(name) or not _valid_external_text(value)
+        for name, value in fields.items()
+    ):
         return None
     function_id, separator, title = fields["Function"].partition(" | ")
     if not separator or not function_id or not title:
         return None
+    if not _SAFE_GIST_ID_RE.fullmatch(function_id):
+        return None
+    if fields["Maturity"] not in _ALLOWED_MATURITY:
+        return None
     return _ParsedGist(
-        gist_id=match.group("gist_id"),
+        gist_id=gist_id,
         function_id=function_id,
         title=title,
         fields=fields,
@@ -873,11 +977,34 @@ def _invalid_entry_count(vault: Path, valid_entries: int) -> int:
     memory_dir = vault / "memory"
     if not memory_dir.exists():
         return 0
-    headings = sum(
-        len(re.findall(r"(?m)^## ", path.read_text(encoding="utf-8")))
-        for path in memory_dir.glob("*.md")
-    )
-    return max(0, headings - valid_entries)
+    headings = 0
+    invalid_files = 0
+    for path in memory_dir.glob("*.md"):
+        content = _read_history_file(path)
+        if content is None:
+            invalid_files += 1
+        else:
+            headings += len(re.findall(r"(?m)^## ", content))
+    return invalid_files + max(0, headings - valid_entries)
+
+
+def _valid_external_text(value: str) -> bool:
+    return len(value) <= _MAX_RECORDED_CHARS and _sanitize_sensitive_text(value) == value
+
+
+def _read_history_file(path: Path) -> str | None:
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(_MAX_HISTORY_FILE_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > _MAX_HISTORY_FILE_BYTES:
+        return None
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return content if len(content) <= _MAX_HISTORY_FILE_CHARS else None
 
 
 def _words(value: str) -> set[str]:
