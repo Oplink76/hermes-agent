@@ -1,4 +1,4 @@
-"""Shared allowlist of ``/api/*`` paths that bypass dashboard auth.
+"""Shared allowlist of exact paths that bypass dashboard auth.
 
 Two middlewares enforce dashboard auth and previously kept independent
 copies of this list:
@@ -31,6 +31,10 @@ the SPA should bootstrap it after login instead.
 from __future__ import annotations
 
 PUBLIC_API_PATHS: frozenset[str] = frozenset({
+    # Public, read-only directions for governed external work intake.
+    # Board validation happens in the handler and the response contains no
+    # credential, task content, signing material, or board listing.
+    "/.well-known/hermes-inbox",
     # Liveness probe target. Returns version, gateway state, active
     # session count, and the dashboard auth-gate shape. No bodies, no
     # session content, no secrets. Documented as the portal's wildcard
