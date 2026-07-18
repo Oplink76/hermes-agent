@@ -4361,6 +4361,23 @@ def _ensure_qualification_boundary_objects(conn: sqlite3.Connection) -> None:
         BEGIN
             SELECT RAISE(ABORT, 'qualification required before task materialization');
         END;
+        CREATE TRIGGER IF NOT EXISTS strict_requalification_intake_service_insert
+        BEFORE INSERT ON qualification_intake
+        WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
+         AND EXISTS (
+             SELECT 1
+               FROM json_each(
+                   CASE WHEN json_valid(NEW.raw_request) = 1
+                        THEN NEW.raw_request ELSE '{}'
+                   END
+               )
+              WHERE json_each.key = 'kind'
+                AND json_each.value = 'task_requalification'
+         )
+         AND hermes_governance_write_authorized() != 1
+        BEGIN
+            SELECT RAISE(ABORT, 'requalification intake requires Hermes service authority');
+        END;
         CREATE TRIGGER IF NOT EXISTS strict_task_links_service_insert
         BEFORE INSERT ON task_links
         WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
@@ -4707,6 +4724,60 @@ def task_snapshot_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "current_step_key": row["current_step_key"],
         "current_run_id": row["current_run_id"],
     }
+
+
+def task_repository_evidence(row: sqlite3.Row) -> dict[str, Any]:
+    """Capture read-only repository facts for a task's current workspace."""
+
+    keys = set(row.keys())
+    evidence = {
+        "branch_name": row["branch_name"] if "branch_name" in keys else None,
+        "project_id": row["project_id"] if "project_id" in keys else None,
+        "workspace_kind": row["workspace_kind"] if "workspace_kind" in keys else None,
+        "workspace_path": row["workspace_path"] if "workspace_path" in keys else None,
+    }
+    workspace_path = evidence["workspace_path"]
+    if not workspace_path:
+        evidence["available"] = False
+        return evidence
+    git_executable = shutil.which("git")
+    if git_executable is None:
+        evidence["available"] = False
+        return evidence
+    root = _git_toplevel(
+        Path(str(workspace_path)).expanduser(),
+        git_executable=git_executable,
+    )
+    if root is None:
+        evidence["available"] = False
+        return evidence
+
+    def git_output(*args: str) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                [git_executable, "-C", str(root), *args],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return (result.stdout or "").strip() if result.returncode == 0 else None
+
+    head = git_output("rev-parse", "HEAD")
+    status = git_output("status", "--porcelain")
+    branch = git_output("branch", "--show-current")
+    evidence.update(
+        {
+            "available": head is not None and status is not None,
+            "repository_root": str(root),
+            "head": head,
+            "current_branch": branch or None,
+            "status_porcelain": status.splitlines() if status is not None else None,
+        }
+    )
+    return evidence
 
 
 def assert_task_snapshot(
@@ -8445,13 +8516,21 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # if parents are still in progress the task must wait in 'todo'
         # until recompute_ready picks it up. RCA: Bug 2 at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone_parents = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+        parents = conn.execute(
+            "SELECT p.status, p.workflow_template_id, p.current_step_key "
+            "FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ?",
             (task_id,),
-        ).fetchone()
-        new_status = "todo" if undone_parents else "ready"
+        ).fetchall()
+        release_measure_unblocks = _product_release_measure_unblocks_dependents(meta)
+        has_undone_parent = any(
+            not _dependency_parent_satisfied(
+                parent,
+                release_measure_unblocks=release_measure_unblocks,
+            )
+            for parent in parents
+        )
+        new_status = "todo" if has_undone_parent else "ready"
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
@@ -9000,11 +9079,18 @@ def _strict_destructive_write_forbidden(conn: sqlite3.Connection) -> bool:
 # Workspace resolution
 # ---------------------------------------------------------------------------
 
-def _git_toplevel(path: Path) -> Optional[Path]:
+def _git_toplevel(
+    path: Path,
+    *,
+    git_executable: Optional[str] = None,
+) -> Optional[Path]:
     """Return the git toplevel containing ``path``, or ``None`` if not in a repo."""
+    executable = git_executable or shutil.which("git")
+    if executable is None:
+        return None
     try:
         result = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            [executable, "-C", str(path), "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
             timeout=30,
@@ -11392,6 +11478,9 @@ class ReconcileResult:
     main this pass via :func:`_merge_standalone_story_to_main` /
     :func:`merge_epic_to_main`. Populated ONLY when the board opts into
     ``product_workflow.merge_after_green`` (default OFF); at most one per pass."""
+    requalification_requested: list[str] = field(default_factory=list)
+    """Qualified scheduled card ids sent back through the existing Hermes
+    qualification intake this pass; at most one per pass."""
 
 
 def reconcile(
@@ -11445,7 +11534,12 @@ def reconcile(
     ``reconcile`` repeatedly over a healthy (live-PID) running card does
     nothing on every pass.
 
-    3. **Story->epic integration (W3).** At most ONE ``done`` story whose
+    3. **Scheduled-card requalification.** On strict product boards, at most
+       ONE qualified ``scheduled`` card with no active worker is submitted as
+       inert requalification intake. A pending intake makes the step
+       idempotent. All other waits and terminal states are left untouched.
+
+    4. **Story->epic integration (W3).** At most ONE ``done`` story whose
        branch is not yet an ancestor of its epic's integration branch is
        merged in via :func:`integrate_story_to_epic` this pass -- the safety
        net for the same reason steps 1-2 exist: nothing else guarantees a
@@ -11538,7 +11632,41 @@ def reconcile(
         if pid_or_none is not None:
             result.spawned.append(task_id)
 
-    # Step 3: integrate at most one un-integrated Done story into its epic
+    # Step 3: send at most one qualified scheduled card back through the
+    # existing qualification intake. Development sequencing is dependency-
+    # driven; ``scheduled`` has no normal dispatcher wake on a strict v2 board.
+    qualification = meta.get("qualification")
+    if isinstance(qualification, dict) and qualification.get("required") is True:
+        from hermes_cli import kanban_intake
+
+        candidates = conn.execute(
+            """
+            SELECT t.id
+              FROM tasks t
+             WHERE t.status = 'scheduled'
+               AND t.work_item_kind = 'card'
+               AND t.work_contract_id IS NOT NULL
+               AND t.current_run_id IS NULL
+               AND t.claim_lock IS NULL
+               AND COALESCE(t.current_step_key, '') != 'release_measure'
+             ORDER BY t.priority DESC, t.created_at ASC, t.id ASC
+            """
+        ).fetchall()
+        for candidate in candidates:
+            task_id = str(candidate["id"])
+            if _has_sticky_block(conn, task_id):
+                continue
+            receipt = kanban_intake.submit_requalification(
+                conn,
+                task_id=task_id,
+                reason="qualified scheduled work has no normal wake action",
+            )
+            if not receipt["created"]:
+                continue
+            result.requalification_requested.append(task_id)
+            break
+
+    # Step 4: integrate at most one un-integrated Done story into its epic
     # branch this pass (W3). Scans done cards in completion order;
     # "already_integrated" / no-epic-parent / unresolvable cards are skipped
     # (not counted as this pass's action) so a real integration can still
@@ -11546,7 +11674,7 @@ def reconcile(
     done_rows = conn.execute(
         "SELECT id FROM tasks WHERE status = 'done' ORDER BY completed_at ASC"
     ).fetchall()
-    # Step 4 (merge-back): carry finished work to LOCAL main. OFF unless the
+    # Step 5 (merge-back): carry finished work to LOCAL main. OFF unless the
     # board opts into product_workflow.merge_after_green -- when off, behavior
     # is byte-for-byte the pre-existing integrate-one-per-pass loop.
     merge_after_green = _product_merge_after_green(product_board_metadata(board))

@@ -320,6 +320,18 @@ def validate_decision(
     item_kind = work.get("item_kind")
     if item_kind not in {"card", "epic"}:
         errors.append("work item kind must be card or epic")
+    target_task_id = kanban_intake.requalification_target_id(intake)
+    if isinstance(target_task_id, str):
+        target = conn.execute(
+            "SELECT work_item_kind FROM tasks WHERE id = ?", (target_task_id,)
+        ).fetchone()
+        if target is None:
+            errors.append("requalification target does not exist")
+        elif item_kind != target["work_item_kind"]:
+            errors.append("requalification must preserve the existing work item kind")
+        dependencies = routing.get("dependencies")
+        if isinstance(dependencies, list) and target_task_id in dependencies:
+            errors.append("a requalified task cannot depend on itself")
     allowed_work_types = policy.get("work_types", DEFAULT_WORK_TYPES)
     if not isinstance(allowed_work_types, (list, tuple)) or work.get("work_type") not in allowed_work_types:
         errors.append("work type is not allowed by board policy")
@@ -488,6 +500,17 @@ def build_qualification_prompt(
         "repository_instructions": _repository_instructions(board_metadata),
         "current_task_graph": _task_graph(conn),
     }
+    target_task_id = kanban_intake.requalification_target_id(intake)
+    requalification = ""
+    if isinstance(target_task_id, str):
+        requalification = (
+            f"Requalify the existing card {target_task_id}; preserve its identity. "
+            "Use captured evidence to route already-delivered work to the latest "
+            "justified phase; otherwise choose the earliest unfinished phase. Return "
+            "it to the normal handover flow, and express sequencing as dependencies, "
+            "not scheduled. Do not create a replacement card or use break-glass "
+            "override.\n\n"
+        )
     repair = ""
     if validation_errors:
         repair = (
@@ -495,7 +518,8 @@ def build_qualification_prompt(
             "these errors:\n- " + "\n- ".join(validation_errors)
         )
     return (
-        "Qualify this inert work request for Hermes. Decide meaning; do not invent "
+        requalification
+        + "Qualify this inert work request for Hermes. Decide meaning; do not invent "
         "evidence. Return one JSON object containing qualification_path, work, "
         "routing, entry_assessment, handover, rules, classification, and po_evidence "
         "only for the PO path. Use only phases, profiles, work types, task ids, and "

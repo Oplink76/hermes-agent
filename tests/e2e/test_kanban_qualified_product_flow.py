@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_intake as intake
 from hermes_cli import kanban_qualifier as qualifier
 
 
@@ -181,3 +182,66 @@ def test_real_entry_shapes_qualify_or_reject_without_bypassing_routing(
         assert conn.execute(
             "SELECT COUNT(*) FROM tasks WHERE work_contract_id IS NOT NULL"
         ).fetchone()[0] == 5
+
+
+def test_requalification_uses_existing_qualifier_and_same_card(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    board = "requalification-flow"
+    kb.ensure_product_board_defaults(board)
+    metadata = kb.read_board_metadata(board)
+    metadata["qualification"]["required"] = True
+    kb.board_metadata_path(board).write_text(json.dumps(metadata), encoding="utf-8")
+
+    with kb.connect(board=board) as conn:
+        initial_decision = _decision(
+            "Resume the existing card", "development", "maintenance"
+        )
+        initial = qualifier.submit_request(
+            conn,
+            request={"title": "Resume the existing card"},
+            source="e2e",
+            attachments=(
+                {"name": "evidence:backlog"},
+                {"name": "evidence:architecture"},
+            ),
+        )
+        qualified = qualifier.qualify_intake(
+            conn,
+            board=board,
+            intake_id=initial["intake_id"],
+            model_call=lambda _prompt: initial_decision,
+            secret=b"test-only-secret",
+            issued_at=100,
+        )
+        task_id = qualified["task_id"]
+        kb.add_comment(conn, task_id, "developer", "evidence:development")
+        assert kb.schedule_task(conn, task_id, reason="legacy sequencing")
+
+        receipt = intake.submit_requalification(
+            conn,
+            task_id=task_id,
+            reason="scheduled development work has no wake action",
+        )
+        successor_decision = _decision(
+            "Resume the existing card", "test", "maintenance"
+        )
+        result = qualifier.qualify_intake(
+            conn,
+            board=board,
+            intake_id=receipt["intake_id"],
+            model_call=lambda _prompt: successor_decision,
+            secret=b"test-only-secret",
+            issued_at=101,
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert result["status"] == "qualified"
+        assert result["task_id"] == task_id
+        assert task.current_step_key == "test"
+        assert task.assignee == "tester"
+        assert task.status == "ready"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE work_contract_id IS NOT NULL"
+        ).fetchone()[0] == 1
