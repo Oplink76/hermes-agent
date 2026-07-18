@@ -81,7 +81,7 @@ def _strict_product_board(tmp_path, monkeypatch, board: str) -> None:
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
 
-def _materialized_scheduled_card(connection, board: str) -> str:
+def _materialized_card(connection, board: str) -> str:
     request_id = kb.create_qualification_intake(
         connection,
         raw_request=json.dumps(
@@ -105,8 +105,41 @@ def _materialized_scheduled_card(connection, board: str) -> str:
         signed_contract=_signed_contract(request_id),
         secret=b"test-only-secret",
     )
+    return task_id
+
+
+def _materialized_scheduled_card(connection, board: str) -> str:
+    task_id = _materialized_card(connection, board)
     assert kb.schedule_task(connection, task_id, reason="no wake action")
     return task_id
+
+
+def _materialized_epic(connection, board: str) -> str:
+    request_id = kb.create_qualification_intake(
+        connection,
+        raw_request=json.dumps(
+            {"kind": "task_create", "request": {"title": "Qualified Epic"}}
+        ),
+        source="hermes",
+    )
+    contract = _signed_contract(request_id)["contract"]
+    contract["work"]["item_kind"] = "epic"
+    contract["work"]["title"] = "Qualified Epic"
+    contract["routing"] = {
+        "entry_phase": None,
+        "assignee": None,
+        "epic_id": None,
+        "dependencies": [],
+    }
+    contract["handover"]["next_phase"] = None
+    contract["handover"]["next_role"] = None
+    signed = intake.sign_work_contract(contract, secret=b"test-only-secret")
+    return intake.materialize_contract(
+        connection,
+        board=board,
+        signed_contract=signed,
+        secret=b"test-only-secret",
+    )
 
 
 def test_intake_submission_is_durable_and_inert(conn):
@@ -610,3 +643,144 @@ def test_submit_requalification_is_inert_durable_and_idempotent(
         assert payload["kind"] == "task_requalification"
         assert payload["target_task_id"] == task_id
         assert payload["reason"] == "qualified scheduled work has no wake action"
+
+
+def test_successor_contract_requalifies_same_card_and_preserves_audit(
+    tmp_path, monkeypatch
+):
+    board = "strict-requalification-apply"
+    _strict_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_scheduled_card(connection, board)
+        before_count = connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        old_contract_id = kb.get_task(connection, task_id).work_contract_id
+        receipt = intake.submit_requalification(
+            connection,
+            task_id=task_id,
+            reason="resume through the governed flow",
+        )
+        contract = _signed_contract(receipt["intake_id"])["contract"]
+        contract["work"]["title"] = "Requalified card"
+        contract["work"]["outcome"] = "The same card resumes safely"
+        successor = intake.sign_work_contract(
+            contract, secret=b"test-only-secret"
+        )
+
+        materialized_id = intake.materialize_contract(
+            connection,
+            board=board,
+            signed_contract=successor,
+            secret=b"test-only-secret",
+        )
+        repeated_id = intake.materialize_contract(
+            connection,
+            board=board,
+            signed_contract=successor,
+            secret=b"test-only-secret",
+        )
+
+        card = kb.get_task(connection, task_id)
+        assert materialized_id == repeated_id == task_id
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before_count
+        assert card.title == "Requalified card"
+        assert card.body == "The same card resumes safely"
+        assert card.current_step_key == "development"
+        assert card.assignee == "developer"
+        assert card.status == "ready"
+        assert card.work_contract_id != old_contract_id
+        assert kb.get_work_contract(connection, old_contract_id) is not None
+        event = [
+            item
+            for item in kb.list_events(connection, task_id)
+            if item.kind == "requalified"
+        ][-1]
+        assert event.payload == {
+            "intake_id": receipt["intake_id"],
+            "old_work_contract_id": old_contract_id,
+            "new_work_contract_id": card.work_contract_id,
+            "entry_phase": "development",
+        }
+
+
+def test_requalification_replaces_dependencies_and_epic_membership(
+    tmp_path, monkeypatch
+):
+    board = "strict-requalification-relationships"
+    _strict_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        target_id = _materialized_scheduled_card(connection, board)
+        unfinished_parent_id = _materialized_card(connection, board)
+        epic_id = _materialized_epic(connection, board)
+        receipt = intake.submit_requalification(
+            connection,
+            task_id=target_id,
+            reason="replace sequencing with dependencies",
+        )
+        contract = _signed_contract(receipt["intake_id"])["contract"]
+        contract["routing"]["dependencies"] = [unfinished_parent_id]
+        contract["routing"]["epic_id"] = epic_id
+        successor = intake.sign_work_contract(
+            contract, secret=b"test-only-secret"
+        )
+
+        assert (
+            intake.materialize_contract(
+                connection,
+                board=board,
+                signed_contract=successor,
+                secret=b"test-only-secret",
+            )
+            == target_id
+        )
+
+        assert kb.parent_ids(connection, target_id) == [unfinished_parent_id]
+        assert kb.epic_id_for_task(connection, target_id) == epic_id
+        assert kb.get_task(connection, target_id).status == "todo"
+
+
+def test_requalification_rejects_break_glass_and_rolls_back(
+    tmp_path, monkeypatch
+):
+    board = "strict-requalification-no-override"
+    _strict_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_scheduled_card(connection, board)
+        receipt = intake.submit_requalification(
+            connection,
+            task_id=task_id,
+            reason="ordinary requalification",
+        )
+        old_contract_id = kb.get_task(connection, task_id).work_contract_id
+        before_contract_count = connection.execute(
+            "SELECT COUNT(*) FROM work_contracts"
+        ).fetchone()[0]
+        contract = _signed_contract(receipt["intake_id"])["contract"]
+        contract["qualification_path"] = "override"
+        contract["override_authority"] = {
+            "reason": "not ordinary requalification",
+            "source_session": "session-1",
+            "instruction_ref": "message-1",
+        }
+        signed = intake.sign_work_contract(
+            contract, secret=b"test-only-secret"
+        )
+
+        with pytest.raises(intake.WorkContractError, match="break-glass override"):
+            intake.materialize_contract(
+                connection,
+                board=board,
+                signed_contract=signed,
+                secret=b"test-only-secret",
+            )
+
+        assert kb.get_task(connection, task_id).work_contract_id == old_contract_id
+        assert kb.get_qualification_intake(
+            connection, receipt["intake_id"]
+        )["status"] == "pending"
+        assert (
+            connection.execute("SELECT COUNT(*) FROM work_contracts").fetchone()[0]
+            == before_contract_count
+        )

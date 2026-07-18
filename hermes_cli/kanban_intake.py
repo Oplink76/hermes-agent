@@ -569,6 +569,101 @@ def submit_intake(
     }
 
 
+def _apply_requalification(
+    conn: Any,
+    *,
+    board: str,
+    intake_record: Mapping[str, Any],
+    contract_id: str,
+    fields: Mapping[str, Any],
+) -> str:
+    """Apply a successor Work Contract to its existing scheduled card."""
+
+    from hermes_cli import kanban_db
+
+    payload = intake_payload(intake_record)
+    target_task_id = payload.get("target_task_id")
+    if payload.get("kind") != "task_requalification" or not isinstance(
+        target_task_id, str
+    ):
+        raise WorkContractError("requalification intake is missing its target task")
+
+    row = conn.execute(
+        "SELECT * FROM tasks WHERE id = ?", (target_task_id,)
+    ).fetchone()
+    if row is None:
+        raise WorkContractError(f"unknown requalification task: {target_task_id}")
+    if row["status"] != "scheduled":
+        raise WorkContractError("requalification target is no longer scheduled")
+    if row["current_run_id"] is not None or row["claim_lock"] is not None:
+        raise WorkContractError("cannot requalify a task with an active worker")
+    if row["work_contract_id"] is None:
+        raise WorkContractError("requalification requires a qualified task")
+    if fields["work_item_kind"] != row["work_item_kind"]:
+        raise WorkContractError("requalification must preserve the work item kind")
+
+    old_contract_id = str(row["work_contract_id"])
+    parents = tuple(dict.fromkeys(str(item) for item in fields["parents"]))
+    if target_task_id in parents:
+        raise WorkContractError("a requalified task cannot depend on itself")
+
+    with kanban_db.authorized_governance_write():
+        updated = conn.execute(
+            """
+            UPDATE tasks
+               SET title = ?, body = ?, assignee = ?,
+                   workflow_template_id = ?, current_step_key = ?,
+                   work_contract_id = ?, work_item_kind = ?
+             WHERE id = ?
+               AND status = 'scheduled'
+               AND current_run_id IS NULL
+               AND claim_lock IS NULL
+               AND work_contract_id = ?
+            """,
+            (
+                str(fields["title"]),
+                str(fields["body"]),
+                fields["assignee"],
+                fields["workflow_template_id"],
+                fields["current_step_key"],
+                contract_id,
+                fields["work_item_kind"],
+                target_task_id,
+                old_contract_id,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise WorkContractError("requalification target changed during qualification")
+
+        conn.execute("DELETE FROM task_links WHERE child_id = ?", (target_task_id,))
+        for parent_id in parents:
+            kanban_db.link_tasks(conn, parent_id, target_task_id)
+
+        conn.execute(
+            "DELETE FROM epic_memberships WHERE task_id = ?", (target_task_id,)
+        )
+        epic_id = fields.get("epic_id")
+        if epic_id:
+            kanban_db.add_epic_membership(
+                conn, epic_id=str(epic_id), task_id=target_task_id
+            )
+
+        kanban_db._append_event(
+            conn,
+            target_task_id,
+            "requalified",
+            {
+                "intake_id": str(intake_record["id"]),
+                "old_work_contract_id": old_contract_id,
+                "new_work_contract_id": contract_id,
+                "entry_phase": fields["current_step_key"],
+            },
+        )
+        if not kanban_db.unblock_task(conn, target_task_id):
+            raise WorkContractError("requalification target could not resume")
+    return target_task_id
+
+
 def materialize_contract(
     conn: Any,
     *,
@@ -618,6 +713,12 @@ def materialize_contract(
             raise WorkContractError(
                 f"qualification intake {request_id} is already {intake_record['status']}"
             )
+        payload = intake_payload(intake_record)
+        is_requalification = payload.get("kind") == "task_requalification"
+        if is_requalification and contract["qualification_path"] == "override":
+            raise WorkContractError(
+                "requalification cannot use the break-glass override"
+            )
 
         from hermes_cli import kanban_qualifier
 
@@ -657,24 +758,33 @@ def materialize_contract(
             contract_id=contract_id,
         )
         with kanban_db.authorized_governance_write():
-            task_id = kanban_db.create_task(
-                conn,
-                title=str(fields["title"]),
-                body=str(fields["body"]),
-                assignee=fields["assignee"],
-                created_by="hermes-qualification",
-                parents=tuple(fields["parents"]),
-                board=board,
-                workflow_template_id=fields["workflow_template_id"],
-                current_step_key=fields["current_step_key"],
-                work_contract_id=contract_id,
-                work_item_kind=fields["work_item_kind"],
-            )
-            epic_id = fields.get("epic_id")
-            if epic_id:
-                kanban_db.add_epic_membership(
-                    conn, epic_id=str(epic_id), task_id=task_id
+            if is_requalification:
+                task_id = _apply_requalification(
+                    conn,
+                    board=board,
+                    intake_record=intake_record,
+                    contract_id=contract_id,
+                    fields=fields,
                 )
+            else:
+                task_id = kanban_db.create_task(
+                    conn,
+                    title=str(fields["title"]),
+                    body=str(fields["body"]),
+                    assignee=fields["assignee"],
+                    created_by="hermes-qualification",
+                    parents=tuple(fields["parents"]),
+                    board=board,
+                    workflow_template_id=fields["workflow_template_id"],
+                    current_step_key=fields["current_step_key"],
+                    work_contract_id=contract_id,
+                    work_item_kind=fields["work_item_kind"],
+                )
+                epic_id = fields.get("epic_id")
+                if epic_id:
+                    kanban_db.add_epic_membership(
+                        conn, epic_id=str(epic_id), task_id=task_id
+                    )
         kanban_db._append_event(
             conn,
             task_id,
