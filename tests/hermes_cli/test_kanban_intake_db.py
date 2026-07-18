@@ -1125,6 +1125,43 @@ def test_reconcile_does_not_retry_rejected_requalification(
         assert sorted(record["status"] for record in records) == ["pending", "rejected"]
 
 
+def test_reconcile_retries_rejected_requalification_after_qualifier_revision_change(
+    tmp_path, monkeypatch
+):
+    board = "strict-v2-requalification-new-qualifier"
+    _strict_v2_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_scheduled_card(connection, board)
+        first = kb.reconcile(connection, board=board, spawn_ready=False)
+        first_intake = kb.list_qualification_intakes(
+            connection, status="pending"
+        )[0]
+        kb.record_qualification_decision(
+            connection,
+            intake_id=first_intake["id"],
+            decision="rejected",
+            actor_profile="hermes",
+            reason="old qualifier contract",
+        )
+        monkeypatch.setattr(
+            intake,
+            "REQUALIFICATION_QUALIFIER_REVISION",
+            intake.REQUALIFICATION_QUALIFIER_REVISION + 1,
+        )
+
+        second = kb.reconcile(connection, board=board, spawn_ready=False)
+
+        assert first.requalification_requested == [task_id]
+        assert second.requalification_requested == [task_id]
+        pending = kb.list_qualification_intakes(connection, status="pending")
+        assert len(pending) == 1
+        assert (
+            intake.intake_payload(pending[0])["qualifier_revision"]
+            == intake.REQUALIFICATION_QUALIFIER_REVISION
+        )
+
+
 def test_reconcile_leaves_scheduled_card_with_unresolved_blocker_untouched(
     tmp_path, monkeypatch
 ):
