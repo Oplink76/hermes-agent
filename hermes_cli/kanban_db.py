@@ -4740,7 +4740,14 @@ def task_repository_evidence(row: sqlite3.Row) -> dict[str, Any]:
     if not workspace_path:
         evidence["available"] = False
         return evidence
-    root = _git_toplevel(Path(str(workspace_path)).expanduser())
+    git_executable = shutil.which("git")
+    if git_executable is None:
+        evidence["available"] = False
+        return evidence
+    root = _git_toplevel(
+        Path(str(workspace_path)).expanduser(),
+        git_executable=git_executable,
+    )
     if root is None:
         evidence["available"] = False
         return evidence
@@ -4748,7 +4755,7 @@ def task_repository_evidence(row: sqlite3.Row) -> dict[str, Any]:
     def git_output(*args: str) -> Optional[str]:
         try:
             result = subprocess.run(
-                ["git", "-C", str(root), *args],
+                [git_executable, "-C", str(root), *args],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -9072,11 +9079,18 @@ def _strict_destructive_write_forbidden(conn: sqlite3.Connection) -> bool:
 # Workspace resolution
 # ---------------------------------------------------------------------------
 
-def _git_toplevel(path: Path) -> Optional[Path]:
+def _git_toplevel(
+    path: Path,
+    *,
+    git_executable: Optional[str] = None,
+) -> Optional[Path]:
     """Return the git toplevel containing ``path``, or ``None`` if not in a repo."""
+    executable = git_executable or shutil.which("git")
+    if executable is None:
+        return None
     try:
         result = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            [executable, "-C", str(path), "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
             timeout=30,
@@ -11642,13 +11656,13 @@ def reconcile(
             task_id = str(candidate["id"])
             if _has_sticky_block(conn, task_id):
                 continue
-            if kanban_intake.existing_requalification_intake(conn, task_id):
-                continue
-            kanban_intake.submit_requalification(
+            receipt = kanban_intake.submit_requalification(
                 conn,
                 task_id=task_id,
                 reason="qualified scheduled work has no normal wake action",
             )
+            if not receipt["created"]:
+                continue
             result.requalification_requested.append(task_id)
             break
 

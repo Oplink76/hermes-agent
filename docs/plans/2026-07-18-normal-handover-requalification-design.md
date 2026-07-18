@@ -43,7 +43,7 @@ Extend the existing bounded `reconcile()` safety net; do not create a daemon, sc
 
 One reconcile pass may enqueue at most one requalification intake. It acts only on an unambiguous, non-terminal card with no worker and no valid normal next action. For the first implementation slice this means a qualified `scheduled` card on a strict v2 product board. Product-development sequencing belongs in contract dependencies; `scheduled` remains available elsewhere for genuine time-based waits.
 
-The intake record is the idempotency marker: a task with a pending requalification intake is not enqueued again.
+The intake record is the idempotency marker: a task with a pending requalification intake is not enqueued again. A rejected intake suppresses retries only while its evidence digest is unchanged; new task, history, dependency, or repository evidence permits one new ordinary qualification attempt.
 
 These are not stale and must not be requalified:
 

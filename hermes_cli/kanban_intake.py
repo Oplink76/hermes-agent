@@ -439,8 +439,10 @@ def requalification_target_id(intake: Mapping[str, Any]) -> Optional[str]:
 def existing_requalification_intake(
     conn: Any,
     task_id: str,
+    *,
+    evidence_digest: str,
 ) -> Optional[dict[str, Any]]:
-    """Return the pending or rejected terminal marker for one task."""
+    """Return an active intake or a rejection of the same evidence."""
 
     rows = conn.execute(
         "SELECT * FROM qualification_intake "
@@ -448,9 +450,35 @@ def existing_requalification_intake(
     ).fetchall()
     for row in rows:
         record = dict(row)
-        if requalification_target_id(record) == task_id:
+        if requalification_target_id(record) != task_id:
+            continue
+        if record["status"] == "pending":
+            return record
+        if intake_payload(record).get("evidence_digest") == evidence_digest:
             return record
     return None
+
+
+def _requalification_evidence_digest(evidence: Mapping[str, Any]) -> str:
+    """Hash evidence while excluding the intake's own bookkeeping event."""
+
+    stable = copy.deepcopy(dict(evidence))
+    events = stable.get("events")
+    if isinstance(events, list):
+        stable["events"] = [
+            event
+            for event in events
+            if not isinstance(event, Mapping)
+            or event.get("kind") != "requalification_requested"
+        ]
+    canonical = json.dumps(
+        stable,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def submit_requalification(
@@ -484,20 +512,10 @@ def submit_requalification(
                 raise WorkContractError("cannot requalify a task with an active worker")
             if row["current_step_key"] == "release_measure":
                 raise WorkContractError("release_measure follows release evidence policy")
-
-            existing = existing_requalification_intake(conn, task_id)
-            if existing is not None:
-                intake_id = str(existing["id"])
-                return {
-                    "status": (
-                        "requalification_required"
-                        if existing["status"] == "pending"
-                        else "requalification_rejected"
-                    ),
-                    "intake_id": intake_id,
-                    "intake_status": str(existing["status"]),
-                    "task_id": task_id,
-                }
+            if kanban_db._has_sticky_block(conn, task_id):
+                raise WorkContractError(
+                    "cannot requalify a task with an unresolved blocker"
+                )
 
             stored_contract = kanban_db.get_work_contract(
                 conn, str(row["work_contract_id"])
@@ -521,12 +539,32 @@ def submit_requalification(
                 ],
                 "repository": kanban_db.task_repository_evidence(row),
             }
+            evidence_digest = _requalification_evidence_digest(evidence)
+            existing = existing_requalification_intake(
+                conn,
+                task_id,
+                evidence_digest=evidence_digest,
+            )
+            if existing is not None:
+                intake_id = str(existing["id"])
+                return {
+                    "status": (
+                        "requalification_required"
+                        if existing["status"] == "pending"
+                        else "requalification_rejected"
+                    ),
+                    "created": False,
+                    "intake_id": intake_id,
+                    "intake_status": str(existing["status"]),
+                    "task_id": task_id,
+                }
             raw_request = json.dumps(
                 {
                     "kind": "task_requalification",
                     "target_task_id": task_id,
                     "reason": reason,
                     "evidence": evidence,
+                    "evidence_digest": evidence_digest,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -548,6 +586,7 @@ def submit_requalification(
     _wake_intake_qualifier()
     return {
         "status": "requalification_required",
+        "created": True,
         "intake_id": intake_id,
         "intake_status": "pending",
         "task_id": task_id,

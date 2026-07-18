@@ -663,7 +663,9 @@ def test_submit_requalification_is_inert_durable_and_idempotent(
             reason="qualified scheduled work has no wake action",
         )
 
-        assert first == second
+        assert first["created"] is True
+        assert second["created"] is False
+        assert first["intake_id"] == second["intake_id"]
         assert kb.get_task(connection, task_id).status == "scheduled"
         pending = kb.list_qualification_intakes(connection, status="pending")
         assert [record["id"] for record in pending] == [first["intake_id"]]
@@ -801,6 +803,38 @@ def test_requalification_captures_current_git_head_and_status(tmp_path, monkeypa
         assert repository_evidence["head"] == head
         assert repository_evidence["current_branch"] == "main"
         assert repository_evidence["status_porcelain"] == []
+
+
+def test_repository_evidence_is_unavailable_when_git_is_not_installed(
+    tmp_path, monkeypatch
+):
+    board = "strict-requalification-no-git"
+    _strict_product_board(tmp_path, monkeypatch, board)
+    monkeypatch.setattr(kb.shutil, "which", lambda _name: None)
+
+    def unexpected_subprocess(*_args, **_kwargs):
+        pytest.fail("repository evidence must not shell out when git is unavailable")
+
+    monkeypatch.setattr(kb.subprocess, "run", unexpected_subprocess)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_scheduled_card(connection, board)
+        with kb.authorized_governance_write():
+            connection.execute(
+                "UPDATE tasks SET workspace_kind = 'dir', workspace_path = ? "
+                "WHERE id = ?",
+                (str(tmp_path), task_id),
+            )
+        receipt = intake.submit_requalification(
+            connection,
+            task_id=task_id,
+            reason="capture portable repository evidence",
+        )
+        payload = intake.intake_payload(
+            kb.get_qualification_intake(connection, receipt["intake_id"])
+        )
+
+        assert payload["evidence"]["repository"]["available"] is False
 
 
 def test_successor_contract_requalifies_same_card_and_preserves_audit(
@@ -1076,16 +1110,19 @@ def test_reconcile_does_not_retry_rejected_requalification(
         )
 
         second = kb.reconcile(connection, board=board, spawn_ready=False)
+        kb.add_comment(connection, task_id, "operator", "New evidence is available")
+        third = kb.reconcile(connection, board=board, spawn_ready=False)
 
         assert first.requalification_requested == [task_id]
         assert second.requalification_requested == []
+        assert third.requalification_requested == [task_id]
         records = [
             record
             for record in kb.list_qualification_intakes(connection)
             if intake.requalification_target_id(record) == task_id
         ]
-        assert len(records) == 1
-        assert records[0]["status"] == "rejected"
+        assert len(records) == 2
+        assert sorted(record["status"] for record in records) == ["pending", "rejected"]
 
 
 def test_reconcile_leaves_scheduled_card_with_unresolved_blocker_untouched(
@@ -1112,6 +1149,30 @@ def test_reconcile_leaves_scheduled_card_with_unresolved_blocker_untouched(
 
         assert result.requalification_requested == []
         assert kb.list_qualification_intakes(connection, status="pending") == []
+
+
+def test_submit_requalification_rejects_an_unresolved_blocker(
+    tmp_path, monkeypatch
+):
+    board = "strict-requalification-direct-blocked"
+    _strict_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_scheduled_card(connection, board)
+        with kb.authorized_governance_write():
+            kb._append_event(
+                connection,
+                task_id,
+                "blocked",
+                {"reason": "waiting for explicit operator input"},
+            )
+
+        with pytest.raises(intake.WorkContractError, match="unresolved blocker"):
+            intake.submit_requalification(
+                connection,
+                task_id=task_id,
+                reason="must not bypass the blocker",
+            )
 
 
 @pytest.mark.parametrize("status", ["ready", "todo", "blocked", "done"])
