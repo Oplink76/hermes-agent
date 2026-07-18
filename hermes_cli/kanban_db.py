@@ -108,9 +108,10 @@ def _remember_kanban_run_best_effort(
     run_id: Optional[int],
     outcome: str,
     transition_event_id: Optional[int],
+    memory_capture_id: str,
     summary: Optional[str] = None,
 ) -> None:
-    """Capture advisory memory only after the enclosing transaction commits."""
+    """Capture after commit when the exact event still carries its opaque nonce."""
     try:
         if transition_event_id is None:
             _log.warning(
@@ -122,10 +123,20 @@ def _remember_kanban_run_best_effort(
         def capture() -> None:
             try:
                 survived = conn.execute(
-                    "SELECT 1 FROM task_events WHERE id = ? AND task_id = ?",
+                    "SELECT payload FROM task_events WHERE id = ? AND task_id = ?",
                     (int(transition_event_id), task_id),
                 ).fetchone()
                 if survived is None:
+                    return
+                payload = json.loads(survived["payload"] or "{}")
+                captured_id = (
+                    payload.get("memory_capture_id")
+                    if isinstance(payload, dict)
+                    else None
+                )
+                if not isinstance(captured_id, str) or not secrets.compare_digest(
+                    captured_id, memory_capture_id
+                ):
                     return
                 from hermes_cli.agent_memory_vault import remember_kanban_run
 
@@ -2678,7 +2689,7 @@ def _route_product_human_block_to_preflight(
     attempted_resolutions: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     human_escalation_assignee: Optional[str] = "default",
-) -> Optional[tuple[bool, Optional[int]]]:
+) -> Optional[tuple[bool, Optional[int], str]]:
     """Route the first product-board human block to Hermes instead of Slack.
 
     The next human block for the same unresolved preflight falls through to the
@@ -2700,7 +2711,7 @@ def _route_product_human_block_to_preflight(
             (task_id,),
         ).fetchone()
         if row is None:
-            return False, None
+            return False, None, ""
         step_key = row["current_step_key"] or "backlog"
         if row["workflow_template_id"] != "product" and not step_key:
             return None
@@ -2727,7 +2738,7 @@ def _route_product_human_block_to_preflight(
         )
         cur = conn.execute(sql, params)
         if cur.rowcount != 1:
-            return False, None
+            return False, None, ""
         # v2 flag maintenance: the worker that hit the obstacle has stopped,
         # but ``default`` hasn't given up yet -- clear ``running`` only.
         # ``blocked`` stays 0. Direct UPDATE (no _sync_legacy_status): the
@@ -2753,6 +2764,7 @@ def _route_product_human_block_to_preflight(
                 metadata={"attempted_resolutions": attempts} if attempts else None,
                 step_key=step_key,
             )
+        memory_capture_id = secrets.token_hex(16)
         transition_event_id = _append_event(
             conn,
             task_id,
@@ -2765,10 +2777,11 @@ def _route_product_human_block_to_preflight(
                 "hermes_assignee": hermes_assignee,
                 "step_key": step_key,
                 "resume_status": resume_status,
+                "memory_capture_id": memory_capture_id,
             },
             run_id=run_id,
         )
-    return True, transition_event_id
+    return True, transition_event_id, memory_capture_id
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
@@ -3482,14 +3495,12 @@ class _KanbanConnection(sqlite3.Connection):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._post_commit_callbacks: list[Callable[[], None]] = []
-        self._post_commit_savepoints: list[tuple[str, int]] = []
 
     def add_post_commit_callback(self, callback: Callable[[], None]) -> None:
         self._post_commit_callbacks.append(callback)
 
     def _run_post_commit_callbacks(self) -> None:
         callbacks, self._post_commit_callbacks = self._post_commit_callbacks, []
-        self._post_commit_savepoints.clear()
         for callback in callbacks:
             try:
                 callback()
@@ -3498,39 +3509,14 @@ class _KanbanConnection(sqlite3.Connection):
 
     def _clear_post_commit_callbacks(self) -> None:
         self._post_commit_callbacks.clear()
-        self._post_commit_savepoints.clear()
-
-    def _savepoint_index(self, name: str) -> Optional[int]:
-        normalized = name.strip('"`[]').casefold()
-        for index in range(len(self._post_commit_savepoints) - 1, -1, -1):
-            if self._post_commit_savepoints[index][0] == normalized:
-                return index
-        return None
 
     def execute(self, sql: str, parameters: Iterable[Any] = (), /) -> sqlite3.Cursor:
         cursor = super().execute(sql, parameters)
         boundary = " ".join(sql.strip().rstrip(";").upper().split())
-        tokens = boundary.split()
         if boundary in {"COMMIT", "END", "END TRANSACTION"}:
             self._run_post_commit_callbacks()
         elif boundary in {"ROLLBACK", "ROLLBACK TRANSACTION"}:
             self._clear_post_commit_callbacks()
-        elif len(tokens) == 2 and tokens[0] == "SAVEPOINT":
-            self._post_commit_savepoints.append(
-                (tokens[1].strip('"`[]').casefold(), len(self._post_commit_callbacks))
-            )
-        elif len(tokens) in {3, 4} and tokens[:2] == ["ROLLBACK", "TO"]:
-            name = tokens[3] if tokens[2] == "SAVEPOINT" else tokens[2]
-            index = self._savepoint_index(name)
-            if index is not None:
-                callback_count = self._post_commit_savepoints[index][1]
-                del self._post_commit_callbacks[callback_count:]
-                del self._post_commit_savepoints[index + 1 :]
-        elif len(tokens) in {2, 3} and tokens[0] == "RELEASE":
-            name = tokens[2] if tokens[1] == "SAVEPOINT" else tokens[1]
-            index = self._savepoint_index(name)
-            if index is not None:
-                del self._post_commit_savepoints[index:]
         return cursor
 
     def commit(self) -> None:
@@ -7642,9 +7628,11 @@ def complete_task(
         # full summary stays on the run row.
         ev_summary = (summary if summary is not None else result) or ""
         ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
+        memory_capture_id = secrets.token_hex(16)
         completed_payload: dict = {
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
+            "memory_capture_id": memory_capture_id,
         }
         if _release_evidence is not None:
             completed_payload["release_evidence"] = dict(_release_evidence)
@@ -7676,6 +7664,7 @@ def complete_task(
         run_id=run_id,
         outcome="completed",
         transition_event_id=transition_event_id,
+        memory_capture_id=memory_capture_id,
         summary=summary if summary is not None else result,
     )
     # Prose-scan the summary + result for t_<hex> references that do
@@ -8350,7 +8339,7 @@ def block_task(
         human_escalation_assignee=human_escalation_assignee,
     )
     if product_preflight is not None:
-        preflight_succeeded, transition_event_id = product_preflight
+        preflight_succeeded, transition_event_id, memory_capture_id = product_preflight
         if preflight_succeeded:
             _remember_kanban_run_best_effort(
                 conn,
@@ -8359,6 +8348,7 @@ def block_task(
                 run_id=expected_run_id,
                 outcome="blocked",
                 transition_event_id=transition_event_id,
+                memory_capture_id=memory_capture_id,
                 summary=reason,
             )
         return preflight_succeeded
@@ -8366,6 +8356,7 @@ def block_task(
     routed_to = "blocked"
     recurrences = 0
     attempts = [str(a).strip() for a in (attempted_resolutions or []) if str(a).strip()]
+    memory_capture_id = secrets.token_hex(16)
 
     # Dependency waits have an early return of their own. Keep capture outside
     # the transaction so advisory memory can never participate in the state
@@ -8421,7 +8412,12 @@ def block_task(
                 )
             transition_event_id = _append_event(
                 conn, task_id, "dependency_wait",
-                {"reason": reason, "kind": kind, "attempted_resolutions": attempts},
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "attempted_resolutions": attempts,
+                    "memory_capture_id": memory_capture_id,
+                },
                 run_id=run_id,
             )
             _blocked_task = get_task(conn, task_id)
@@ -8440,6 +8436,7 @@ def block_task(
             run_id=run_id,
             outcome="blocked",
             transition_event_id=transition_event_id,
+            memory_capture_id=memory_capture_id,
             summary=reason,
         )
         return True
@@ -8514,6 +8511,7 @@ def block_task(
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
                     "attempted_resolutions": attempts,
+                    "memory_capture_id": memory_capture_id,
                 },
                 run_id=run_id,
             )
@@ -8579,7 +8577,13 @@ def block_task(
                 )
             transition_event_id = _append_event(
                 conn, task_id, "blocked",
-                {"reason": reason, "kind": kind, "recurrences": recurrences, "attempted_resolutions": attempts},
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "recurrences": recurrences,
+                    "attempted_resolutions": attempts,
+                    "memory_capture_id": memory_capture_id,
+                },
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
@@ -8598,6 +8602,7 @@ def block_task(
         run_id=run_id,
         outcome="blocked",
         transition_event_id=transition_event_id,
+        memory_capture_id=memory_capture_id,
         summary=reason,
     )
     return True
@@ -11482,6 +11487,7 @@ def handoff(
             )
             if expected_run_id is not None and run_id is None:
                 raise RuntimeError("handoff run ownership changed")
+            memory_capture_id = secrets.token_hex(16)
             transition_event_id = _append_event(
                 conn,
                 task_id,
@@ -11492,6 +11498,7 @@ def handoff(
                     "sha": sha,
                     "assignee": next_assignee,
                     "summary": summary,
+                    "memory_capture_id": memory_capture_id,
                 },
                 run_id=run_id,
             )
@@ -11506,6 +11513,7 @@ def handoff(
         run_id=run_id,
         outcome="advanced",
         transition_event_id=transition_event_id,
+        memory_capture_id=memory_capture_id,
         summary=summary,
     )
     return True

@@ -6,6 +6,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_qualifier as qualifier
 from hermes_cli.agent_memory_vault import SessionGist, append_gist
@@ -175,6 +177,7 @@ def test_complete_handoff_and_block_append_functionality_first_gists(
     assert "Kanban transition completed" in history
     assert "Kanban transition advanced" in history
     assert "Kanban transition blocked" in history
+    assert "memory_capture_id" not in history
 
 
 def test_memory_capture_waits_for_outer_transaction_commit(tmp_path, monkeypatch):
@@ -231,8 +234,23 @@ def test_savepoint_rollback_discards_deferred_capture(tmp_path, monkeypatch):
     assert _gist_history(vault) == ""
 
 
-def test_savepoint_rollback_discards_capture_when_event_id_is_reused(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    ("savepoint_sql", "rollback_sql", "release_sql"),
+    (
+        (
+            'SAVEPOINT "caller work"',
+            'ROLLBACK TO SAVEPOINT "caller work"',
+            'RELEASE SAVEPOINT "caller work"',
+        ),
+        (
+            "SAVEPOINT caller_work",
+            "ROLLBACK TRANSACTION TO SAVEPOINT caller_work",
+            "RELEASE SAVEPOINT caller_work",
+        ),
+    ),
+)
+def test_savepoint_syntax_cannot_ghost_capture_a_reused_event_id(
+    tmp_path, monkeypatch, savepoint_sql, rollback_sql, release_sql
 ):
     vault = tmp_path / "Agent Memory"
     monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(vault))
@@ -243,11 +261,11 @@ def test_savepoint_rollback_discards_capture_when_event_id_is_reused(
             idempotency_key="rolled-back-event-identity",
         )
         conn.execute("BEGIN")
-        conn.execute("SAVEPOINT caller_work")
+        conn.execute(savepoint_sql)
         assert kb.block_task(conn, task_id, kind="transient") is True
         rolled_back_event_id = kb.list_events(conn, task_id)[-1].id
 
-        conn.execute("ROLLBACK TO SAVEPOINT caller_work")
+        conn.execute(rollback_sql)
         reused_event_id = kb._append_event(
             conn,
             task_id,
@@ -255,27 +273,10 @@ def test_savepoint_rollback_discards_capture_when_event_id_is_reused(
             {"author": "operator", "len": 0},
         )
         assert reused_event_id == rolled_back_event_id
-        conn.execute("RELEASE SAVEPOINT caller_work")
+        conn.execute(release_sql)
         conn.execute("COMMIT")
 
     assert _gist_history(vault) == ""
-
-
-def test_nested_savepoint_rollback_discards_only_inner_callbacks(tmp_path):
-    calls = []
-    with kb.connect(tmp_path / "kanban.db") as conn:
-        conn.execute("BEGIN")
-        conn.execute("SAVEPOINT outer_work")
-        conn.add_post_commit_callback(lambda: calls.append("outer"))
-        conn.execute("SAVEPOINT inner_work")
-        conn.add_post_commit_callback(lambda: calls.append("inner"))
-
-        conn.execute("ROLLBACK TO SAVEPOINT inner_work")
-        conn.execute("RELEASE SAVEPOINT inner_work")
-        conn.execute("RELEASE SAVEPOINT outer_work")
-        conn.execute("COMMIT")
-
-    assert calls == ["outer"]
 
 
 def test_two_runless_blocks_use_distinct_transition_event_identity(
