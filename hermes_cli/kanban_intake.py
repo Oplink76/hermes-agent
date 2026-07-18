@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 CONTRACT_VERSION = 1
 DEFAULT_POLICY_VERSION = "product-handoff-v2+qualification-v1"
-REQUALIFICATION_QUALIFIER_REVISION = 2
+REQUALIFICATION_QUALIFIER_REVISION = 3
 SIGNING_KEY_RELATIVE_PATH = "kanban/work_contract_signing.key"
 
 _SIGNING_METADATA_FIELDS = {"canonical_json", "digest", "signature", "contract"}

@@ -177,8 +177,23 @@ def test_requalification_prompt_matches_late_entry_validator_contract(conn, poli
         intake=_requalification_intake(conn, task_id),
     )
 
-    assert '"skipped_phases":[{"phase":"<skipped phase>"' in prompt
-    assert "copy each evidence reference exactly from AUTHORITATIVE INPUT" in prompt
+    assert (
+        '"entry_assessment":{"reason":"<why this phase is the correct entry>",'
+        '"skipped_phases":[{"phase":"<skipped phase>"' in prompt
+    )
+    assert "copy each evidence reference exactly" in prompt.lower()
+    assert "raw_intake or submitted_evidence only" in prompt
+    assert "current_task_graph cannot be used as phase evidence" in prompt
+    assert (
+        '"entry_assessment":{"reason":"<why Review is the correct entry>",'
+        '"skipped_phases":[{"phase":"<skipped phase>"' in prompt
+    )
+    assert (
+        '"provenance":{"writer":{"profile":"<writer profile>",'
+        '"artifact":"<exact writer artifact>"},"tester":'
+        '{"profile":"<independent tester profile>",'
+        '"artifact":"<exact test artifact>"}}' in prompt
+    )
 
 
 def test_requalification_decision_cannot_change_work_item_kind(conn, policy):
@@ -376,6 +391,34 @@ def test_late_entry_rejects_non_object_and_unsubmitted_evidence(conn, policy):
             intake=_intake(conn),
             decision=decision,
         )
+
+
+def test_late_entry_accepts_exact_non_ascii_attachment_evidence(conn, policy):
+    decision = _decision()
+    decision["routing"].update(
+        {"entry_phase": "architecture", "assignee": "architect"}
+    )
+    decision["handover"].update(next_phase="development", next_role="developer")
+    decision["entry_assessment"] = {
+        "reason": "Backlog is already satisfied",
+        "skipped_phases": [
+            {
+                "phase": "backlog",
+                "reason": "The approved brief is attached",
+                "evidence": ["review-grøn"],
+            }
+        ],
+        "evidence": ["review-grøn"],
+    }
+
+    validated = qualifier.validate_decision(
+        conn,
+        board_metadata=policy,
+        intake=_intake(conn, attachments=({"name": "review-grøn"},)),
+        decision=decision,
+    )
+
+    assert validated["routing"]["entry_phase"] == "architecture"
 
 
 def test_late_entry_cannot_reuse_evidence_from_an_unrelated_card(conn, policy):

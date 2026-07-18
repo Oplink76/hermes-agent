@@ -160,7 +160,11 @@ def _evidence_corpus(intake: Mapping[str, Any]) -> str:
     """Return only evidence submitted with this intake."""
 
     parts = [str(intake.get("raw_request") or "")]
-    parts.append(json.dumps(intake.get("attachments") or [], default=str))
+    parts.append(
+        json.dumps(
+            intake.get("attachments") or [], ensure_ascii=False, default=str
+        )
+    )
     return "\n".join(parts)
 
 
@@ -483,8 +487,15 @@ PO PATH ADDITION: Set qualification_path to "po", use "path:po", and add only gr
 
 LATE ENTRY OBJECT SHAPE: When entry_phase is not the first phase, list every
 earlier phase in policy order as
-{"skipped_phases":[{"phase":"<skipped phase>","reason":"<why it is complete>","evidence":["<exact substring copied from AUTHORITATIVE INPUT>"]}]}.
-Use [] only when no phase is skipped, and copy each evidence reference exactly from AUTHORITATIVE INPUT; do not paraphrase it.
+{"entry_assessment":{"reason":"<why this phase is the correct entry>","skipped_phases":[{"phase":"<skipped phase>","reason":"<why it is complete>","evidence":["<exact substring copied from intake evidence>"]}],"evidence":["<same exact evidence references>"]}}.
+Use [] only when no phase is skipped. Copy each evidence reference exactly from
+raw_intake or submitted_evidence only; do not paraphrase it. Board policy,
+repository_instructions, and current_task_graph cannot be used as phase evidence.
+
+REVIEW ENTRY OBJECT SHAPE: Add independent writer and tester evidence inside the
+complete entry_assessment object as
+{"entry_assessment":{"reason":"<why Review is the correct entry>","skipped_phases":[{"phase":"<skipped phase>","reason":"<why it is complete>","evidence":["<exact intake evidence>"]}],"evidence":["<same exact evidence references>"],"provenance":{"writer":{"profile":"<writer profile>","artifact":"<exact writer artifact>"},"tester":{"profile":"<independent tester profile>","artifact":"<exact test artifact>"}}}}.
+Copy both artifacts exactly from raw_intake or submitted_evidence only.
 """.strip()
 
 
