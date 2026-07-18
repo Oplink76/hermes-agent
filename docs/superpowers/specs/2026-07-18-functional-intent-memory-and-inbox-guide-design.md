@@ -1,67 +1,83 @@
 # Functional Intent Memory and Inbox Guide Design
 
-**Status:** Approved design, pending written-spec review
+**Status:** Inbox guide merged; advisory Agent Memory implemented on an
+unmerged branch and not live
 **Date:** 2026-07-18
 
 ## Purpose
 
-External AIs need one discoverable Hermes-owned interface that explains what,
-where, and how to submit work to qualified intake. Hermes also needs a durable
-cross-project memory that prevents agents from rebuilding functionality that
-already exists.
+External development AIs need one clear Hermes-owned interface for delivering
+work intent. Hermes and its workers also need a small, portable memory of
+functionality already handled so they can notice related work before starting.
 
-The canonical identity is the intended functionality, not a Kanban card. Cards,
-agent runs, sessions, commits, tests, and releases are evidence attached to one
-Functional Intent.
+This slice keeps those concerns simple:
 
-## Decisions
+1. the public inbox guide explains how external AIs submit governed intent;
+2. Agent Memory records and recalls concise historical evidence; and
+3. Hermes' existing qualification, Work Contract, Kanban, and handover flow
+   remains the only workflow authority.
 
-1. Create a central Agent Memory vault outside Hermes, beside Ole's Second Brain:
-   `/Users/cloudadvisor/Library/CloudStorage/OneDrive-CloudAdvisorApS/Agent Memory`.
-2. Use the same human-readable vault structure as the Second Brain. Markdown is
-   the source of truth; any machine index is derived and rebuildable.
-3. Every Hermes agent/session appends a structured gist through its normal
-   handover. Agents cannot edit or delete previous memory.
-4. Hermes lints the vault, validates evidence, generates a derived functional
-   index, refreshes the snapshot, and promotes durable learning.
-5. Functional recall runs twice: during inbox qualification and immediately
-   before every worker starts.
-6. Exact verified matches are enforced. Similarity is evidence for Hermes to
-   decide reuse, extension, or new functionality; similarity alone never
-   silently blocks work.
-7. Requalification and rework remain normal same-card handovers. The memory does
-   not create a parallel workflow, controller, or editable authority marker.
+Functionality is the memory identity. Cards, runs, commits, PRs, tests, and
+releases are evidence about that functionality, not its identity.
 
-## Language
+## 1. Public Inbox Guide: Merged
 
-**Functional Intent**
+The public, read-only guide is merged into the Hermes fork at commit
+`232338d2b0a072b7edbab8514eb544f67fd419bc`:
 
-A stable, cross-card description of the user outcome and functional boundary.
+```http
+GET /.well-known/hermes-inbox?board=<board-slug>
+```
 
-**Session Gist**
+It returns a board-specific JSON guide with:
 
-One append-only, structured summary written by an agent run through its normal
-handover.
+- the allowed and forbidden authority boundary;
+- the existing authenticated intake and receipt routes;
+- the request example and receipt states; and
+- a copy-ready prompt an external AI can follow.
 
-**Functional Recall**
+The guide does not expose credentials, task content, signing data, private
+board listings, or filesystem paths. Missing, malformed, unknown, and
+non-qualified boards are rejected.
 
-A grounded search for identical, overlapping, or related functionality using the
-vault's structured index and current repository/board evidence.
+The canonical endpoint contract and verification are documented in the
+[Hermes Inbox Guide implementation plan](../plans/2026-07-18-hermes-inbox-guide.md).
+The running installation only exposes this endpoint after a build containing
+the merge commit is deployed.
 
-**Verified Code Complete**
+This slice does **not** add a dedicated inbox bearer token or new durable
+external-request idempotency. The guide accurately describes the existing
+authenticated Hermes API context; it does not claim those deferred safeguards
+already exist.
 
-Development completion recorded by the normal governed handover with concrete
-repository evidence. Test, Review, Release, or Done may still be unfinished.
+## 2. Advisory Agent Memory: Implemented on This Branch
 
-**Derived Index**
+Agent Memory is one external Markdown vault. It is a historical evidence store,
+not a controller, queue, workflow gate, or second source of Kanban truth.
 
-A disposable machine-readable projection of the Markdown vault. It is never a
-second source of truth and can be rebuilt by Hermes lint.
+### External vault
 
-## Agent Memory Vault
+The bootstrapped external vault intended for this installation is:
 
-The vault is independent of the Hermes installation and repository. Hermes is a
-consumer and curator, not the filesystem owner.
+`/Users/cloudadvisor/Library/CloudStorage/OneDrive-CloudAdvisorApS/Agent Memory`
+
+The directory exists, but it is not configured or live. After the branch is
+merged and the exact merge SHA is deployed, an operator enables it through the
+root Hermes `config.yaml`:
+
+```yaml
+agent_memory:
+  enabled: true
+  vault_path: /Users/cloudadvisor/Library/CloudStorage/OneDrive-CloudAdvisorApS/Agent Memory
+```
+
+Missing configuration disables memory cleanly. Hermes never creates a fallback
+under `~/.hermes`. `HERMES_AGENT_MEMORY_VAULT` is an internal propagation
+bridge: the root Hermes process resolves `agent_memory.vault_path` and passes
+that path to profile-scoped workers so they share the same vault. It is not the
+operator-facing configuration contract.
+
+The initialized structure is:
 
 ```text
 Agent Memory/
@@ -70,321 +86,142 @@ Agent Memory/
 ├── index.md
 ├── log.md
 ├── memory/
-│   └── YYYY-MM-DD.md
 ├── wiki/
 │   ├── functions/
 │   └── learnings/
 ├── raw/
 └── .derived/
+    ├── agent-memory.lock
     └── functions.json
 ```
 
-- `agents.md` defines the binding append/lint schema.
-- `snapshot.md` is capped current context for agents.
-- `index.md` is the human-readable catalog.
-- `log.md` records curator/lint activity.
-- `memory/YYYY-MM-DD.md` contains append-only Session Gists.
-- `wiki/functions/` contains one durable page per Functional Intent.
-- `wiki/learnings/` contains promoted cross-session behavioral learning.
-- `raw/` is immutable evidence and is never rewritten by Hermes.
-- `.derived/functions.json` is generated, ignored by human editing, and
-  completely rebuildable.
+`agents.md` is the binding Session Gist schema. Markdown under `memory/` is the
+append-only history. `snapshot.md`, `index.md`, `log.md`, and
+`.derived/functions.json` are deterministic projections that lint can rebuild.
+The empty `wiki/` and `raw/` directories reserve the human-readable layout;
+promotion into them is not implemented in this slice.
 
-Hermes reads the vault path from configuration. This installation uses the
-absolute path above; no code assumes every user has OneDrive or that the vault
-lives under `~/.hermes`.
+### Session Gists
 
-## Functional Intent Record
-
-Each function page has a stable opaque `function_id` plus a readable title and
-aliases. Renaming a title does not change its identity.
-
-Required fields:
-
-- `function_id`
-- title and aliases
-- intended user outcome
-- product, project, board, and repository labels
-- included and excluded functional scope
-- current maturity: `proposed`, `planned`, `in_development`, `code_complete`,
-  `tested`, `reviewed`, `released`, or `superseded`
-- implementation locations and relevant commits/PRs
-- related cards, Work Contracts, sessions, and agents
-- current evidence and unresolved gaps
-- known overlaps or successor Functional Intents
-
-Cards never become the function's identity. One function can have several
-historical cards or sessions, but only one current delivery state.
-
-## Session Gist Schema
-
-Every agent run appends one entry as part of normal complete, block, or handover.
-There is no separate optional memory workflow for the agent to remember.
+Hermes appends one bounded Session Gist after a durable v2 handoff, completion,
+or block transition. The entry uses the schema written to `agents.md`:
 
 ```markdown
 ## HH:MM | <agent-id> | <role>
+<!-- gist_id: <opaque-id> -->
 - Function: <function_id> | <title>
-- Context: board=<slug>; card=<id>; project=<id>; repository=<path-or-url>
-- Summary: <1-3 sentences>
+- Context: <board/card/project/repository evidence>
+- Summary: <concise governed transition summary>
 - Reused: <existing functionality/evidence, or none>
 - Result: <what changed or was learned>
-- Maturity: <allowed maturity value>
-- Evidence: <commits, PRs, tests, review/release references>
-- Behavior: <mistakes, rework, useful agent/process learning, or none>
+- Maturity: <planned/in_development/code_complete/tested/reviewed/released>
+- Evidence: <allowed repository/commit/PR/test/review/release identifiers>
+- Behavior: <learning, or none>
 - Decisions: <decisions, or none>
 - Open loops: <remaining work, or none>
 ```
 
-No private chain-of-thought, full transcript, secret, credential, or unrelated
-conversation belongs in Agent Memory. Raw artifacts may be referenced when
-needed.
+The gist identity includes the immutable transition event, so retrying capture
+does not append the same transition twice. Capture waits for the outer database
+commit; a rolled-back transition leaves no gist.
 
-If a worker crashes before handover, Hermes appends a minimal crash gist from the
-durable run, event, and heartbeat records. It must be clearly marked incomplete
-and cannot promote functional maturity.
+Hermes generates the stored summary and accepts only a strict allowlist of
+evidence identifiers. Values are bounded and redacted. Worker transcripts,
+private reasoning, credentials, secrets, arbitrary run metadata, event payloads,
+and unrelated conversation are not stored.
 
-## Hermes Memory Lint
+### Functionality-first identity
 
-Hermes lint is bounded and idempotent. It:
+For v2 work, `function_id` is derived deterministically from the Work Contract's
+stable functional boundary: work kind/type, desired outcome, scope, and
+out-of-scope. The readable title is not part of that identity.
 
-1. validates required headings and fields;
-2. verifies board, card, function, repository, and evidence references where
-   possible;
-3. rejects secrets and forbidden transcript/reasoning content from promotion;
-4. detects duplicate or conflicting Functional Intent records;
-5. rebuilds `.derived/functions.json`;
-6. proposes or applies deterministic snapshot/index refreshes; and
-7. promotes repeated, evidenced behavioral learning into `wiki/learnings/`.
+When no Work Contract exists, Hermes may use an immutable task idempotency key.
+Legacy work with only a mutable title or body has no safe functional identity,
+so memory capture is skipped with a warning. It is safer to remember nothing
+than to create a false identity.
 
-Lint never deletes or rewrites historical Session Gists or anything under
-`raw/`. Invalid entries remain visible, are marked by lint, and are excluded
-from hard execution guards until repaired.
+### Two advisory recall points
 
-## Public Inbox Guide
+Recall is bounded lexical matching over recent valid gists. It runs:
 
-Add one public, read-only discovery endpoint:
+1. during qualification, where matches are included as historical evidence;
+2. before worker execution, where matches are labelled as historical notes.
 
-```http
-GET /.well-known/hermes-inbox?board=<board-slug>
-```
+Recalled text is never an instruction, authority source, qualification result,
+duplicate decision, or execution guard. Hermes and workers must verify it
+against the current Work Contract, board, and repository before deciding to
+reuse or extend functionality.
 
-It returns JSON suitable for an AI or a human. It does not list private boards,
-expose tokens, reveal Work Contract signing data, or return task content.
+### Lint and failure boundary
 
-The response includes:
+Lint validates the required gist shape and deterministically rebuilds the
+derived function index, snapshot, index, and log. Vault mutation is serialized
+with a bounded cross-process lock, and projections are atomically replaced.
+Historical gist files are not rewritten by lint.
 
-- guide and schema version;
-- purpose and authority boundary;
-- the requested board and whether qualified intake is required;
-- authenticated submission URL and method;
-- receipt/status lookup instructions;
-- authentication type and required scope, never the credential;
-- required request schema;
-- idempotency rules;
-- functional-memory and duplicate-work behavior;
-- forbidden actions, including direct routing, phase, assignment, override, or
-  board mutation;
-- a copy-ready request example; and
-- possible receipt/decision states.
+Memory is best effort. An unconfigured, unavailable, invalid, or temporarily
+locked vault can produce a warning or no match, but cannot create, move, block,
+complete, roll back, or otherwise alter a Kanban card or run.
 
-Malformed board slugs return `400`, unknown boards return `404`, and boards that
-do not use qualified intake return `409`. The endpoint remains safe to expose to
-an unauthenticated internet client.
+### Live-state boundary
 
-## Authenticated Inbox
+The external directory can be initialized before deployment, but Agent Memory
+is **not live** until all three conditions are true:
 
-Reuse the official Hermes qualification intake rather than creating another
-inbox. External AIs submit through the documented Kanban intake route using a
-dedicated inbox-only bearer token. The token grants only:
+1. this branch is merged through the normal PR and CI path;
+2. the exact resulting merge SHA is deployed to the Hermes installation; and
+3. Hermes configuration explicitly enables Agent Memory and points at the
+   external path above.
 
-- submit inert ordinary intake;
-- read the caller's receipt/status; and
-- no dashboard, board mutation, qualification, routing, requalification,
-  override, memory-write, or signing authority.
+Initializing the vault alone does not activate capture or recall. No live
+Hermes configuration is changed by this implementation task.
 
-The token is separate from the dashboard session token. Deployments may disable
-external bearer submission while keeping the public guide available.
+## 3. Deferred Safeguards and Learning
 
-The guide returns the existing board-scoped routes, resolved against the same
-Hermes origin:
+The following are intentionally not implemented in this slice:
 
-```http
-POST /api/plugins/kanban/intake?board=<board-slug>
-GET /api/plugins/kanban/intake/{intake_id}?board=<board-slug>
-```
+- hard duplicate rejection or blocking worker execution;
+- semantic or embedding-based similarity search;
+- a dedicated inbox bearer-auth scope;
+- durable idempotency for external inbox requests;
+- crash fallback gists;
+- historical bootstrap from existing boards, runs, commits, or PRs;
+- generated Functional Intent wiki pages or function-wiki promotion;
+- behavior-learning validation or promotion;
+- a memory scheduler, daemon, workflow, or controller; and
+- memory-driven card creation, routing, qualification, requalification, or
+  break-glass override.
 
-The first route creates or returns the durable receipt. The second returns only
-the receipt/status visible to that authenticated caller.
-
-The request envelope is versioned and requires:
-
-```json
-{
-  "version": 1,
-  "client_request_id": "stable-id-from-the-calling-system",
-  "functional_intent": {
-    "title": "Readable capability title",
-    "desired_outcome": "Measurable user-visible outcome",
-    "project": "project identity",
-    "repository": "repository identity when known",
-    "scope": ["included behavior"],
-    "out_of_scope": ["excluded behavior"],
-    "aliases": []
-  },
-  "evidence": [],
-  "source": {
-    "agent": "claude-code",
-    "session_id": "caller-session-id"
-  }
-}
-```
-
-`board + authenticated caller + client_request_id` is a durable idempotency
-identity. Retrying it returns the existing intake receipt. That identity must
-survive qualification and materialization; it cannot be discarded when a Work
-Contract or card is created.
-
-## Stage 1: Inbox Functional Recall
-
-After durable inert intake and before materialization, Hermes searches Agent
-Memory using:
-
-- exact `function_id`, stable request identity, issue, commit, PR, or repository
-  references;
-- product, project, repository, outcome, scope, and aliases; and
-- semantic similarity across Functional Intent text and promoted learnings.
-
-Hermes records one grounded qualification result:
-
-**Reuse existing**
-
-The requested outcome already exists or is active. Return the existing
-`function_id` and relevant card/receipt. Do not create replacement implementation
-work.
-
-**Extend existing**
-
-The request adds a bounded missing behavior. Create only the extension scope and
-attach it to the existing `function_id`.
-
-**New function**
-
-No sufficiently grounded match exists. Establish a new Functional Intent and
-continue through ordinary qualification.
-
-**Needs Hermes resolution**
-
-Evidence conflicts or similarity is material but ambiguous. Hermes resolves the
-classification using its existing qualification role. Ole is asked only if
-authority or intended outcome cannot be determined.
-
-Exact identity/evidence matches are deterministic. Similarity alone cannot
-silently reject or merge work.
-
-## Stage 2: Pre-Worker Functional Recall
-
-Immediately before every worker claim/spawn, Hermes repeats recall using the
-final Work Contract, current function record, current board history, and current
-repository evidence. It records a `functional_recall_checked` event with the
-function ID, decision, evidence references, and query/index revision.
-
-For Development:
-
-- exact `code_complete`, `tested`, `reviewed`, or `released` evidence prevents a
-  new Developer run;
-- Hermes returns the same card through ordinary requalification/handover to the
-  latest justified unfinished phase;
-- partial overlap produces explicit reuse/extension instructions in the worker
-  context; and
-- an explicit Review `rework_requested` event after the completion evidence may
-  reopen Development on the same function and same card.
-
-Test, Review, and Release continue normally after code completion. Code complete
-does not mean Done.
-
-If the vault or derived index is temporarily unavailable, Hermes persists the
-intake and retries. It fails closed only for starting Development that could
-duplicate verified functionality; it does not fabricate a match, mutate the
-board, or escalate to Ole before bounded recovery attempts are exhausted.
-
-## Existing Work Bootstrap
-
-The first lint/bootstrap pass builds Functional Intent candidates from existing
-Work Contracts, task events, comments, run summaries, commits, PRs, tests, and
-release evidence. It does not bulk-edit card status or claim that self-reported
-work is verified.
-
-The current code-complete Cockpit cards and older blocked cards with recorded
-delivery evidence must therefore become searchable before the safeguard is
-enabled. Conflicting or incomplete records remain visible as unresolved memory,
-not trusted hard guards.
+These may be designed separately if evidence shows they are needed. They must
+not be inferred from the presence of the vault, its empty directories, the
+public inbox guide, or recalled historical text.
 
 ## Security and Authority
 
-- External callers can read the guide and submit inert intent only.
-- Agents append only their own Session Gist through normal handover.
-- Agents cannot edit/delete history, promote maturity, alter the derived index,
-  qualify work, route cards, or invoke break glass.
-- Hermes validates/promotes memory and owns both recall decisions.
-- Ole's authenticated Hermes-only break glass remains unchanged.
-- The user Second Brain vault is never read or modified by this feature.
-- Agent Memory contains no credentials, signing secrets, private reasoning, or
-  full transcripts.
+- External AIs follow the inbox guide and submit intent through Hermes; they do
+  not orchestrate directly on a project board.
+- Hermes' existing engine, Work Contracts, roles, handovers, and operating
+  rules remain authoritative.
+- Agent Memory contains generated, bounded evidence only and grants no
+  authority to its writers or readers.
+- The adjacent Second Brain is a separate user vault and is never read,
+  modified, indexed, or used as an Agent Memory fallback.
+- Trading, Cockpit, and every Kanban board are outside this slice.
 
-## Failure Handling
+## Verification and Acceptance
 
-- Duplicate `client_request_id`: return the original receipt.
-- Exact functional match: return reuse/extension disposition; do not create a
-  duplicate card.
-- Similarity conflict: keep intake inert while Hermes resolves it.
-- Invalid memory entry: retain it, lint-mark it, and exclude it from hard guards.
-- Missing Agent Memory vault: create no implicit Hermes-local replacement; report
-  configuration error and retry safely.
-- Crash before Session Gist: append a minimal incomplete crash gist.
-- Review requests changes: reopen Development only on the same function/card and
-  record the rework relationship.
+This slice is complete when:
 
-## Verification
-
-Tests must prove:
-
-1. the public guide is safe without authentication and contains no token, task
-   content, signing material, private board listing, or filesystem secret;
-2. inbox submission requires the dedicated limited credential;
-3. retrying identical intake returns the same receipt and materializes at most
-   one card;
-4. exact existing functionality reuses its `function_id` and does not create
-   implementation work;
-5. similar functionality is presented to Hermes but not silently merged;
-6. verified code-complete evidence prevents Development at pre-spawn;
-7. an explicit Review rework event permits Development on the same card;
-8. every complete/block/handover appends one valid Session Gist;
-9. worker crashes produce incomplete fallback gists without maturity promotion;
-10. lint rebuilds the derived index deterministically and never changes raw or
-    historical memory;
-11. Agent Memory unavailability follows the documented fail-closed boundary;
-12. current qualification, Work Contract, requalification, dispatcher, and
-    handover tests remain green; and
-13. Trading gateways and boards remain untouched.
-
-## Success Criteria
-
-- Ole can give any external AI one public URL and it can determine exactly how
-  to submit governed intent and check its receipt.
-- Functionality, not cards, is the durable identity used for recall and learning.
-- Retried or already-delivered intent cannot create duplicate implementation
-  work through the governed inbox.
-- Every agent contributes structured, portable learning without gaining memory
-  curation or workflow authority.
-- Hermes catches duplicate functionality both before qualification and before
-  execution while preserving normal Test, Review, Release, and same-card rework.
-
-## Non-Goals
-
-- no second workflow engine, scheduler, or controller;
-- no card-as-function identity;
-- no automatic semantic merge without grounded Hermes judgment;
-- no full transcript or private reasoning archive;
-- no direct external qualification, routing, override, or board mutation;
-- no modification of Ole's Second Brain vault; and
-- no Trading-board activation.
+- the public inbox-guide behavior remains covered by its existing tests;
+- the external vault API tests prove explicit configuration, append-only
+  deduplication, redaction, bounded recall, deterministic lint, concurrency,
+  and idempotent initialization;
+- Kanban integration tests prove post-commit capture, rollback isolation,
+  functionality-first identity, advisory recall, and best-effort failure;
+- the external vault exists with the module-generated `agents.md` and no
+  fabricated historical gists;
+- running initialization twice leaves the initialized content unchanged;
+- the Second Brain, live Hermes configuration, boards, Cockpit, and Trading are
+  untouched; and
+- deployment is reported separately from merge and vault initialization.

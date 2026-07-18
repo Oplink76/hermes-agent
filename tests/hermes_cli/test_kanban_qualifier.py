@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_qualifier as qualifier
+from hermes_cli.agent_memory_vault import SessionGist, append_gist
 
 
 @pytest.fixture
@@ -135,6 +137,56 @@ def test_qualification_prompt_includes_exact_card_and_epic_output_shapes(conn, p
     assert '"item_kind":"epic"' in prompt
     assert "PO PATH ADDITION" in prompt
     assert '"po_evidence":{"run_id":123' in prompt
+
+
+def test_qualification_prompt_includes_bounded_advisory_agent_memory(
+    conn, policy, tmp_path, monkeypatch
+):
+    vault = tmp_path / "Agent Memory"
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(vault))
+    append_gist(
+        vault,
+        SessionGist(
+            gist_id="qualification-history",
+            occurred_at=datetime(2026, 7, 18, 12, 0),
+            agent_id="developer",
+            role="development",
+            function_id="function-governed-flow",
+            title="Ship qualified governed flow",
+            context="board=product; card=prior",
+            summary="The governed flow was previously implemented.",
+            reused="none",
+            result="Implementation exists.",
+            maturity="code_complete",
+            evidence="commit abc123; tests green",
+            behavior="none",
+            decisions="none",
+            open_loops="Review remains.",
+        ),
+    )
+
+    prompt = qualifier.build_qualification_prompt(
+        conn,
+        board_metadata=policy,
+        intake=_intake(conn),
+    )
+    payload = json.loads(prompt.split("AUTHORITATIVE INPUT:\n", 1)[1])
+
+    assert payload["agent_memory_recall"] == [
+        {
+            "function_id": "function-governed-flow",
+            "title": "Ship qualified governed flow",
+            "gist_id": "qualification-history",
+            "evidence": "commit abc123; tests green",
+            "snippet": (
+                "Ship qualified governed flow: The governed flow was previously "
+                "implemented."
+            ),
+        }
+    ]
+    assert "historical evidence only" in prompt.lower()
+    assert "decide reuse or extension" in prompt.lower()
+    assert "similarity alone cannot reject or merge" in prompt.lower()
 
 
 def _requalification_intake(conn, target_task_id: str):
