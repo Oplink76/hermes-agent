@@ -57,14 +57,25 @@ not a controller, queue, workflow gate, or second source of Kanban truth.
 
 ### External vault
 
-The configured vault for this installation is:
+The bootstrapped external vault intended for this installation is:
 
 `/Users/cloudadvisor/Library/CloudStorage/OneDrive-CloudAdvisorApS/Agent Memory`
 
-Hermes resolves it from `HERMES_AGENT_MEMORY_VAULT`, or from
-`agent_memory.vault_path` when Agent Memory is not disabled. Missing
-configuration disables memory cleanly. Hermes never creates a fallback under
-`~/.hermes`.
+The directory exists, but it is not configured or live. After the branch is
+merged and the exact merge SHA is deployed, an operator enables it through the
+root Hermes `config.yaml`:
+
+```yaml
+agent_memory:
+  enabled: true
+  vault_path: /Users/cloudadvisor/Library/CloudStorage/OneDrive-CloudAdvisorApS/Agent Memory
+```
+
+Missing configuration disables memory cleanly. Hermes never creates a fallback
+under `~/.hermes`. `HERMES_AGENT_MEMORY_VAULT` is an internal propagation
+bridge: the root Hermes process resolves `agent_memory.vault_path` and passes
+that path to profile-scoped workers so they share the same vault. It is not the
+operator-facing configuration contract.
 
 The initialized structure is:
 
@@ -80,6 +91,7 @@ Agent Memory/
 │   └── learnings/
 ├── raw/
 └── .derived/
+    ├── agent-memory.lock
     └── functions.json
 ```
 
