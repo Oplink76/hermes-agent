@@ -81,6 +81,7 @@ def test_initialize_vault_creates_only_the_documented_external_structure(tmp_pat
 
     assert {path.relative_to(vault).as_posix() for path in vault.rglob("*")} == {
         ".derived",
+        ".derived/agent-memory.lock",
         ".derived/functions.json",
         "agents.md",
         "index.md",
@@ -92,6 +93,7 @@ def test_initialize_vault_creates_only_the_documented_external_structure(tmp_pat
         "wiki/functions",
         "wiki/learnings",
     }
+    assert not vault.with_name(vault.name + ".lock").exists()
 
 
 def test_append_writes_the_structured_gist_once_and_redacts_recorded_text(tmp_path):

@@ -107,34 +107,26 @@ def _remember_kanban_run_best_effort(
     task_id: str,
     run_id: Optional[int],
     outcome: str,
+    transition_event_id: Optional[int],
     summary: Optional[str] = None,
 ) -> None:
     """Capture advisory memory only after the enclosing transaction commits."""
     try:
-        event_kinds = {
-            "completed": ("completed",),
-            "advanced": ("handoff",),
-            "blocked": (
-                "blocked",
-                "dependency_wait",
-                "block_loop_detected",
-                "human_input_preflight",
-            ),
-        }.get(outcome, ())
-        placeholders = ",".join("?" for _ in event_kinds)
-        event = (
-            conn.execute(
-                f"SELECT id FROM task_events WHERE task_id = ? "
-                f"AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1",
-                (task_id, *event_kinds),
-            ).fetchone()
-            if event_kinds
-            else None
-        )
-        event_id = int(event["id"]) if event is not None else None
+        if transition_event_id is None:
+            _log.warning(
+                "Skipping Agent Memory capture for %s: transition event has no identity",
+                task_id,
+            )
+            return
 
         def capture() -> None:
             try:
+                survived = conn.execute(
+                    "SELECT 1 FROM task_events WHERE id = ? AND task_id = ?",
+                    (int(transition_event_id), task_id),
+                ).fetchone()
+                if survived is None:
+                    return
                 from hermes_cli.agent_memory_vault import remember_kanban_run
 
                 remember_kanban_run(
@@ -144,7 +136,7 @@ def _remember_kanban_run_best_effort(
                     run_id=run_id,
                     outcome=outcome,
                     summary=summary,
-                    transition_event_id=event_id,
+                    transition_event_id=transition_event_id,
                 )
             except Exception as exc:
                 _log.warning(
@@ -2686,7 +2678,7 @@ def _route_product_human_block_to_preflight(
     attempted_resolutions: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     human_escalation_assignee: Optional[str] = "default",
-) -> Optional[bool]:
+) -> Optional[tuple[bool, Optional[int]]]:
     """Route the first product-board human block to Hermes instead of Slack.
 
     The next human block for the same unresolved preflight falls through to the
@@ -2708,7 +2700,7 @@ def _route_product_human_block_to_preflight(
             (task_id,),
         ).fetchone()
         if row is None:
-            return False
+            return False, None
         step_key = row["current_step_key"] or "backlog"
         if row["workflow_template_id"] != "product" and not step_key:
             return None
@@ -2735,7 +2727,7 @@ def _route_product_human_block_to_preflight(
         )
         cur = conn.execute(sql, params)
         if cur.rowcount != 1:
-            return False
+            return False, None
         # v2 flag maintenance: the worker that hit the obstacle has stopped,
         # but ``default`` hasn't given up yet -- clear ``running`` only.
         # ``blocked`` stays 0. Direct UPDATE (no _sync_legacy_status): the
@@ -2761,7 +2753,7 @@ def _route_product_human_block_to_preflight(
                 metadata={"attempted_resolutions": attempts} if attempts else None,
                 step_key=step_key,
             )
-        _append_event(
+        transition_event_id = _append_event(
             conn,
             task_id,
             PRODUCT_WORKFLOW_PRECHECK_EVENT,
@@ -2776,7 +2768,7 @@ def _route_product_human_block_to_preflight(
             },
             run_id=run_id,
         )
-    return True
+    return True, transition_event_id
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
@@ -6181,7 +6173,7 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
-) -> None:
+) -> int:
     """Record an event row.  Called from within an already-open txn.
 
     ``run_id`` is optional: pass the current run id so UIs can group
@@ -6191,11 +6183,12 @@ def _append_event(
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
+    cursor = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    return int(cursor.lastrowid)
 
 
 def _end_run(
@@ -7644,7 +7637,7 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
-        _append_event(
+        transition_event_id = _append_event(
             conn, task_id, "completed",
             completed_payload,
             run_id=run_id,
@@ -7655,6 +7648,7 @@ def complete_task(
         task_id=task_id,
         run_id=run_id,
         outcome="completed",
+        transition_event_id=transition_event_id,
         summary=summary if summary is not None else result,
     )
     # Prose-scan the summary + result for t_<hex> references that do
@@ -8329,16 +8323,18 @@ def block_task(
         human_escalation_assignee=human_escalation_assignee,
     )
     if product_preflight is not None:
-        if product_preflight:
+        preflight_succeeded, transition_event_id = product_preflight
+        if preflight_succeeded:
             _remember_kanban_run_best_effort(
                 conn,
                 board=board,
                 task_id=task_id,
                 run_id=expected_run_id,
                 outcome="blocked",
+                transition_event_id=transition_event_id,
                 summary=reason,
             )
-        return product_preflight
+        return preflight_succeeded
     meta = product_board_metadata(board)
     routed_to = "blocked"
     recurrences = 0
@@ -8396,7 +8392,7 @@ def block_task(
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
                 )
-            _append_event(
+            transition_event_id = _append_event(
                 conn, task_id, "dependency_wait",
                 {"reason": reason, "kind": kind, "attempted_resolutions": attempts},
                 run_id=run_id,
@@ -8416,6 +8412,7 @@ def block_task(
             task_id=task_id,
             run_id=run_id,
             outcome="blocked",
+            transition_event_id=transition_event_id,
             summary=reason,
         )
         return True
@@ -8482,7 +8479,7 @@ def block_task(
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
                 )
-            _append_event(
+            transition_event_id = _append_event(
                 conn, task_id, "block_loop_detected",
                 {
                     "reason": reason,
@@ -8553,7 +8550,7 @@ def block_task(
                     outcome="blocked",
                     summary=reason,
                 )
-            _append_event(
+            transition_event_id = _append_event(
                 conn, task_id, "blocked",
                 {"reason": reason, "kind": kind, "recurrences": recurrences, "attempted_resolutions": attempts},
                 run_id=run_id,
@@ -8573,6 +8570,7 @@ def block_task(
         task_id=task_id,
         run_id=run_id,
         outcome="blocked",
+        transition_event_id=transition_event_id,
         summary=reason,
     )
     return True
@@ -11457,7 +11455,7 @@ def handoff(
             )
             if expected_run_id is not None and run_id is None:
                 raise RuntimeError("handoff run ownership changed")
-            _append_event(
+            transition_event_id = _append_event(
                 conn,
                 task_id,
                 "handoff",
@@ -11480,6 +11478,7 @@ def handoff(
         task_id=task_id,
         run_id=run_id,
         outcome="advanced",
+        transition_event_id=transition_event_id,
         summary=summary,
     )
     return True

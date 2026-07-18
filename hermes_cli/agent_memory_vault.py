@@ -24,7 +24,6 @@ _MAX_EVIDENCE_CHARS = 500
 _MAX_RECALL_RESULTS = 20
 _MAX_RECALL_FILES = 31
 _MAX_RECALL_GISTS = 100
-_MAX_GENERATED_SUMMARY_CHARS = 800
 _VAULT_LOCK_TIMEOUT_SECONDS = 5.0
 _VAULT_LOCK_POLL_SECONDS = 0.05
 _SAFE_GIST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}")
@@ -48,10 +47,11 @@ _REQUIRED_FIELDS = (
     "Open loops",
 )
 _WORD_RE = re.compile(r"[a-z0-9][a-z0-9_-]{1,}")
-_UNSAFE_SUMMARY_RE = re.compile(
-    r"(?im)(?:^|\n)\s*(?:user|assistant|system|tool|human|ai)\s*:"
-    r"|</?(?:analysis|reasoning|thought)>"
-    r"|\b(?:private reasoning|chain of thought|hidden reasoning|transcript)\b"
+_COMMIT_RE = re.compile(r"[0-9a-fA-F]{7,64}")
+_PR_RE = re.compile(r"(?i)(?:PR\s*)?#\d+|\d+")
+_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/#@+\-]{0,199}")
+_UNSAFE_IDENTIFIER_RE = re.compile(
+    r"(?i)chain[_-]?of[_-]?thought|reasoning|deliberation|transcript|user:"
 )
 _EVIDENCE_KEYS = {
     "branch",
@@ -84,6 +84,16 @@ _EVIDENCE_KEYS = {
     "verification",
     "verification_summary",
 }
+_COMMIT_EVIDENCE_KEYS = {
+    "candidate_sha",
+    "commit",
+    "commit_sha",
+    "reviewed_commit",
+    "sha",
+    "source_sha",
+}
+_PR_EVIDENCE_KEYS = {"pr", "pull_request"}
+_REPOSITORY_EVIDENCE_KEYS = {"repo", "repository", "repository_url"}
 
 _log = logging.getLogger(__name__)
 
@@ -183,10 +193,25 @@ def remember_kanban_run(
         run = _kanban_run(conn, task_id, run_id)
         contract = _kanban_work_contract(conn, task["work_contract_id"])
         work = _functional_work(task, contract)
+        if work is None:
+            _log.warning(
+                "skipping Agent Memory capture for board=%s task=%s: "
+                "no stable functional boundary",
+                board,
+                task_id,
+            )
+            return False
+        if transition_event_id is None:
+            _log.warning(
+                "skipping Agent Memory capture for board=%s task=%s: "
+                "no transition event identity",
+                board,
+                task_id,
+            )
+            return False
+        function_id = _function_id(work)
         recorded_run_id = int(run["id"]) if run is not None else run_id
-        event = _kanban_event(
-            conn, task_id, recorded_run_id, transition_event_id
-        )
+        event = _kanban_event(conn, task_id, transition_event_id)
         occurred_at = datetime.fromtimestamp(
             int(run["ended_at"] or run["started_at"])
             if run is not None and (run["ended_at"] or run["started_at"])
@@ -196,31 +221,14 @@ def remember_kanban_run(
             str(run["step_key"] or "") if run is not None
             else str(task["current_step_key"] or "")
         )
-        summary_candidate = str(
-            summary
-            or (run["summary"] if run is not None else None)
-            or task["result"]
-            or outcome
-        )
-        summary_text = _governed_summary(
-            summary_candidate,
+        summary_text = _transition_summary(
             outcome=outcome,
             status=str(task["status"]),
             phase=phase,
+            event_id=transition_event_id,
         )
         with _vault_lock(vault):
             _initialize_vault_unlocked(vault)
-            function_id = _existing_function_id(vault, board, task_id)
-            if function_id is None:
-                if work is None:
-                    _log.warning(
-                        "skipping Agent Memory capture for board=%s task=%s: "
-                        "no stable functional boundary",
-                        board,
-                        task_id,
-                    )
-                    return False
-                function_id = _function_id(work)
             gist = SessionGist(
                 gist_id=_kanban_gist_id(
                     board,
@@ -356,10 +364,6 @@ def _functional_work(
             "title": task["title"],
             "idempotency_key": str(task["idempotency_key"]),
         }
-    if task["body"]:
-        return {"title": task["title"], "outcome": str(task["body"])}
-    if task["result"]:
-        return {"title": task["title"], "outcome": str(task["result"])}
     return None
 
 
@@ -389,27 +393,11 @@ def _function_id(work: dict[str, Any]) -> str:
 def _kanban_event(
     conn: Any,
     task_id: str,
-    run_id: int | None,
-    event_id: int | None,
+    event_id: int,
 ) -> Any:
-    if event_id is not None:
-        row = conn.execute(
-            "SELECT id, kind, payload FROM task_events WHERE id = ? AND task_id = ?",
-            (int(event_id), task_id),
-        ).fetchone()
-        if row is not None:
-            return row
-    if run_id is not None:
-        row = conn.execute(
-            "SELECT id, kind, payload FROM task_events WHERE task_id = ? AND run_id = ? "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id, int(run_id)),
-        ).fetchone()
-        if row is not None:
-            return row
     return conn.execute(
-        "SELECT id, kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
-        (task_id,),
+        "SELECT id, kind, payload FROM task_events WHERE id = ? AND task_id = ?",
+        (int(event_id), task_id),
     ).fetchone()
 
 
@@ -455,34 +443,17 @@ def _kanban_maturity(outcome: str, phase: str, status: str) -> str:
     return "planned"
 
 
-def _existing_function_id(vault: Path, board: str, task_id: str) -> str | None:
-    expected = {"board": board, "card": task_id}
-    for entry in reversed(_valid_entries(vault)):
-        context = {}
-        for component in entry.fields["Context"].split(";"):
-            key, separator, value = component.strip().partition("=")
-            if separator:
-                context[key] = value
-        if all(context.get(key) == value for key, value in expected.items()):
-            return entry.function_id
-    return None
-
-
-def _governed_summary(
-    candidate: str,
+def _transition_summary(
     *,
     outcome: str,
     status: str,
     phase: str,
+    event_id: int | None,
 ) -> str:
-    normalized = " ".join(candidate.split())
-    if (
-        not normalized
-        or len(normalized) > _MAX_GENERATED_SUMMARY_CHARS
-        or _UNSAFE_SUMMARY_RE.search(candidate)
-    ):
-        return f"Kanban transition {outcome}: status={status}; phase={phase or 'none'}."
-    return normalized
+    return (
+        f"Kanban transition {outcome}: status={status}; "
+        f"phase={phase or 'none'}; event={event_id or 'none'}."
+    )
 
 
 def _kanban_evidence(task: Any, run: Any, event: Any) -> str:
@@ -522,16 +493,59 @@ def _evidence_values(mapping: Mapping[str, Any]) -> list[str]:
             values.extend(f"{key}.{item}" for item in nested)
             continue
         if isinstance(value, (list, tuple)):
-            rendered = ", ".join(
-                _recorded_text(item)
-                for item in value
-                if not isinstance(item, (Mapping, list, tuple))
-            )
+            rendered_values = []
+            for item in value:
+                if isinstance(item, (Mapping, list, tuple)):
+                    continue
+                validated = _validated_evidence_value(key, item)
+                if validated is not None:
+                    rendered_values.append(validated)
+            rendered = ", ".join(rendered_values)
         else:
-            rendered = _recorded_text(value)
+            rendered = _validated_evidence_value(key, value) or ""
         if rendered:
             values.append(f"{key}={_clip(rendered, _MAX_EVIDENCE_CHARS)}")
     return values
+
+
+def _validated_evidence_value(key: str, value: object) -> str | None:
+    candidate = " ".join(str(value).split())
+    if not candidate or len(candidate) > _MAX_EVIDENCE_CHARS:
+        return None
+    if _UNSAFE_IDENTIFIER_RE.search(candidate):
+        return None
+    if key in _COMMIT_EVIDENCE_KEYS:
+        valid = bool(_COMMIT_RE.fullmatch(candidate))
+    elif key in _PR_EVIDENCE_KEYS:
+        valid = bool(_PR_RE.fullmatch(candidate) or _is_pr_url(candidate))
+    elif key in _REPOSITORY_EVIDENCE_KEYS:
+        valid = _is_repository_reference(candidate)
+    else:
+        valid = "://" not in candidate and bool(_IDENTIFIER_RE.fullmatch(candidate))
+    return _recorded_text(candidate) if valid else None
+
+
+def _is_http_url(value: str) -> bool:
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return False
+    return parts.scheme.lower() in {"http", "https"} and bool(parts.netloc)
+
+
+def _is_pr_url(value: str) -> bool:
+    if not _is_http_url(value):
+        return False
+    path = urlsplit(value).path.lower()
+    return any(marker in path for marker in ("/pull/", "/pulls/", "/merge_requests/"))
+
+
+def _is_repository_reference(value: str) -> bool:
+    return (
+        _is_http_url(value)
+        or value.startswith("/")
+        or bool(re.match(r"^[A-Za-z]:[\\/]", value))
+    )
 
 
 def initialize_vault(vault: Path) -> None:
@@ -659,7 +673,7 @@ def _lint_vault_unlocked(vault: Path) -> LintReport:
 @contextlib.contextmanager
 def _vault_lock(vault: Path) -> Iterator[None]:
     """Acquire a bounded host-wide lock for one vault mutation."""
-    lock_path = Path(vault).with_name(Path(vault).name + ".lock")
+    lock_path = Path(vault) / ".derived" / "agent-memory.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+b")
     acquired = False
