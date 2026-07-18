@@ -320,12 +320,7 @@ def validate_decision(
     item_kind = work.get("item_kind")
     if item_kind not in {"card", "epic"}:
         errors.append("work item kind must be card or epic")
-    intake_request = kanban_intake.intake_payload(intake)
-    target_task_id = (
-        intake_request.get("target_task_id")
-        if intake_request.get("kind") == "task_requalification"
-        else None
-    )
+    target_task_id = kanban_intake.requalification_target_id(intake)
     if isinstance(target_task_id, str):
         target = conn.execute(
             "SELECT work_item_kind FROM tasks WHERE id = ?", (target_task_id,)
@@ -505,18 +500,14 @@ def build_qualification_prompt(
         "repository_instructions": _repository_instructions(board_metadata),
         "current_task_graph": _task_graph(conn),
     }
-    intake_request = kanban_intake.intake_payload(intake)
-    target_task_id = (
-        intake_request.get("target_task_id")
-        if intake_request.get("kind") == "task_requalification"
-        else None
-    )
+    target_task_id = kanban_intake.requalification_target_id(intake)
     requalification = ""
     if isinstance(target_task_id, str):
         requalification = (
             f"Requalify the existing card {target_task_id}; preserve its identity. "
-            "Use captured evidence to choose the earliest justified phase, return it "
-            "to the normal handover flow, and express sequencing as dependencies, "
+            "Use captured evidence to route already-delivered work to the latest "
+            "justified phase; otherwise choose the earliest unfinished phase. Return "
+            "it to the normal handover flow, and express sequencing as dependencies, "
             "not scheduled. Do not create a replacement card or use break-glass "
             "override.\n\n"
         )

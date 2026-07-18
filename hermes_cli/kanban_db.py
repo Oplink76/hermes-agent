@@ -4364,12 +4364,16 @@ def _ensure_qualification_boundary_objects(conn: sqlite3.Connection) -> None:
         CREATE TRIGGER IF NOT EXISTS strict_requalification_intake_service_insert
         BEFORE INSERT ON qualification_intake
         WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
-         AND json_extract(
-                 CASE WHEN json_valid(NEW.raw_request) = 1
-                      THEN NEW.raw_request ELSE '{}'
-                 END,
-                 '$.kind'
-             ) = 'task_requalification'
+         AND EXISTS (
+             SELECT 1
+               FROM json_each(
+                   CASE WHEN json_valid(NEW.raw_request) = 1
+                        THEN NEW.raw_request ELSE '{}'
+                   END
+               )
+              WHERE json_each.key = 'kind'
+                AND json_each.value = 'task_requalification'
+         )
          AND hermes_governance_write_authorized() != 1
         BEGIN
             SELECT RAISE(ABORT, 'requalification intake requires Hermes service authority');
@@ -4720,6 +4724,53 @@ def task_snapshot_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "current_step_key": row["current_step_key"],
         "current_run_id": row["current_run_id"],
     }
+
+
+def task_repository_evidence(row: sqlite3.Row) -> dict[str, Any]:
+    """Capture read-only repository facts for a task's current workspace."""
+
+    keys = set(row.keys())
+    evidence = {
+        "branch_name": row["branch_name"] if "branch_name" in keys else None,
+        "project_id": row["project_id"] if "project_id" in keys else None,
+        "workspace_kind": row["workspace_kind"] if "workspace_kind" in keys else None,
+        "workspace_path": row["workspace_path"] if "workspace_path" in keys else None,
+    }
+    workspace_path = evidence["workspace_path"]
+    if not workspace_path:
+        evidence["available"] = False
+        return evidence
+    root = _git_toplevel(Path(str(workspace_path)).expanduser())
+    if root is None:
+        evidence["available"] = False
+        return evidence
+
+    def git_output(*args: str) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(root), *args],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return (result.stdout or "").strip() if result.returncode == 0 else None
+
+    head = git_output("rev-parse", "HEAD")
+    status = git_output("status", "--porcelain")
+    branch = git_output("branch", "--show-current")
+    evidence.update(
+        {
+            "available": head is not None and status is not None,
+            "repository_root": str(root),
+            "head": head,
+            "current_branch": branch or None,
+            "status_porcelain": status.splitlines() if status is not None else None,
+        }
+    )
+    return evidence
 
 
 def assert_task_snapshot(
@@ -8458,13 +8509,21 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # if parents are still in progress the task must wait in 'todo'
         # until recompute_ready picks it up. RCA: Bug 2 at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone_parents = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+        parents = conn.execute(
+            "SELECT p.status, p.workflow_template_id, p.current_step_key "
+            "FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ?",
             (task_id,),
-        ).fetchone()
-        new_status = "todo" if undone_parents else "ready"
+        ).fetchall()
+        release_measure_unblocks = _product_release_measure_unblocks_dependents(meta)
+        has_undone_parent = any(
+            not _dependency_parent_satisfied(
+                parent,
+                release_measure_unblocks=release_measure_unblocks,
+            )
+            for parent in parents
+        )
+        new_status = "todo" if has_undone_parent else "ready"
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
@@ -11564,7 +11623,9 @@ def reconcile(
     # driven; ``scheduled`` has no normal dispatcher wake on a strict v2 board.
     qualification = meta.get("qualification")
     if isinstance(qualification, dict) and qualification.get("required") is True:
-        candidate = conn.execute(
+        from hermes_cli import kanban_intake
+
+        candidates = conn.execute(
             """
             SELECT t.id
               FROM tasks t
@@ -11574,37 +11635,22 @@ def reconcile(
                AND t.current_run_id IS NULL
                AND t.claim_lock IS NULL
                AND COALESCE(t.current_step_key, '') != 'release_measure'
-               AND NOT EXISTS (
-                   SELECT 1
-                     FROM qualification_intake qi
-                    WHERE qi.status = 'pending'
-                      AND json_extract(
-                              CASE WHEN json_valid(qi.raw_request) = 1
-                                   THEN qi.raw_request ELSE '{}'
-                              END,
-                              '$.kind'
-                          ) = 'task_requalification'
-                      AND json_extract(
-                              CASE WHEN json_valid(qi.raw_request) = 1
-                                   THEN qi.raw_request ELSE '{}'
-                              END,
-                              '$.target_task_id'
-                          ) = t.id
-               )
              ORDER BY t.priority DESC, t.created_at ASC, t.id ASC
-             LIMIT 1
             """
-        ).fetchone()
-        if candidate is not None:
-            from hermes_cli import kanban_intake
-
+        ).fetchall()
+        for candidate in candidates:
             task_id = str(candidate["id"])
+            if _has_sticky_block(conn, task_id):
+                continue
+            if kanban_intake.existing_requalification_intake(conn, task_id):
+                continue
             kanban_intake.submit_requalification(
                 conn,
                 task_id=task_id,
                 reason="qualified scheduled work has no normal wake action",
             )
             result.requalification_requested.append(task_id)
+            break
 
     # Step 4: integrate at most one un-integrated Done story into its epic
     # branch this pass (W3). Scans done cards in completion order;

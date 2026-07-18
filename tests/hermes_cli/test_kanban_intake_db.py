@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 
 import pytest
 
@@ -621,6 +622,27 @@ def test_requalification_intake_requires_hermes_service_authority(
             )
 
 
+def test_requalification_authority_rejects_duplicate_kind_keys(
+    tmp_path, monkeypatch
+):
+    board = "strict-requalification-duplicate-kind"
+    _strict_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_scheduled_card(connection, board)
+        raw_request = (
+            '{"kind":"task_create","kind":"task_requalification",'
+            f'"target_task_id":"{task_id}"}}'
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="Hermes service authority"):
+            kb.create_qualification_intake(
+                connection,
+                raw_request=raw_request,
+                source="codex",
+            )
+
+
 def test_submit_requalification_is_inert_durable_and_idempotent(
     tmp_path, monkeypatch
 ):
@@ -651,6 +673,134 @@ def test_submit_requalification_is_inert_durable_and_idempotent(
         assert payload["kind"] == "task_requalification"
         assert payload["target_task_id"] == task_id
         assert payload["reason"] == "qualified scheduled work has no wake action"
+
+
+def test_submit_requalification_ignores_legacy_non_json_intake(
+    tmp_path, monkeypatch
+):
+    board = "strict-requalification-legacy-intake"
+    _strict_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        kb.create_qualification_intake(
+            connection,
+            raw_request="legacy opaque request",
+            source="legacy",
+        )
+        task_id = _materialized_scheduled_card(connection, board)
+
+        receipt = intake.submit_requalification(
+            connection,
+            task_id=task_id,
+            reason="resume through the governed flow",
+        )
+
+        assert receipt["task_id"] == task_id
+        assert receipt["intake_status"] == "pending"
+
+
+def test_requalification_captures_complete_history_and_repository_state(
+    tmp_path, monkeypatch
+):
+    board = "strict-requalification-evidence"
+    _strict_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_scheduled_card(connection, board)
+        for number in range(51):
+            kb.add_comment(connection, task_id, "test", f"history-{number}")
+        with kb.authorized_governance_write():
+            connection.execute(
+                "UPDATE tasks SET workspace_kind = 'dir', workspace_path = ?, "
+                "branch_name = 'feature/evidence' WHERE id = ?",
+                (str(tmp_path), task_id),
+            )
+
+        receipt = intake.submit_requalification(
+            connection,
+            task_id=task_id,
+            reason="qualify from complete current evidence",
+        )
+        payload = intake.intake_payload(
+            kb.get_qualification_intake(connection, receipt["intake_id"])
+        )
+
+        assert len(payload["evidence"]["comments"]) == 51
+        assert payload["evidence"]["repository"] == {
+            "branch_name": "feature/evidence",
+            "project_id": None,
+            "workspace_kind": "dir",
+            "workspace_path": str(tmp_path),
+            "available": False,
+        }
+
+
+def test_requalification_captures_current_git_head_and_status(tmp_path, monkeypatch):
+    board = "strict-requalification-git-evidence"
+    _strict_product_board(tmp_path, monkeypatch, board)
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (repository / "README.md").write_text("evidence\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Hermes Test",
+            "-c",
+            "user.email=hermes@example.invalid",
+            "commit",
+            "-m",
+            "test evidence",
+        ],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_scheduled_card(connection, board)
+        with kb.authorized_governance_write():
+            connection.execute(
+                "UPDATE tasks SET workspace_kind = 'worktree', workspace_path = ?, "
+                "branch_name = 'main' WHERE id = ?",
+                (str(repository), task_id),
+            )
+        receipt = intake.submit_requalification(
+            connection,
+            task_id=task_id,
+            reason="capture repository evidence",
+        )
+        payload = intake.intake_payload(
+            kb.get_qualification_intake(connection, receipt["intake_id"])
+        )
+
+        repository_evidence = payload["evidence"]["repository"]
+        assert repository_evidence["available"] is True
+        assert repository_evidence["head"] == head
+        assert repository_evidence["current_branch"] == "main"
+        assert repository_evidence["status_porcelain"] == []
 
 
 def test_successor_contract_requalifies_same_card_and_preserves_audit(
@@ -748,6 +898,78 @@ def test_requalification_replaces_dependencies_and_epic_membership(
         assert kb.get_task(connection, target_id).status == "todo"
 
 
+def test_requalification_treats_archived_dependency_as_satisfied(
+    tmp_path, monkeypatch
+):
+    board = "strict-requalification-archived-parent"
+    _strict_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        target_id = _materialized_scheduled_card(connection, board)
+        parent_id = _materialized_card(connection, board)
+        with kb.authorized_governance_write():
+            assert kb.archive_task(connection, parent_id) is True
+        receipt = intake.submit_requalification(
+            connection,
+            task_id=target_id,
+            reason="derive state from normal dependency rules",
+        )
+        contract = _signed_contract(receipt["intake_id"])["contract"]
+        contract["routing"]["dependencies"] = [parent_id]
+
+        intake.materialize_contract(
+            connection,
+            board=board,
+            signed_contract=intake.sign_work_contract(
+                contract, secret=b"test-only-secret"
+            ),
+            secret=b"test-only-secret",
+        )
+
+        assert kb.get_task(connection, target_id).status == "ready"
+
+
+def test_requalification_uses_autonomous_release_dependency_policy(
+    tmp_path, monkeypatch
+):
+    board = "strict-requalification-release-parent"
+    _strict_product_board(tmp_path, monkeypatch, board)
+    metadata_path = kb.board_metadata_path(board)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.setdefault("product_workflow", {})[
+        "release_measure_unblocks_dependents"
+    ] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with kb.connect(board=board) as connection:
+        target_id = _materialized_scheduled_card(connection, board)
+        parent_id = _materialized_card(connection, board)
+        with kb.authorized_governance_write():
+            connection.execute(
+                "UPDATE tasks SET status = 'ready', current_step_key = "
+                "'release_measure', assignee = NULL WHERE id = ?",
+                (parent_id,),
+            )
+        receipt = intake.submit_requalification(
+            connection,
+            task_id=target_id,
+            reason="follow the board's dependency policy",
+        )
+        contract = _signed_contract(receipt["intake_id"])["contract"]
+        contract["routing"]["dependencies"] = [parent_id]
+
+        intake.materialize_contract(
+            connection,
+            board=board,
+            signed_contract=intake.sign_work_contract(
+                contract, secret=b"test-only-secret"
+            ),
+            secret=b"test-only-secret",
+        )
+
+        assert kb.get_task(connection, target_id).status == "ready"
+
+
 def test_requalification_rejects_break_glass_and_rolls_back(
     tmp_path, monkeypatch
 ):
@@ -833,6 +1055,63 @@ def test_reconcile_does_not_duplicate_pending_requalification(
         pending = kb.list_qualification_intakes(connection, status="pending")
         assert len(pending) == 1
         assert intake.intake_payload(pending[0])["target_task_id"] == task_id
+
+
+def test_reconcile_does_not_retry_rejected_requalification(
+    tmp_path, monkeypatch
+):
+    board = "strict-v2-requalification-rejected"
+    _strict_v2_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_scheduled_card(connection, board)
+        first = kb.reconcile(connection, board=board, spawn_ready=False)
+        intake_id = kb.list_qualification_intakes(connection, status="pending")[0]["id"]
+        kb.record_qualification_decision(
+            connection,
+            intake_id=intake_id,
+            decision="rejected",
+            actor_profile="hermes",
+            reason="requires operator attention",
+        )
+
+        second = kb.reconcile(connection, board=board, spawn_ready=False)
+
+        assert first.requalification_requested == [task_id]
+        assert second.requalification_requested == []
+        records = [
+            record
+            for record in kb.list_qualification_intakes(connection)
+            if intake.requalification_target_id(record) == task_id
+        ]
+        assert len(records) == 1
+        assert records[0]["status"] == "rejected"
+
+
+def test_reconcile_leaves_scheduled_card_with_unresolved_blocker_untouched(
+    tmp_path, monkeypatch
+):
+    board = "strict-v2-requalification-blocked"
+    _strict_v2_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_scheduled_card(connection, board)
+        with kb.authorized_governance_write():
+            connection.execute(
+                "UPDATE tasks SET block_kind = 'needs_input' WHERE id = ?",
+                (task_id,),
+            )
+            kb._append_event(
+                connection,
+                task_id,
+                "blocked",
+                {"reason": "waiting for explicit operator input"},
+            )
+
+        result = kb.reconcile(connection, board=board, spawn_ready=False)
+
+        assert result.requalification_requested == []
+        assert kb.list_qualification_intakes(connection, status="pending") == []
 
 
 @pytest.mark.parametrize("status", ["ready", "todo", "blocked", "done"])

@@ -426,6 +426,33 @@ def intake_payload(intake: Mapping[str, Any]) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
+def requalification_target_id(intake: Mapping[str, Any]) -> Optional[str]:
+    """Return the existing task targeted by a requalification intake."""
+
+    payload = intake_payload(intake)
+    target_task_id = payload.get("target_task_id")
+    if payload.get("kind") != "task_requalification":
+        return None
+    return target_task_id if isinstance(target_task_id, str) else None
+
+
+def existing_requalification_intake(
+    conn: Any,
+    task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return the pending or rejected terminal marker for one task."""
+
+    rows = conn.execute(
+        "SELECT * FROM qualification_intake "
+        "WHERE status IN ('pending', 'rejected') ORDER BY created_at, id"
+    ).fetchall()
+    for row in rows:
+        record = dict(row)
+        if requalification_target_id(record) == task_id:
+            return record
+    return None
+
+
 def submit_requalification(
     conn: Any,
     *,
@@ -458,24 +485,17 @@ def submit_requalification(
             if row["current_step_key"] == "release_measure":
                 raise WorkContractError("release_measure follows release evidence policy")
 
-            existing = conn.execute(
-                """
-                SELECT id FROM qualification_intake
-                 WHERE status = 'pending'
-                   AND json_valid(raw_request) = 1
-                   AND json_extract(raw_request, '$.kind') = 'task_requalification'
-                   AND json_extract(raw_request, '$.target_task_id') = ?
-                 ORDER BY created_at, id
-                 LIMIT 1
-                """,
-                (task_id,),
-            ).fetchone()
+            existing = existing_requalification_intake(conn, task_id)
             if existing is not None:
                 intake_id = str(existing["id"])
                 return {
-                    "status": "requalification_required",
+                    "status": (
+                        "requalification_required"
+                        if existing["status"] == "pending"
+                        else "requalification_rejected"
+                    ),
                     "intake_id": intake_id,
-                    "intake_status": "pending",
+                    "intake_status": str(existing["status"]),
                     "task_id": task_id,
                 }
 
@@ -483,22 +503,23 @@ def submit_requalification(
                 conn, str(row["work_contract_id"])
             )
             evidence = {
-                "task": kanban_db.task_snapshot_from_row(row),
+                "task": dict(row),
                 "contract": (
                     stored_contract.get("contract") if stored_contract else None
                 ),
                 "dependencies": kanban_db.parent_ids(conn, task_id),
                 "epic_id": kanban_db.epic_id_for_task(conn, task_id),
                 "runs": [
-                    asdict(run) for run in kanban_db.list_runs(conn, task_id)[-50:]
+                    asdict(run) for run in kanban_db.list_runs(conn, task_id)
                 ],
                 "events": [
-                    asdict(event) for event in kanban_db.list_events(conn, task_id)[-50:]
+                    asdict(event) for event in kanban_db.list_events(conn, task_id)
                 ],
                 "comments": [
                     asdict(comment)
-                    for comment in kanban_db.list_comments(conn, task_id)[-50:]
+                    for comment in kanban_db.list_comments(conn, task_id)
                 ],
+                "repository": kanban_db.task_repository_evidence(row),
             }
             raw_request = json.dumps(
                 {
@@ -572,7 +593,6 @@ def submit_intake(
 def _apply_requalification(
     conn: Any,
     *,
-    board: str,
     intake_record: Mapping[str, Any],
     contract_id: str,
     fields: Mapping[str, Any],
@@ -581,11 +601,8 @@ def _apply_requalification(
 
     from hermes_cli import kanban_db
 
-    payload = intake_payload(intake_record)
-    target_task_id = payload.get("target_task_id")
-    if payload.get("kind") != "task_requalification" or not isinstance(
-        target_task_id, str
-    ):
+    target_task_id = requalification_target_id(intake_record)
+    if target_task_id is None:
         raise WorkContractError("requalification intake is missing its target task")
 
     row = conn.execute(
@@ -761,7 +778,6 @@ def materialize_contract(
             if is_requalification:
                 task_id = _apply_requalification(
                     conn,
-                    board=board,
                     intake_record=intake_record,
                     contract_id=contract_id,
                     fields=fields,

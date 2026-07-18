@@ -165,6 +165,8 @@ def test_requalification_prompt_preserves_identity_and_normal_handover(conn, pol
     assert "preserve its identity" in prompt
     assert "normal handover" in prompt
     assert "dependencies, not scheduled" in prompt
+    assert "already-delivered work to the latest justified phase" in prompt
+    assert "earliest unfinished phase" in prompt
 
 
 def test_requalification_decision_cannot_change_work_item_kind(conn, policy):
