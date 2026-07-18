@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 from typing import Mapping
+from urllib.parse import urlsplit, urlunsplit
 
 from agent.redact import redact_sensitive_text
 
@@ -19,12 +20,7 @@ _MAX_RECALL_RESULTS = 20
 _MAX_RECALL_FILES = 31
 _MAX_RECALL_GISTS = 100
 _SAFE_GIST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}")
-_SENSITIVE_QUERY_VALUE_RE = re.compile(
-    r"(?P<prefix>[?&;])(?P<key>access[_-]?token|refresh[_-]?token|api[_-]?key|apikey|"
-    r"client[_-]?secret|private[_-]?key|token|auth(?:orization)?|signature|sig|secret|"
-    r"password|credential|key)=(?P<value>[^&#\s]*)",
-    re.IGNORECASE,
-)
+_HTTP_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 _GIST_RE = re.compile(
     r"(?ms)^## (?P<header>[^\n]+)\n"
     r"<!-- gist_id: (?P<gist_id>[^<>\n]+) -->\n"
@@ -261,16 +257,45 @@ def _render_gist(gist: SessionGist, gist_id: str) -> str:
 
 def _recorded_text(value: object) -> str:
     redacted = redact_sensitive_text("" if value is None else str(value), force=True)
-    redacted = _SENSITIVE_QUERY_VALUE_RE.sub(
-        lambda match: f"{match.group('prefix')}{match.group('key')}=«redacted-secret»",
-        redacted,
-    )
+    redacted = _HTTP_URL_RE.sub(_redact_http_url_values, redacted)
     normalized = " ".join(redacted.split())
     return _clip(normalized, _MAX_RECORDED_CHARS)
 
 
 def _clip(value: str, maximum: int) -> str:
     return value if len(value) <= maximum else value[: maximum - 1] + "…"
+
+
+def _redact_http_url_values(match: re.Match[str]) -> str:
+    """Keep an HTTP(S) URL recognizable without storing any credential value."""
+    try:
+        parts = urlsplit(match.group(0))
+    except ValueError:
+        return "«redacted-url»"
+
+    userinfo, separator, host = parts.netloc.rpartition("@")
+    if separator and ":" in userinfo:
+        username, _, _password = userinfo.partition(":")
+        netloc = f"{username}:«redacted-secret»@{host}"
+    else:
+        netloc = parts.netloc
+    return urlunsplit(
+        (
+            parts.scheme,
+            netloc,
+            parts.path,
+            _redact_url_parameter_values(parts.query),
+            _redact_url_parameter_values(parts.fragment),
+        )
+    )
+
+
+def _redact_url_parameter_values(component: str) -> str:
+    return re.sub(
+        r"(^|[&;])([^&;=]+)=([^&;]*)",
+        lambda match: f"{match.group(1)}{match.group(2)}=«redacted-secret»",
+        component,
+    )
 
 
 def _gist_id(value: object) -> str:
