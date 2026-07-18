@@ -16,6 +16,15 @@ from agent.redact import redact_sensitive_text
 _MAX_RECORDED_CHARS = 2_000
 _MAX_EVIDENCE_CHARS = 500
 _MAX_RECALL_RESULTS = 20
+_MAX_RECALL_FILES = 31
+_MAX_RECALL_GISTS = 100
+_SAFE_GIST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}")
+_SENSITIVE_QUERY_VALUE_RE = re.compile(
+    r"(?P<prefix>[?&;])(?P<key>access[_-]?token|refresh[_-]?token|api[_-]?key|apikey|"
+    r"client[_-]?secret|private[_-]?key|token|auth(?:orization)?|signature|sig|secret|"
+    r"password|credential|key)=(?P<value>[^&#\s]*)",
+    re.IGNORECASE,
+)
 _GIST_RE = re.compile(
     r"(?ms)^## (?P<header>[^\n]+)\n"
     r"<!-- gist_id: (?P<gist_id>[^<>\n]+) -->\n"
@@ -134,15 +143,15 @@ def initialize_vault(vault: Path) -> None:
 
 def append_gist(vault: Path, gist: SessionGist) -> bool:
     """Append one redacted Session Gist, returning false for an existing gist ID."""
-    initialize_vault(vault)
     vault = Path(vault)
     gist_id = _gist_id(gist.gist_id)
+    entry = _render_gist(gist, gist_id)
+    initialize_vault(vault)
     if _gist_exists(vault, gist_id):
         return False
 
     occurred_on = _occurred_on(gist.occurred_at)
     history_path = vault / "memory" / f"{occurred_on.isoformat()}.md"
-    entry = _render_gist(gist, gist_id)
     with history_path.open("a", encoding="utf-8") as handle:
         if history_path.stat().st_size:
             handle.write("\n")
@@ -159,7 +168,7 @@ def recall(vault: Path, query: str, limit: int = 5) -> list[MemoryMatch]:
         return []
 
     matches: list[MemoryMatch] = []
-    for entry in _valid_entries(Path(vault)):
+    for entry in _recent_valid_entries(Path(vault)):
         title_words = _words(entry.title)
         all_text = " ".join((entry.function_id, entry.title, *entry.fields.values()))
         shared_words = query_words & _words(all_text)
@@ -252,6 +261,10 @@ def _render_gist(gist: SessionGist, gist_id: str) -> str:
 
 def _recorded_text(value: object) -> str:
     redacted = redact_sensitive_text("" if value is None else str(value), force=True)
+    redacted = _SENSITIVE_QUERY_VALUE_RE.sub(
+        lambda match: f"{match.group('prefix')}{match.group('key')}=«redacted-secret»",
+        redacted,
+    )
     normalized = " ".join(redacted.split())
     return _clip(normalized, _MAX_RECORDED_CHARS)
 
@@ -261,11 +274,11 @@ def _clip(value: str, maximum: int) -> str:
 
 
 def _gist_id(value: object) -> str:
-    identifier = re.sub(r"[^A-Za-z0-9._:-]+", "-", str(value).strip())
-    identifier = identifier.strip("-._:")
-    if not identifier:
-        raise ValueError("gist_id must contain an opaque identifier")
-    return _clip(identifier, 200)
+    if not isinstance(value, str) or not _SAFE_GIST_ID_RE.fullmatch(value):
+        raise ValueError("gist_id must be a bounded opaque identifier")
+    if redact_sensitive_text(value, force=True) != value:
+        raise ValueError("gist_id must be a bounded opaque identifier")
+    return value
 
 
 def _occurred_on(value: object) -> date:
@@ -287,6 +300,24 @@ def _valid_entries(vault: Path) -> list[_ParsedGist]:
             parsed = _parse_gist(match, path)
             if parsed is not None:
                 entries.append(parsed)
+    return entries
+
+
+def _recent_valid_entries(vault: Path) -> list[_ParsedGist]:
+    """Read only bounded recent history for advisory recall."""
+    memory_dir = vault / "memory"
+    if not memory_dir.exists():
+        return []
+
+    entries: list[_ParsedGist] = []
+    for path in sorted(memory_dir.glob("*.md"), reverse=True)[:_MAX_RECALL_FILES]:
+        matches = list(_GIST_RE.finditer(path.read_text(encoding="utf-8")))
+        for match in reversed(matches):
+            parsed = _parse_gist(match, path)
+            if parsed is not None:
+                entries.append(parsed)
+                if len(entries) == _MAX_RECALL_GISTS:
+                    return entries
     return entries
 
 

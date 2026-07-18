@@ -2,6 +2,9 @@
 
 import json
 from datetime import datetime
+from pathlib import Path
+
+import pytest
 
 from hermes_cli.agent_memory_vault import (
     SessionGist,
@@ -87,6 +90,46 @@ def test_append_writes_the_structured_gist_once_and_redacts_recorded_text(tmp_pa
     assert "ghp_" in daily_history
 
 
+def test_append_rejects_a_secret_bearing_gist_id_before_creating_the_vault(tmp_path):
+    vault = tmp_path / "Agent Memory"
+    gist = _gist("ghp_abcdefghijklmnopqrstuvwxyz1234567890")
+
+    with pytest.raises(ValueError, match="opaque"):
+        append_gist(vault, gist)
+
+    assert not vault.exists()
+
+
+def test_append_scrubs_credential_query_values_but_preserves_normal_evidence_urls(tmp_path):
+    vault = tmp_path / "Agent Memory"
+    initialize_vault(vault)
+    gist = _gist("gist-credential-url")
+    gist.evidence = (
+        "credential https://ci.example.test/builds/42?access_token=top-secret "
+        "normal https://ci.example.test/builds/43?job=deploy"
+    )
+
+    assert append_gist(vault, gist) is True
+
+    history = (vault / "memory" / "2026-07-18.md").read_text(encoding="utf-8")
+    assert "access_token=top-secret" not in history
+    assert "access_token=«redacted-secret»" in history
+    assert "https://ci.example.test/builds/43?job=deploy" in history
+
+
+@pytest.mark.parametrize("query_key", ["refresh_token", "client_secret", "api_key", "signature"])
+def test_append_scrubs_common_credential_query_keys(tmp_path, query_key):
+    vault = tmp_path / "Agent Memory"
+    gist = _gist(f"gist-{query_key}")
+    gist.evidence = f"https://ci.example.test/builds/42?{query_key}=top-secret"
+
+    assert append_gist(vault, gist) is True
+
+    history = (vault / "memory" / "2026-07-18.md").read_text(encoding="utf-8")
+    assert f"{query_key}=top-secret" not in history
+    assert f"{query_key}=«redacted-secret»" in history
+
+
 def test_recall_returns_related_functionality_with_capped_evidence(tmp_path):
     vault = tmp_path / "Agent Memory"
     initialize_vault(vault)
@@ -100,6 +143,30 @@ def test_recall_returns_related_functionality_with_capped_evidence(tmp_path):
     assert matches[0].title == "Export release evidence"
     assert "commit abc123" in matches[0].evidence
     assert len(matches[0].snippet) <= 500
+
+
+def test_recall_does_not_read_daily_files_older_than_the_recent_scan_bound(tmp_path, monkeypatch):
+    vault = tmp_path / "Agent Memory"
+    initialize_vault(vault)
+    memory = vault / "memory"
+    oldest = memory / "2026-01-01.md"
+    oldest.write_text("old history must not be read", encoding="utf-8")
+    for day in range(2, 32):
+        (memory / f"2026-01-{day:02d}.md").write_text("", encoding="utf-8")
+    recent = _gist("recent-gist")
+    recent.occurred_at = datetime(2026, 2, 1, 9, 0)
+    assert append_gist(vault, recent) is True
+
+    original_read_text = Path.read_text
+
+    def reject_oldest_read(path, *args, **kwargs):
+        if path == oldest:
+            raise AssertionError("recall read history outside its recent-file bound")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", reject_oldest_read)
+
+    assert recall(vault, "release evidence")
 
 
 def test_lint_rebuilds_derived_files_without_rewriting_daily_history(tmp_path):
