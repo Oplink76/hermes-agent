@@ -137,6 +137,78 @@ def test_qualification_prompt_includes_exact_card_and_epic_output_shapes(conn, p
     assert '"po_evidence":{"run_id":123' in prompt
 
 
+def _requalification_intake(conn, target_task_id: str):
+    intake_id = kb.create_qualification_intake(
+        conn,
+        raw_request=json.dumps(
+            {
+                "kind": "task_requalification",
+                "target_task_id": target_task_id,
+                "reason": "resume governed work",
+                "evidence": {"task": {"status": "scheduled"}},
+            }
+        ),
+        source="hermes-reconcile",
+    )
+    return kb.get_qualification_intake(conn, intake_id)
+
+
+def test_requalification_prompt_preserves_identity_and_normal_handover(conn, policy):
+    task_id = kb.create_task(conn, title="Existing qualified card")
+    prompt = qualifier.build_qualification_prompt(
+        conn,
+        board_metadata=policy,
+        intake=_requalification_intake(conn, task_id),
+    )
+
+    assert f"Requalify the existing card {task_id}" in prompt
+    assert "preserve its identity" in prompt
+    assert "normal handover" in prompt
+    assert "dependencies, not scheduled" in prompt
+
+
+def test_requalification_decision_cannot_change_work_item_kind(conn, policy):
+    task_id = kb.create_task(conn, title="Existing qualified card")
+    decision = _decision()
+    decision["work"]["item_kind"] = "epic"
+    decision["routing"] = {
+        "entry_phase": None,
+        "assignee": None,
+        "epic_id": None,
+        "dependencies": [],
+    }
+    decision["handover"]["next_phase"] = None
+    decision["handover"]["next_role"] = None
+
+    with pytest.raises(
+        qualifier.QualificationValidationError,
+        match="preserve the existing work item kind",
+    ):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=_requalification_intake(conn, task_id),
+            decision=decision,
+        )
+
+
+def test_requalification_decision_cannot_depend_on_its_target(conn, policy):
+    task_id = kb.create_task(conn, title="Existing qualified card")
+    decision = _decision()
+    decision["routing"]["dependencies"] = [task_id]
+
+    with pytest.raises(
+        qualifier.QualificationValidationError,
+        match="cannot depend on itself",
+    ):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=_requalification_intake(conn, task_id),
+            decision=decision,
+        )
+
+
 def test_hermes_path_validates_without_product_owner_evidence(conn, policy):
     validated = qualifier.validate_decision(
         conn,
