@@ -2243,6 +2243,13 @@ DEFAULT_CONFIG = {
         "provider": "",
     },
 
+    # External, append-only agent handover memory.  No implicit vault is
+    # created: deployments opt in with an absolute path outside HERMES_HOME.
+    "agent_memory": {
+        "enabled": False,
+        "vault_path": "",
+    },
+
     # Subagent delegation — override the provider:model used by delegate_task
     # so child agents can run on a different (cheaper/faster) provider and model.
     # Uses the same runtime provider resolution as CLI/gateway startup, so all
