@@ -11405,6 +11405,9 @@ class ReconcileResult:
     main this pass via :func:`_merge_standalone_story_to_main` /
     :func:`merge_epic_to_main`. Populated ONLY when the board opts into
     ``product_workflow.merge_after_green`` (default OFF); at most one per pass."""
+    requalification_requested: list[str] = field(default_factory=list)
+    """Qualified scheduled card ids sent back through the existing Hermes
+    qualification intake this pass; at most one per pass."""
 
 
 def reconcile(
@@ -11458,7 +11461,12 @@ def reconcile(
     ``reconcile`` repeatedly over a healthy (live-PID) running card does
     nothing on every pass.
 
-    3. **Story->epic integration (W3).** At most ONE ``done`` story whose
+    3. **Scheduled-card requalification.** On strict product boards, at most
+       ONE qualified ``scheduled`` card with no active worker is submitted as
+       inert requalification intake. A pending intake makes the step
+       idempotent. All other waits and terminal states are left untouched.
+
+    4. **Story->epic integration (W3).** At most ONE ``done`` story whose
        branch is not yet an ancestor of its epic's integration branch is
        merged in via :func:`integrate_story_to_epic` this pass -- the safety
        net for the same reason steps 1-2 exist: nothing else guarantees a
@@ -11551,7 +11559,54 @@ def reconcile(
         if pid_or_none is not None:
             result.spawned.append(task_id)
 
-    # Step 3: integrate at most one un-integrated Done story into its epic
+    # Step 3: send at most one qualified scheduled card back through the
+    # existing qualification intake. Development sequencing is dependency-
+    # driven; ``scheduled`` has no normal dispatcher wake on a strict v2 board.
+    qualification = meta.get("qualification")
+    if isinstance(qualification, dict) and qualification.get("required") is True:
+        candidate = conn.execute(
+            """
+            SELECT t.id
+              FROM tasks t
+             WHERE t.status = 'scheduled'
+               AND t.work_item_kind = 'card'
+               AND t.work_contract_id IS NOT NULL
+               AND t.current_run_id IS NULL
+               AND t.claim_lock IS NULL
+               AND COALESCE(t.current_step_key, '') != 'release_measure'
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM qualification_intake qi
+                    WHERE qi.status = 'pending'
+                      AND json_extract(
+                              CASE WHEN json_valid(qi.raw_request) = 1
+                                   THEN qi.raw_request ELSE '{}'
+                              END,
+                              '$.kind'
+                          ) = 'task_requalification'
+                      AND json_extract(
+                              CASE WHEN json_valid(qi.raw_request) = 1
+                                   THEN qi.raw_request ELSE '{}'
+                              END,
+                              '$.target_task_id'
+                          ) = t.id
+               )
+             ORDER BY t.priority DESC, t.created_at ASC, t.id ASC
+             LIMIT 1
+            """
+        ).fetchone()
+        if candidate is not None:
+            from hermes_cli import kanban_intake
+
+            task_id = str(candidate["id"])
+            kanban_intake.submit_requalification(
+                conn,
+                task_id=task_id,
+                reason="qualified scheduled work has no normal wake action",
+            )
+            result.requalification_requested.append(task_id)
+
+    # Step 4: integrate at most one un-integrated Done story into its epic
     # branch this pass (W3). Scans done cards in completion order;
     # "already_integrated" / no-epic-parent / unresolvable cards are skipped
     # (not counted as this pass's action) so a real integration can still
@@ -11559,7 +11614,7 @@ def reconcile(
     done_rows = conn.execute(
         "SELECT id FROM tasks WHERE status = 'done' ORDER BY completed_at ASC"
     ).fetchall()
-    # Step 4 (merge-back): carry finished work to LOCAL main. OFF unless the
+    # Step 5 (merge-back): carry finished work to LOCAL main. OFF unless the
     # board opts into product_workflow.merge_after_green -- when off, behavior
     # is byte-for-byte the pre-existing integrate-one-per-pass loop.
     merge_after_green = _product_merge_after_green(product_board_metadata(board))

@@ -81,6 +81,14 @@ def _strict_product_board(tmp_path, monkeypatch, board: str) -> None:
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
 
+def _strict_v2_product_board(tmp_path, monkeypatch, board: str) -> None:
+    _strict_product_board(tmp_path, monkeypatch, board)
+    metadata_path = kb.board_metadata_path(board)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.setdefault("product_workflow", {})["handoff_v2"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+
 def _materialized_card(connection, board: str) -> str:
     request_id = kb.create_qualification_intake(
         connection,
@@ -784,3 +792,84 @@ def test_requalification_rejects_break_glass_and_rolls_back(
             connection.execute("SELECT COUNT(*) FROM work_contracts").fetchone()[0]
             == before_contract_count
         )
+
+
+def test_reconcile_requests_one_scheduled_requalification_per_pass(
+    tmp_path, monkeypatch
+):
+    board = "strict-v2-requalification-bounded"
+    _strict_v2_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        first_id = _materialized_scheduled_card(connection, board)
+        second_id = _materialized_scheduled_card(connection, board)
+        connection.execute(
+            "UPDATE tasks SET priority = 10 WHERE id = ?", (first_id,)
+        )
+
+        result = kb.reconcile(connection, board=board, spawn_ready=False)
+
+        assert result.requalification_requested == [first_id]
+        pending = kb.list_qualification_intakes(connection, status="pending")
+        assert len(pending) == 1
+        assert intake.intake_payload(pending[0])["target_task_id"] == first_id
+        assert kb.get_task(connection, second_id).status == "scheduled"
+
+
+def test_reconcile_does_not_duplicate_pending_requalification(
+    tmp_path, monkeypatch
+):
+    board = "strict-v2-requalification-idempotent"
+    _strict_v2_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_scheduled_card(connection, board)
+
+        first = kb.reconcile(connection, board=board, spawn_ready=False)
+        second = kb.reconcile(connection, board=board, spawn_ready=False)
+
+        assert first.requalification_requested == [task_id]
+        assert second.requalification_requested == []
+        pending = kb.list_qualification_intakes(connection, status="pending")
+        assert len(pending) == 1
+        assert intake.intake_payload(pending[0])["target_task_id"] == task_id
+
+
+@pytest.mark.parametrize("status", ["ready", "todo", "blocked", "done"])
+def test_reconcile_leaves_non_scheduled_qualified_work_untouched(
+    tmp_path, monkeypatch, status
+):
+    board = f"strict-v2-requalification-{status}"
+    _strict_v2_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_scheduled_card(connection, board)
+        connection.execute(
+            "UPDATE tasks SET status = ? WHERE id = ?", (status, task_id)
+        )
+
+        result = kb.reconcile(connection, board=board, spawn_ready=False)
+
+        assert result.requalification_requested == []
+        assert kb.list_qualification_intakes(connection, status="pending") == []
+
+
+def test_reconcile_leaves_release_measure_to_release_evidence_policy(
+    tmp_path, monkeypatch
+):
+    board = "strict-v2-requalification-release"
+    _strict_v2_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_scheduled_card(connection, board)
+        with kb.authorized_governance_write():
+            connection.execute(
+                "UPDATE tasks SET current_step_key = 'release_measure', assignee = NULL "
+                "WHERE id = ?",
+                (task_id,),
+            )
+
+        result = kb.reconcile(connection, board=board, spawn_ready=False)
+
+        assert result.requalification_requested == []
+        assert kb.list_qualification_intakes(connection, status="pending") == []
