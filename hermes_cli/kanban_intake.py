@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 CONTRACT_VERSION = 1
 DEFAULT_POLICY_VERSION = "product-handoff-v2+qualification-v1"
+REQUALIFICATION_QUALIFIER_REVISION = 2
 SIGNING_KEY_RELATIVE_PATH = "kanban/work_contract_signing.key"
 
 _SIGNING_METADATA_FIELDS = {"canonical_json", "digest", "signature", "contract"}
@@ -441,6 +442,7 @@ def existing_requalification_intake(
     task_id: str,
     *,
     evidence_digest: str,
+    qualifier_revision: int,
 ) -> Optional[dict[str, Any]]:
     """Return an active intake or a rejection of the same evidence."""
 
@@ -454,7 +456,11 @@ def existing_requalification_intake(
             continue
         if record["status"] == "pending":
             return record
-        if intake_payload(record).get("evidence_digest") == evidence_digest:
+        payload = intake_payload(record)
+        if (
+            payload.get("evidence_digest") == evidence_digest
+            and payload.get("qualifier_revision", 1) == qualifier_revision
+        ):
             return record
     return None
 
@@ -544,6 +550,7 @@ def submit_requalification(
                 conn,
                 task_id,
                 evidence_digest=evidence_digest,
+                qualifier_revision=REQUALIFICATION_QUALIFIER_REVISION,
             )
             if existing is not None:
                 intake_id = str(existing["id"])
@@ -565,6 +572,7 @@ def submit_requalification(
                     "reason": reason,
                     "evidence": evidence,
                     "evidence_digest": evidence_digest,
+                    "qualifier_revision": REQUALIFICATION_QUALIFIER_REVISION,
                 },
                 sort_keys=True,
                 separators=(",", ":"),

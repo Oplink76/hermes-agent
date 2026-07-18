@@ -169,6 +169,18 @@ def test_requalification_prompt_preserves_identity_and_normal_handover(conn, pol
     assert "earliest unfinished phase" in prompt
 
 
+def test_requalification_prompt_matches_late_entry_validator_contract(conn, policy):
+    task_id = kb.create_task(conn, title="Existing qualified card")
+    prompt = qualifier.build_qualification_prompt(
+        conn,
+        board_metadata=policy,
+        intake=_requalification_intake(conn, task_id),
+    )
+
+    assert '"skipped_phases":[{"phase":"<skipped phase>"' in prompt
+    assert "copy each evidence reference exactly from AUTHORITATIVE INPUT" in prompt
+
+
 def test_requalification_decision_cannot_change_work_item_kind(conn, policy):
     task_id = kb.create_task(conn, title="Existing qualified card")
     decision = _decision()

@@ -480,6 +480,11 @@ EPIC OUTPUT SHAPE:
 {"qualification_path":"hermes","work":{"item_kind":"epic","work_type":"<allowed type>","title":"Required concise Epic title","outcome":"Required measurable Epic outcome","scope":["Included body of work"],"out_of_scope":["Unrelated work"]},"routing":{"entry_phase":null,"assignee":null,"epic_id":null,"dependencies":[]},"entry_assessment":{"reason":"<reason>","skipped_phases":[],"evidence":[]},"handover":{"deliverables":["Required Epic result"],"required_evidence":["Evidence supplied by member cards"],"done_when":["The Epic outcome is verified"],"next_phase":null,"next_role":null},"rules":{"allowed":["Organize qualified member cards"],"forbidden":["Execute the Epic as a card"]},"classification":["framework:epic","path:hermes"]}
 
 PO PATH ADDITION: Set qualification_path to "po", use "path:po", and add only grounded evidence in "po_evidence":{"run_id":123,"artifact":"<referenced artifact>"}.
+
+LATE ENTRY OBJECT SHAPE: When entry_phase is not the first phase, list every
+earlier phase in policy order as
+{"skipped_phases":[{"phase":"<skipped phase>","reason":"<why it is complete>","evidence":["<exact substring copied from AUTHORITATIVE INPUT>"]}]}.
+Use [] only when no phase is skipped, and copy each evidence reference exactly from AUTHORITATIVE INPUT; do not paraphrase it.
 """.strip()
 
 
