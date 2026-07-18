@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_cli import agent_memory_vault as memory_vault
 from hermes_cli.agent_memory_vault import (
     SessionGist,
     append_gist,
@@ -182,6 +183,42 @@ def test_append_rejects_a_secret_bearing_gist_id_before_creating_the_vault(tmp_p
     assert not vault.exists()
 
 
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"maturity": "experimental"},
+        {"function_id": "malformed function"},
+        {"function_id": "f" * 200, "title": "x" * 1_900},
+    ),
+    ids=("maturity", "function-id", "combined-function-field"),
+)
+def test_append_rejects_rendered_gists_that_fail_the_reader_schema(
+    tmp_path, changes
+):
+    vault = tmp_path / "Agent Memory"
+    gist = _gist("invalid-rendered-gist")
+    for name, value in changes.items():
+        setattr(gist, name, value)
+
+    with pytest.raises(ValueError, match="schema"):
+        append_gist(vault, gist)
+
+    assert not list((vault / "memory").glob("*.md"))
+
+
+def test_every_successful_append_is_lint_valid_and_recallable(tmp_path):
+    vault = tmp_path / "Agent Memory"
+    gist = _gist("writer-reader-invariant")
+
+    assert append_gist(vault, gist) is True
+
+    report = lint_vault(vault)
+    matches = recall(vault, gist.gist_id)
+    assert report.valid_entries == 1
+    assert report.invalid_entries == 0
+    assert [match.gist_id for match in matches] == [gist.gist_id]
+
+
 def test_append_scrubs_credential_query_values_but_preserves_normal_evidence_urls(tmp_path):
     vault = tmp_path / "Agent Memory"
     initialize_vault(vault)
@@ -225,7 +262,7 @@ def test_append_scrubs_common_credential_query_keys(tmp_path, query_key):
         ),
         (
             "https://build-user:top-secret@ci.example.test/builds/42",
-            "https://build-user:«redacted-secret»@ci.example.test/builds/42",
+            "https://«redacted-secret»@ci.example.test/builds/42",
         ),
     ],
 )
@@ -261,23 +298,23 @@ def test_append_redacts_bare_http_url_query_and_fragment_components(tmp_path, ur
 
 
 @pytest.mark.parametrize(
-    ("url", "safe_prefix"),
+    ("url", "redacted_url"),
     (
         (
             "wss://socket-user:top-secret@socket.example/ws?token=hidden#session",
-            "wss://socket-user:",
+            "wss://«redacted-secret»@socket.example/ws?[REDACTED]#[REDACTED]",
         ),
         (
             "ftp://ftp-user:top-secret@files.example/archive?token=hidden#part",
-            "ftp://ftp-user:",
+            "ftp://«redacted-secret»@files.example/archive?[REDACTED]#[REDACTED]",
         ),
         (
             "postgresql://db-user:top-secret@db.example/app?sslpassword=hidden#dsn",
-            "postgresql://db-user:",
+            "postgresql://«redacted-secret»@db.example/app?[REDACTED]#[REDACTED]",
         ),
     ),
 )
-def test_append_redacts_url_secrets_across_schemes(tmp_path, url, safe_prefix):
+def test_append_redacts_url_secrets_across_schemes(tmp_path, url, redacted_url):
     vault = tmp_path / "Agent Memory"
     gist = _gist("gist-cross-scheme-url")
     gist.evidence = url
@@ -287,8 +324,36 @@ def test_append_redacts_url_secrets_across_schemes(tmp_path, url, safe_prefix):
     history = (vault / "memory" / "2026-07-18.md").read_text(encoding="utf-8")
     assert "top-secret" not in history
     assert "hidden" not in history
-    assert safe_prefix in history
-    assert "?[REDACTED]#[REDACTED]" in history
+    assert redacted_url in history
+
+
+@pytest.mark.parametrize(
+    ("url", "redacted_url"),
+    (
+        (
+            "custom://opaquecredentialvalue12345@custom.example/archive",
+            "custom://«redacted-secret»@custom.example/archive",
+        ),
+        (
+            "wss://opaquecredentialvalue12345@socket.example/ws",
+            "wss://«redacted-secret»@socket.example/ws",
+        ),
+    ),
+)
+def test_append_redacts_all_bare_url_userinfo_without_leaving_fragments(
+    tmp_path, url, redacted_url
+):
+    vault = tmp_path / "Agent Memory"
+    gist = _gist("gist-bare-userinfo")
+    gist.evidence = url
+
+    assert append_gist(vault, gist) is True
+
+    history = (vault / "memory" / "2026-07-18.md").read_text(encoding="utf-8")
+    assert "opaquecredentialvalue12345" not in history
+    assert "opaque" not in history
+    assert "12345" not in history
+    assert redacted_url in history
 
 
 @pytest.mark.parametrize(
@@ -315,6 +380,23 @@ def test_manual_malformed_or_secret_bearing_gists_are_invalid(
     assert report.valid_entries == 0
     assert report.invalid_entries >= 1
     assert recall(vault, "manual function release evidence") == []
+
+
+def test_manual_gist_with_transcript_or_private_reasoning_markers_is_invalid(
+    tmp_path,
+):
+    vault = tmp_path / "Agent Memory"
+    initialize_vault(vault)
+    (vault / "memory" / "2026-07-18.md").write_text(
+        _manual_gist(summary="chain_of_thought hidden reasoning transcript"),
+        encoding="utf-8",
+    )
+
+    report = lint_vault(vault)
+
+    assert report.valid_entries == 0
+    assert report.invalid_entries >= 1
+    assert recall(vault, "hidden reasoning transcript") == []
 
 
 def test_oversized_manual_history_file_is_invalid_and_not_recalled(tmp_path):
@@ -358,16 +440,20 @@ def test_recall_does_not_read_daily_files_older_than_the_recent_scan_bound(tmp_p
     recent.occurred_at = datetime(2026, 2, 1, 9, 0)
     assert append_gist(vault, recent) is True
 
-    original_read_text = Path.read_text
+    original_read_history_file = memory_vault._read_history_file
+    read_paths = []
 
-    def reject_oldest_read(path, *args, **kwargs):
+    def track_bounded_read(path):
+        read_paths.append(path)
         if path == oldest:
             raise AssertionError("recall read history outside its recent-file bound")
-        return original_read_text(path, *args, **kwargs)
+        return original_read_history_file(path)
 
-    monkeypatch.setattr(Path, "read_text", reject_oldest_read)
+    monkeypatch.setattr(memory_vault, "_read_history_file", track_bounded_read)
 
     assert recall(vault, "release evidence")
+    assert oldest not in read_paths
+    assert len(read_paths) == 31
 
 
 def test_lint_rebuilds_derived_files_without_rewriting_daily_history(tmp_path):

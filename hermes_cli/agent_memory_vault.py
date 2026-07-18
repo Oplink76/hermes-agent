@@ -644,11 +644,14 @@ def append_gist(vault: Path, gist: SessionGist) -> bool:
 def _append_gist_unlocked(vault: Path, gist: SessionGist) -> bool:
     gist_id = _gist_id(gist.gist_id)
     entry = _render_gist(gist, gist_id)
+    occurred_on = _occurred_on(gist.occurred_at)
+    history_path = vault / "memory" / f"{occurred_on.isoformat()}.md"
+    rendered_match = _GIST_RE.fullmatch(entry)
+    if rendered_match is None or _parse_gist(rendered_match, history_path) is None:
+        raise ValueError("rendered Session Gist does not satisfy the vault schema")
     if _gist_exists(vault, gist_id):
         return False
 
-    occurred_on = _occurred_on(gist.occurred_at)
-    history_path = vault / "memory" / f"{occurred_on.isoformat()}.md"
     existing_size = history_path.stat().st_size if history_path.exists() else 0
     separator_size = 1 if existing_size else 0
     if (
@@ -865,12 +868,8 @@ def _redact_url_values(match: re.Match[str]) -> str:
     except ValueError:
         return "«redacted-url»"
 
-    userinfo, separator, host = parts.netloc.rpartition("@")
-    if separator and ":" in userinfo:
-        username, _, _password = userinfo.partition(":")
-        netloc = f"{username}:«redacted-secret»@{host}"
-    else:
-        netloc = parts.netloc
+    _userinfo, separator, host = parts.netloc.rpartition("@")
+    netloc = f"«redacted-secret»@{host}" if separator else parts.netloc
     return urlunsplit(
         (
             parts.scheme,
@@ -989,7 +988,11 @@ def _invalid_entry_count(vault: Path, valid_entries: int) -> int:
 
 
 def _valid_external_text(value: str) -> bool:
-    return len(value) <= _MAX_RECORDED_CHARS and _sanitize_sensitive_text(value) == value
+    return (
+        len(value) <= _MAX_RECORDED_CHARS
+        and _sanitize_sensitive_text(value) == value
+        and not _UNSAFE_IDENTIFIER_RE.search(value)
+    )
 
 
 def _read_history_file(path: Path) -> str | None:
