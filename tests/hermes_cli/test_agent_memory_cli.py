@@ -18,6 +18,12 @@ from hermes_cli.subcommands.agent_memory import (
 _SENTINEL = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_agent_memory_environment(monkeypatch):
+    monkeypatch.delenv("HERMES_AGENT_MEMORY_VAULT", raising=False)
+    monkeypatch.delenv("HERMES_AGENT_MEMORY_OUTBOX", raising=False)
+
+
 def _executor_payload():
     return {
         "agent_id": "codex",
@@ -231,7 +237,6 @@ def test_absolute_symlink_input_is_rejected_without_content_echo(tmp_path, capsy
 
 
 def test_unconfigured_recall_returns_empty_disabled_receipt(monkeypatch, capsys):
-    monkeypatch.delenv("HERMES_AGENT_MEMORY_VAULT", raising=False)
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(_recall_payload())))
 
     assert cmd_agent_memory(_parse(["agent-memory", "recall"])) == 0
@@ -242,10 +247,7 @@ def test_unconfigured_recall_returns_empty_disabled_receipt(monkeypatch, capsys)
     assert result["receipt"]["continue_work"] is True
 
 
-def test_status_returns_counts_and_never_content(monkeypatch, capsys):
-    monkeypatch.delenv("HERMES_AGENT_MEMORY_VAULT", raising=False)
-    monkeypatch.delenv("HERMES_AGENT_MEMORY_OUTBOX", raising=False)
-
+def test_status_returns_counts_and_never_content(capsys):
     assert cmd_agent_memory(_parse(["agent-memory", "status"])) == 0
 
     result = json.loads(capsys.readouterr().out)
@@ -259,10 +261,7 @@ def test_status_returns_counts_and_never_content(monkeypatch, capsys):
         assert private_value not in rendered
 
 
-def test_reconcile_returns_only_bounded_operational_counts(monkeypatch, capsys):
-    monkeypatch.delenv("HERMES_AGENT_MEMORY_VAULT", raising=False)
-    monkeypatch.delenv("HERMES_AGENT_MEMORY_OUTBOX", raising=False)
-
+def test_reconcile_returns_only_bounded_operational_counts(capsys):
     assert cmd_agent_memory(_parse(["agent-memory", "reconcile"])) == 0
 
     result = json.loads(capsys.readouterr().out)
