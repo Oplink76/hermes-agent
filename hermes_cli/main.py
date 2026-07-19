@@ -294,10 +294,6 @@ from hermes_cli.subcommands.login import build_login_parser
 from hermes_cli.subcommands.logout import build_logout_parser
 from hermes_cli.subcommands.auth import build_auth_parser
 from hermes_cli.subcommands.status import build_status_parser
-from hermes_cli.subcommands.agent_memory import (
-    build_agent_memory_parser,
-    cmd_agent_memory,
-)
 from hermes_cli.subcommands.webhook import build_webhook_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
@@ -12434,7 +12430,7 @@ def _build_provider_choices() -> list[str]:
 # to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
+        "acp", "agent-memory", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
@@ -13218,10 +13214,18 @@ def main():
     _add_portal_parser(subparsers)
 
     # =========================================================================
-    # kanban command — multi-profile collaboration board
+    # agent-memory command — worker protocol for vault jobs
     # =========================================================================
+    from hermes_cli.subcommands.agent_memory import (
+        build_agent_memory_parser,
+        cmd_agent_memory,
+    )
+
     build_agent_memory_parser(subparsers, cmd_agent_memory=cmd_agent_memory)
 
+    # =========================================================================
+    # kanban command — multi-profile collaboration board
+    # =========================================================================
     from hermes_cli.kanban import build_parser as _build_kanban_parser
 
     kanban_parser = _build_kanban_parser(subparsers)
