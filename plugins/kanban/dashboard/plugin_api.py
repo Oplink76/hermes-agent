@@ -44,15 +44,16 @@ import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Annotated, Any, Literal, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_intake
 from hermes_cli import kanban_diagnostics as kd
+from agent.redact import redact_sensitive_text
 
 log = logging.getLogger(__name__)
 
@@ -515,6 +516,163 @@ class IntakeBody(BaseModel):
     request: dict[str, Any]
     session_id: Optional[str] = None
     attachments: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class WorkInboxNewWorkBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[2]
+    kind: Literal["new_work"]
+    request: dict[str, Any]
+    session_id: Optional[str] = None
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class WorkInboxAssignedDeliveryBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[2]
+    kind: Literal["assigned_delivery"]
+    task_id: str
+    run_id: int
+    work_contract_id: str
+    outcome: Literal["completed", "blocked"]
+    summary: str
+    result: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
+    block_kind: Optional[str] = None
+    attempted_resolutions: list[str] = Field(default_factory=list)
+
+
+WorkInboxBody = Annotated[
+    WorkInboxNewWorkBody | WorkInboxAssignedDeliveryBody,
+    Field(discriminator="kind"),
+]
+
+_WORK_INBOX_METADATA_KEYS = {
+    "ai_provenance",
+    "changed_files",
+    "tests_run",
+    "workflow_outcome",
+}
+
+
+def _work_inbox_metadata(metadata: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if metadata is None:
+        return None
+    unknown = set(metadata) - _WORK_INBOX_METADATA_KEYS
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"unknown Work Inbox metadata keys: {sorted(unknown)}",
+        )
+    serialized = redact_sensitive_text(
+        json.dumps(metadata, ensure_ascii=False), force=True,
+    )
+    try:
+        return json.loads(serialized)
+    except json.JSONDecodeError:
+        return metadata
+
+
+def _require_work_inbox_assignment(
+    conn: sqlite3.Connection,
+    payload: WorkInboxAssignedDeliveryBody,
+) -> None:
+    task = kanban_db.get_task(conn, payload.task_id)
+    run = kanban_db.get_run(conn, payload.run_id)
+    if (
+        task is None
+        or run is None
+        or run.task_id != payload.task_id
+        or run.ended_at is not None
+        or task.current_run_id != payload.run_id
+        or task.work_contract_id != payload.work_contract_id
+        or task.work_item_kind == "epic"
+        or task.goal_mode
+        or task.current_step_key == "release_measure"
+        or task.status != "running"
+    ):
+        raise HTTPException(status_code=409, detail="assigned delivery no longer matches its active Work Contract run")
+
+
+@router.post("/work-inbox")
+def submit_work_inbox(
+    request: Request,
+    payload: WorkInboxBody,
+    board: str = Query(...),
+):
+    """Accept one authenticated external submission through existing boundaries."""
+
+    from plugins.dashboard_auth.work_inbox import WORK_INBOX_SCOPE
+
+    principal = getattr(request.state, "token_principal", None)
+    if principal is None or WORK_INBOX_SCOPE not in principal.scopes:
+        raise HTTPException(status_code=403, detail="Work Inbox scope required")
+    board = _resolve_board(board)
+    metadata = kanban_db.read_board_metadata(board)
+    if not kanban_intake.qualification_required(metadata):
+        raise HTTPException(status_code=409, detail="This board does not require qualified intake")
+    conn = _conn(board=board)
+    try:
+        if isinstance(payload, WorkInboxNewWorkBody):
+            receipt = kanban_intake.submit_intake(
+                conn,
+                request=payload.request,
+                source=f"work-inbox:{principal.provider}:{principal.principal}",
+                session_id=payload.session_id,
+                attachments=tuple(payload.attachments),
+            )
+            return JSONResponse(status_code=202, content=receipt)
+
+        _require_work_inbox_assignment(conn, payload)
+        metadata = _work_inbox_metadata(payload.metadata)
+        if (
+            payload.outcome == "blocked"
+            and payload.block_kind is not None
+            and payload.block_kind not in kanban_db.VALID_BLOCK_KINDS
+        ):
+            raise HTTPException(status_code=422, detail="unknown block kind")
+        summary = redact_sensitive_text(payload.summary, force=True)
+        result = (
+            redact_sensitive_text(payload.result, force=True)
+            if payload.result is not None
+            else None
+        )
+        try:
+            if payload.outcome == "completed":
+                ok = kanban_db.complete_task(
+                    conn,
+                    payload.task_id,
+                    result=result,
+                    summary=summary,
+                    metadata=metadata or None,
+                    expected_run_id=payload.run_id,
+                    board=board,
+                )
+            else:
+                with kanban_db.authorized_governance_write():
+                    ok = kanban_db.block_task(
+                        conn,
+                        payload.task_id,
+                        reason=summary,
+                        kind=payload.block_kind,
+                        attempted_resolutions=payload.attempted_resolutions,
+                        expected_run_id=payload.run_id,
+                        board=board,
+                    )
+        except (
+            kanban_db.ArtifactPreservationError,
+            kanban_db.ProductProvenanceError,
+            kanban_db.ProductWorkflowStateError,
+            kanban_db.ReleaseEvidenceError,
+        ) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not ok:
+            raise HTTPException(status_code=409, detail="assigned delivery could not be applied")
+        return {"status": "handover_applied"}
+    finally:
+        conn.close()
 
 
 @router.post("/intake", status_code=202)

@@ -12,7 +12,7 @@ from hermes_cli import kanban_db, web_server
 from hermes_cli.kanban_inbox_guide import build_inbox_guide
 
 
-def test_build_inbox_guide_is_copy_ready_and_contains_no_credential():
+def test_guide_names_one_minimal_work_inbox_route():
     guide_url = "https://hermes.example/.well-known/hermes-inbox?board=strict"
 
     body = build_inbox_guide(
@@ -20,24 +20,25 @@ def test_build_inbox_guide_is_copy_ready_and_contains_no_credential():
         origin="https://hermes.example",
     )
 
-    assert body["guide_version"] == 1
+    assert body["guide_version"] == 2
+    assert body["name"] == "Hermes Work Inbox"
     assert body["board"] == "strict"
     assert body["qualification_required"] is True
     assert body["submission"]["method"] == "POST"
     assert body["submission"]["url"] == (
-        "https://hermes.example/api/plugins/kanban/intake?board=strict"
+        "https://hermes.example/api/plugins/kanban/work-inbox?board=strict"
     )
-    assert body["receipt"]["url_template"] == (
-        "https://hermes.example/api/plugins/kanban/intake/{intake_id}?board=strict"
-    )
-    assert body["submission"]["example"]["request"]["client_request_id"]
+    assert set(body["submission"]["kinds"]) == {"new_work", "assigned_delivery"}
+    assert body["submission"]["scope"] == "work_inbox:submit"
     assert guide_url in body["copy_ready_prompt"]
-    assert "Do not create, edit, assign, route, qualify, or override" in (
-        body["copy_ready_prompt"]
-    )
+    assert body["retry"]["automatic_retry"] is False
+    assert "receipt" not in body
     serialized = json.dumps(body)
-    assert "secret" not in serialized.lower()
+    assert "token" not in serialized.lower()
     assert "canonical_json" not in serialized
+    assert "<assigned task id>" in serialized
+    assert "<assigned Work Contract id>" in serialized
+    assert str(get_hermes_home()) not in serialized
 
 
 @pytest.fixture
