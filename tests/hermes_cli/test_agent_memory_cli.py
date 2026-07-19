@@ -4,12 +4,16 @@ import argparse
 from datetime import datetime
 import io
 import json
+import os
+from pathlib import Path
 import sys
 
 import pytest
 
 from hermes_cli import main as main_module
+from hermes_cli.subcommands import agent_memory as agent_memory_cli
 from hermes_cli.subcommands.agent_memory import (
+    _read_input,
     build_agent_memory_parser,
     cmd_agent_memory,
 )
@@ -236,6 +240,48 @@ def test_absolute_symlink_input_is_rejected_without_content_echo(tmp_path, capsy
     )
 
 
+def test_file_input_reads_the_validated_open_fd_when_path_is_replaced(
+    tmp_path, monkeypatch
+):
+    request = tmp_path / "request.json"
+    original_payload = _recall_payload()
+    replacement_payload = {**_recall_payload(), "operation_id": "recall-replaced"}
+    request.write_text(json.dumps(original_payload), encoding="utf-8")
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text(json.dumps(replacement_payload), encoding="utf-8")
+    real_is_file = Path.is_file
+    real_os_open = os.open
+    state = {"swapped": False, "flags": None}
+
+    def replace_path() -> None:
+        if state["swapped"]:
+            return
+        request.unlink()
+        request.symlink_to(replacement)
+        state["swapped"] = True
+
+    def swap_after_legacy_validation(self):
+        result = real_is_file(self)
+        if self == request and result:
+            replace_path()
+        return result
+
+    def swap_after_open(path, flags, mode=0o777):
+        descriptor = real_os_open(path, flags, mode)
+        if Path(path) == request:
+            state["flags"] = flags
+            replace_path()
+        return descriptor
+
+    monkeypatch.setattr(Path, "is_file", swap_after_legacy_validation)
+    monkeypatch.setattr(agent_memory_cli, "os", os, raising=False)
+    monkeypatch.setattr(agent_memory_cli.os, "open", swap_after_open)
+
+    assert _read_input(str(request)) == original_payload
+    if hasattr(os, "O_NOFOLLOW"):
+        assert state["flags"] & os.O_NOFOLLOW
+
+
 def test_unconfigured_recall_returns_empty_disabled_receipt(monkeypatch, capsys):
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(_recall_payload())))
 
@@ -280,3 +326,17 @@ def test_write_returns_receipt(monkeypatch, capsys):
     result = json.loads(capsys.readouterr().out)
     assert set(result) == {"receipt"}
     assert result["receipt"]["continue_work"] is True
+
+
+def test_unconfigured_write_returns_disabled_and_creates_no_outbox(
+    tmp_path, monkeypatch, capsys
+):
+    home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(_write_payload())))
+
+    assert cmd_agent_memory(_parse(["agent-memory", "write"])) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["receipt"]["status"] == "disabled"
+    assert not (home / "recovery" / "agent-memory-outbox").exists()

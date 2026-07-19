@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
+import stat
 import sys
 from typing import Callable
 
@@ -79,10 +81,35 @@ def _read_input(source: str) -> object:
             raw = raw.encode("utf-8")
     else:
         path = Path(source)
-        if not path.is_absolute() or path.is_symlink() or not path.is_file():
+        if not path.is_absolute():
             raise ValueError("input must be an absolute regular file")
-        with path.open("rb") as handle:
-            raw = handle.read(_MAX_INPUT_BYTES + 1)
+        try:
+            before = os.lstat(path)
+        except OSError as exc:
+            raise ValueError("input must be an absolute regular file") from exc
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise ValueError("input must be an absolute regular file")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise ValueError("input must be an absolute regular file") from exc
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (before.st_dev, before.st_ino)
+            ):
+                raise ValueError("input must be an absolute regular file")
+            with os.fdopen(descriptor, "rb") as handle:
+                descriptor = -1
+                raw = handle.read(_MAX_INPUT_BYTES + 1)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
     if len(raw) > _MAX_INPUT_BYTES:
         raise ValueError("input exceeds the maximum size")
     try:

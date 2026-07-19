@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 import time
 from typing import Iterator, Mapping
@@ -30,10 +31,18 @@ from hermes_cli.agent_memory_vault import (
 
 _OUTBOX_LOCK_TIMEOUT_SECONDS = 5.0
 _OUTBOX_LOCK_POLL_SECONDS = 0.05
+# Canonical CLI requests are capped at 64 KiB. The durable envelope adds a
+# receipt plus JSON structure, so 128 KiB safely contains every accepted write
+# while bounding status, hash, and reconcile reads.
+_MAX_OUTBOX_ENVELOPE_BYTES = 131_072
 _ATTENTION_AFTER = timedelta(hours=24)
 _ACK_NAME = ".attention-ack.json"
 _WRITE_STATUSES = frozenset({"stored", "already_stored", "queued", "disabled"})
 _RECALL_STATUSES = frozenset({"matched", "empty", "unavailable", "disabled"})
+
+
+class _OperationConflict(ValueError):
+    """One stable operation ID was reused for a different contract."""
 
 
 def _sorted_mapping(value: Mapping[str, object]) -> dict[str, object]:
@@ -328,6 +337,7 @@ class WorkerWriteRequest:
             decisions=validated.decisions,
             open_loops=validated.open_loops,
             executor=validated.executor,
+            operation_id=validated.operation_id,
         )
 
 
@@ -375,8 +385,45 @@ def configured_outbox_path(environ: Mapping[str, str] | None = None) -> Path:
         path = Path(configured).expanduser()
         if not path.is_absolute():
             raise ValueError("Agent Memory outbox path must be absolute")
-        return path.resolve(strict=False)
-    return (get_hermes_home() / "agent-memory" / "outbox").resolve(strict=False)
+        return Path(os.path.abspath(path))
+    return Path(
+        os.path.abspath(
+            get_hermes_home() / "recovery" / "agent-memory-outbox"
+        )
+    )
+
+
+def _validate_outbox_path(outbox: Path) -> None:
+    """Reject symlinked existing components before any outbox mutation."""
+    outbox = Path(outbox)
+    if not outbox.is_absolute():
+        raise ValueError("Agent Memory outbox path must be absolute")
+    current = Path(outbox.anchor)
+    for part in outbox.parts[1:]:
+        current /= part
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ValueError("unsafe Agent Memory outbox path") from exc
+        if stat.S_ISLNK(mode):
+            raise ValueError("Agent Memory outbox path contains a symlink")
+        if current != outbox and not stat.S_ISDIR(mode):
+            raise ValueError("unsafe Agent Memory outbox path component")
+    try:
+        mode = os.lstat(outbox).st_mode
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ValueError("unsafe Agent Memory outbox path") from exc
+    if not stat.S_ISDIR(mode):
+        raise ValueError("Agent Memory outbox path must be a directory")
+
+
+def _outbox_exists(outbox: Path) -> bool:
+    _validate_outbox_path(outbox)
+    return outbox.exists()
 
 
 def write_worker_gist(request: WorkerWriteRequest) -> MemoryReceipt:
@@ -397,30 +444,92 @@ def store_gist_or_queue(
     delegation_id: str,
     executor: ExecutorIdentity,
 ) -> MemoryReceipt:
-    gist = replace(gist, executor=executor)
+    operation_id = _identifier(operation_id, "operation_id")
+    gist = replace(gist, executor=executor, operation_id=operation_id)
     _validated_gist_mapping(gist)
-    outbox = configured_outbox_path()
+    vault_resolution_failed = False
     try:
         vault = configured_vault_path()
+    except Exception:
+        vault = None
+        vault_resolution_failed = True
+    if vault is None and not vault_resolution_failed:
+        return MemoryReceipt.for_gist(
+            operation_id=operation_id,
+            task_id=task_id,
+            run_id=run_id,
+            delegation_id=delegation_id,
+            executor=executor,
+            operation="write",
+            status="disabled",
+            continue_work=True,
+            gist_id=gist.gist_id,
+        )
+
+    queued_receipt = MemoryReceipt.for_gist(
+        operation_id=operation_id,
+        task_id=task_id,
+        run_id=run_id,
+        delegation_id=delegation_id,
+        executor=executor,
+        operation="write",
+        status="queued",
+        continue_work=True,
+        gist_id=gist.gist_id,
+    )
+    outbox = configured_outbox_path()
+    existing_queued = _queued_operation_receipt(
+        outbox, _gist_envelope(gist, queued_receipt)
+    )
+    if existing_queued is not None:
+        return existing_queued
+    try:
         if vault is not None and vault.is_dir():
+            existing = _stored_operation(vault, operation_id)
+            if existing is not None:
+                _validate_stored_operation(existing, gist, executor)
+                return MemoryReceipt.for_gist(
+                    operation_id=operation_id,
+                    task_id=task_id,
+                    run_id=run_id,
+                    delegation_id=delegation_id,
+                    executor=executor,
+                    operation="write",
+                    status="already_stored",
+                    continue_work=True,
+                    gist_id=existing.gist_id,
+                )
             stored = append_gist(vault, gist)
             lint_vault(vault)
+            if not stored:
+                existing = _stored_operation(vault, operation_id)
+                if existing is None:
+                    raise OSError("Agent Memory operation was not persisted")
+                _validate_stored_operation(existing, gist, executor)
+                return MemoryReceipt.for_gist(
+                    operation_id=operation_id,
+                    task_id=task_id,
+                    run_id=run_id,
+                    delegation_id=delegation_id,
+                    executor=executor,
+                    operation="write",
+                    status="already_stored",
+                    continue_work=True,
+                    gist_id=existing.gist_id,
+                )
             return MemoryReceipt.for_gist(
                 operation_id=operation_id, task_id=task_id, run_id=run_id,
                 delegation_id=delegation_id, executor=executor, operation="write",
-                status="stored" if stored else "already_stored", continue_work=True,
+                status="stored", continue_work=True,
                 gist_id=gist.gist_id,
             )
+    except _OperationConflict:
+        raise
     except Exception:
         # A validated gist still needs a durable handover when the external
         # vault or its configuration is temporarily unavailable.
         pass
-    receipt = MemoryReceipt.for_gist(
-        operation_id=operation_id, task_id=task_id, run_id=run_id,
-        delegation_id=delegation_id, executor=executor, operation="write",
-        status="queued", continue_work=True, gist_id=gist.gist_id,
-    )
-    envelope = _gist_envelope(gist, receipt)
+    envelope = _gist_envelope(gist, queued_receipt)
     return _queue_envelope(outbox, envelope)
 
 
@@ -465,9 +574,12 @@ def _validated_gist_mapping(gist: SessionGist) -> dict[str, object]:
         raise ValueError("Session Gist does not satisfy the vault schema")
     function_id, _, title = parsed.fields["Function"].partition(" | ")
     executor = ExecutorIdentity.from_mapping(json.loads(parsed.fields["Executor"]))
+    if parsed.operation_id is None:
+        raise ValueError("protocol Session Gist requires operation_id")
     return _sorted_mapping(
         {
             "gist_id": parsed.gist_id,
+            "operation_id": parsed.operation_id,
             "occurred_at": _datetime_text(gist.occurred_at),
             "agent_id": vault_api._recorded_text(gist.agent_id),
             "role": vault_api._recorded_text(gist.role),
@@ -490,6 +602,7 @@ def _validated_gist_mapping(gist: SessionGist) -> dict[str, object]:
 _GIST_KEYS = frozenset(
     {
         "gist_id",
+        "operation_id",
         "occurred_at",
         "agent_id",
         "role",
@@ -513,6 +626,7 @@ def _gist_from_mapping(value: object) -> SessionGist:
     mapping = _exact_mapping(value, _GIST_KEYS, "queued gist")
     gist = SessionGist(
         gist_id=_identifier(mapping["gist_id"], "gist_id"),
+        operation_id=_identifier(mapping["operation_id"], "operation_id"),
         occurred_at=_datetime_value(mapping["occurred_at"]),
         agent_id=_text(mapping["agent_id"], "agent_id"),
         role=_text(mapping["role"], "role"),
@@ -531,6 +645,41 @@ def _gist_from_mapping(value: object) -> SessionGist:
     )
     _validated_gist_mapping(gist)
     return gist
+
+
+def _stored_operation(vault: Path, operation_id: str):
+    matches = [
+        entry
+        for entry in vault_api._valid_entries(vault)
+        if entry.operation_id == operation_id
+    ]
+    if len(matches) > 1:
+        raise _OperationConflict("duplicate Agent Memory operation_id in vault")
+    return matches[0] if matches else None
+
+
+def _stored_executor(entry) -> ExecutorIdentity | None:
+    raw = entry.fields.get("Executor")
+    if raw is None:
+        return None
+    try:
+        return ExecutorIdentity.from_mapping(json.loads(raw))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _validate_stored_operation(
+    entry,
+    gist: SessionGist,
+    executor: ExecutorIdentity,
+) -> None:
+    stored_executor = _stored_executor(entry)
+    if (
+        entry.function_id != gist.function_id
+        or stored_executor is None
+        or stored_executor.to_mapping() != executor.to_mapping()
+    ):
+        raise _OperationConflict("conflicting Agent Memory operation contract")
 
 
 def _gist_envelope(gist: SessionGist, receipt: MemoryReceipt) -> dict[str, object]:
@@ -606,6 +755,60 @@ def _validate_envelope(value: object, path: Path | None = None) -> dict[str, obj
     return canonical
 
 
+def _same_write_operation_contract(
+    existing: Mapping[str, object], candidate: Mapping[str, object]
+) -> bool:
+    try:
+        existing_receipt = MemoryReceipt.from_mapping(existing["receipt"])
+        candidate_receipt = MemoryReceipt.from_mapping(candidate["receipt"])
+        existing_gist = _gist_from_mapping(existing["gist"])
+        candidate_gist = _gist_from_mapping(candidate["gist"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (
+        existing_receipt.operation_id == candidate_receipt.operation_id
+        and existing_receipt.operation == candidate_receipt.operation == "write"
+        and existing_receipt.task_id == candidate_receipt.task_id
+        and existing_receipt.run_id == candidate_receipt.run_id
+        and existing_receipt.delegation_id == candidate_receipt.delegation_id
+        and existing_receipt.executor.to_mapping()
+        == candidate_receipt.executor.to_mapping()
+        and existing_gist.function_id == candidate_gist.function_id
+        and existing_gist.operation_id == candidate_gist.operation_id
+        == existing_receipt.operation_id
+    )
+
+
+def _find_queued_operation(
+    outbox: Path, candidate: Mapping[str, object]
+) -> MemoryReceipt | None:
+    candidate_receipt = MemoryReceipt.from_mapping(candidate["receipt"])
+    for path in _pending_paths(outbox):
+        try:
+            existing = _load_envelope(path)
+            existing_receipt = MemoryReceipt.from_mapping(existing["receipt"])
+        except (TypeError, ValueError):
+            continue
+        if (
+            existing.get("kind") != "gist"
+            or existing_receipt.operation_id != candidate_receipt.operation_id
+        ):
+            continue
+        if not _same_write_operation_contract(existing, candidate):
+            raise _OperationConflict("conflicting Agent Memory operation contract")
+        return existing_receipt
+    return None
+
+
+def _queued_operation_receipt(
+    outbox: Path, candidate: Mapping[str, object]
+) -> MemoryReceipt | None:
+    if not _outbox_exists(outbox):
+        return None
+    with _outbox_lock(outbox):
+        return _find_queued_operation(outbox, candidate)
+
+
 def _queue_envelope(outbox: Path, envelope: Mapping[str, object]) -> MemoryReceipt:
     validated = _validate_envelope(envelope)
     target = outbox / _envelope_name(validated)
@@ -619,6 +822,10 @@ def _queue_envelope(outbox: Path, envelope: Mapping[str, object]) -> MemoryRecei
         + "\n"
     )
     with _outbox_lock(outbox):
+        if validated.get("kind") == "gist":
+            existing_operation = _find_queued_operation(outbox, validated)
+            if existing_operation is not None:
+                return existing_operation
         if target.exists():
             existing = _load_envelope(target)
             if not _same_operation_envelope(existing, validated):
@@ -650,19 +857,53 @@ def _same_operation_envelope(
 
 
 def _load_envelope(path: Path) -> dict[str, object]:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("unsafe Agent Memory outbox envelope")
+    raw = _read_outbox_bytes(path)
+    if len(raw) > _MAX_OUTBOX_ENVELOPE_BYTES:
+        raise ValueError("corrupt Agent Memory outbox envelope")
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("corrupt Agent Memory outbox envelope") from exc
     return _validate_envelope(value, path)
+
+
+def _read_outbox_bytes(path: Path) -> bytes:
+    """Read at most one byte beyond the documented envelope bound."""
+    path = Path(path)
+    try:
+        before = os.lstat(path)
+    except OSError as exc:
+        raise ValueError("unsafe Agent Memory outbox envelope") from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ValueError("unsafe Agent Memory outbox envelope")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError("unsafe Agent Memory outbox envelope") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise ValueError("unsafe Agent Memory outbox envelope")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            return handle.read(_MAX_OUTBOX_ENVELOPE_BYTES + 1)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 @contextlib.contextmanager
 def _outbox_lock(outbox: Path) -> Iterator[None]:
     outbox = Path(outbox)
+    _validate_outbox_path(outbox)
     outbox.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _validate_outbox_path(outbox)
     try:
         os.chmod(outbox, 0o700)
     except OSError:
@@ -673,7 +914,8 @@ def _outbox_lock(outbox: Path) -> Iterator[None]:
         flags |= os.O_NOFOLLOW
     descriptor = os.open(lock_path, flags, 0o600)
     try:
-        os.fchmod(descriptor, 0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
         handle = os.fdopen(descriptor, "r+b")
     except Exception:
         os.close(descriptor)
@@ -724,7 +966,8 @@ def _atomic_write(outbox: Path, target: Path, content: bytes) -> None:
     )
     temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, 0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(content)
             handle.flush()
@@ -777,7 +1020,7 @@ def reconcile_configured_outbox(now: datetime | None = None) -> ReconcileReport:
     current = _utc_now() if now is None else now
     outbox = configured_outbox_path()
     vault, vault_available = _configured_vault_state()
-    if not outbox.exists():
+    if not _outbox_exists(outbox):
         return ReconcileReport(0, 0, 0, 0, vault_available)
     moved = 0
     closed = 0
@@ -798,13 +1041,26 @@ def reconcile_configured_outbox(now: datetime | None = None) -> ReconcileReport:
                 closed += 1
                 continue
             gist = _gist_from_mapping(envelope["gist"])
+            receipt = MemoryReceipt.from_mapping(envelope["receipt"])
             try:
                 append_gist(vault, gist)
                 lint_vault(vault)
-                matches = recall(vault, gist.gist_id, limit=1)
             except (OSError, TimeoutError, ValueError):
                 continue
-            if not matches or matches[0].gist_id != gist.gist_id:
+            try:
+                stored = _stored_operation(vault, receipt.operation_id)
+                stored_executor = (
+                    _stored_executor(stored) if stored is not None else None
+                )
+                if (
+                    stored is None
+                    or stored.gist_id != receipt.gist_id
+                    or stored_executor is None
+                    or stored_executor.to_mapping()
+                    != receipt.executor.to_mapping()
+                ):
+                    continue
+            except (AttributeError, TypeError, ValueError):
                 continue
             path.unlink()
             moved += 1
@@ -813,6 +1069,7 @@ def reconcile_configured_outbox(now: datetime | None = None) -> ReconcileReport:
 
 
 def _pending_paths(outbox: Path) -> list[Path]:
+    _validate_outbox_path(outbox)
     return sorted(path for path in outbox.glob("*.json") if path.name != _ACK_NAME)
 
 
@@ -832,9 +1089,9 @@ def _pending_state(
         except ValueError:
             corrupt += 1
             try:
-                raw_hash = hashlib.sha256(path.read_bytes()).hexdigest()
-                modified = datetime.fromtimestamp(path.stat().st_mtime)
-            except OSError:
+                raw_hash = hashlib.sha256(_read_outbox_bytes(path)).hexdigest()
+                modified = datetime.fromtimestamp(os.lstat(path).st_mtime)
+            except (OSError, ValueError):
                 raw_hash = "unreadable"
                 modified = _utc_now() if fallback_now is None else fallback_now
             queued_at = modified
@@ -849,7 +1106,7 @@ def configured_outbox_status(now: datetime | None = None) -> OutboxStatus:
     current = _utc_now() if now is None else now
     outbox = configured_outbox_path()
     vault, vault_available = _configured_vault_state()
-    if outbox.exists():
+    if _outbox_exists(outbox):
         with _outbox_lock(outbox):
             pending, corrupt, oldest, identities = _pending_state(
                 outbox, fallback_now=current
@@ -864,7 +1121,12 @@ def configured_outbox_status(now: datetime | None = None) -> OutboxStatus:
     if corrupt:
         attention = True
         reason = "corrupt_or_unsafe"
-    elif pending and oldest is not None and current - oldest >= _ATTENTION_AFTER:
+    elif (
+        pending
+        and not vault_available
+        and oldest is not None
+        and current - oldest >= _ATTENTION_AFTER
+    ):
         attention = True
         reason = "pending_for_24_hours"
     else:
@@ -889,8 +1151,11 @@ def configured_outbox_status(now: datetime | None = None) -> OutboxStatus:
 def _read_ack(outbox: Path) -> str | None:
     path = outbox / _ACK_NAME
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raw = _read_outbox_bytes(path)
+        if len(raw) > _MAX_OUTBOX_ENVELOPE_BYTES:
+            return None
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if (
         isinstance(value, dict)
@@ -936,16 +1201,23 @@ def receipt_is_present(receipt: MemoryReceipt) -> bool:
             path = configured_outbox_path() / f"gist-{receipt.gist_id}.json"
             envelope = _load_envelope(path)
             stored = MemoryReceipt.from_mapping(envelope["receipt"])
+            if stored.to_mapping() == receipt.to_mapping():
+                return True
         except Exception:
-            return False
-        return stored.to_mapping() == receipt.to_mapping()
+            pass
     vault, vault_available = _configured_vault_state()
     if not vault_available or vault is None:
         return False
     try:
-        return any(
-            match.gist_id == receipt.gist_id
-            for match in recall(vault, receipt.gist_id or "", limit=1)
+        stored_gist = _stored_operation(vault, receipt.operation_id)
+        stored_executor = (
+            _stored_executor(stored_gist) if stored_gist is not None else None
+        )
+        return bool(
+            stored_gist is not None
+            and stored_gist.gist_id == receipt.gist_id
+            and stored_executor is not None
+            and stored_executor.to_mapping() == receipt.executor.to_mapping()
         )
     except Exception:
         return False

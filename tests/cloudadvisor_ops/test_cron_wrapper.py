@@ -536,6 +536,36 @@ def test_scheduled_memory_check_is_quiet_before_24_hours(
     assert capsys.readouterr() == ("", "")
 
 
+@pytest.mark.parametrize(
+    "completed",
+    (
+        subprocess.CompletedProcess([], 2, stdout="", stderr="status failed"),
+        subprocess.CompletedProcess([], 0, stdout="not-json", stderr=""),
+        subprocess.CompletedProcess([], 0, stdout=json.dumps({"extra": True}), stderr=""),
+    ),
+)
+def test_scheduled_memory_routine_status_failures_are_quiet_and_fail_open(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    completed: subprocess.CompletedProcess[str],
+) -> None:
+    run = SequenceRun([completed])
+
+    assert run_agent_memory_attention(_config(tmp_path), run=run) == 0
+    assert capsys.readouterr() == ("", "")
+
+
+def test_scheduled_memory_status_timeout_is_quiet_and_fail_open(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("agent-memory status", 120)
+
+    assert run_agent_memory_attention(_config(tmp_path), run=timeout) == 0
+    assert capsys.readouterr() == ("", "")
+
+
 def test_scheduled_memory_check_delivers_for_corrupt_envelope(
     tmp_path: Path,
 ) -> None:
@@ -663,6 +693,28 @@ def test_scheduled_memory_delivery_failure_does_not_acknowledge(
         acknowledge=acknowledged.append,
     ) == 2
     assert acknowledged == []
+
+
+def test_scheduled_memory_acknowledgement_failure_returns_2(
+    tmp_path: Path,
+) -> None:
+    run = SequenceRun([
+        subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(_memory_status()), stderr=""
+        )
+    ])
+    sent: list[str] = []
+
+    def fail_acknowledgement(_fingerprint: str) -> None:
+        raise OSError("ack unavailable")
+
+    assert run_agent_memory_attention(
+        _config(tmp_path),
+        run=run,
+        deliver=sent.append,
+        acknowledge=fail_acknowledgement,
+    ) == 2
+    assert len(sent) == 1
 
 
 def test_main_runs_memory_check_after_sync_auto_mode(

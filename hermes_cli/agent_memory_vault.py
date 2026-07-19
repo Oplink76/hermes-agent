@@ -33,6 +33,7 @@ _SCHEME_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"']+")
 _GIST_RE = re.compile(
     r"(?ms)^## (?P<header>[^\n]+)\n"
     r"<!-- gist_id: (?P<gist_id>[^<>\n]+) -->\n"
+    r"(?:<!-- operation_id: (?P<operation_id>[^<>\n]+) -->\n)?"
     r"(?P<body>.*?)(?=^## |\Z)"
 )
 _FIELD_RE = re.compile(r"(?m)^- (?P<name>[^:]+): (?P<value>.*)$")
@@ -206,6 +207,7 @@ class SessionGist:
     decisions: str
     open_loops: str
     executor: ExecutorIdentity | None = None
+    operation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -232,6 +234,7 @@ class LintReport:
 @dataclass(frozen=True)
 class _ParsedGist:
     gist_id: str
+    operation_id: str | None
     function_id: str
     title: str
     fields: dict[str, str]
@@ -743,6 +746,10 @@ def _append_gist_unlocked(vault: Path, gist: SessionGist) -> bool:
     rendered_match = _GIST_RE.fullmatch(entry)
     if rendered_match is None or _parse_gist(rendered_match, history_path) is None:
         raise ValueError("rendered Session Gist does not satisfy the vault schema")
+    if gist.operation_id is not None and any(
+        item.operation_id == gist.operation_id for item in _valid_entries(vault)
+    ):
+        return False
     if _gist_exists(vault, gist_id):
         return False
 
@@ -771,9 +778,20 @@ def recall(vault: Path, query: str, limit: int = 5) -> list[MemoryMatch]:
     matches: list[MemoryMatch] = []
     for entry in _recent_valid_entries(Path(vault)):
         title_words = _words(entry.title)
-        all_text = " ".join((entry.function_id, entry.title, *entry.fields.values()))
+        all_text = " ".join(
+            (
+                entry.function_id,
+                entry.operation_id or "",
+                entry.title,
+                *entry.fields.values(),
+            )
+        )
         shared_words = query_words & _words(all_text)
-        exact_identifier = query_folded in {entry.function_id.lower(), entry.gist_id.lower()}
+        exact_identifier = query_folded in {
+            entry.function_id.lower(),
+            entry.gist_id.lower(),
+            (entry.operation_id or "").lower(),
+        }
         score = (
             (1_000 if exact_identifier else 0)
             + len(shared_words)
@@ -902,7 +920,7 @@ def _write_if_missing(path: Path, content: str) -> None:
 
 
 def _agents_template() -> str:
-    return """# Agent Memory Vault\n\nAppend-only Session Gists use this schema:\n\n```markdown\n## HH:MM | <agent-id> | <role>\n<!-- gist_id: <opaque-id> -->\n- Function: <function_id> | <title>\n- Context: <board/card/project/repository evidence>\n- Summary: <1-3 sentences>\n- Reused: <existing functionality/evidence, or none>\n- Result: <what changed or was learned>\n- Maturity: <allowed maturity value>\n- Evidence: <commits, PRs, tests, review/release references>\n- Behavior: <learning, or none>\n- Decisions: <decisions, or none>\n- Open loops: <remaining work, or none>\n```\n\nDo not store transcripts, private reasoning, credentials, secrets, or unrelated conversation.\n"""
+    return """# Agent Memory Vault\n\nAppend-only Session Gists use this schema:\n\n```markdown\n## HH:MM | <agent-id> | <role>\n<!-- gist_id: <opaque-id> -->\n<!-- operation_id: <optional-stable-operation-id> -->\n- Function: <function_id> | <title>\n- Context: <board/card/project/repository evidence>\n- Summary: <1-3 sentences>\n- Reused: <existing functionality/evidence, or none>\n- Result: <what changed or was learned>\n- Maturity: <allowed maturity value>\n- Evidence: <commits, PRs, tests, review/release references>\n- Behavior: <learning, or none>\n- Decisions: <decisions, or none>\n- Open loops: <remaining work, or none>\n```\n\nThe operation_id comment is optional for compatibility with older and manual gists. Do not store transcripts, private reasoning, credentials, secrets, or unrelated conversation.\n"""
 
 
 def _gist_exists(vault: Path, gist_id: str) -> bool:
@@ -938,6 +956,8 @@ def _render_gist(gist: SessionGist, gist_id: str) -> str:
         (_recorded_text(occurred_at.strftime("%H:%M")), _recorded_text(gist.agent_id), _recorded_text(gist.role))
     )
     lines = [f"## {header}", f"<!-- gist_id: {gist_id} -->"]
+    if gist.operation_id is not None:
+        lines.append(f"<!-- operation_id: {_operation_id(gist.operation_id)} -->")
     lines.extend(f"- {name}: {value}" for name, value in fields)
     return "\n".join(lines) + "\n"
 
@@ -993,6 +1013,13 @@ def _gist_id(value: object) -> str:
     return value
 
 
+def _operation_id(value: object) -> str:
+    try:
+        return _gist_id(value)
+    except ValueError as exc:
+        raise ValueError("operation_id must be a bounded opaque identifier") from exc
+
+
 def _occurred_on(value: object) -> date:
     if isinstance(value, datetime):
         return value.date()
@@ -1045,6 +1072,10 @@ def _parse_gist(match: re.Match[str], source: Path) -> _ParsedGist | None:
         return None
     try:
         gist_id = _gist_id(match.group("gist_id"))
+        raw_operation_id = match.group("operation_id")
+        operation_id = (
+            _operation_id(raw_operation_id) if raw_operation_id is not None else None
+        )
     except ValueError:
         return None
 
@@ -1074,6 +1105,7 @@ def _parse_gist(match: re.Match[str], source: Path) -> _ParsedGist | None:
         return None
     return _ParsedGist(
         gist_id=gist_id,
+        operation_id=operation_id,
         function_id=function_id,
         title=title,
         fields=fields,

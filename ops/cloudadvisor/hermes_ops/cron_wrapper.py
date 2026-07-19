@@ -359,22 +359,27 @@ def run_agent_memory_attention(
         if completed.returncode != 0:
             raise ValueError("Agent Memory status command failed")
         status = _load_agent_memory_status(completed.stdout or "")
-        if not status["notify_ole"]:
-            return 0
-        reasons = {
-            "pending_for_24_hours": "external vault unavailable for 24 hours",
-            "corrupt_or_unsafe": "unsafe or corrupt outbox entry",
-        }
-        reason = reasons[str(status["reason"])]
-        message = "\n".join(
-            [
-                "🚨 Hermes Agent Memory needs attention",
-                "Recommendation: inspect the Agent Memory outbox",
-                f"Reason: {reason}",
-                f"Pending entries: {status['pending']}",
-                "Hermes kept development running and preserved writes locally.",
-            ]
-        ) + "\n"
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        # This is a best-effort attention sidecar. Routine status/config/parse,
+        # timeout, and lock failures must not fail successful health or sync.
+        return 0
+    if not status["notify_ole"]:
+        return 0
+    reasons = {
+        "pending_for_24_hours": "external vault unavailable for 24 hours",
+        "corrupt_or_unsafe": "unsafe or corrupt outbox entry",
+    }
+    reason = reasons[str(status["reason"])]
+    message = "\n".join(
+        [
+            "🚨 Hermes Agent Memory needs attention",
+            "Recommendation: inspect the Agent Memory outbox",
+            f"Reason: {reason}",
+            f"Pending entries: {status['pending']}",
+            "Hermes kept development running and preserved writes locally.",
+        ]
+    ) + "\n"
+    try:
         _deliver_message(
             config,
             message,
@@ -383,10 +388,8 @@ def run_agent_memory_attention(
         )
         acknowledge(str(status["fingerprint"]))
         return 0
-    except subprocess.TimeoutExpired:
-        print("Agent Memory attention wrapper failed: command timed out", file=sys.stderr)
-    except (OSError, ValueError) as exc:
-        print(f"Agent Memory attention wrapper failed: {exc}", file=sys.stderr)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        print(f"Agent Memory attention delivery failed: {exc}", file=sys.stderr)
     return 2
 
 

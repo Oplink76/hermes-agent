@@ -198,6 +198,30 @@ def test_executor_metadata_is_optional_and_canonical(tmp_path):
     assert '- Executor: {"agent_id":"codex"' in history
 
 
+def test_operation_id_is_optional_bounded_and_round_trips_in_markdown(tmp_path):
+    vault = tmp_path / "Agent Memory"
+    old = _gist(gist_id="old-compatible")
+    current = _gist(gist_id="operation-gist")
+    current.operation_id = "write-operation-123"
+
+    assert append_gist(vault, old) is True
+    assert append_gist(vault, current) is True
+
+    history = (vault / "memory" / "2026-07-18.md").read_text(encoding="utf-8")
+    assert history.count("<!-- operation_id:") == 1
+    assert "<!-- operation_id: write-operation-123 -->" in history
+    entries = memory_vault._valid_entries(vault)
+    assert [(entry.gist_id, entry.operation_id) for entry in entries] == [
+        ("old-compatible", None),
+        ("operation-gist", "write-operation-123"),
+    ]
+
+    invalid = _gist(gist_id="invalid-operation")
+    invalid.operation_id = "x" * 201
+    with pytest.raises(ValueError, match="operation_id"):
+        append_gist(vault, invalid)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (

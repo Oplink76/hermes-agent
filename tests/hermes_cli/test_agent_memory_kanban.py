@@ -12,10 +12,13 @@ from hermes_cli import agent_memory_protocol as memory_protocol
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_qualifier as qualifier
 from hermes_cli.agent_memory_protocol import (
+    MemoryReceipt,
     WorkerRecallRequest,
     WorkerWriteRequest,
     configured_outbox_status,
     recall_for_worker,
+    receipt_is_present,
+    reconcile_configured_outbox,
     write_worker_gist,
 )
 from hermes_cli.agent_memory_vault import (
@@ -1129,6 +1132,42 @@ def test_queued_gist_allows_handoff_without_duplicate(tmp_path, monkeypatch):
         f"gist-gist-{claimed.current_run_id}.json"
     ]
     assert not vault.exists()
+
+
+def test_reconciled_queued_receipt_allows_handoff_and_suppresses_fallback(
+    tmp_path, monkeypatch
+):
+    board, vault = _configured_product_board(tmp_path, monkeypatch)
+    vault.rmdir()
+    with kb.connect(board=board) as conn:
+        task_id = _qualified_task(
+            conn, board=board, title="Reconciled queue worker gist"
+        )
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None and claimed.current_run_id is not None
+        metadata = _worker_metadata(
+            conn, task_id, claimed.current_run_id, board=board
+        )
+        queued = MemoryReceipt.from_mapping(metadata["agent_memory"]["write"])
+        assert queued.status == "queued"
+
+        vault.mkdir()
+        report = reconcile_configured_outbox()
+        assert report.moved == 1
+        assert receipt_is_present(queued) is True
+        assert kb.handoff(
+            conn,
+            task_id,
+            board=board,
+            summary="Reconciled handoff",
+            metadata=metadata,
+            expected_run_id=claimed.current_run_id,
+        )
+
+    history = _gist_history(vault)
+    assert history.count("<!-- gist_id:") == 1
+    assert history.count('"responsibility":"writer"') == 1
+    assert '"responsibility":"orchestrator"' not in history
 
 
 def test_missing_receipts_leave_task_running(tmp_path, monkeypatch):

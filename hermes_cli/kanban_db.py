@@ -387,14 +387,18 @@ def _agent_memory_write_matches_function(
         if not protocol.receipt_is_present(receipt):
             return False
         if receipt.status == "queued":
-            envelope = protocol._load_envelope(
-                protocol.configured_outbox_path() / f"gist-{receipt.gist_id}.json"
-            )
-            gist = envelope.get("gist")
-            return (
-                isinstance(gist, dict)
-                and gist.get("function_id") == expected_function_id
-            )
+            try:
+                envelope = protocol._load_envelope(
+                    protocol.configured_outbox_path()
+                    / f"gist-{receipt.gist_id}.json"
+                )
+                gist = envelope.get("gist")
+                if isinstance(gist, dict):
+                    return gist.get("function_id") == expected_function_id
+            except (OSError, TypeError, ValueError):
+                # Reconcile deletes the queued envelope only after the same
+                # operation/gist/executor proof exists in the vault.
+                pass
         vault = configured_vault_path()
         if vault is None:
             return False

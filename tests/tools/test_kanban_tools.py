@@ -499,6 +499,97 @@ def test_resolve_schema_is_strict_and_bounded():
         assert set(executor["properties"]) == executor_keys
         assert set(executor["required"]) == executor_keys
 
+    block_params = kt.KANBAN_BLOCK_SCHEMA["parameters"]
+    assert block_params["additionalProperties"] is False
+    assert block_params["properties"]["metadata"] == metadata
+
+
+def _canonical_memory_metadata_for_tools(task_id="t_owned", run_id=7):
+    from hermes_cli.agent_memory_protocol import MemoryReceipt
+    from hermes_cli.agent_memory_vault import ExecutorIdentity
+
+    executor = ExecutorIdentity(
+        agent_id="codex",
+        model="test-model",
+        surface="codex-cli",
+        hermes_role="developer",
+        execution_id=f"exec-{run_id}",
+        responsibility="writer",
+    )
+    return {
+        "agent_memory": {
+            "recall": MemoryReceipt.for_gist(
+                operation_id=f"recall-{run_id}",
+                operation="recall",
+                status="empty",
+                continue_work=True,
+                task_id=task_id,
+                run_id=run_id,
+                delegation_id=f"delegation-{run_id}",
+                gist_id=None,
+                executor=executor,
+            ).to_mapping(),
+            "write": MemoryReceipt.for_gist(
+                operation_id=f"write-{run_id}",
+                operation="write",
+                status="stored",
+                continue_work=True,
+                task_id=task_id,
+                run_id=run_id,
+                delegation_id=f"delegation-{run_id}",
+                gist_id=f"gist-{run_id}",
+                executor=executor,
+            ).to_mapping(),
+        }
+    }
+
+
+@pytest.mark.parametrize("extra_level", ("metadata", "agent_memory", "receipt", "executor"))
+def test_block_rejects_noncanonical_memory_metadata_before_database_access(
+    monkeypatch, extra_level
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_owned")
+    metadata = _canonical_memory_metadata_for_tools()
+    if extra_level == "metadata":
+        metadata["private"] = True
+    elif extra_level == "agent_memory":
+        metadata["agent_memory"]["private"] = True
+    elif extra_level == "receipt":
+        metadata["agent_memory"]["write"]["private"] = True
+    else:
+        metadata["agent_memory"]["write"]["executor"]["private"] = True
+    monkeypatch.setattr(
+        kt,
+        "_connect",
+        lambda **_kwargs: pytest.fail("noncanonical metadata reached the database"),
+    )
+
+    result = json.loads(
+        kt._handle_block({"reason": "blocked", "metadata": metadata})
+    )
+
+    assert "canonical recall and write receipts" in result["error"]
+
+
+def test_block_canonicalizes_memory_metadata_before_persistence(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        run_id = kb.get_task(conn, worker_env).current_run_id
+    metadata = _canonical_memory_metadata_for_tools(worker_env, run_id)
+
+    result = json.loads(
+        kt._handle_block({"reason": "blocked", "metadata": metadata})
+    )
+
+    assert result["ok"] is True
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, worker_env)
+    assert run.metadata == metadata
+
 
 def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
     from tools import kanban_tools as kt

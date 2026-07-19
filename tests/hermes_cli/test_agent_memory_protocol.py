@@ -23,7 +23,12 @@ from hermes_cli.agent_memory_protocol import (
     reconcile_configured_outbox,
     write_worker_gist,
 )
-from hermes_cli.agent_memory_vault import ExecutorIdentity, recall
+from hermes_cli.agent_memory_vault import (
+    ExecutorIdentity,
+    SessionGist,
+    append_gist,
+    recall,
+)
 
 
 def _configured_paths(tmp_path, monkeypatch, *, create_vault):
@@ -183,6 +188,27 @@ def test_reconcile_after_restart_moves_and_verifies(tmp_path, monkeypatch):
     assert (report.moved, report.pending) == (1, 0)
     assert not list(outbox.glob("*.json"))
     assert recall(vault, "gist-123")[0].gist_id == "gist-123"
+    assert receipt_is_present(queued) is True
+
+
+def test_reconciled_receipt_rejects_a_different_executor(tmp_path, monkeypatch):
+    vault, _outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    queued = write_worker_gist(_write_request("exec-123", "gist-123"))
+    vault.mkdir(parents=True)
+    assert reconcile_configured_outbox().moved == 1
+    forged = MemoryReceipt.for_gist(
+        operation_id=queued.operation_id,
+        operation="write",
+        status="queued",
+        continue_work=True,
+        task_id=queued.task_id,
+        run_id=queued.run_id,
+        delegation_id=queued.delegation_id,
+        gist_id=queued.gist_id,
+        executor=_write_request("exec-forged", "gist-123").executor,
+    )
+
+    assert receipt_is_present(forged) is False
 
 
 def test_concurrent_writers_leave_two_valid_atomic_envelopes(tmp_path, monkeypatch):
@@ -224,6 +250,43 @@ def test_duplicate_gist_operation_reuses_one_envelope_and_receipt(tmp_path, monk
     assert first.to_mapping() == second.to_mapping()
     assert len(list(outbox.glob("gist-*.json"))) == 1
     assert next(outbox.glob("gist-*.json")).read_bytes() == before
+
+
+def test_queued_operation_retry_with_new_gist_id_reuses_original_receipt(
+    tmp_path, monkeypatch
+):
+    _, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    first_request = _write_request("exec-123", "gist-original")
+    retry_request = _write_request("exec-123", "gist-retry")
+    retry_request.operation_id = first_request.operation_id
+
+    first = write_worker_gist(first_request)
+    retry = write_worker_gist(retry_request)
+
+    assert retry.to_mapping() == first.to_mapping()
+    assert retry.gist_id == "gist-original"
+    assert [path.name for path in outbox.glob("gist-*.json")] == [
+        "gist-gist-original.json"
+    ]
+
+
+def test_stored_operation_retry_with_new_gist_id_reuses_original_gist(
+    tmp_path, monkeypatch
+):
+    vault, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=True)
+    first_request = _write_request("exec-123", "gist-original")
+    retry_request = _write_request("exec-123", "gist-retry")
+    retry_request.operation_id = first_request.operation_id
+
+    first = write_worker_gist(first_request)
+    retry = write_worker_gist(retry_request)
+
+    assert first.status == "stored"
+    assert retry.status == "already_stored"
+    assert retry.gist_id == first.gist_id == "gist-original"
+    assert recall(vault, first_request.operation_id)[0].gist_id == "gist-original"
+    assert len(list((vault / "memory").glob("*.md"))) == 1
+    assert not outbox.exists()
 
 
 def test_queued_envelope_contains_redacted_values_only(tmp_path, monkeypatch):
@@ -323,6 +386,22 @@ def test_vault_outage_requires_attention_only_after_24_hours(tmp_path, monkeypat
     assert threshold.attention_required is True
     assert threshold.notify_ole is True
     assert threshold.reason == "pending_for_24_hours"
+
+
+def test_old_pending_write_is_quiet_while_vault_is_available(tmp_path, monkeypatch):
+    vault, _outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    queued_at = datetime(2026, 7, 18, 10, 0)
+    monkeypatch.setattr(protocol, "_utc_now", lambda: queued_at)
+    assert write_worker_gist(_write_request("exec-123", "gist-123")).status == "queued"
+    vault.mkdir(parents=True)
+
+    status = configured_outbox_status(now=queued_at + timedelta(hours=48))
+
+    assert status.vault_available is True
+    assert status.pending == 1
+    assert status.attention_required is False
+    assert status.notify_ole is False
+    assert status.reason == "none"
 
 
 @pytest.mark.parametrize(
@@ -477,7 +556,7 @@ def test_configured_outbox_path_defaults_to_profile_hermes_home(tmp_path, monkey
     home = tmp_path / "profile"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.delenv("HERMES_AGENT_MEMORY_OUTBOX", raising=False)
-    assert configured_outbox_path() == home / "agent-memory" / "outbox"
+    assert configured_outbox_path() == home / "recovery" / "agent-memory-outbox"
 
 
 def test_configured_outbox_path_normalizes_relative_hermes_home(
@@ -490,7 +569,7 @@ def test_configured_outbox_path_normalizes_relative_hermes_home(
     outbox = configured_outbox_path()
 
     assert outbox == (
-        tmp_path / "relative-profile" / "agent-memory" / "outbox"
+        tmp_path / "relative-profile" / "recovery" / "agent-memory-outbox"
     ).resolve()
     assert outbox.is_absolute()
 
@@ -500,6 +579,88 @@ def test_configured_outbox_path_rejects_relative_explicit_override(monkeypatch):
 
     with pytest.raises(ValueError, match="absolute"):
         configured_outbox_path()
+
+
+def test_unconfigured_write_returns_disabled_without_creating_outbox(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_AGENT_MEMORY_VAULT", raising=False)
+    monkeypatch.delenv("HERMES_AGENT_MEMORY_OUTBOX", raising=False)
+    monkeypatch.setattr(protocol, "configured_vault_path", lambda: None)
+
+    receipt = write_worker_gist(_write_request("exec-123", "gist-123"))
+
+    assert receipt.status == "disabled"
+    assert receipt.continue_work is True
+    assert not configured_outbox_path().exists()
+
+
+def test_queue_portability_without_os_fchmod(tmp_path, monkeypatch):
+    _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    monkeypatch.delattr(protocol.os, "fchmod", raising=False)
+
+    receipt = write_worker_gist(_write_request("exec-123", "gist-123"))
+
+    assert receipt.status == "queued"
+    assert receipt_is_present(receipt) is True
+
+
+def test_outbox_rejects_symlinked_root_without_mutating_external_target(
+    tmp_path, monkeypatch
+):
+    external = tmp_path / "external"
+    external.mkdir(mode=0o755)
+    original_mode = external.stat().st_mode
+    outbox = tmp_path / "outbox-link"
+    outbox.symlink_to(external, target_is_directory=True)
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(tmp_path / "missing-vault"))
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_OUTBOX", str(outbox))
+
+    with pytest.raises(ValueError, match="symlink"):
+        write_worker_gist(_write_request("exec-123", "gist-123"))
+
+    assert list(external.iterdir()) == []
+    assert external.stat().st_mode == original_mode
+
+
+def test_outbox_rejects_symlinked_existing_component_before_mkdir(
+    tmp_path, monkeypatch
+):
+    external = tmp_path / "external"
+    external.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(external, target_is_directory=True)
+    outbox = linked_parent / "nested-outbox"
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(tmp_path / "missing-vault"))
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_OUTBOX", str(outbox))
+
+    with pytest.raises(ValueError, match="symlink"):
+        write_worker_gist(_write_request("exec-123", "gist-123"))
+
+    assert not (external / "nested-outbox").exists()
+
+
+def test_outbox_envelope_exact_size_boundary_and_one_byte_over(
+    tmp_path, monkeypatch
+):
+    _, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    write_worker_gist(_write_request("exec-123", "gist-123"))
+    path = outbox / "gist-gist-123.json"
+    original = path.read_bytes()
+    limit = getattr(protocol, "_MAX_OUTBOX_ENVELOPE_BYTES", 131_072)
+    assert len(original) < limit
+
+    path.write_bytes(original + (b" " * (limit - len(original))))
+    assert protocol._load_envelope(path)["kind"] == "gist"
+
+    path.write_bytes(original + (b" " * (limit + 1 - len(original))))
+    with pytest.raises(ValueError, match="corrupt"):
+        protocol._load_envelope(path)
+    status = configured_outbox_status()
+    assert status.reason == "corrupt_or_unsafe"
+    assert status.attention_required is True
 
 
 def test_functional_identity_reuses_work_contract_identity_algorithm():
@@ -556,3 +717,42 @@ def test_stored_receipt_presence_is_false_when_vault_config_resolution_fails(
     monkeypatch.setattr(protocol, "configured_vault_path", fail_config)
 
     assert receipt_is_present(receipt) is False
+
+
+def test_old_same_function_gist_without_current_operation_id_rejects_receipt(
+    tmp_path, monkeypatch
+):
+    vault, _outbox = _configured_paths(tmp_path, monkeypatch, create_vault=True)
+    request = _write_request("exec-123", "gist-old")
+    old_gist = SessionGist(
+        gist_id=request.gist_id,
+        occurred_at=request.occurred_at,
+        agent_id=request.executor.agent_id,
+        role=request.executor.hermes_role,
+        function_id=request.function_id,
+        title=request.title,
+        context=request.context,
+        summary=request.summary,
+        reused=request.reused,
+        result=request.result,
+        maturity=request.maturity,
+        evidence=request.evidence,
+        behavior=request.behavior,
+        decisions=request.decisions,
+        open_loops=request.open_loops,
+        executor=request.executor,
+    )
+    assert append_gist(vault, old_gist) is True
+    fabricated = MemoryReceipt.for_gist(
+        operation_id=request.operation_id,
+        operation="write",
+        status="stored",
+        continue_work=True,
+        task_id=request.task_id,
+        run_id=request.run_id,
+        delegation_id=request.delegation_id,
+        gist_id=request.gist_id,
+        executor=request.executor,
+    )
+
+    assert receipt_is_present(fabricated) is False
