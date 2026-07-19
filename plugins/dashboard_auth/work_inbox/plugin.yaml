@@ -1,0 +1,7 @@
+name: work-inbox
+version: 1.0.0
+description: "Dashboard auth provider for Hermes Work Inbox submissions."
+author: NousResearch
+kind: backend
+requires_env:
+  - HERMES_WORK_INBOX_SECRET

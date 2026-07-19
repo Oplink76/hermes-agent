@@ -1,5 +1,11 @@
 # Functional Intent Memory and Inbox Guide Design
 
+> **Inbox boundary superseded:** The inbox portions of this document are
+> superseded by
+> [`2026-07-19-work-inbox-delivery-boundary-design.md`](./2026-07-19-work-inbox-delivery-boundary-design.md).
+> Agent Memory remains unchanged. The canonical external boundary is the Work
+> Inbox; qualification and requalification are downstream Hermes decisions.
+
 **Status:** Inbox guide merged; advisory Agent Memory implemented on an
 unmerged branch and not live
 **Date:** 2026-07-18

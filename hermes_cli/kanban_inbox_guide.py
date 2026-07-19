@@ -6,7 +6,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 
-GUIDE_VERSION = 1
+GUIDE_VERSION = 2
 
 
 def build_inbox_guide(
@@ -18,45 +18,28 @@ def build_inbox_guide(
 
     query = urlencode({"board": board})
     guide_url = f"{origin}/.well-known/hermes-inbox?{query}"
-    intake_url = f"{origin}/api/plugins/kanban/intake?{query}"
-    receipt_url = f"{origin}/api/plugins/kanban/intake/{{intake_id}}?{query}"
+    inbox_url = f"{origin}/api/plugins/kanban/work-inbox?{query}"
     copy_ready_prompt = (
         f"Read {guide_url} before doing any work. Treat it as the authority "
-        "for how to deliver development work to Hermes. Submit the intended "
-        "outcome through the Hermes inbox exactly as documented. Do not "
-        "create, edit, assign, route, qualify, or override Kanban cards "
-        "directly. If you cannot authenticate or required information is "
-        "missing, tell me what is missing instead of bypassing Hermes."
+        "for how to deliver development work to Hermes. Use the fixed Work "
+        "Inbox submission route exactly as documented. Do not create, edit, "
+        "assign, route, qualify, or override Kanban cards directly."
     )
     example_request = {
-        "version": 1,
-        "client_request_id": "<stable-id-from-your-system>",
-        "functional_intent": {
-            "title": "<short capability title>",
-            "desired_outcome": "<measurable user-visible outcome>",
-            "project": "<project identity>",
-            "repository": "<repository URL or path when known>",
-            "scope": ["<included behavior>"],
-            "out_of_scope": ["<excluded behavior>"],
-            "aliases": [],
-        },
-        "evidence": [],
-        "source": {
-            "agent": "<agent name>",
-            "session_id": "<session id>",
-        },
+        "version": 2,
+        "kind": "new_work",
+        "request": {"functional_intent": {"title": "<short capability title>"}},
+        "session_id": "<external session id>",
+        "attachments": [],
     }
     return {
         "guide_version": GUIDE_VERSION,
-        "name": "Hermes Qualified Work Inbox",
+        "name": "Hermes Work Inbox",
         "board": board,
         "qualification_required": True,
-        "purpose": (
-            "Submit intended work for Hermes qualification without creating "
-            "or routing Kanban cards directly."
-        ),
+        "purpose": "Submit new work for qualification or hand over an exact assigned delivery.",
         "authority": {
-            "allowed": ["submit inert work intent", "read its intake receipt"],
+            "allowed": ["submit inert work intent", "hand over assigned delivery"],
             "forbidden": [
                 "direct card creation or mutation",
                 "phase or assignee selection",
@@ -66,31 +49,33 @@ def build_inbox_guide(
         },
         "submission": {
             "method": "POST",
-            "url": intake_url,
+            "url": inbox_url,
             "content_type": "application/json",
+            "scope": "work_inbox:submit",
+            "kinds": ["new_work", "assigned_delivery"],
             "authentication": {
                 "required": True,
-                "type": "authenticated Hermes API context",
+                "type": "bearer",
+                "authorization_header": "Authorization: Bearer <machine credential>",
                 "credential_included": False,
             },
-            "example": {
-                "request": example_request,
-                "session_id": "<session id>",
-                "attachments": [],
+            "examples": {
+                "new_work": example_request,
+                "assigned_delivery": {
+                    "version": 2,
+                    "kind": "assigned_delivery",
+                    "task_id": "<assigned task id>",
+                    "run_id": 123,
+                    "work_contract_id": "<assigned Work Contract id>",
+                    "outcome": "completed",
+                    "summary": "<delivery summary>",
+                    "metadata": {"tests_run": ["<command>"]},
+                },
             },
         },
-        "receipt": {
-            "method": "GET",
-            "url_template": receipt_url,
-            "states": ["pending", "qualified", "rejected", "overridden"],
-        },
         "retry": {
-            "client_request_id_required": True,
             "automatic_retry": False,
-            "instruction": (
-                "Keep the returned intake_id and check its receipt before "
-                "retrying."
-            ),
+            "instruction": "Do not retry automatically; inspect the response first.",
         },
         "copy_ready_prompt": copy_ready_prompt,
     }
