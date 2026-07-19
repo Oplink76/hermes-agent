@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+import errno
 import hashlib
 import json
 import os
@@ -372,9 +373,10 @@ def configured_outbox_path(environ: Mapping[str, str] | None = None) -> Path:
     configured = (environment.get("HERMES_AGENT_MEMORY_OUTBOX") or "").strip()
     if configured:
         path = Path(configured).expanduser()
-        if path.is_absolute():
-            return path
-    return get_hermes_home() / "agent-memory" / "outbox"
+        if not path.is_absolute():
+            raise ValueError("Agent Memory outbox path must be absolute")
+        return path.resolve(strict=False)
+    return (get_hermes_home() / "agent-memory" / "outbox").resolve(strict=False)
 
 
 def write_worker_gist(request: WorkerWriteRequest) -> MemoryReceipt:
@@ -397,17 +399,22 @@ def store_gist_or_queue(
 ) -> MemoryReceipt:
     gist = replace(gist, executor=executor)
     _validated_gist_mapping(gist)
-    vault = configured_vault_path()
     outbox = configured_outbox_path()
-    if vault is not None and vault.is_dir():
-        stored = append_gist(vault, gist)
-        lint_vault(vault)
-        return MemoryReceipt.for_gist(
-            operation_id=operation_id, task_id=task_id, run_id=run_id,
-            delegation_id=delegation_id, executor=executor, operation="write",
-            status="stored" if stored else "already_stored", continue_work=True,
-            gist_id=gist.gist_id,
-        )
+    try:
+        vault = configured_vault_path()
+        if vault is not None and vault.is_dir():
+            stored = append_gist(vault, gist)
+            lint_vault(vault)
+            return MemoryReceipt.for_gist(
+                operation_id=operation_id, task_id=task_id, run_id=run_id,
+                delegation_id=delegation_id, executor=executor, operation="write",
+                status="stored" if stored else "already_stored", continue_work=True,
+                gist_id=gist.gist_id,
+            )
+    except Exception:
+        # A validated gist still needs a durable handover when the external
+        # vault or its configuration is temporarily unavailable.
+        pass
     receipt = MemoryReceipt.for_gist(
         operation_id=operation_id, task_id=task_id, run_id=run_id,
         delegation_id=delegation_id, executor=executor, operation="write",
@@ -419,24 +426,27 @@ def store_gist_or_queue(
 
 def recall_for_worker(request: WorkerRecallRequest) -> tuple[list[MemoryMatch], MemoryReceipt]:
     request = WorkerRecallRequest.from_mapping(request.to_mapping())
-    vault = configured_vault_path()
-    if vault is None:
-        return [], _recall_receipt(request, "disabled")
-    if not vault.is_dir():
-        receipt = _recall_receipt(request, "unavailable")
-        durable_receipt = _queue_envelope(
-            configured_outbox_path(), _recall_incident(request, receipt)
-        )
-        return [], durable_receipt
     try:
+        vault = configured_vault_path()
+        if vault is None:
+            return [], _recall_receipt(request, "disabled")
+        if not vault.is_dir():
+            return [], _unavailable_recall(request)
         matches = recall(vault, request.query, limit=5)
-    except (OSError, TimeoutError, ValueError):
-        receipt = _recall_receipt(request, "unavailable")
-        durable_receipt = _queue_envelope(
+    except Exception:
+        return [], _unavailable_recall(request)
+    return matches, _recall_receipt(request, "matched" if matches else "empty")
+
+
+def _unavailable_recall(request: WorkerRecallRequest) -> MemoryReceipt:
+    """Return fail-open recall status after best-effort incident recording."""
+    receipt = _recall_receipt(request, "unavailable")
+    try:
+        return _queue_envelope(
             configured_outbox_path(), _recall_incident(request, receipt)
         )
-        return [], durable_receipt
-    return matches, _recall_receipt(request, "matched" if matches else "empty")
+    except Exception:
+        return receipt
 
 
 def _recall_receipt(request: WorkerRecallRequest, status: str) -> MemoryReceipt:
@@ -613,6 +623,7 @@ def _queue_envelope(outbox: Path, envelope: Mapping[str, object]) -> MemoryRecei
             existing = _load_envelope(target)
             if not _same_operation_envelope(existing, validated):
                 raise ValueError("conflicting Agent Memory outbox envelope identity")
+            _fsync_directory(outbox)
             return MemoryReceipt.from_mapping(existing["receipt"])
         _atomic_write(outbox, target, canonical.encode("utf-8"))
         if not target.is_file():
@@ -657,7 +668,16 @@ def _outbox_lock(outbox: Path) -> Iterator[None]:
     except OSError:
         pass
     lock_path = outbox / ".agent-memory.lock"
-    handle = lock_path.open("a+b")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        handle = os.fdopen(descriptor, "r+b")
+    except Exception:
+        os.close(descriptor)
+        raise
     acquired = False
     try:
         deadline = time.monotonic() + _OUTBOX_LOCK_TIMEOUT_SECONDS
@@ -710,8 +730,38 @@ def _atomic_write(outbox: Path, target: Path, content: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, target)
+        _fsync_directory(outbox)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Durably persist a replaced directory entry when the platform supports it."""
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    unsupported = {
+        errno.EBADF,
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    }
+    try:
+        descriptor = os.open(directory, flags)
+    except OSError as exc:
+        if exc.errno in unsupported:
+            return
+        raise
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            if exc.errno not in unsupported:
+                raise
+    finally:
+        os.close(descriptor)
 
 
 def reconcile_configured_outbox(now: datetime | None = None) -> ReconcileReport:

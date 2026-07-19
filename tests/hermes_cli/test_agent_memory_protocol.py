@@ -2,7 +2,9 @@
 
 from datetime import datetime, timedelta
 import json
+import os
 import sqlite3
+import stat
 import threading
 
 import pytest
@@ -102,7 +104,74 @@ def test_unavailable_vault_queues_validated_gist_and_continues(tmp_path, monkeyp
     assert [p.name for p in outbox.glob("*.json")] == ["gist-gist-123.json"]
     assert oct(outbox.stat().st_mode & 0o777) == "0o700"
     assert oct(next(outbox.glob("*.json")).stat().st_mode & 0o777) == "0o600"
+    assert oct((outbox / ".agent-memory.lock").stat().st_mode & 0o777) == "0o600"
     assert receipt_is_present(receipt) is True
+
+
+@pytest.mark.parametrize("failed_step", ("append", "lint"))
+def test_existing_vault_write_failure_falls_back_to_durable_queue(
+    tmp_path, monkeypatch, failed_step
+):
+    _, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=True)
+
+    def fail(*_args, **_kwargs):
+        raise OSError(f"simulated {failed_step} failure")
+
+    target = "lint_vault" if failed_step == "lint" else "append_gist"
+    monkeypatch.setattr(protocol, target, fail)
+
+    receipt = write_worker_gist(_write_request("exec-123", "gist-123"))
+
+    assert receipt.status == "queued"
+    assert receipt.continue_work is True
+    assert [path.name for path in outbox.glob("gist-*.json")] == [
+        "gist-gist-123.json"
+    ]
+    assert MemoryReceipt.from_mapping(receipt.to_mapping()) == receipt
+    assert receipt_is_present(receipt) is True
+
+
+def test_vault_config_resolution_failure_falls_back_to_durable_queue(
+    tmp_path, monkeypatch
+):
+    _, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+
+    def fail_config():
+        raise OSError("simulated vault config failure")
+
+    monkeypatch.setattr(protocol, "configured_vault_path", fail_config)
+
+    receipt = write_worker_gist(_write_request("exec-123", "gist-123"))
+
+    assert receipt.status == "queued"
+    assert (outbox / "gist-gist-123.json").is_file()
+    assert receipt_is_present(receipt) is True
+
+
+def test_atomic_queue_syncs_containing_directory_before_receipt_return(
+    tmp_path, monkeypatch
+):
+    _, _ = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    events = []
+    original_fsync = os.fsync
+
+    def record_fsync(descriptor):
+        kind = (
+            "directory-sync"
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode)
+            else "file-sync"
+        )
+        events.append(kind)
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(protocol.os, "fsync", record_fsync)
+
+    receipt = write_worker_gist(_write_request("exec-123", "gist-123"))
+    events.append("receipt-returned")
+
+    assert receipt.status == "queued"
+    assert "file-sync" in events
+    assert events.index("directory-sync") < events.index("receipt-returned")
 
 
 def test_reconcile_after_restart_moves_and_verifies(tmp_path, monkeypatch):
@@ -279,6 +348,63 @@ def test_recall_receipts_cover_matches_empty_outages_and_incident_recovery(tmp_p
     assert matched.status == "matched"
 
 
+def test_recall_config_resolution_failure_is_fail_open(tmp_path, monkeypatch):
+    _configured_paths(tmp_path, monkeypatch, create_vault=False)
+
+    def fail_config():
+        raise OSError("simulated vault config failure")
+
+    monkeypatch.setattr(protocol, "configured_vault_path", fail_config)
+
+    matches, receipt = recall_for_worker(_recall_request())
+
+    assert matches == []
+    assert receipt.status == "unavailable"
+    assert receipt.continue_work is True
+
+
+def test_recall_outbox_lock_timeout_is_fail_open(tmp_path, monkeypatch):
+    _, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    ready = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        with protocol._outbox_lock(outbox):
+            ready.set()
+            release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    assert ready.wait(timeout=2)
+    monkeypatch.setattr(protocol, "_OUTBOX_LOCK_TIMEOUT_SECONDS", 0.05)
+    try:
+        matches, receipt = recall_for_worker(_recall_request())
+    finally:
+        release.set()
+        holder.join(timeout=2)
+
+    assert holder.is_alive() is False
+    assert matches == []
+    assert receipt.status == "unavailable"
+    assert receipt.continue_work is True
+    assert not list(outbox.glob("recall-*.json"))
+
+
+def test_recall_outbox_disk_failure_is_fail_open(tmp_path, monkeypatch):
+    _configured_paths(tmp_path, monkeypatch, create_vault=False)
+
+    def fail_disk(*_args, **_kwargs):
+        raise OSError("simulated outbox disk failure")
+
+    monkeypatch.setattr(protocol, "_atomic_write", fail_disk)
+
+    matches, receipt = recall_for_worker(_recall_request())
+
+    assert matches == []
+    assert receipt.status == "unavailable"
+    assert receipt.continue_work is True
+
+
 def test_unavailable_recall_incident_never_queues_secret_query_text(tmp_path, monkeypatch):
     _, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
     secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
@@ -306,6 +432,28 @@ def test_configured_outbox_path_defaults_to_profile_hermes_home(tmp_path, monkey
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.delenv("HERMES_AGENT_MEMORY_OUTBOX", raising=False)
     assert configured_outbox_path() == home / "agent-memory" / "outbox"
+
+
+def test_configured_outbox_path_normalizes_relative_hermes_home(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", "relative-profile")
+    monkeypatch.delenv("HERMES_AGENT_MEMORY_OUTBOX", raising=False)
+
+    outbox = configured_outbox_path()
+
+    assert outbox == (
+        tmp_path / "relative-profile" / "agent-memory" / "outbox"
+    ).resolve()
+    assert outbox.is_absolute()
+
+
+def test_configured_outbox_path_rejects_relative_explicit_override(monkeypatch):
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_OUTBOX", "relative-outbox")
+
+    with pytest.raises(ValueError, match="absolute"):
+        configured_outbox_path()
 
 
 def test_functional_identity_reuses_work_contract_identity_algorithm():
