@@ -138,10 +138,15 @@ def _worker_metadata(
     board: str,
     surface: str = "hermes-direct",
     hermes_role: str | None = None,
+    function_id_override: str | None = None,
+    recall_function_id_override: str | None = None,
+    delegation_id_override: str | None = None,
 ) -> dict:
     identity = functional_identity_for_task(conn, task_id)
     assert identity is not None
     function_id, title, query = identity
+    function_id = function_id_override or function_id
+    recall_function_id = recall_function_id_override or function_id
     run = kb.get_run(conn, run_id)
     assert run is not None
     role = hermes_role or {
@@ -151,7 +156,9 @@ def _worker_metadata(
         "test": "tester",
         "review": "reviewer",
     }.get(run.step_key or "", run.profile or "worker")
-    delegation_id = kb._agent_memory_delegation_id(board, task_id, run_id)
+    delegation_id = delegation_id_override or kb._agent_memory_delegation_id(
+        board, task_id, run_id
+    )
     executor = ExecutorIdentity(
         agent_id="hermes" if surface == "hermes-direct" else "codex",
         model="test-model",
@@ -162,11 +169,13 @@ def _worker_metadata(
     )
     _matches, recall_receipt = recall_for_worker(
         WorkerRecallRequest(
-            operation_id=f"recall-{run_id}",
+            operation_id=kb._agent_memory_operation_id(
+                "recall", delegation_id, recall_function_id
+            ),
             task_id=task_id,
             run_id=run_id,
             delegation_id=delegation_id,
-            function_id=function_id,
+            function_id=recall_function_id,
             title=title,
             query=query,
             executor=executor,
@@ -174,7 +183,9 @@ def _worker_metadata(
     )
     write_receipt = write_worker_gist(
         WorkerWriteRequest(
-            operation_id=f"write-{run_id}",
+            operation_id=kb._agent_memory_operation_id(
+                "write", delegation_id, function_id
+            ),
             task_id=task_id,
             run_id=run_id,
             delegation_id=delegation_id,
@@ -999,6 +1010,128 @@ def test_wrong_task_or_run_receipts_leave_task_running(
             )
         assert set(exc.value.invalid) == {"recall", "write"}
         assert kb.get_task(conn, task_id).status == "running"
+
+
+def test_wrong_function_receipts_leave_task_running(tmp_path, monkeypatch):
+    board, _vault = _configured_product_board(tmp_path, monkeypatch)
+    with kb.connect(board=board) as conn:
+        task_id = _qualified_task(conn, board=board, title="Wrong memory function")
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None and claimed.current_run_id is not None
+        metadata = _worker_metadata(
+            conn,
+            task_id,
+            claimed.current_run_id,
+            board=board,
+            function_id_override="function-wrong-contract",
+        )
+
+        with pytest.raises(kb.AgentMemoryHandoverError) as exc:
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="done",
+                metadata=metadata,
+                expected_run_id=claimed.current_run_id,
+                board=board,
+            )
+
+        assert set(exc.value.invalid) == {"recall", "write"}
+        assert kb.get_task(conn, task_id).status == "running"
+
+
+def test_wrong_recall_function_receipt_leaves_task_running(tmp_path, monkeypatch):
+    board, _vault = _configured_product_board(tmp_path, monkeypatch)
+    with kb.connect(board=board) as conn:
+        task_id = _qualified_task(conn, board=board, title="Wrong recall function")
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None and claimed.current_run_id is not None
+        metadata = _worker_metadata(
+            conn,
+            task_id,
+            claimed.current_run_id,
+            board=board,
+            recall_function_id_override="function-wrong-recall-contract",
+        )
+
+        with pytest.raises(kb.AgentMemoryHandoverError) as exc:
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="done",
+                metadata=metadata,
+                expected_run_id=claimed.current_run_id,
+                board=board,
+            )
+
+        assert exc.value.invalid == ("recall",)
+        assert kb.get_task(conn, task_id).status == "running"
+
+
+def test_wrong_delegation_receipts_leave_task_running(tmp_path, monkeypatch):
+    board, _vault = _configured_product_board(tmp_path, monkeypatch)
+    with kb.connect(board=board) as conn:
+        task_id = _qualified_task(conn, board=board, title="Wrong delegation")
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None and claimed.current_run_id is not None
+        metadata = _worker_metadata(
+            conn,
+            task_id,
+            claimed.current_run_id,
+            board=board,
+            delegation_id_override="kanban:wrong-delegation",
+        )
+
+        with pytest.raises(kb.AgentMemoryHandoverError) as exc:
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="done",
+                metadata=metadata,
+                expected_run_id=claimed.current_run_id,
+                board=board,
+            )
+
+        assert set(exc.value.invalid) == {"recall", "write"}
+        assert kb.get_task(conn, task_id).status == "running"
+
+
+@pytest.mark.parametrize("wrong_identity", ["function_id", "delegation_id"])
+def test_wrong_worker_identity_does_not_suppress_fallback(
+    tmp_path, monkeypatch, wrong_identity
+):
+    board, vault = _configured_product_board(tmp_path, monkeypatch)
+    with kb.connect(board=board) as conn:
+        task_id = _qualified_task(conn, board=board, title="Fallback identity")
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None and claimed.current_run_id is not None
+        overrides = (
+            {"function_id_override": "function-wrong-contract"}
+            if wrong_identity == "function_id"
+            else {"delegation_id_override": "kanban:wrong-delegation"}
+        )
+        metadata = _worker_metadata(
+            conn,
+            task_id,
+            claimed.current_run_id,
+            board=board,
+            **overrides,
+        )
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="legacy close still captures fallback",
+            metadata=metadata,
+            expected_run_id=None,
+            board=board,
+            product_workflow_enabled=False,
+        )
+
+    history = _gist_history(vault)
+    assert history.count("<!-- gist_id:") == 2
+    assert history.count('"responsibility":"writer"') == 1
+    assert history.count('"responsibility":"orchestrator"') == 1
 
 
 def test_block_requires_receipts_and_preserves_them(tmp_path, monkeypatch):

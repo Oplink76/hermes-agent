@@ -137,6 +137,27 @@ def _agent_memory_delegation_id(board: str, task_id: str, run_id: int) -> str:
     return "kanban:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:40]
 
 
+def _agent_memory_operation_id(
+    operation: str,
+    delegation_id: str,
+    function_id: str,
+) -> str:
+    """Bind one receipt operation to both delegation and Work Contract."""
+    if operation not in {"recall", "write"}:
+        raise ValueError("Agent Memory operation must be recall or write")
+    canonical = json.dumps(
+        {
+            "delegation_id": delegation_id,
+            "function_id": function_id,
+            "operation": operation,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:40]
+    return f"kanban-{operation}:{digest}"
+
+
 def _agent_memory_hermes_role(task: "Task", run: Optional["Run"] = None) -> str:
     if (run and run.profile == "resolver") or task.assignee == "resolver":
         return "resolver"
@@ -252,8 +273,12 @@ def _validate_agent_memory_handover(
     if expected_run_id is None:
         return dict(metadata or {})
     board = board or _board_slug_for_connection(conn)
-    if _agent_memory_governed_identity(conn, task_id, board=board) is None:
+    governed_identity = _agent_memory_governed_identity(
+        conn, task_id, board=board
+    )
+    if governed_identity is None:
         return dict(metadata or {})
+    expected_function_id = governed_identity[0]
 
     task = get_task(conn, task_id)
     run = get_run(conn, expected_run_id)
@@ -274,11 +299,15 @@ def _validate_agent_memory_handover(
     )
     invalid: list[str] = []
     receipts: dict[str, Any] = {}
-    from hermes_cli.agent_memory_protocol import MemoryReceipt, receipt_is_present
+    from hermes_cli.agent_memory_protocol import MemoryReceipt
 
     delegation_id = _agent_memory_delegation_id(
         board, task_id, expected_run_id
     )
+    expected_operation_ids = {
+        name: _agent_memory_operation_id(name, delegation_id, expected_function_id)
+        for name in ("recall", "write")
+    }
     expected_role = _agent_memory_hermes_role(task, run)
     expected_responsibility = "reviewer" if run.step_key == "review" else "writer"
     for name in ("recall", "write"):
@@ -296,6 +325,7 @@ def _validate_agent_memory_handover(
         )
         if (
             receipt.operation != name
+            or receipt.operation_id != expected_operation_ids[name]
             or receipt.status not in allowed_status
             or receipt.continue_work is not True
             or receipt.task_id != task_id
@@ -315,8 +345,13 @@ def _validate_agent_memory_handover(
         != receipts["write"].executor.to_mapping()
     ):
         invalid.extend(name for name in ("recall", "write") if name not in invalid)
-    if "write" in receipts and not receipt_is_present(receipts["write"]):
-        invalid.append("write")
+    if "write" in receipts and not _agent_memory_write_matches_function(
+        receipts["write"], expected_function_id
+    ):
+        # Recall receipts deliberately carry no recalled prose or function
+        # fields. Their functional binding is the same-executor/delegation
+        # pair plus the durable write, so a mismatched write invalidates both.
+        invalid.extend(name for name in ("recall", "write") if name not in invalid)
     if missing or invalid:
         raise AgentMemoryHandoverError(
             missing=missing,
@@ -340,6 +375,38 @@ def _validate_agent_memory_handover(
     return merged
 
 
+def _agent_memory_write_matches_function(
+    receipt: "MemoryReceipt",
+    expected_function_id: str,
+) -> bool:
+    """Verify the receipt's durable gist belongs to the current function."""
+    try:
+        from hermes_cli import agent_memory_protocol as protocol
+        from hermes_cli.agent_memory_vault import configured_vault_path, recall
+
+        if not protocol.receipt_is_present(receipt):
+            return False
+        if receipt.status == "queued":
+            envelope = protocol._load_envelope(
+                protocol.configured_outbox_path() / f"gist-{receipt.gist_id}.json"
+            )
+            gist = envelope.get("gist")
+            return (
+                isinstance(gist, dict)
+                and gist.get("function_id") == expected_function_id
+            )
+        vault = configured_vault_path()
+        if vault is None:
+            return False
+        return any(
+            match.gist_id == receipt.gist_id
+            and match.function_id == expected_function_id
+            for match in recall(vault, receipt.gist_id or "", limit=1)
+        )
+    except Exception:
+        return False
+
+
 def _has_matching_worker_write_receipt(
     conn: sqlite3.Connection,
     *,
@@ -350,20 +417,31 @@ def _has_matching_worker_write_receipt(
     if run_id is None:
         return False
     try:
+        governed_identity = _agent_memory_governed_identity(
+            conn, task_id, board=board
+        )
+        if governed_identity is None:
+            return False
         run = get_run(conn, run_id)
         memory = (run.metadata or {}).get("agent_memory") if run else None
         raw = memory.get("write") if isinstance(memory, dict) else None
-        from hermes_cli.agent_memory_protocol import MemoryReceipt, receipt_is_present
+        from hermes_cli.agent_memory_protocol import MemoryReceipt
 
         receipt = MemoryReceipt.from_mapping(raw)
         return (
             receipt.operation == "write"
+            and receipt.operation_id
+            == _agent_memory_operation_id(
+                "write", receipt.delegation_id, governed_identity[0]
+            )
             and receipt.status in {"stored", "already_stored", "queued"}
             and receipt.task_id == task_id
             and receipt.run_id == run_id
             and receipt.delegation_id
             == _agent_memory_delegation_id(board, task_id, run_id)
-            and receipt_is_present(receipt)
+            and _agent_memory_write_matches_function(
+                receipt, governed_identity[0]
+            )
         )
     except Exception:
         return False
@@ -15055,7 +15133,9 @@ def _agent_memory_protocol_context(
             "version": 1,
         },
         "function_id": function_id,
-        "operation_id": "<unique-recall-operation-id>",
+        "operation_id": _agent_memory_operation_id(
+            "recall", delegation_id, function_id
+        ),
         "query": query,
         "run_id": run.id,
         "task_id": task.id,
@@ -15073,7 +15153,9 @@ def _agent_memory_protocol_context(
         "maturity": "<maturity>",
         "occurred_at": "<ISO-8601-timestamp>",
         "open_loops": "<bounded-open-loops-or-none>",
-        "operation_id": "<unique-write-operation-id>",
+        "operation_id": _agent_memory_operation_id(
+            "write", delegation_id, function_id
+        ),
         "result": "<bounded-result>",
         "reused": "<bounded-reuse-or-none>",
         "run_id": run.id,

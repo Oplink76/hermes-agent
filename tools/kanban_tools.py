@@ -935,12 +935,34 @@ def _handle_resolve(args: dict, **kw) -> str:
     if metadata is not None and not isinstance(metadata, dict):
         return tool_error("kanban_resolve: metadata must be an object/dict")
     if metadata is not None:
-        meta_json = redact_sensitive_text(json.dumps(metadata), force=True)
+        if set(metadata) != {"agent_memory"}:
+            return tool_error(
+                "kanban_resolve: metadata must contain only agent_memory"
+            )
+        agent_memory = metadata.get("agent_memory")
+        if not isinstance(agent_memory, dict) or set(agent_memory) != {
+            "recall", "write",
+        }:
+            return tool_error(
+                "kanban_resolve: metadata.agent_memory must contain exactly "
+                "recall and write"
+            )
         try:
-            metadata = json.loads(meta_json)
-        except json.JSONDecodeError:
-            pass
-    metadata = _stamp_worker_session_metadata(tid, metadata)
+            from hermes_cli.agent_memory_protocol import MemoryReceipt
+
+            metadata = {
+                "agent_memory": {
+                    name: MemoryReceipt.from_mapping(
+                        agent_memory[name]
+                    ).to_mapping()
+                    for name in ("recall", "write")
+                }
+            }
+        except (TypeError, ValueError):
+            return tool_error(
+                "kanban_resolve: metadata.agent_memory must contain canonical "
+                "recall and write receipts"
+            )
     resolver_model = (
         os.environ.get("HERMES_INFERENCE_MODEL")
         or os.environ.get("HERMES_MODEL")
@@ -1769,6 +1791,57 @@ KANBAN_COMPLETE_SCHEMA = {
     },
 }
 
+
+def _agent_memory_receipt_schema(operation: str) -> dict:
+    statuses = (
+        ["matched", "empty", "unavailable"]
+        if operation == "recall"
+        else ["stored", "already_stored", "queued"]
+    )
+    executor = {
+        "type": "object",
+        "properties": {
+            "agent_id": {"type": "string"},
+            "execution_id": {"type": "string"},
+            "hermes_role": {"type": "string"},
+            "model": {"type": "string"},
+            "responsibility": {"type": "string"},
+            "surface": {"type": "string"},
+            "version": {"type": "integer", "enum": [1]},
+        },
+        "required": [
+            "agent_id", "execution_id", "hermes_role", "model",
+            "responsibility", "surface", "version",
+        ],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "continue_work": {"type": "boolean", "enum": [True]},
+            "delegation_id": {"type": "string"},
+            "executor": executor,
+            "gist_id": (
+                {"type": "null"}
+                if operation == "recall"
+                else {"type": "string"}
+            ),
+            "occurred_at": {"type": "string"},
+            "operation": {"type": "string", "enum": [operation]},
+            "operation_id": {"type": "string"},
+            "run_id": {"type": "integer"},
+            "status": {"type": "string", "enum": statuses},
+            "task_id": {"type": "string"},
+        },
+        "required": [
+            "continue_work", "delegation_id", "executor", "gist_id",
+            "occurred_at", "operation", "operation_id", "run_id", "status",
+            "task_id",
+        ],
+        "additionalProperties": False,
+    }
+
+
 KANBAN_RESOLVE_SCHEMA = {
     "name": "kanban_resolve",
     "description": (
@@ -1799,10 +1872,22 @@ KANBAN_RESOLVE_SCHEMA = {
             "metadata": {
                 "type": "object",
                 "description": (
-                    "Existing structured handover metadata. For governed Agent "
-                    "Memory work, include agent_memory.recall and "
-                    "agent_memory.write receipts."
+                    "Shared governed handover envelope containing only the "
+                    "actual worker's Agent Memory recall and write receipts."
                 ),
+                "properties": {
+                    "agent_memory": {
+                        "type": "object",
+                        "properties": {
+                            "recall": _agent_memory_receipt_schema("recall"),
+                            "write": _agent_memory_receipt_schema("write"),
+                        },
+                        "required": ["recall", "write"],
+                        "additionalProperties": False,
+                    },
+                },
+                "required": ["agent_memory"],
+                "additionalProperties": False,
             },
             "expected": {
                 "type": "object",

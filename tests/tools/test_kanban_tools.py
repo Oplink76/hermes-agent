@@ -471,7 +471,33 @@ def test_resolve_schema_is_strict_and_bounded():
         "task_id", "board", "decision", "fault_domain", "diagnosis",
         "reason", "expected", "repair", "metadata",
     }
-    assert params["properties"]["metadata"]["type"] == "object"
+    metadata = params["properties"]["metadata"]
+    assert metadata["type"] == "object"
+    assert metadata["required"] == ["agent_memory"]
+    assert metadata["additionalProperties"] is False
+    assert set(metadata["properties"]) == {"agent_memory"}
+    agent_memory = metadata["properties"]["agent_memory"]
+    assert agent_memory["required"] == ["recall", "write"]
+    assert agent_memory["additionalProperties"] is False
+    assert set(agent_memory["properties"]) == {"recall", "write"}
+    receipt_keys = {
+        "continue_work", "delegation_id", "executor", "gist_id",
+        "occurred_at", "operation", "operation_id", "run_id", "status",
+        "task_id",
+    }
+    executor_keys = {
+        "agent_id", "execution_id", "hermes_role", "model",
+        "responsibility", "surface", "version",
+    }
+    for operation in ("recall", "write"):
+        receipt = agent_memory["properties"][operation]
+        assert receipt["additionalProperties"] is False
+        assert set(receipt["properties"]) == receipt_keys
+        assert set(receipt["required"]) == receipt_keys
+        executor = receipt["properties"]["executor"]
+        assert executor["additionalProperties"] is False
+        assert set(executor["properties"]) == executor_keys
+        assert set(executor["required"]) == executor_keys
 
 
 def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
@@ -1720,6 +1746,60 @@ def test_resolver_tool_resumes_release_preflight(
     monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resolver.current_run_id))
+    from hermes_cli.agent_memory_protocol import MemoryReceipt
+    from hermes_cli.agent_memory_vault import ExecutorIdentity
+
+    executor = ExecutorIdentity(
+        agent_id="hermes",
+        model="resolver-test-model",
+        surface="hermes-direct",
+        hermes_role="resolver",
+        execution_id=f"resolver-{resolver.current_run_id}",
+        responsibility="writer",
+    )
+    delegation_id = f"kanban:resolver-{resolver.current_run_id}"
+    memory_metadata = {
+        "agent_memory": {
+            "recall": MemoryReceipt.for_gist(
+                operation_id=f"recall-{resolver.current_run_id}",
+                operation="recall",
+                status="empty",
+                continue_work=True,
+                task_id=tid,
+                run_id=resolver.current_run_id,
+                delegation_id=delegation_id,
+                gist_id=None,
+                executor=executor,
+            ).to_mapping(),
+            "write": MemoryReceipt.for_gist(
+                operation_id=f"write-{resolver.current_run_id}",
+                operation="write",
+                status="stored",
+                continue_work=True,
+                task_id=tid,
+                run_id=resolver.current_run_id,
+                delegation_id=delegation_id,
+                gist_id=f"gist-{resolver.current_run_id}",
+                executor=executor,
+            ).to_mapping(),
+        }
+    }
+
+    rejected = json.loads(kt._handle_resolve({
+        "task_id": tid,
+        "decision": "resume",
+        "fault_domain": "task_state",
+        "diagnosis": "The release confirmation already exists.",
+        "reason": "Use the recorded release approval.",
+        "expected": expected,
+        "metadata": {
+            **memory_metadata,
+            "private_notes": "must not cross the Resolver boundary",
+        },
+    }))
+    assert "metadata must contain only agent_memory" in rejected["error"]
+    with kb.connect(board=board) as conn:
+        assert kb.get_task(conn, tid).current_run_id == resolver.current_run_id
 
     out = json.loads(kt._handle_resolve({
         "task_id": tid,
@@ -1728,16 +1808,19 @@ def test_resolver_tool_resumes_release_preflight(
         "diagnosis": "The release confirmation already exists.",
         "reason": "Use the recorded release approval.",
         "expected": expected,
+        "metadata": memory_metadata,
     }))
     assert out["ok"] is True
 
     with kb.connect(board=board) as conn:
         task = kb.get_task(conn, tid)
         event_kinds = [event.kind for event in kb.list_events(conn, tid)]
+        resolver_run = kb.get_run(conn, resolver.current_run_id)
     assert task.status == "ready"
     assert task.assignee == "productowner"
     assert task.current_step_key == "release_measure"
     assert event_kinds.count("human_input_preflight_resolved") == 1
+    assert resolver_run.metadata["agent_memory"] == memory_metadata["agent_memory"]
 
 
 def test_resolver_tool_rejects_foreign_task(monkeypatch):
@@ -1778,6 +1861,54 @@ def test_resolver_tool_rejects_legacy_fields_before_database_call(monkeypatch):
     }))
 
     assert "unexpected fields: fix_task_id" in out["error"]
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected_error"),
+    [
+        (
+            {
+                "agent_memory": {"recall": {}, "write": {}},
+                "private_notes": "must not cross the Resolver boundary",
+            },
+            "metadata must contain only agent_memory",
+        ),
+        (
+            {
+                "agent_memory": {
+                    "recall": {},
+                    "write": {},
+                    "hermes_recall": {"forged": True},
+                }
+            },
+            "metadata.agent_memory must contain exactly recall and write",
+        ),
+    ],
+)
+def test_resolver_tool_rejects_unbounded_metadata_before_database_call(
+    monkeypatch, metadata, expected_error
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_owned")
+    monkeypatch.setattr(
+        kt,
+        "_connect",
+        lambda **_kwargs: pytest.fail("unbounded metadata reached the database"),
+    )
+
+    out = json.loads(kt._handle_resolve({
+        "task_id": "t_owned",
+        "decision": "resume",
+        "fault_domain": "task_state",
+        "diagnosis": "recoverable",
+        "reason": "resume",
+        "expected": {},
+        "metadata": metadata,
+    }))
+
+    assert expected_error in out["error"]
 
 
 def test_product_block_prefers_board_resolver_profile(monkeypatch, tmp_path):
