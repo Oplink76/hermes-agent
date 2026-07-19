@@ -58,6 +58,18 @@ _ALLOWED_MATURITY = frozenset(
         "released",
     }
 )
+_ALLOWED_EXECUTION_SURFACES = frozenset(
+    {
+        "hermes-direct",
+        "hermes-child",
+        "codex-cli",
+        "claude-code-cli",
+        "cowork-mcp",
+    }
+)
+_ALLOWED_EXECUTOR_RESPONSIBILITIES = frozenset(
+    {"orchestrator", "writer", "reviewer"}
+)
 _WORD_RE = re.compile(r"[a-z0-9][a-z0-9_-]{1,}")
 _COMMIT_RE = re.compile(r"[0-9a-fA-F]{7,64}")
 _PR_RE = re.compile(r"(?i)(?:PR\s*)?#\d+|\d+")
@@ -115,6 +127,65 @@ _REPOSITORY_EVIDENCE_KEYS = {"repo", "repository", "repository_url"}
 _log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class ExecutorIdentity:
+    """Canonical identity of the executor responsible for one memory action."""
+
+    agent_id: str
+    model: str
+    surface: str
+    hermes_role: str
+    execution_id: str
+    responsibility: str
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "ExecutorIdentity":
+        expected = {
+            "agent_id",
+            "execution_id",
+            "hermes_role",
+            "model",
+            "responsibility",
+            "surface",
+            "version",
+        }
+        if not isinstance(value, Mapping) or set(value) != expected:
+            raise ValueError("executor identity must contain exactly the canonical keys")
+        if value["version"] != 1 or isinstance(value["version"], bool):
+            raise ValueError("unsupported Agent Memory executor identity version")
+        identity = cls(
+            agent_id=_identity_text(value["agent_id"]),
+            model=_identity_text(value["model"]),
+            surface=_identity_text(value["surface"]),
+            hermes_role=_identity_text(value["hermes_role"]),
+            execution_id=_identity_text(value["execution_id"]),
+            responsibility=_identity_text(value["responsibility"]),
+        )
+        identity.canonical_json()
+        return identity
+
+    def to_mapping(self) -> dict[str, object]:
+        return json.loads(self.canonical_json())
+
+    def canonical_json(self) -> str:
+        if self.surface not in _ALLOWED_EXECUTION_SURFACES:
+            raise ValueError("unsupported Agent Memory execution surface")
+        if self.responsibility not in _ALLOWED_EXECUTOR_RESPONSIBILITIES:
+            raise ValueError("unsupported Agent Memory executor responsibility")
+        value = {
+            "agent_id": _identity_text(self.agent_id),
+            "execution_id": _identity_text(self.execution_id),
+            "hermes_role": _identity_text(self.hermes_role),
+            "model": _identity_text(self.model),
+            "responsibility": _identity_text(self.responsibility),
+            "surface": _identity_text(self.surface),
+            "version": 1,
+        }
+        return json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+
+
 @dataclass
 class SessionGist:
     """A bounded, redacted record appended by one agent handover."""
@@ -134,6 +205,7 @@ class SessionGist:
     behavior: str
     decisions: str
     open_loops: str
+    executor: ExecutorIdentity | None = None
 
 
 @dataclass(frozen=True)
@@ -344,6 +416,23 @@ def recall_for_task(title: str, body: str | None) -> list[MemoryMatch]:
     except Exception as exc:
         _log.warning("Agent Memory worker recall failed: %s", exc)
         return []
+
+
+def functional_identity_for_task(
+    conn: Any, task_id: str
+) -> tuple[str, str, str] | None:
+    """Return the existing Work Contract identity and its recall vocabulary."""
+    task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if task is None:
+        return None
+    contract = _kanban_work_contract(conn, task["work_contract_id"])
+    work = _functional_work(task, contract)
+    if work is None:
+        return None
+    function_id = _function_id(work)
+    title = _recorded_text(work.get("title") or task["title"] or function_id)
+    query = _recorded_text(f"{title} {_functional_boundary_text(work)}")
+    return function_id, title, query
 
 
 def _kanban_run(conn: Any, task_id: str, run_id: int) -> Any:
@@ -831,7 +920,7 @@ def _render_gist(gist: SessionGist, gist_id: str) -> str:
     occurred_at = gist.occurred_at
     if not isinstance(occurred_at, datetime):
         raise TypeError("occurred_at must be a datetime")
-    fields = (
+    fields = [
         ("Function", f"{_recorded_text(gist.function_id)} | {_recorded_text(gist.title)}"),
         ("Context", _recorded_text(gist.context)),
         ("Summary", _recorded_text(gist.summary)),
@@ -842,7 +931,9 @@ def _render_gist(gist: SessionGist, gist_id: str) -> str:
         ("Behavior", _recorded_text(gist.behavior)),
         ("Decisions", _recorded_text(gist.decisions)),
         ("Open loops", _recorded_text(gist.open_loops)),
-    )
+    ]
+    if gist.executor is not None:
+        fields.insert(1, ("Executor", gist.executor.canonical_json()))
     header = " | ".join(
         (_recorded_text(occurred_at.strftime("%H:%M")), _recorded_text(gist.agent_id), _recorded_text(gist.role))
     )
@@ -855,6 +946,14 @@ def _recorded_text(value: object) -> str:
     redacted = _sanitize_sensitive_text("" if value is None else str(value))
     normalized = " ".join(redacted.split())
     return _clip(normalized, _MAX_RECORDED_CHARS)
+
+
+def _identity_text(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value) > _MAX_RECORDED_CHARS:
+        raise ValueError("Agent Memory executor identity field is invalid")
+    if _sanitize_sensitive_text(value) != value or _UNSAFE_IDENTIFIER_RE.search(value):
+        raise ValueError("Agent Memory executor identity field is unsafe")
+    return _recorded_text(value)
 
 
 def _clip(value: str, maximum: int) -> str:
@@ -961,6 +1060,11 @@ def _parse_gist(match: re.Match[str], source: Path) -> _ParsedGist | None:
         for name, value in fields.items()
     ):
         return None
+    if "Executor" in fields:
+        try:
+            ExecutorIdentity.from_mapping(json.loads(fields["Executor"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
     function_id, separator, title = fields["Function"].partition(" | ")
     if not separator or not function_id or not title:
         return None

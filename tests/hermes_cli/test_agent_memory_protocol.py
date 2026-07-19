@@ -1,0 +1,349 @@
+"""Durable worker protocol tests for the external Agent Memory vault."""
+
+from datetime import datetime, timedelta
+import json
+import sqlite3
+import threading
+
+import pytest
+
+from hermes_cli import agent_memory_protocol as protocol
+from hermes_cli.agent_memory_protocol import (
+    MemoryReceipt,
+    WorkerRecallRequest,
+    WorkerWriteRequest,
+    acknowledge_attention,
+    configured_outbox_path,
+    configured_outbox_status,
+    functional_identity_for_task,
+    recall_for_worker,
+    receipt_is_present,
+    reconcile_configured_outbox,
+    write_worker_gist,
+)
+from hermes_cli.agent_memory_vault import ExecutorIdentity, recall
+
+
+def _configured_paths(tmp_path, monkeypatch, *, create_vault):
+    home = tmp_path / ".hermes"
+    home.mkdir(exist_ok=True)
+    vault = tmp_path / "Agent Memory"
+    outbox = tmp_path / "outbox"
+    if create_vault:
+        vault.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(vault))
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_OUTBOX", str(outbox))
+    return vault, outbox
+
+
+def _write_request(execution_id, gist_id):
+    executor = ExecutorIdentity(
+        agent_id="codex", model="test-model", surface="codex-cli",
+        hermes_role="developer", execution_id=execution_id,
+        responsibility="writer",
+    )
+    return WorkerWriteRequest(
+        operation_id=f"write-{execution_id}", task_id="t-memory",
+        run_id=7, delegation_id="delegation-7", gist_id=gist_id,
+        occurred_at=datetime(2026, 7, 19, 12, 0),
+        function_id="function-memory", title="Agent Memory",
+        context="board=default; task=t-memory; run=7",
+        summary="Implemented bounded memory work.", reused="none",
+        result="Worker memory recorded.", maturity="code_complete",
+        evidence="tests: focused suite passed", behavior="none",
+        decisions="none", open_loops="none", executor=executor,
+    )
+
+
+def _recall_request(execution_id="exec-123"):
+    return WorkerRecallRequest(
+        operation_id=f"recall-{execution_id}", task_id="t-memory", run_id=7,
+        delegation_id="delegation-7", function_id="function-memory",
+        title="Agent Memory", query="bounded memory work",
+        executor=ExecutorIdentity(
+            agent_id="codex", model="test-model", surface="codex-cli",
+            hermes_role="developer", execution_id=execution_id,
+            responsibility="writer",
+        ),
+    )
+
+
+def test_request_and_receipt_mappings_are_exact_and_round_trip():
+    write = _write_request("exec-123", "gist-123")
+    recall_request = _recall_request()
+    assert WorkerWriteRequest.from_mapping(write.to_mapping()) == write
+    assert WorkerRecallRequest.from_mapping(recall_request.to_mapping()) == recall_request
+    assert len(write.to_mapping()) == 18
+    assert len(recall_request.to_mapping()) == 8
+    with pytest.raises(ValueError, match="exactly"):
+        WorkerRecallRequest.from_mapping({**recall_request.to_mapping(), "extra": True})
+    with pytest.raises(ValueError, match="exactly"):
+        WorkerWriteRequest.from_mapping({**write.to_mapping(), "extra": True})
+
+    receipt = MemoryReceipt.for_gist(
+        operation_id="write-exec-123", operation="write", status="queued",
+        continue_work=True, task_id="t-memory", run_id=7,
+        delegation_id="delegation-7", gist_id="gist-123", executor=write.executor,
+    )
+    assert MemoryReceipt.from_mapping(receipt.to_mapping()) == receipt
+    assert list(receipt.to_mapping()) == sorted(receipt.to_mapping())
+
+
+def test_unavailable_vault_queues_validated_gist_and_continues(tmp_path, monkeypatch):
+    vault = tmp_path / "missing-onedrive" / "Agent Memory"
+    outbox = tmp_path / "outbox"
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(vault))
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_OUTBOX", str(outbox))
+    receipt = write_worker_gist(_write_request("exec-123", "gist-123"))
+    assert receipt.status == "queued"
+    assert receipt.continue_work is True
+    assert not vault.exists()
+    assert [p.name for p in outbox.glob("*.json")] == ["gist-gist-123.json"]
+    assert oct(outbox.stat().st_mode & 0o777) == "0o700"
+    assert oct(next(outbox.glob("*.json")).stat().st_mode & 0o777) == "0o600"
+    assert receipt_is_present(receipt) is True
+
+
+def test_reconcile_after_restart_moves_and_verifies(tmp_path, monkeypatch):
+    vault, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    queued = write_worker_gist(_write_request("exec-123", "gist-123"))
+    assert queued.status == "queued"
+    vault.mkdir(parents=True)
+    report = reconcile_configured_outbox(now=datetime(2026, 7, 19, 10, 0))
+    assert (report.moved, report.pending) == (1, 0)
+    assert not list(outbox.glob("*.json"))
+    assert recall(vault, "gist-123")[0].gist_id == "gist-123"
+
+
+def test_concurrent_writers_leave_two_valid_atomic_envelopes(tmp_path, monkeypatch):
+    _, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    receipts = []
+    errors = []
+
+    def write(request):
+        try:
+            receipts.append(write_worker_gist(request))
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=write, args=(_write_request(f"exec-{index}", f"gist-{index}"),))
+        for index in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert errors == []
+    assert [thread.is_alive() for thread in threads] == [False, False]
+    assert sorted(receipt.status for receipt in receipts) == ["queued", "queued"]
+    paths = sorted(outbox.glob("gist-*.json"))
+    assert [path.name for path in paths] == ["gist-gist-0.json", "gist-gist-1.json"]
+    assert all(json.loads(path.read_text())["kind"] == "gist" for path in paths)
+
+
+def test_duplicate_gist_operation_reuses_one_envelope_and_receipt(tmp_path, monkeypatch):
+    _, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    request = _write_request("exec-123", "gist-123")
+
+    first = write_worker_gist(request)
+    before = next(outbox.glob("gist-*.json")).read_bytes()
+    second = write_worker_gist(request)
+
+    assert first.to_mapping() == second.to_mapping()
+    assert len(list(outbox.glob("gist-*.json"))) == 1
+    assert next(outbox.glob("gist-*.json")).read_bytes() == before
+
+
+def test_queued_envelope_contains_redacted_values_only(tmp_path, monkeypatch):
+    _, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+    request = _write_request("exec-123", "gist-123")
+    request.summary = f"Completed with token {secret}"
+
+    write_worker_gist(request)
+
+    raw = next(outbox.glob("gist-*.json")).read_bytes()
+    assert secret.encode() not in raw
+    assert b"ghp_" in raw
+
+
+def test_corrupt_envelope_is_retained_and_requires_immediate_attention(tmp_path, monkeypatch):
+    _, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=True)
+    outbox.mkdir(mode=0o700)
+    corrupt = outbox / "gist-corrupt.json"
+    corrupt.write_text("{not-json", encoding="utf-8")
+
+    report = reconcile_configured_outbox(now=datetime(2026, 7, 19, 12, 0))
+    status = configured_outbox_status(now=datetime(2026, 7, 19, 12, 0))
+
+    assert report.corrupt == 1
+    assert corrupt.exists()
+    assert status.attention_required is True
+    assert status.notify_ole is True
+    assert status.reason == "corrupt_or_unsafe"
+    acknowledge_attention(status.fingerprint)
+    assert configured_outbox_status(now=datetime(2026, 7, 19, 12, 0)).notify_ole is False
+
+
+def test_symlinked_envelope_is_retained_as_unsafe_data(tmp_path, monkeypatch):
+    vault, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    write_worker_gist(_write_request("exec-123", "gist-123"))
+    queued = next(outbox.glob("gist-*.json"))
+    outside = tmp_path / queued.name
+    queued.rename(outside)
+    queued.symlink_to(outside)
+    vault.mkdir()
+
+    report = reconcile_configured_outbox()
+
+    assert report.corrupt == 1
+    assert queued.is_symlink()
+    assert recall(vault, "gist-123") == []
+
+
+def test_missing_external_root_is_never_created(tmp_path, monkeypatch):
+    vault, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+
+    write_worker_gist(_write_request("exec-123", "gist-123"))
+    report = reconcile_configured_outbox(now=datetime(2026, 7, 19, 12, 0))
+
+    assert not vault.exists()
+    assert outbox.is_dir()
+    assert report.vault_available is False
+    assert report.pending == 1
+
+
+def test_outbox_lock_timeout_never_returns_a_false_queued_receipt(tmp_path, monkeypatch):
+    _, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    ready = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        with protocol._outbox_lock(outbox):
+            ready.set()
+            release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    assert ready.wait(timeout=2)
+    monkeypatch.setattr(protocol, "_OUTBOX_LOCK_TIMEOUT_SECONDS", 0.05)
+    try:
+        with pytest.raises(TimeoutError, match="Agent Memory outbox lock"):
+            write_worker_gist(_write_request("exec-123", "gist-123"))
+    finally:
+        release.set()
+        holder.join(timeout=2)
+
+    assert not list(outbox.glob("gist-*.json"))
+
+
+def test_vault_outage_requires_attention_only_after_24_hours(tmp_path, monkeypatch):
+    _, _ = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    queued_at = datetime(2026, 7, 18, 10, 0)
+    monkeypatch.setattr(protocol, "_utc_now", lambda: queued_at)
+    write_worker_gist(_write_request("exec-123", "gist-123"))
+
+    before = configured_outbox_status(now=queued_at + timedelta(hours=23, minutes=59))
+    threshold = configured_outbox_status(now=queued_at + timedelta(hours=24))
+
+    assert before.attention_required is False
+    assert before.notify_ole is False
+    assert threshold.attention_required is True
+    assert threshold.notify_ole is True
+    assert threshold.reason == "pending_for_24_hours"
+
+
+def test_recall_receipts_cover_matches_empty_outages_and_incident_recovery(tmp_path, monkeypatch):
+    vault, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    request = _recall_request()
+    matches, unavailable = recall_for_worker(request)
+    assert matches == []
+    assert unavailable.status == "unavailable"
+    assert unavailable.continue_work is True
+    assert len(list(outbox.glob("recall-*.json"))) == 1
+
+    vault.mkdir()
+    empty_matches, empty = recall_for_worker(request)
+    assert empty_matches == []
+    assert empty.status == "empty"
+    report = reconcile_configured_outbox()
+    assert report.closed_incidents == 1
+    assert not list(outbox.glob("recall-*.json"))
+
+    assert write_worker_gist(_write_request("exec-123", "gist-123")).status == "stored"
+    matched_results, matched = recall_for_worker(request)
+    assert [item.gist_id for item in matched_results] == ["gist-123"]
+    assert matched.status == "matched"
+
+
+def test_unavailable_recall_incident_never_queues_secret_query_text(tmp_path, monkeypatch):
+    _, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+    request = _recall_request()
+    request = WorkerRecallRequest(
+        operation_id=request.operation_id,
+        task_id=request.task_id,
+        run_id=request.run_id,
+        delegation_id=request.delegation_id,
+        function_id=request.function_id,
+        title=request.title,
+        query=f"find memory for token {secret}",
+        executor=request.executor,
+    )
+
+    recall_for_worker(request)
+
+    raw = next(outbox.glob("recall-*.json")).read_bytes()
+    assert secret.encode() not in raw
+    assert b"find memory for token" not in raw
+
+
+def test_configured_outbox_path_defaults_to_profile_hermes_home(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_AGENT_MEMORY_OUTBOX", raising=False)
+    assert configured_outbox_path() == home / "agent-memory" / "outbox"
+
+
+def test_functional_identity_reuses_work_contract_identity_algorithm():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, title TEXT, idempotency_key TEXT, work_contract_id TEXT
+        );
+        CREATE TABLE work_contracts (id TEXT PRIMARY KEY, canonical_json TEXT);
+        """
+    )
+    contract = {
+        "work": {
+            "item_kind": "feature", "work_type": "implementation",
+            "title": "Durable memory", "outcome": "Worker gists survive restarts",
+            "scope": ["protocol"], "out_of_scope": ["cockpit"],
+        }
+    }
+    conn.execute("INSERT INTO work_contracts VALUES (?, ?)", ("wc-1", json.dumps(contract)))
+    conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?)", ("t-1", "Fallback", None, "wc-1"))
+
+    identity = functional_identity_for_task(conn, "t-1")
+
+    assert identity is not None
+    function_id, title, query = identity
+    assert function_id.startswith("function-")
+    assert title == "Durable memory"
+    assert "Worker gists survive restarts" in query
+
+
+def test_receipt_presence_rejects_queued_claim_without_envelope(tmp_path, monkeypatch):
+    _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    receipt = MemoryReceipt.for_gist(
+        operation_id="write-exec-123", operation="write", status="queued",
+        continue_work=True, task_id="t-memory", run_id=7,
+        delegation_id="delegation-7", gist_id="missing-gist",
+        executor=_write_request("exec-123", "gist-123").executor,
+    )
+    assert receipt_is_present(receipt) is False

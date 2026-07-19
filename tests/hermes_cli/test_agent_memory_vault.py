@@ -10,6 +10,7 @@ import pytest
 
 from hermes_cli import agent_memory_vault as memory_vault
 from hermes_cli.agent_memory_vault import (
+    ExecutorIdentity,
     SessionGist,
     append_gist,
     configured_vault_path,
@@ -19,7 +20,7 @@ from hermes_cli.agent_memory_vault import (
 )
 
 
-def _gist(gist_id="gist-1", *, title="Export release evidence"):
+def _gist(gist_id="gist-1", *, title="Export release evidence", executor=None):
     return SessionGist(
         gist_id=gist_id,
         occurred_at=datetime(2026, 7, 18, 14, 5),
@@ -36,6 +37,7 @@ def _gist(gist_id="gist-1", *, title="Export release evidence"):
         behavior="none",
         decisions="Use Markdown as the source of truth.",
         open_loops="Review and release remain.",
+        executor=executor,
     )
 
 
@@ -171,6 +173,123 @@ def test_append_writes_the_structured_gist_once_and_redacts_recorded_text(tmp_pa
     assert "- Summary: Added a portable release-evidence export." in daily_history
     assert "ghp_abcdefghijklmnopqrstuvwxyz1234567890" not in daily_history
     assert "ghp_" in daily_history
+
+
+def test_executor_metadata_is_optional_and_canonical(tmp_path):
+    vault = tmp_path / "Agent Memory"
+    assert append_gist(vault, _gist(gist_id="old-format")) is True
+    assert append_gist(
+        vault,
+        _gist(
+            gist_id="worker-format",
+            executor=ExecutorIdentity(
+                agent_id="codex",
+                model="gpt-5.5",
+                surface="codex-cli",
+                hermes_role="developer",
+                execution_id="exec-123",
+                responsibility="writer",
+            ),
+        ),
+    ) is True
+    report = lint_vault(vault)
+    history = (vault / "memory" / "2026-07-18.md").read_text()
+    assert report.valid_entries == 2
+    assert '- Executor: {"agent_id":"codex"' in history
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("surface", "terminal"),
+        ("responsibility", "observer"),
+        ("agent_id", "x" * 2_001),
+        ("model", "x" * 2_001),
+        ("hermes_role", "x" * 2_001),
+        ("execution_id", "x" * 2_001),
+        ("model", "chain of thought"),
+        ("hermes_role", "full transcript"),
+        ("execution_id", "ghp_abcdefghijklmnopqrstuvwxyz1234567890"),
+    ),
+)
+def test_executor_metadata_rejects_unsupported_unsafe_or_secret_values(
+    tmp_path, field, value
+):
+    vault = tmp_path / "Agent Memory"
+    values = {
+        "agent_id": "codex",
+        "model": "test-model",
+        "surface": "codex-cli",
+        "hermes_role": "developer",
+        "execution_id": "exec-123",
+        "responsibility": "writer",
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError):
+        append_gist(vault, _gist(executor=ExecutorIdentity(**values)))
+
+    assert not list((vault / "memory").glob("*.md"))
+
+
+@pytest.mark.parametrize(
+    "surface",
+    ("hermes-direct", "hermes-child", "codex-cli", "claude-code-cli", "cowork-mcp"),
+)
+def test_executor_metadata_accepts_each_governed_surface(tmp_path, surface):
+    identity = ExecutorIdentity(
+        agent_id="codex",
+        model="test-model",
+        surface=surface,
+        hermes_role="developer",
+        execution_id=f"exec-{surface}",
+        responsibility="reviewer",
+    )
+    assert append_gist(tmp_path / surface, _gist(executor=identity)) is True
+
+
+def test_manual_gist_with_duplicate_executor_fields_is_invalid(tmp_path):
+    vault = tmp_path / "Agent Memory"
+    initialize_vault(vault)
+    executor = ExecutorIdentity(
+        agent_id="codex",
+        model="test-model",
+        surface="codex-cli",
+        hermes_role="developer",
+        execution_id="exec-123",
+        responsibility="writer",
+    ).canonical_json()
+    manual = _manual_gist().replace(
+        "- Context:", f"- Executor: {executor}\n- Executor: {executor}\n- Context:"
+    )
+    (vault / "memory" / "2026-07-18.md").write_text(manual, encoding="utf-8")
+
+    report = lint_vault(vault)
+
+    assert report.valid_entries == 0
+    assert report.invalid_entries == 1
+
+
+def test_append_rejects_duplicate_executor_fields_before_writing_history(tmp_path):
+    class DuplicateExecutor(ExecutorIdentity):
+        def canonical_json(self):
+            canonical = super().canonical_json()
+            return f"{canonical}\n- Executor: {canonical}"
+
+    vault = tmp_path / "Agent Memory"
+    executor = DuplicateExecutor(
+        agent_id="codex",
+        model="test-model",
+        surface="codex-cli",
+        hermes_role="developer",
+        execution_id="exec-123",
+        responsibility="writer",
+    )
+
+    with pytest.raises(ValueError, match="schema"):
+        append_gist(vault, _gist(executor=executor))
+
+    assert not list((vault / "memory").glob("*.md"))
 
 
 def test_append_rejects_a_secret_bearing_gist_id_before_creating_the_vault(tmp_path):
