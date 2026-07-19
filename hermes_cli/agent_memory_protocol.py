@@ -978,6 +978,21 @@ def _atomic_write(outbox: Path, target: Path, content: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _reclassify_unsafe(outbox: Path, path: Path) -> None:
+    """Atomically retain deterministic conflicts for existing unsafe handling."""
+    target = outbox / f"unsafe-{path.name}"
+    suffix = 1
+    while True:
+        try:
+            os.lstat(target)
+        except FileNotFoundError:
+            break
+        target = outbox / f"unsafe-{suffix}-{path.name}"
+        suffix += 1
+    os.replace(path, target)
+    _fsync_directory(outbox)
+
+
 def _fsync_directory(directory: Path) -> None:
     """Durably persist a replaced directory entry when the platform supports it."""
     if os.name == "nt":
@@ -1049,18 +1064,22 @@ def reconcile_configured_outbox(now: datetime | None = None) -> ReconcileReport:
                 continue
             try:
                 stored = _stored_operation(vault, receipt.operation_id)
-                stored_executor = (
-                    _stored_executor(stored) if stored is not None else None
-                )
-                if (
-                    stored is None
-                    or stored.gist_id != receipt.gist_id
-                    or stored_executor is None
-                    or stored_executor.to_mapping()
-                    != receipt.executor.to_mapping()
-                ):
-                    continue
-            except (AttributeError, TypeError, ValueError):
+            except _OperationConflict:
+                _reclassify_unsafe(outbox, path)
+                continue
+            except (OSError, TimeoutError, ValueError):
+                continue
+            stored_executor = (
+                _stored_executor(stored) if stored is not None else None
+            )
+            if (
+                stored is None
+                or stored.gist_id != receipt.gist_id
+                or stored_executor is None
+                or stored_executor.to_mapping()
+                != receipt.executor.to_mapping()
+            ):
+                _reclassify_unsafe(outbox, path)
                 continue
             path.unlink()
             moved += 1

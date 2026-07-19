@@ -191,6 +191,86 @@ def test_reconcile_after_restart_moves_and_verifies(tmp_path, monkeypatch):
     assert receipt_is_present(queued) is True
 
 
+def test_reconcile_reclassifies_conflicting_stored_operation_as_unsafe(
+    tmp_path, monkeypatch
+):
+    vault, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    queued_request = _write_request("exec-123", "gist-queued")
+    stored_request = _write_request("exec-123", "gist-stored")
+    assert write_worker_gist(queued_request).status == "queued"
+    queued_path = outbox / "gist-gist-queued.json"
+    queued_content = queued_path.read_bytes()
+    vault.mkdir(parents=True)
+    assert append_gist(vault, stored_request.to_session_gist()) is True
+    fsync_modes = []
+    original_fsync = os.fsync
+
+    def record_fsync(descriptor):
+        fsync_modes.append(os.fstat(descriptor).st_mode)
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(protocol.os, "fsync", record_fsync)
+
+    report = reconcile_configured_outbox(now=datetime(2026, 7, 19, 12, 0))
+    unsafe_path = outbox / "unsafe-gist-gist-queued.json"
+    status = configured_outbox_status(now=datetime(2026, 7, 19, 12, 0))
+
+    assert report.to_mapping() == {
+        "closed_incidents": 0,
+        "corrupt": 1,
+        "moved": 0,
+        "pending": 1,
+        "vault_available": True,
+    }
+    assert not queued_path.exists()
+    assert unsafe_path.read_bytes() == queued_content
+    assert any(stat.S_ISDIR(mode) for mode in fsync_modes)
+    assert status.attention_required is True
+    assert status.reason == "corrupt_or_unsafe"
+    assert status.notify_ole is True
+    acknowledge_attention(status.fingerprint)
+    acknowledged = configured_outbox_status(now=datetime(2026, 7, 19, 12, 0))
+    assert acknowledged.attention_required is True
+    assert acknowledged.notify_ole is False
+
+
+@pytest.mark.parametrize("failed_step", ("append", "lint"))
+def test_reconcile_keeps_transient_vault_failure_pending_without_alert(
+    tmp_path, monkeypatch, failed_step
+):
+    vault, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    queued_at = datetime(2026, 7, 19, 11, 0)
+    monkeypatch.setattr(protocol, "_utc_now", lambda: queued_at)
+    assert write_worker_gist(
+        _write_request("exec-123", "gist-queued")
+    ).status == "queued"
+    queued_path = outbox / "gist-gist-queued.json"
+    queued_content = queued_path.read_bytes()
+    vault.mkdir(parents=True)
+
+    def fail_transiently(*_args, **_kwargs):
+        raise OSError("simulated transient vault failure")
+
+    target = "lint_vault" if failed_step == "lint" else "append_gist"
+    monkeypatch.setattr(protocol, target, fail_transiently)
+
+    now = queued_at + timedelta(minutes=30)
+    report = reconcile_configured_outbox(now=now)
+    status = configured_outbox_status(now=now)
+
+    assert report.to_mapping() == {
+        "closed_incidents": 0,
+        "corrupt": 0,
+        "moved": 0,
+        "pending": 1,
+        "vault_available": True,
+    }
+    assert queued_path.read_bytes() == queued_content
+    assert status.attention_required is False
+    assert status.notify_ole is False
+    assert status.reason == "none"
+
+
 def test_reconciled_receipt_rejects_a_different_executor(tmp_path, monkeypatch):
     vault, _outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
     queued = write_worker_gist(_write_request("exec-123", "gist-123"))
