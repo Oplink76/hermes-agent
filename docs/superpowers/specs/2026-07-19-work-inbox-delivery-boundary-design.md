@@ -1,6 +1,6 @@
 # Minimal Work Inbox Delivery Boundary Design
 
-**Status:** Approved for planning
+**Status:** Approved
 **Date:** 2026-07-19
 **Supersedes:** The earlier durable-receipt design on the abandoned
 `design/work-inbox-delivery-boundary` implementation branch.
@@ -120,8 +120,9 @@ create and route a card.
 
 For `outcome=blocked`, the request instead includes an existing Hermes
 `block_kind` and optional `attempted_resolutions`. The adapter validates the
-closed shape, rejects private metadata keys beginning with `_`, and performs
-these read-only checks before handover:
+closed shape, accepts only the existing handover metadata keys
+`ai_provenance`, `changed_files`, `tests_run`, and `workflow_outcome`, and
+performs these read-only checks before handover:
 
 - requested board is a strict Hermes board;
 - task exists and is an executable card;
