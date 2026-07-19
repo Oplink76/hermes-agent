@@ -2,11 +2,11 @@
 
 **Date:** 2026-07-19
 
-**Status:** Implemented and branch-verified; deployment pending
+**Status:** Live
 
 **Extends:** `2026-07-18-functional-intent-memory-and-inbox-guide-design.md`
 
-## Branch Verification Evidence
+## Verification and Live Evidence
 
 - Branch head before this evidence commit:
   `c6ac6a7f57b628faa1e5e72630b12373cbc0aa58`.
@@ -20,8 +20,31 @@
 - Final Standards review: Approved, with no Critical, Important, or Minor
   findings. Final Spec review: Approved, with no Critical, Important, or Minor
   findings.
-- Live external-surface, deployment, restart, attention, and Trading checks
-  remain pending in Task 6 steps 4–9. This branch is not marked Live.
+- PR #44 merged at functional SHA
+  `46d59ac0df2561f31dd0bef7d30c8c4050bb2b60` and was deployed through the
+  guarded exact-SHA path as deployment
+  `20260719T131151Z-46d59ac0df25-6b4deecc`. Mandatory health checks passed
+  against that exact SHA.
+- A disposable qualified-v2 card on an isolated default board completed the
+  normal development, test, review, and release-measure flow, then archived.
+  The Work Contract was `wc_c4efd69cfe047a62b91dfea1`; the actual workers
+  were Codex CLI (`gpt-5.5`), Claude Code CLI, and Claude Code through Cowork
+  MCP. All three recalled before work and stored exactly one bounded gist after
+  work; the isolated outbox ended empty.
+- With a disposable external vault absent, separate worker processes continued
+  after recall and write returned non-blocking outbox receipts. After the vault
+  was restored, a new process reconciled the gist and incident, removed both
+  pending files, and recalled the recovered gist exactly once.
+- A backdated disposable entry triggered the 24-hour attention state once.
+  Repeated unchanged checks did not notify again; acknowledgement cleared the
+  notification, and a materially changed fingerprint produced one new
+  notification. No external notification was sent by this acceptance harness.
+- Production Agent Memory recorded completion gist
+  `release-agent-memory-worker-protocol-46d59ac0`; immediate recall matched it.
+  Production status was healthy with zero pending entries.
+- The default Hermes gateway and dashboard remained healthy. All 13 Trading
+  gateway labels remained disabled and unloaded throughout deployment and live
+  acceptance.
 
 ## Purpose
 
