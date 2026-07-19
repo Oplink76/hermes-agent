@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import asdict
 import json
 from pathlib import Path
@@ -19,6 +20,23 @@ from hermes_cli.agent_memory_protocol import (
 
 
 _MAX_INPUT_BYTES = 65_536
+_ARGUMENT_ERROR = "agent-memory: invalid arguments"
+
+
+def _redacted_argument_error(_message: str) -> None:
+    print(_ARGUMENT_ERROR, file=sys.stderr)
+    raise SystemExit(2)
+
+
+class _AgentMemoryArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        _redacted_argument_error(message)
+
+    def parse_known_args(self, args=None, namespace=None):
+        parsed, extras = super().parse_known_args(args, namespace)
+        if extras:
+            self.error("unrecognized arguments")
+        return parsed, extras
 
 
 def build_agent_memory_parser(subparsers, *, cmd_agent_memory: Callable) -> None:
@@ -26,7 +44,12 @@ def build_agent_memory_parser(subparsers, *, cmd_agent_memory: Callable) -> None
     parser = subparsers.add_parser(
         "agent-memory", help="Recall and record governed worker memory"
     )
-    verbs = parser.add_subparsers(dest="agent_memory_action", required=True)
+    parser.error = _redacted_argument_error
+    verbs = parser.add_subparsers(
+        dest="agent_memory_action",
+        required=True,
+        parser_class=_AgentMemoryArgumentParser,
+    )
     for name in ("recall", "write"):
         child = verbs.add_parser(name)
         child.add_argument("--input", default="-")

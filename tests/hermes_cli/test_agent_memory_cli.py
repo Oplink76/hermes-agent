@@ -6,6 +6,9 @@ import io
 import json
 import sys
 
+import pytest
+
+from hermes_cli import main as main_module
 from hermes_cli.subcommands.agent_memory import (
     build_agent_memory_parser,
     cmd_agent_memory,
@@ -79,6 +82,51 @@ def _assert_rejected(args, capsys, *, request_text):
     assert request_text not in captured.err
 
 
+def _assert_main_syntax_rejected(monkeypatch, capsys, argv, *, request_text):
+    monkeypatch.setattr(sys, "argv", ["hermes", *argv])
+
+    with pytest.raises(SystemExit) as excinfo:
+        main_module.main()
+
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == ["agent-memory: invalid arguments"]
+    assert _SENTINEL not in captured.err
+    assert request_text not in captured.err
+
+
+def test_missing_action_uses_one_scoped_redacted_argparse_error(monkeypatch, capsys):
+    _assert_main_syntax_rejected(
+        monkeypatch,
+        capsys,
+        ["agent-memory"],
+        request_text="agent_memory_action",
+    )
+
+
+def test_unknown_action_uses_one_scoped_redacted_argparse_error(monkeypatch, capsys):
+    malformed = f"unknown-{_SENTINEL}"
+    _assert_main_syntax_rejected(
+        monkeypatch,
+        capsys,
+        ["agent-memory", malformed],
+        request_text=malformed,
+    )
+
+
+def test_unknown_child_option_uses_one_scoped_redacted_argparse_error(
+    monkeypatch, capsys
+):
+    malformed = f"--private-{_SENTINEL}"
+    _assert_main_syntax_rejected(
+        monkeypatch,
+        capsys,
+        ["agent-memory", "recall", malformed],
+        request_text=malformed,
+    )
+
+
 def test_recall_reads_stdin_and_returns_receipt(monkeypatch, capsys):
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(_recall_payload())))
     args = _parse(["agent-memory", "recall", "--input", "-"])
@@ -113,8 +161,20 @@ def test_unknown_request_key_returns_2_without_echoing_payload(monkeypatch, caps
     )
 
 
-def test_payload_over_65536_bytes_returns_2(monkeypatch, capsys):
-    request_text = "x" * 65_537 + _SENTINEL
+def test_payload_at_65536_bytes_is_accepted(monkeypatch, capsys):
+    encoded = json.dumps(_recall_payload()).encode("utf-8")
+    request_text = encoded.decode("utf-8") + " " * (65_536 - len(encoded))
+    assert len(request_text.encode("utf-8")) == 65_536
+    monkeypatch.setattr(sys, "stdin", io.StringIO(request_text))
+
+    assert cmd_agent_memory(_parse(["agent-memory", "recall"])) == 0
+    assert json.loads(capsys.readouterr().out)["receipt"]["status"] == "disabled"
+
+
+def test_payload_at_65537_bytes_returns_2(monkeypatch, capsys):
+    encoded = json.dumps(_recall_payload()).encode("utf-8")
+    request_text = encoded.decode("utf-8") + " " * (65_537 - len(encoded))
+    assert len(request_text.encode("utf-8")) == 65_537
     monkeypatch.setattr(sys, "stdin", io.StringIO(request_text))
 
     _assert_rejected(
@@ -141,6 +201,21 @@ def test_absolute_regular_input_file_is_accepted(tmp_path, capsys):
     ) == 0
 
     assert json.loads(capsys.readouterr().out)["receipt"]["status"] == "disabled"
+
+
+def test_absolute_symlink_input_is_rejected_without_content_echo(tmp_path, capsys):
+    payload = {**_recall_payload(), "query": _SENTINEL}
+    request_text = json.dumps(payload)
+    target = tmp_path / "request-target.json"
+    target.write_text(request_text, encoding="utf-8")
+    symlink = tmp_path / "request-link.json"
+    symlink.symlink_to(target)
+
+    _assert_rejected(
+        _parse(["agent-memory", "recall", "--input", str(symlink)]),
+        capsys,
+        request_text=request_text,
+    )
 
 
 def test_unconfigured_recall_returns_empty_disabled_receipt(monkeypatch, capsys):
