@@ -325,6 +325,52 @@ def test_vault_outage_requires_attention_only_after_24_hours(tmp_path, monkeypat
     assert threshold.reason == "pending_for_24_hours"
 
 
+@pytest.mark.parametrize(
+    ("age", "attention_required", "notify_ole"),
+    (
+        (timedelta(hours=23, minutes=59), False, False),
+        (timedelta(hours=24), True, True),
+    ),
+)
+def test_vault_config_failure_preserves_pending_status_and_attention(
+    tmp_path, monkeypatch, age, attention_required, notify_ole
+):
+    vault, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
+    queued_at = datetime(2026, 7, 18, 10, 0)
+    monkeypatch.setattr(protocol, "_utc_now", lambda: queued_at)
+    assert write_worker_gist(_write_request("exec-123", "gist-123")).status == "queued"
+    envelope = outbox / "gist-gist-123.json"
+    before = envelope.read_bytes()
+
+    def fail_config():
+        raise OSError("persistent vault config failure")
+
+    monkeypatch.setattr(protocol, "configured_vault_path", fail_config)
+    now = queued_at + age
+
+    report = reconcile_configured_outbox(now=now)
+    status = configured_outbox_status(now=now)
+
+    assert report.to_mapping() == {
+        "closed_incidents": 0,
+        "corrupt": 0,
+        "moved": 0,
+        "pending": 1,
+        "vault_available": False,
+    }
+    assert envelope.read_bytes() == before
+    assert not vault.exists()
+    assert status.enabled is True
+    assert status.vault_available is False
+    assert status.pending == 1
+    assert status.attention_required is attention_required
+    assert status.notify_ole is notify_ole
+    assert status.reason == (
+        "pending_for_24_hours" if attention_required else "none"
+    )
+    assert len(status.fingerprint) == 64
+
+
 def test_recall_receipts_cover_matches_empty_outages_and_incident_recovery(tmp_path, monkeypatch):
     vault, outbox = _configured_paths(tmp_path, monkeypatch, create_vault=False)
     request = _recall_request()
@@ -494,4 +540,19 @@ def test_receipt_presence_rejects_queued_claim_without_envelope(tmp_path, monkey
         delegation_id="delegation-7", gist_id="missing-gist",
         executor=_write_request("exec-123", "gist-123").executor,
     )
+    assert receipt_is_present(receipt) is False
+
+
+def test_stored_receipt_presence_is_false_when_vault_config_resolution_fails(
+    tmp_path, monkeypatch
+):
+    _configured_paths(tmp_path, monkeypatch, create_vault=True)
+    receipt = write_worker_gist(_write_request("exec-123", "gist-123"))
+    assert receipt.status == "stored"
+
+    def fail_config():
+        raise OSError("persistent vault config failure")
+
+    monkeypatch.setattr(protocol, "configured_vault_path", fail_config)
+
     assert receipt_is_present(receipt) is False

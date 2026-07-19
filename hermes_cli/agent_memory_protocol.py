@@ -764,11 +764,19 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
+def _configured_vault_state() -> tuple[Path | None, bool]:
+    """Resolve the external vault without blocking local outbox inspection."""
+    try:
+        vault = configured_vault_path()
+        return vault, vault is not None and vault.is_dir()
+    except Exception:
+        return None, False
+
+
 def reconcile_configured_outbox(now: datetime | None = None) -> ReconcileReport:
     current = _utc_now() if now is None else now
     outbox = configured_outbox_path()
-    vault = configured_vault_path()
-    vault_available = vault is not None and vault.is_dir()
+    vault, vault_available = _configured_vault_state()
     if not outbox.exists():
         return ReconcileReport(0, 0, 0, 0, vault_available)
     moved = 0
@@ -840,8 +848,7 @@ def _pending_state(
 def configured_outbox_status(now: datetime | None = None) -> OutboxStatus:
     current = _utc_now() if now is None else now
     outbox = configured_outbox_path()
-    vault = configured_vault_path()
-    vault_available = vault is not None and vault.is_dir()
+    vault, vault_available = _configured_vault_state()
     if outbox.exists():
         with _outbox_lock(outbox):
             pending, corrupt, oldest, identities = _pending_state(
@@ -868,7 +875,7 @@ def configured_outbox_status(now: datetime | None = None) -> OutboxStatus:
     ).hexdigest()
     acknowledged = _read_ack(outbox)
     return OutboxStatus(
-        enabled=vault is not None,
+        enabled=vault is not None or pending > 0,
         vault_available=vault_available,
         pending=pending,
         oldest_pending_hours=oldest_hours,
@@ -925,20 +932,20 @@ def receipt_is_present(receipt: MemoryReceipt) -> bool:
     }:
         return False
     if receipt.status == "queued":
-        path = configured_outbox_path() / f"gist-{receipt.gist_id}.json"
         try:
+            path = configured_outbox_path() / f"gist-{receipt.gist_id}.json"
             envelope = _load_envelope(path)
             stored = MemoryReceipt.from_mapping(envelope["receipt"])
-        except (OSError, ValueError):
+        except Exception:
             return False
         return stored.to_mapping() == receipt.to_mapping()
-    vault = configured_vault_path()
-    if vault is None or not vault.is_dir():
+    vault, vault_available = _configured_vault_state()
+    if not vault_available or vault is None:
         return False
     try:
         return any(
             match.gist_id == receipt.gist_id
             for match in recall(vault, receipt.gist_id or "", limit=1)
         )
-    except (OSError, TimeoutError, ValueError):
+    except Exception:
         return False
