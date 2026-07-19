@@ -1,20 +1,18 @@
 """Real middleware tests for the Work Inbox bearer route."""
 from __future__ import annotations
 
-import secrets
 import json
+import secrets
 import subprocess
 from pathlib import Path
 
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-import plugins.dashboard_auth.work_inbox as work_inbox
-from hermes_cli.dashboard_auth import clear_providers, register_provider, token_auth
-from plugins.kanban.dashboard import plugin_api
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_intake as intake
+from hermes_cli import plugins, web_server
+from hermes_cli.dashboard_auth import clear_providers, token_auth
 
 
 @pytest.fixture
@@ -23,18 +21,25 @@ def strong_secret() -> str:
 
 
 @pytest.fixture
-def app_client(strong_secret):
+def app_client(strong_secret, monkeypatch):
     clear_providers()
     token_auth.clear_token_routes()
-    app = FastAPI()
-    app.middleware("http")(token_auth.token_auth_middleware)
-    app.include_router(plugin_api.router, prefix="/api/plugins/kanban")
-    provider = work_inbox.WorkInboxSecretProvider(secret=strong_secret)
-    register_provider(provider)
-    token_auth.register_token_route(work_inbox.WORK_INBOX_ROUTE_PATH)
+    monkeypatch.setenv("HERMES_WORK_INBOX_SECRET", strong_secret)
+    monkeypatch.setattr(plugins, "_plugin_manager", plugins.PluginManager())
+    plugins.discover_plugins()
+    previous = {
+        "bound_host": getattr(web_server.app.state, "bound_host", None),
+        "bound_port": getattr(web_server.app.state, "bound_port", None),
+        "auth_required": getattr(web_server.app.state, "auth_required", None),
+    }
+    web_server.app.state.bound_host = "127.0.0.1"
+    web_server.app.state.bound_port = 9119
+    web_server.app.state.auth_required = False
     try:
-        yield TestClient(app)
+        yield TestClient(web_server.app, base_url="http://127.0.0.1:9119")
     finally:
+        for key, value in previous.items():
+            setattr(web_server.app.state, key, value)
         clear_providers()
         token_auth.clear_token_routes()
 
@@ -108,6 +113,22 @@ def _contracted_running_card(board: str, tmp_path: Path) -> tuple[str, str, int,
         return board, task_id, task.current_run_id, str(task.work_contract_id)
 
 
+def _assigned_completion_body(
+    task_id: str,
+    run_id: int,
+    contract_id: str,
+) -> dict:
+    return {
+        "version": 2,
+        "kind": "assigned_delivery",
+        "task_id": task_id,
+        "run_id": run_id,
+        "work_contract_id": contract_id,
+        "outcome": "completed",
+        "summary": "wrong assignment",
+    }
+
+
 def test_exact_work_inbox_route_uses_real_bearer_middleware(
     app_client, strict_board, strong_secret,
 ):
@@ -127,7 +148,7 @@ def test_exact_work_inbox_route_uses_real_bearer_middleware(
         "/api/plugins/kanban/work-inbox/other?board=strict",
         headers={"Authorization": f"Bearer {strong_secret}"},
         json={},
-    ).status_code == 404
+    ).status_code == 401
 
 
 def test_new_work_delegates_to_existing_intake(app_client, strict_board, strong_secret):
@@ -147,6 +168,33 @@ def test_new_work_delegates_to_existing_intake(app_client, strict_board, strong_
     assert response.json()["status"] == "qualification_required"
     with kb.connect(board=strict_board) as conn:
         assert len(kb.list_qualification_intakes(conn, status="pending")) == 1
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_new_work_patch_evidence_creates_only_pending_intake(
+    app_client, strict_board, strong_secret,
+):
+    patch = "diff --git a/app.py b/app.py\n+@@ -1 +1 @@\n-old\n+new\n"
+    response = app_client.post(
+        f"/api/plugins/kanban/work-inbox?board={strict_board}",
+        headers={"Authorization": f"Bearer {strong_secret}"},
+        json={
+            "version": 2,
+            "kind": "new_work",
+            "request": {
+                "functional_intent": {"title": "Review existing patch"},
+                "evidence": [{"kind": "patch", "content": patch}],
+            },
+        },
+    )
+
+    assert response.status_code == 202
+    with kb.connect(board=strict_board) as conn:
+        intakes = kb.list_qualification_intakes(conn, status="pending")
+        assert len(intakes) == 1
+        assert json.loads(intakes[0]["raw_request"])["request"]["evidence"] == [
+            {"kind": "patch", "content": patch}
+        ]
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
 
 
@@ -249,11 +297,7 @@ def test_rejected_assigned_delivery_does_not_mutate_task_or_events(
     with kb.connect(board=board) as conn:
         before = kb.get_task(conn, task_id)
         before_events = len(kb.list_events(conn, task_id))
-    body = {
-        "version": 2, "kind": "assigned_delivery", "task_id": task_id,
-        "run_id": run_id, "work_contract_id": contract_id,
-        "outcome": "completed", "summary": "wrong assignment",
-    }
+    body = _assigned_completion_body(task_id, run_id, contract_id)
     mutate(body)
 
     response = app_client.post(
@@ -265,4 +309,48 @@ def test_rejected_assigned_delivery_does_not_mutate_task_or_events(
     with kb.connect(board=board) as conn:
         after = kb.get_task(conn, task_id)
         assert after == before
+        assert len(kb.list_events(conn, task_id)) == before_events
+
+
+def test_task_mismatched_assignment_does_not_mutate_task_or_events(
+    app_client, strict_board, strong_secret, tmp_path,
+):
+    board, task_id, run_id, contract_id = _contracted_running_card(strict_board, tmp_path)
+    _, other_task_id, _, other_contract_id = _contracted_running_card(strict_board, tmp_path)
+    with kb.connect(board=board) as conn:
+        before = kb.get_task(conn, other_task_id)
+        before_events = len(kb.list_events(conn, other_task_id))
+
+    response = app_client.post(
+        f"/api/plugins/kanban/work-inbox?board={board}",
+        headers={"Authorization": f"Bearer {strong_secret}"},
+        json=_assigned_completion_body(other_task_id, run_id, other_contract_id),
+    )
+
+    assert response.status_code == 409
+    with kb.connect(board=board) as conn:
+        assert kb.get_task(conn, other_task_id) == before
+        assert len(kb.list_events(conn, other_task_id)) == before_events
+        assert kb.get_task(conn, task_id).current_run_id == run_id
+        assert kb.get_task(conn, task_id).work_contract_id == contract_id
+
+
+def test_ended_run_assignment_does_not_mutate_task_or_events(
+    app_client, strict_board, strong_secret, tmp_path,
+):
+    board, task_id, run_id, contract_id = _contracted_running_card(strict_board, tmp_path)
+    with kb.connect(board=board) as conn:
+        assert kb.reclaim_task(conn, task_id, reason="test ended run")
+        before = kb.get_task(conn, task_id)
+        before_events = len(kb.list_events(conn, task_id))
+
+    response = app_client.post(
+        f"/api/plugins/kanban/work-inbox?board={board}",
+        headers={"Authorization": f"Bearer {strong_secret}"},
+        json=_assigned_completion_body(task_id, run_id, contract_id),
+    )
+
+    assert response.status_code == 409
+    with kb.connect(board=board) as conn:
+        assert kb.get_task(conn, task_id) == before
         assert len(kb.list_events(conn, task_id)) == before_events
