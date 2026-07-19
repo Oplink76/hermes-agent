@@ -731,6 +731,14 @@ Use `/context` in interactive mode to see a colored grid of context usage. Key t
 11. **`--bare` skips OAuth** — requires `ANTHROPIC_API_KEY` env var or an `apiKeyHelper` in settings.
 12. **Context degradation is real** — AI output quality measurably degrades above 70% context window usage. Monitor with `/context` and proactively `/compact`.
 
+## Hermes Agent Memory contract
+
+When a Hermes Kanban task includes Required actual-worker memory protocol,
+forward that block verbatim. The CLI worker, not the Hermes orchestrator, runs
+recall before the bounded task and write after it, then returns both receipts.
+unavailable recall and queued write mean continue. Never edit the vault or
+outbox directly.
+
 ## Rules for Hermes Agents
 
 1. **Prefer print mode (`-p`) for single tasks** — cleaner, no dialog handling, structured output
