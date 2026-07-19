@@ -350,10 +350,15 @@ def test_checkpoint_manager_git_hides_windows(monkeypatch):
     monkeypatch.setattr(checkpoint_manager, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
     monkeypatch.setattr(checkpoint_manager.subprocess, "run", fake_run)
 
+    # Simulate the process-wide update-prefetch cross-talk documented by
+    # ``_spawns`` above.
+    captured.append((["git", "fetch", "origin"], {"text": True, "timeout": 5}))
     ok, _, _ = checkpoint_manager._run_git(["status", "--short"], Path("C:/store"), ".")
     assert ok
-    assert captured[0][0][0] == "git"
-    assert captured[0][1]["creationflags"] == _CREATE_NO_WINDOW
+    status_calls = _spawns(captured, "status", "--short")
+    assert [
+        (cmd, kwargs.get("creationflags")) for cmd, kwargs in status_calls
+    ] == [(["git", "status", "--short"], _CREATE_NO_WINDOW)], captured
 
 
 def test_skills_hub_gh_token_hides_windows(monkeypatch):
