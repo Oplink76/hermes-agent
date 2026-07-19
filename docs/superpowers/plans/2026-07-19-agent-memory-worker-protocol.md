@@ -178,13 +178,14 @@ Add named tests with these exact outcomes:
     test_queued_envelope_contains_redacted_values_only
     test_corrupt_envelope_is_retained_and_requires_immediate_attention
     test_missing_external_root_is_never_created
-    test_outbox_lock_timeout_returns_a_queued_or_unavailable_receipt
+    test_outbox_lock_timeout_never_returns_a_false_queued_receipt
     test_vault_outage_requires_attention_only_after_24_hours
 
 The concurrency test starts two `threading.Thread` writers and joins both; the
 duplicate test repeats the identical request; the redaction test searches raw
 outbox bytes for the supplied secret; the lock test uses a 50 ms injected
-timeout; and the age test passes explicit times at 23:59 and 24:00.
+timeout and asserts a focused error rather than a receipt when no durable file
+exists; and the age test passes explicit times at 23:59 and 24:00.
 
 - [ ] **Step 3: Run red tests**
 
