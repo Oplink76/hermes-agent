@@ -53,3 +53,4 @@ def test_register_reads_only_work_inbox_secret_and_registers_exact_route(
     provider = context.register_dashboard_auth_provider.call_args.args[0]
     assert provider.verify_token(token=strong_secret) is not None
     assert token_auth.is_token_route(work_inbox.WORK_INBOX_ROUTE_PATH)
+    assert not token_auth.is_token_route(work_inbox.WORK_INBOX_ROUTE_PATH + "/other")

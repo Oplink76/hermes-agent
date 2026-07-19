@@ -81,8 +81,11 @@ def test_exact_work_inbox_route_uses_real_bearer_middleware(app_client, strong_s
         "/api/plugins/kanban/work-inbox/other?board=strict",
         headers={"Authorization": f"Bearer {strong_secret}"},
         json={},
-    ).status_code == 404
+    ).status_code == 401
 ```
+
+The existing dashboard auth gate rejects an unregistered token subpath before
+router lookup, so the real app returns 401 rather than 404.
 
 - [ ] **Step 2: Write failing new-work and assigned-delivery behavior tests**
 
