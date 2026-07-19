@@ -2,9 +2,26 @@
 
 **Date:** 2026-07-19
 
-**Status:** Approved design; implementation pending
+**Status:** Implemented and branch-verified; deployment pending
 
 **Extends:** `2026-07-18-functional-intent-memory-and-inbox-guide-design.md`
+
+## Branch Verification Evidence
+
+- Branch head before this evidence commit:
+  `c6ac6a7f57b628faa1e5e72630b12373cbc0aa58`.
+- Full suite: 2,058 files, 42,430 passed, 6 failed. All six exact failures
+  reproduce on exact base `1efb26d3944abad20a26166fc420549088f34277`:
+  credential 1, Slack 4, approval 1; zero branch-specific failures.
+- Final focused/E2E: 331/331; relevant protocol/cron/Kanban: 115/115;
+  protocol: 40/40.
+- Ruff and diff checks are clean. The tracked worktree is clean except for the
+  pre-existing untracked `build/` directory.
+- Final Standards review: Approved, with no Critical, Important, or Minor
+  findings. Final Spec review: Approved, with no Critical, Important, or Minor
+  findings.
+- Live external-surface, deployment, restart, attention, and Trading checks
+  remain pending in Task 6 steps 4–9. This branch is not marked Live.
 
 ## Purpose
 
