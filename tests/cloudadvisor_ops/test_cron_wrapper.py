@@ -12,6 +12,7 @@ import pytest
 from ops.cloudadvisor.hermes_ops import cron_wrapper
 from ops.cloudadvisor.hermes_ops.cron_wrapper import (
     CronWrapperConfig,
+    run_agent_memory_attention,
     run_health,
     run_sync_auto,
 )
@@ -109,6 +110,21 @@ def _idempotency(fingerprint: str, packet_sha256: str) -> str:
     return hashlib.sha256(
         f"{fingerprint}:{packet_sha256}".encode("ascii")
     ).hexdigest()
+
+
+def _memory_status(**overrides: object) -> dict[str, object]:
+    status: dict[str, object] = {
+        "enabled": True,
+        "vault_available": False,
+        "pending": 2,
+        "oldest_pending_hours": 25.0,
+        "attention_required": True,
+        "reason": "pending_for_24_hours",
+        "fingerprint": "a" * 64,
+        "notify_ole": True,
+    }
+    status.update(overrides)
+    return status
 
 
 @pytest.mark.parametrize(
@@ -460,6 +476,261 @@ def test_ack_failure_after_delivery_retries_with_same_idempotency_key(
     assert outbox.load().idempotency_key == idempotency_key
 
 
+def test_scheduled_wrapper_delivers_one_memory_attention_per_fingerprint(
+    tmp_path: Path,
+) -> None:
+    statuses = [
+        _memory_status(),
+        _memory_status(notify_ole=False),
+    ]
+    run = SequenceRun(
+        [
+            subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps(status), stderr=""
+            )
+            for status in statuses
+        ]
+    )
+    sent: list[str] = []
+    acknowledged: list[str] = []
+
+    assert run_agent_memory_attention(
+        _config(tmp_path),
+        run=run,
+        deliver=sent.append,
+        acknowledge=acknowledged.append,
+    ) == 0
+    assert run_agent_memory_attention(
+        _config(tmp_path),
+        run=run,
+        deliver=sent.append,
+        acknowledge=acknowledged.append,
+    ) == 0
+
+    assert len(sent) == 1
+    assert "Agent Memory needs attention" in sent[0]
+    assert acknowledged == ["a" * 64]
+
+
+def test_scheduled_memory_check_is_quiet_before_24_hours(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run = SequenceRun([
+        subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps(
+                _memory_status(
+                    oldest_pending_hours=23.99,
+                    attention_required=False,
+                    reason="none",
+                    notify_ole=False,
+                )
+            ),
+            stderr="",
+        )
+    ])
+
+    assert run_agent_memory_attention(_config(tmp_path), run=run) == 0
+    assert capsys.readouterr() == ("", "")
+
+
+def test_scheduled_memory_check_delivers_for_corrupt_envelope(
+    tmp_path: Path,
+) -> None:
+    run = SequenceRun([
+        subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps(
+                _memory_status(
+                    reason="corrupt_or_unsafe",
+                    oldest_pending_hours=0.0,
+                )
+            ),
+            stderr="",
+        )
+    ])
+    sent: list[str] = []
+
+    assert run_agent_memory_attention(
+        _config(tmp_path),
+        run=run,
+        deliver=sent.append,
+        acknowledge=lambda _fingerprint: None,
+    ) == 0
+    assert "Reason: unsafe or corrupt outbox entry" in sent[0]
+
+
+def test_scheduled_memory_attention_never_contains_content(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sentinel = "SECRET-GIST-QUERY-PROMPT-CONTENT"
+    run = SequenceRun([
+        subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps(_memory_status()),
+            stderr=json.dumps({"gist": sentinel, "query": sentinel}),
+        )
+    ])
+    sent: list[str] = []
+
+    assert run_agent_memory_attention(
+        _config(tmp_path),
+        run=run,
+        deliver=sent.append,
+        acknowledge=lambda _fingerprint: None,
+    ) == 0
+    captured = capsys.readouterr()
+    assert sentinel not in captured.out
+    assert sentinel not in captured.err
+    assert sentinel not in sent[0]
+
+
+def test_scheduled_memory_check_skips_acknowledged_fingerprint(
+    tmp_path: Path,
+) -> None:
+    run = SequenceRun([
+        subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps(_memory_status(notify_ole=False)),
+            stderr="",
+        )
+    ])
+    sent: list[str] = []
+    acknowledged: list[str] = []
+
+    assert run_agent_memory_attention(
+        _config(tmp_path),
+        run=run,
+        deliver=sent.append,
+        acknowledge=acknowledged.append,
+    ) == 0
+    assert sent == []
+    assert acknowledged == []
+
+
+def test_scheduled_memory_check_redelivers_after_fingerprint_change(
+    tmp_path: Path,
+) -> None:
+    run = SequenceRun([
+        subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(_memory_status()), stderr=""
+        ),
+        subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps(_memory_status(fingerprint="b" * 64)),
+            stderr="",
+        ),
+    ])
+    sent: list[str] = []
+    acknowledged: list[str] = []
+
+    for _ in range(2):
+        assert run_agent_memory_attention(
+            _config(tmp_path),
+            run=run,
+            deliver=sent.append,
+            acknowledge=acknowledged.append,
+        ) == 0
+
+    assert len(sent) == 2
+    assert acknowledged == ["a" * 64, "b" * 64]
+
+
+def test_scheduled_memory_delivery_failure_does_not_acknowledge(
+    tmp_path: Path,
+) -> None:
+    run = SequenceRun([
+        subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps(_memory_status()), stderr=""
+        )
+    ])
+    acknowledged: list[str] = []
+
+    def fail_delivery(_message: str) -> None:
+        raise OSError("delivery unavailable")
+
+    assert run_agent_memory_attention(
+        _config(tmp_path),
+        run=run,
+        deliver=fail_delivery,
+        acknowledge=acknowledged.append,
+    ) == 2
+    assert acknowledged == []
+
+
+def test_main_runs_memory_check_after_sync_auto_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    monkeypatch.setattr(
+        cron_wrapper,
+        "_config_from_args",
+        lambda _args: _config(tmp_path),
+    )
+    monkeypatch.setattr(
+        cron_wrapper,
+        "run_sync_auto",
+        lambda _config: order.append("sync-auto") or 75,
+    )
+    monkeypatch.setattr(
+        cron_wrapper,
+        "run_agent_memory_attention",
+        lambda _config: order.append("memory") or 2,
+    )
+
+    assert cron_wrapper.main([
+        "sync-auto",
+        "--config",
+        str(tmp_path / "operations.yaml"),
+        "--python",
+        str(tmp_path / "python"),
+        "--install-root",
+        str(tmp_path / "repo"),
+    ]) == 75
+    assert order == ["sync-auto", "memory"]
+
+
+def test_main_runs_memory_check_after_health_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    monkeypatch.setattr(
+        cron_wrapper,
+        "_config_from_args",
+        lambda _args: _config(tmp_path),
+    )
+    monkeypatch.setattr(
+        cron_wrapper,
+        "run_health",
+        lambda _config: order.append("health") or 0,
+    )
+    monkeypatch.setattr(
+        cron_wrapper,
+        "run_agent_memory_attention",
+        lambda _config: order.append("memory") or 2,
+    )
+
+    assert cron_wrapper.main([
+        "health",
+        "--config",
+        str(tmp_path / "operations.yaml"),
+        "--python",
+        str(tmp_path / "python"),
+        "--install-root",
+        str(tmp_path / "repo"),
+    ]) == 2
+    assert order == ["health", "memory"]
+
+
 def test_health_action_is_quiet_when_installed_runtime_is_healthy(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -561,6 +832,11 @@ def test_wrapper_preserves_venv_python_launcher(
         return 0
 
     monkeypatch.setattr(cron_wrapper, "run_sync_auto", capture)
+    monkeypatch.setattr(
+        cron_wrapper,
+        "run_agent_memory_attention",
+        lambda _config: 0,
+    )
 
     assert cron_wrapper.main(
         [
@@ -624,8 +900,27 @@ def test_no_agent_routine_and_direct_success_are_scheduler_silent(
     home = _no_agent_home(tmp_path, monkeypatch)
     config = _no_agent_policy(tmp_path)
     inner = tmp_path / "fake-sync-auto"
+    memory_status = json.dumps(
+        _memory_status(
+            enabled=False,
+            pending=0,
+            oldest_pending_hours=0.0,
+            attention_required=False,
+            reason="none",
+            fingerprint=hashlib.sha256(b"[]").hexdigest(),
+            notify_ole=False,
+        ),
+        separators=(",", ":"),
+    )
     inner.write_text(
-        "#!/bin/sh\nprintf '%s\\n' '"
+        "#!/bin/sh\n"
+        "if [ \"$2\" = \"hermes_cli.main\" ]; then\n"
+        "  printf '%s\\n' '"
+        + memory_status
+        + "'\n"
+        "  exit 0\n"
+        "fi\n"
+        "printf '%s\\n' '"
         + json.dumps(_payload(), separators=(",", ":"))
         + "'\n",
         encoding="utf-8",

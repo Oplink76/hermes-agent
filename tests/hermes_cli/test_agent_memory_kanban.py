@@ -13,6 +13,7 @@ from hermes_cli import kanban_qualifier as qualifier
 from hermes_cli.agent_memory_protocol import (
     WorkerRecallRequest,
     WorkerWriteRequest,
+    configured_outbox_status,
     recall_for_worker,
     write_worker_gist,
 )
@@ -897,6 +898,92 @@ def test_unavailable_hermes_recall_queues_incident_and_still_spawns(
     assert len(observed) == 1
     assert not vault.exists()
     assert len(list(outbox.glob("recall-*.json"))) == 1
+
+
+def test_dispatch_tick_reconciles_outbox_before_card_work(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    vault = tmp_path / "Agent Memory"
+    outbox = tmp_path / "outbox"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(vault))
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_OUTBOX", str(outbox))
+    executor = ExecutorIdentity(
+        agent_id="codex",
+        model="test-model",
+        surface="codex-cli",
+        hermes_role="developer",
+        execution_id="exec-123",
+        responsibility="writer",
+    )
+    receipt = write_worker_gist(
+        WorkerWriteRequest(
+            operation_id="write-123",
+            task_id="t-memory",
+            run_id=7,
+            delegation_id="delegation-123",
+            gist_id="gist-123",
+            occurred_at=datetime(2026, 7, 19, 12, 0),
+            function_id="function-memory-recovery",
+            title="Recover memory",
+            context="board=default; task=t-memory; run=7",
+            summary="Recovery fixture.",
+            reused="none",
+            result="queued",
+            maturity="code_complete",
+            evidence="tests: fixture",
+            behavior="none",
+            decisions="none",
+            open_loops="none",
+            executor=executor,
+        )
+    )
+    assert receipt.status == "queued"
+
+    vault.mkdir()
+    with kb.connect(tmp_path / "kanban.db") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Idle card",
+            idempotency_key="idle-card",
+        )
+        result = kb.dispatch_once(conn, max_spawn=0, board="default")
+        assert result.spawned == []
+        assert kb.get_task(conn, task_id).status == "ready"
+
+    assert recall(vault, "gist-123")[0].gist_id == "gist-123"
+    assert not list(outbox.glob("gist-*.json"))
+
+
+def test_corrupt_outbox_entry_does_not_change_card_or_break_dispatch(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    vault = tmp_path / "Agent Memory"
+    vault.mkdir()
+    outbox = tmp_path / "outbox"
+    outbox.mkdir()
+    corrupt = outbox / "gist-corrupt.json"
+    corrupt.write_text("not-json", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(vault))
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_OUTBOX", str(outbox))
+
+    with kb.connect(tmp_path / "kanban.db") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Idle corrupt recovery card",
+            idempotency_key="idle-corrupt-recovery-card",
+        )
+        result = kb.dispatch_once(conn, max_spawn=0, board="default")
+        task = kb.get_task(conn, task_id)
+
+    assert result.spawned == []
+    assert task.status == "ready"
+    assert task.consecutive_failures == 0
+    assert corrupt.exists()
+    assert configured_outbox_status().attention_required is True
 
 
 def test_stored_and_already_stored_gists_allow_handoff(tmp_path, monkeypatch):

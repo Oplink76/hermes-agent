@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -11,6 +12,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+
+from hermes_cli.agent_memory_protocol import acknowledge_attention
 
 from .decision_packet import load_escalation_decision_packet
 from .sync_status import SyncDecisionOutbox
@@ -52,6 +55,21 @@ _SYNC_FIELDS = {
     "decision_packet_path",
     "decision_packet_sha256",
     "decision_idempotency_key",
+}
+_AGENT_MEMORY_FIELDS = {
+    "enabled",
+    "vault_available",
+    "pending",
+    "oldest_pending_hours",
+    "attention_required",
+    "reason",
+    "fingerprint",
+    "notify_ole",
+}
+_AGENT_MEMORY_REASONS = {
+    "none",
+    "corrupt_or_unsafe",
+    "pending_for_24_hours",
 }
 
 
@@ -228,11 +246,31 @@ def _deliver_pending(
         lines.append(f"Pull request: #{packet.pr_number}")
     lines.append(f"Approve / Wait / Details: {packet.details_artifact}")
     message = "\n".join(lines) + "\n"
+    _deliver_message(
+        config,
+        message,
+        deliver=deliver,
+        delivery_run=delivery_run,
+    )
+    SyncDecisionOutbox(config.outbox_store).acknowledge(
+        fingerprint=pending.escalation_fingerprint,
+        packet_sha256=pending.packet_sha256,
+        idempotency_key=pending.idempotency_key,
+    )
+
+
+def _deliver_message(
+    config: CronWrapperConfig,
+    message: str,
+    *,
+    deliver: Callable[[str], None] | None,
+    delivery_run: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
     if deliver is not None:
         deliver(message)
     else:
         if not config.delivery_command:
-            raise ValueError("sync decision delivery command is not configured")
+            raise ValueError("delivery command is not configured")
         completed = delivery_run(
             list(config.delivery_command),
             cwd=config.install_root,
@@ -243,12 +281,113 @@ def _deliver_pending(
             timeout=120,
         )
         if completed.returncode != 0:
-            raise OSError("sync decision delivery command failed")
-    SyncDecisionOutbox(config.outbox_store).acknowledge(
-        fingerprint=pending.escalation_fingerprint,
-        packet_sha256=pending.packet_sha256,
-        idempotency_key=pending.idempotency_key,
-    )
+            raise OSError("delivery command failed")
+
+
+def _load_agent_memory_status(raw: str) -> dict[str, object]:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid Agent Memory status JSON") from exc
+    if not isinstance(payload, dict) or set(payload) != _AGENT_MEMORY_FIELDS:
+        raise ValueError(
+            "Agent Memory status fields do not match the wrapper schema"
+        )
+    for field in (
+        "enabled",
+        "vault_available",
+        "attention_required",
+        "notify_ole",
+    ):
+        if type(payload[field]) is not bool:
+            raise ValueError(f"Agent Memory status {field} must be boolean")
+    pending = payload["pending"]
+    if type(pending) is not int or pending < 0:
+        raise ValueError("Agent Memory status pending is invalid")
+    oldest = payload["oldest_pending_hours"]
+    if (
+        isinstance(oldest, bool)
+        or not isinstance(oldest, (int, float))
+        or not math.isfinite(oldest)
+        or oldest < 0
+    ):
+        raise ValueError("Agent Memory status oldest_pending_hours is invalid")
+    reason = payload["reason"]
+    if not isinstance(reason, str) or reason not in _AGENT_MEMORY_REASONS:
+        raise ValueError("Agent Memory status reason is invalid")
+    fingerprint = payload["fingerprint"]
+    if (
+        not isinstance(fingerprint, str)
+        or len(fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in fingerprint)
+    ):
+        raise ValueError("Agent Memory status fingerprint is invalid")
+    attention = payload["attention_required"]
+    notify = payload["notify_ole"]
+    if notify and not attention:
+        raise ValueError("Agent Memory notification contradicts attention state")
+    if (reason == "none") != (not attention):
+        raise ValueError("Agent Memory reason contradicts attention state")
+    if attention and pending == 0:
+        raise ValueError("Agent Memory attention requires pending entries")
+    return payload
+
+
+def run_agent_memory_attention(
+    config: CronWrapperConfig,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    deliver: Callable[[str], None] | None = None,
+    delivery_run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    acknowledge: Callable[[str], None] = acknowledge_attention,
+) -> int:
+    try:
+        completed = run(
+            [
+                str(config.python),
+                "-m",
+                "hermes_cli.main",
+                "agent-memory",
+                "status",
+            ],
+            cwd=config.install_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+        if completed.returncode != 0:
+            raise ValueError("Agent Memory status command failed")
+        status = _load_agent_memory_status(completed.stdout or "")
+        if not status["notify_ole"]:
+            return 0
+        reasons = {
+            "pending_for_24_hours": "external vault unavailable for 24 hours",
+            "corrupt_or_unsafe": "unsafe or corrupt outbox entry",
+        }
+        reason = reasons[str(status["reason"])]
+        message = "\n".join(
+            [
+                "🚨 Hermes Agent Memory needs attention",
+                "Recommendation: inspect the Agent Memory outbox",
+                f"Reason: {reason}",
+                f"Pending entries: {status['pending']}",
+                "Hermes kept development running and preserved writes locally.",
+            ]
+        ) + "\n"
+        _deliver_message(
+            config,
+            message,
+            deliver=deliver,
+            delivery_run=delivery_run,
+        )
+        acknowledge(str(status["fingerprint"]))
+        return 0
+    except subprocess.TimeoutExpired:
+        print("Agent Memory attention wrapper failed: command timed out", file=sys.stderr)
+    except (OSError, ValueError) as exc:
+        print(f"Agent Memory attention wrapper failed: {exc}", file=sys.stderr)
+    return 2
 
 
 def _result_requires_no_delivery(
@@ -448,7 +587,11 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError):
         print("sync-auto wrapper failed: invalid configuration", file=sys.stderr)
         return 2
-    return run_health(config) if args.mode == "health" else run_sync_auto(config)
+    primary_code = (
+        run_health(config) if args.mode == "health" else run_sync_auto(config)
+    )
+    memory_code = run_agent_memory_attention(config)
+    return primary_code if primary_code != 0 else memory_code
 
 
 if __name__ == "__main__":

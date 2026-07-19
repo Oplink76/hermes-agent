@@ -14207,6 +14207,16 @@ def _dispatch_once_locked(
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
 
+    if not dry_run:
+        try:
+            from hermes_cli.agent_memory_protocol import (
+                reconcile_configured_outbox,
+            )
+
+            reconcile_configured_outbox()
+        except Exception as exc:
+            _log.warning("Agent Memory reconcile failed; work continues: %s", exc)
+
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
