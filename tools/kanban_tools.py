@@ -144,6 +144,14 @@ def _stamp_worker_session_metadata(
     return stamped
 
 
+def _agent_memory_handover_error(action: str) -> str:
+    return tool_error(
+        f"{action}: kanban handover is still in-flight. Complete Agent Memory "
+        "recall/write, then retry the same kanban_complete or kanban_block call. "
+        "A queued write is accepted; the external vault need not be available."
+    )
+
+
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     """Reject worker-driven destructive calls on foreign task IDs.
 
@@ -836,6 +844,8 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
                 )
+            except kb.AgentMemoryHandoverError:
+                return _agent_memory_handover_error("kanban_complete")
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the
@@ -889,6 +899,35 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(f"kanban_complete: {e}")
 
 
+def _canonical_agent_memory_metadata(metadata: object) -> dict | None:
+    if metadata is None:
+        return None
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata must be an object/dict")
+    if set(metadata) != {"agent_memory"}:
+        raise ValueError("metadata must contain only agent_memory")
+    agent_memory = metadata.get("agent_memory")
+    if not isinstance(agent_memory, dict) or set(agent_memory) != {
+        "recall", "write",
+    }:
+        raise ValueError(
+            "metadata.agent_memory must contain exactly recall and write"
+        )
+    from hermes_cli.agent_memory_protocol import MemoryReceipt
+
+    try:
+        return {
+            "agent_memory": {
+                name: MemoryReceipt.from_mapping(agent_memory[name]).to_mapping()
+                for name in ("recall", "write")
+            }
+        }
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "metadata.agent_memory must contain canonical recall and write receipts"
+        ) from exc
+
+
 def _handle_resolve(args: dict, **kw) -> str:
     """Apply one audited Resolver decision to the current preflight."""
     from hermes_cli import kanban_db as kb_module
@@ -907,7 +946,7 @@ def _handle_resolve(args: dict, **kw) -> str:
 
     allowed_fields = {
         "task_id", "board", "decision", "fault_domain", "diagnosis",
-        "reason", "expected", "repair",
+        "reason", "expected", "repair", "metadata",
     }
     unexpected = sorted(set(args) - allowed_fields)
     if unexpected:
@@ -921,6 +960,11 @@ def _handle_resolve(args: dict, **kw) -> str:
         "repair",
     )
     request = {field: args[field] for field in request_fields if field in args}
+    metadata = args.get("metadata")
+    try:
+        metadata = _canonical_agent_memory_metadata(metadata)
+    except ValueError as exc:
+        return tool_error(f"kanban_resolve: {exc}")
     resolver_model = (
         os.environ.get("HERMES_INFERENCE_MODEL")
         or os.environ.get("HERMES_MODEL")
@@ -934,6 +978,7 @@ def _handle_resolve(args: dict, **kw) -> str:
                 tid,
                 board=board or os.environ.get("HERMES_KANBAN_BOARD"),
                 request=request,
+                metadata=metadata,
                 resolver_profile=resolver_profile,
                 resolver_model=resolver_model,
             )
@@ -946,6 +991,8 @@ def _handle_resolve(args: dict, **kw) -> str:
         return tool_error(
             "kanban_resolve conflict: task changed; refresh with kanban_show"
         )
+    except kb_module.AgentMemoryHandoverError:
+        return _agent_memory_handover_error("kanban_resolve")
     except ValueError as e:
         return tool_error(f"kanban_resolve: {e}")
     except Exception as e:
@@ -955,6 +1002,8 @@ def _handle_resolve(args: dict, **kw) -> str:
 
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
+    from hermes_cli import kanban_db as kb_module
+
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -977,6 +1026,17 @@ def _handle_block(args: dict, **kw) -> str:
             "what you already tried before asking for human input"
         )
     attempted_resolutions = _normalize_attempted_resolutions(attempted_resolutions_raw)
+    metadata = args.get("metadata")
+    if metadata is not None:
+        try:
+            metadata = _canonical_agent_memory_metadata(metadata)
+        except ValueError:
+            return tool_error(
+                "kanban_block: metadata.agent_memory must contain canonical "
+                "recall and write receipts"
+            )
+    else:
+        metadata = _stamp_worker_session_metadata(tid, None)
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1028,6 +1088,7 @@ def _handle_block(args: dict, **kw) -> str:
                 reason=reason,
                 kind=kind,
                 attempted_resolutions=attempted_resolutions,
+                metadata=metadata,
                 expected_run_id=_worker_run_id(tid),
                 board=board,
                 human_escalation_assignee=_product_human_escalation_profile(board),
@@ -1062,6 +1123,8 @@ def _handle_block(args: dict, **kw) -> str:
             conn.close()
     except ValueError as e:
         return tool_error(f"kanban_block: {e}")
+    except kb_module.AgentMemoryHandoverError:
+        return _agent_memory_handover_error("kanban_block")
     except Exception as e:
         logger.exception("kanban_block failed")
         return tool_error(f"kanban_block: {e}")
@@ -1731,6 +1794,81 @@ KANBAN_COMPLETE_SCHEMA = {
     },
 }
 
+
+def _agent_memory_receipt_schema(operation: str) -> dict:
+    statuses = (
+        ["matched", "empty", "unavailable"]
+        if operation == "recall"
+        else ["stored", "already_stored", "queued"]
+    )
+    executor = {
+        "type": "object",
+        "properties": {
+            "agent_id": {"type": "string"},
+            "execution_id": {"type": "string"},
+            "hermes_role": {"type": "string"},
+            "model": {"type": "string"},
+            "responsibility": {"type": "string"},
+            "surface": {"type": "string"},
+            "version": {"type": "integer", "enum": [1]},
+        },
+        "required": [
+            "agent_id", "execution_id", "hermes_role", "model",
+            "responsibility", "surface", "version",
+        ],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "continue_work": {"type": "boolean", "enum": [True]},
+            "delegation_id": {"type": "string"},
+            "executor": executor,
+            "gist_id": (
+                {"type": "null"}
+                if operation == "recall"
+                else {"type": "string"}
+            ),
+            "occurred_at": {"type": "string"},
+            "operation": {"type": "string", "enum": [operation]},
+            "operation_id": {"type": "string"},
+            "run_id": {"type": "integer"},
+            "status": {"type": "string", "enum": statuses},
+            "task_id": {"type": "string"},
+        },
+        "required": [
+            "continue_work", "delegation_id", "executor", "gist_id",
+            "occurred_at", "operation", "operation_id", "run_id", "status",
+            "task_id",
+        ],
+        "additionalProperties": False,
+    }
+
+
+def _agent_memory_metadata_schema() -> dict:
+    """Shared strict handover envelope for Resolver and worker exits."""
+    return {
+        "type": "object",
+        "description": (
+            "Shared governed handover envelope containing only the actual "
+            "worker's Agent Memory recall and write receipts."
+        ),
+        "properties": {
+            "agent_memory": {
+                "type": "object",
+                "properties": {
+                    "recall": _agent_memory_receipt_schema("recall"),
+                    "write": _agent_memory_receipt_schema("write"),
+                },
+                "required": ["recall", "write"],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["agent_memory"],
+        "additionalProperties": False,
+    }
+
+
 KANBAN_RESOLVE_SCHEMA = {
     "name": "kanban_resolve",
     "description": (
@@ -1758,6 +1896,7 @@ KANBAN_RESOLVE_SCHEMA = {
             },
             "diagnosis": {"type": "string"},
             "reason": {"type": "string"},
+            "metadata": _agent_memory_metadata_schema(),
             "expected": {
                 "type": "object",
                 "properties": {
@@ -1865,9 +2004,11 @@ KANBAN_BLOCK_SCHEMA = {
                     "fallback API, asked another agent via comment."
                 ),
             },
+            "metadata": _agent_memory_metadata_schema(),
             "board": _board_schema_prop(),
         },
         "required": ["reason"],
+        "additionalProperties": False,
     },
 }
 

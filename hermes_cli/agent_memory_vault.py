@@ -33,6 +33,7 @@ _SCHEME_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"']+")
 _GIST_RE = re.compile(
     r"(?ms)^## (?P<header>[^\n]+)\n"
     r"<!-- gist_id: (?P<gist_id>[^<>\n]+) -->\n"
+    r"(?:<!-- operation_id: (?P<operation_id>[^<>\n]+) -->\n)?"
     r"(?P<body>.*?)(?=^## |\Z)"
 )
 _FIELD_RE = re.compile(r"(?m)^- (?P<name>[^:]+): (?P<value>.*)$")
@@ -57,6 +58,18 @@ _ALLOWED_MATURITY = frozenset(
         "reviewed",
         "released",
     }
+)
+_ALLOWED_EXECUTION_SURFACES = frozenset(
+    {
+        "hermes-direct",
+        "hermes-child",
+        "codex-cli",
+        "claude-code-cli",
+        "cowork-mcp",
+    }
+)
+_ALLOWED_EXECUTOR_RESPONSIBILITIES = frozenset(
+    {"orchestrator", "writer", "reviewer"}
 )
 _WORD_RE = re.compile(r"[a-z0-9][a-z0-9_-]{1,}")
 _COMMIT_RE = re.compile(r"[0-9a-fA-F]{7,64}")
@@ -115,6 +128,65 @@ _REPOSITORY_EVIDENCE_KEYS = {"repo", "repository", "repository_url"}
 _log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class ExecutorIdentity:
+    """Canonical identity of the executor responsible for one memory action."""
+
+    agent_id: str
+    model: str
+    surface: str
+    hermes_role: str
+    execution_id: str
+    responsibility: str
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "ExecutorIdentity":
+        expected = {
+            "agent_id",
+            "execution_id",
+            "hermes_role",
+            "model",
+            "responsibility",
+            "surface",
+            "version",
+        }
+        if not isinstance(value, Mapping) or set(value) != expected:
+            raise ValueError("executor identity must contain exactly the canonical keys")
+        if value["version"] != 1 or isinstance(value["version"], bool):
+            raise ValueError("unsupported Agent Memory executor identity version")
+        identity = cls(
+            agent_id=_identity_text(value["agent_id"]),
+            model=_identity_text(value["model"]),
+            surface=_identity_text(value["surface"]),
+            hermes_role=_identity_text(value["hermes_role"]),
+            execution_id=_identity_text(value["execution_id"]),
+            responsibility=_identity_text(value["responsibility"]),
+        )
+        identity.canonical_json()
+        return identity
+
+    def to_mapping(self) -> dict[str, object]:
+        return json.loads(self.canonical_json())
+
+    def canonical_json(self) -> str:
+        if self.surface not in _ALLOWED_EXECUTION_SURFACES:
+            raise ValueError("unsupported Agent Memory execution surface")
+        if self.responsibility not in _ALLOWED_EXECUTOR_RESPONSIBILITIES:
+            raise ValueError("unsupported Agent Memory executor responsibility")
+        value = {
+            "agent_id": _identity_text(self.agent_id),
+            "execution_id": _identity_text(self.execution_id),
+            "hermes_role": _identity_text(self.hermes_role),
+            "model": _identity_text(self.model),
+            "responsibility": _identity_text(self.responsibility),
+            "surface": _identity_text(self.surface),
+            "version": 1,
+        }
+        return json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+
+
 @dataclass
 class SessionGist:
     """A bounded, redacted record appended by one agent handover."""
@@ -134,6 +206,8 @@ class SessionGist:
     behavior: str
     decisions: str
     open_loops: str
+    executor: ExecutorIdentity | None = None
+    operation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -160,6 +234,7 @@ class LintReport:
 @dataclass(frozen=True)
 class _ParsedGist:
     gist_id: str
+    operation_id: str | None
     function_id: str
     title: str
     fields: dict[str, str]
@@ -344,6 +419,23 @@ def recall_for_task(title: str, body: str | None) -> list[MemoryMatch]:
     except Exception as exc:
         _log.warning("Agent Memory worker recall failed: %s", exc)
         return []
+
+
+def functional_identity_for_task(
+    conn: Any, task_id: str
+) -> tuple[str, str, str] | None:
+    """Return the existing Work Contract identity and its recall vocabulary."""
+    task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if task is None:
+        return None
+    contract = _kanban_work_contract(conn, task["work_contract_id"])
+    work = _functional_work(task, contract)
+    if work is None:
+        return None
+    function_id = _function_id(work)
+    title = _recorded_text(work.get("title") or task["title"] or function_id)
+    query = _recorded_text(f"{title} {_functional_boundary_text(work)}")
+    return function_id, title, query
 
 
 def _kanban_run(conn: Any, task_id: str, run_id: int) -> Any:
@@ -654,6 +746,10 @@ def _append_gist_unlocked(vault: Path, gist: SessionGist) -> bool:
     rendered_match = _GIST_RE.fullmatch(entry)
     if rendered_match is None or _parse_gist(rendered_match, history_path) is None:
         raise ValueError("rendered Session Gist does not satisfy the vault schema")
+    if gist.operation_id is not None and any(
+        item.operation_id == gist.operation_id for item in _valid_entries(vault)
+    ):
+        return False
     if _gist_exists(vault, gist_id):
         return False
 
@@ -682,9 +778,20 @@ def recall(vault: Path, query: str, limit: int = 5) -> list[MemoryMatch]:
     matches: list[MemoryMatch] = []
     for entry in _recent_valid_entries(Path(vault)):
         title_words = _words(entry.title)
-        all_text = " ".join((entry.function_id, entry.title, *entry.fields.values()))
+        all_text = " ".join(
+            (
+                entry.function_id,
+                entry.operation_id or "",
+                entry.title,
+                *entry.fields.values(),
+            )
+        )
         shared_words = query_words & _words(all_text)
-        exact_identifier = query_folded in {entry.function_id.lower(), entry.gist_id.lower()}
+        exact_identifier = query_folded in {
+            entry.function_id.lower(),
+            entry.gist_id.lower(),
+            (entry.operation_id or "").lower(),
+        }
         score = (
             (1_000 if exact_identifier else 0)
             + len(shared_words)
@@ -813,7 +920,7 @@ def _write_if_missing(path: Path, content: str) -> None:
 
 
 def _agents_template() -> str:
-    return """# Agent Memory Vault\n\nAppend-only Session Gists use this schema:\n\n```markdown\n## HH:MM | <agent-id> | <role>\n<!-- gist_id: <opaque-id> -->\n- Function: <function_id> | <title>\n- Context: <board/card/project/repository evidence>\n- Summary: <1-3 sentences>\n- Reused: <existing functionality/evidence, or none>\n- Result: <what changed or was learned>\n- Maturity: <allowed maturity value>\n- Evidence: <commits, PRs, tests, review/release references>\n- Behavior: <learning, or none>\n- Decisions: <decisions, or none>\n- Open loops: <remaining work, or none>\n```\n\nDo not store transcripts, private reasoning, credentials, secrets, or unrelated conversation.\n"""
+    return """# Agent Memory Vault\n\nAppend-only Session Gists use this schema:\n\n```markdown\n## HH:MM | <agent-id> | <role>\n<!-- gist_id: <opaque-id> -->\n<!-- operation_id: <optional-stable-operation-id> -->\n- Function: <function_id> | <title>\n- Context: <board/card/project/repository evidence>\n- Summary: <1-3 sentences>\n- Reused: <existing functionality/evidence, or none>\n- Result: <what changed or was learned>\n- Maturity: <allowed maturity value>\n- Evidence: <commits, PRs, tests, review/release references>\n- Behavior: <learning, or none>\n- Decisions: <decisions, or none>\n- Open loops: <remaining work, or none>\n```\n\nThe operation_id comment is optional for compatibility with older and manual gists. Do not store transcripts, private reasoning, credentials, secrets, or unrelated conversation.\n"""
 
 
 def _gist_exists(vault: Path, gist_id: str) -> bool:
@@ -831,7 +938,7 @@ def _render_gist(gist: SessionGist, gist_id: str) -> str:
     occurred_at = gist.occurred_at
     if not isinstance(occurred_at, datetime):
         raise TypeError("occurred_at must be a datetime")
-    fields = (
+    fields = [
         ("Function", f"{_recorded_text(gist.function_id)} | {_recorded_text(gist.title)}"),
         ("Context", _recorded_text(gist.context)),
         ("Summary", _recorded_text(gist.summary)),
@@ -842,11 +949,15 @@ def _render_gist(gist: SessionGist, gist_id: str) -> str:
         ("Behavior", _recorded_text(gist.behavior)),
         ("Decisions", _recorded_text(gist.decisions)),
         ("Open loops", _recorded_text(gist.open_loops)),
-    )
+    ]
+    if gist.executor is not None:
+        fields.insert(1, ("Executor", gist.executor.canonical_json()))
     header = " | ".join(
         (_recorded_text(occurred_at.strftime("%H:%M")), _recorded_text(gist.agent_id), _recorded_text(gist.role))
     )
     lines = [f"## {header}", f"<!-- gist_id: {gist_id} -->"]
+    if gist.operation_id is not None:
+        lines.append(f"<!-- operation_id: {_operation_id(gist.operation_id)} -->")
     lines.extend(f"- {name}: {value}" for name, value in fields)
     return "\n".join(lines) + "\n"
 
@@ -855,6 +966,14 @@ def _recorded_text(value: object) -> str:
     redacted = _sanitize_sensitive_text("" if value is None else str(value))
     normalized = " ".join(redacted.split())
     return _clip(normalized, _MAX_RECORDED_CHARS)
+
+
+def _identity_text(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value) > _MAX_RECORDED_CHARS:
+        raise ValueError("Agent Memory executor identity field is invalid")
+    if _sanitize_sensitive_text(value) != value or _UNSAFE_IDENTIFIER_RE.search(value):
+        raise ValueError("Agent Memory executor identity field is unsafe")
+    return _recorded_text(value)
 
 
 def _clip(value: str, maximum: int) -> str:
@@ -892,6 +1011,13 @@ def _gist_id(value: object) -> str:
     if redact_sensitive_text(value, force=True) != value:
         raise ValueError("gist_id must be a bounded opaque identifier")
     return value
+
+
+def _operation_id(value: object) -> str:
+    try:
+        return _gist_id(value)
+    except ValueError as exc:
+        raise ValueError("operation_id must be a bounded opaque identifier") from exc
 
 
 def _occurred_on(value: object) -> date:
@@ -946,6 +1072,10 @@ def _parse_gist(match: re.Match[str], source: Path) -> _ParsedGist | None:
         return None
     try:
         gist_id = _gist_id(match.group("gist_id"))
+        raw_operation_id = match.group("operation_id")
+        operation_id = (
+            _operation_id(raw_operation_id) if raw_operation_id is not None else None
+        )
     except ValueError:
         return None
 
@@ -961,6 +1091,11 @@ def _parse_gist(match: re.Match[str], source: Path) -> _ParsedGist | None:
         for name, value in fields.items()
     ):
         return None
+    if "Executor" in fields:
+        try:
+            ExecutorIdentity.from_mapping(json.loads(fields["Executor"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
     function_id, separator, title = fields["Function"].partition(" | ")
     if not separator or not function_id or not title:
         return None
@@ -970,6 +1105,7 @@ def _parse_gist(match: re.Match[str], source: Path) -> _ParsedGist | None:
         return None
     return _ParsedGist(
         gist_id=gist_id,
+        operation_id=operation_id,
         function_id=function_id,
         title=title,
         fields=fields,
