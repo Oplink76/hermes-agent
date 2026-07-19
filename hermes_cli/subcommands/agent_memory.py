@@ -39,12 +39,25 @@ class _AgentMemoryArgumentParser(argparse.ArgumentParser):
         return parsed, extras
 
 
+def _make_parser_strict(parser: argparse.ArgumentParser) -> None:
+    parser.error = _redacted_argument_error
+    parse_known_args = parser.parse_known_args
+
+    def strict_parse_known_args(args=None, namespace=None):
+        parsed, extras = parse_known_args(args, namespace)
+        if extras:
+            _redacted_argument_error("unrecognized arguments")
+        return parsed, extras
+
+    parser.parse_known_args = strict_parse_known_args
+
+
 def build_agent_memory_parser(subparsers, *, cmd_agent_memory: Callable) -> None:
     """Attach governed worker-memory commands to ``subparsers``."""
     parser = subparsers.add_parser(
         "agent-memory", help="Recall and record governed worker memory"
     )
-    parser.error = _redacted_argument_error
+    _make_parser_strict(parser)
     verbs = parser.add_subparsers(
         dest="agent_memory_action",
         required=True,

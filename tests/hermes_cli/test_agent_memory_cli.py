@@ -115,6 +115,18 @@ def test_unknown_action_uses_one_scoped_redacted_argparse_error(monkeypatch, cap
     )
 
 
+def test_unknown_option_before_action_uses_one_scoped_redacted_argparse_error(
+    monkeypatch, capsys
+):
+    malformed = f"--private-{_SENTINEL}"
+    _assert_main_syntax_rejected(
+        monkeypatch,
+        capsys,
+        ["agent-memory", malformed, "recall"],
+        request_text=malformed,
+    )
+
+
 def test_unknown_child_option_uses_one_scoped_redacted_argparse_error(
     monkeypatch, capsys
 ):
@@ -232,6 +244,7 @@ def test_unconfigured_recall_returns_empty_disabled_receipt(monkeypatch, capsys)
 
 def test_status_returns_counts_and_never_content(monkeypatch, capsys):
     monkeypatch.delenv("HERMES_AGENT_MEMORY_VAULT", raising=False)
+    monkeypatch.delenv("HERMES_AGENT_MEMORY_OUTBOX", raising=False)
 
     assert cmd_agent_memory(_parse(["agent-memory", "status"])) == 0
 
@@ -248,6 +261,7 @@ def test_status_returns_counts_and_never_content(monkeypatch, capsys):
 
 def test_reconcile_returns_only_bounded_operational_counts(monkeypatch, capsys):
     monkeypatch.delenv("HERMES_AGENT_MEMORY_VAULT", raising=False)
+    monkeypatch.delenv("HERMES_AGENT_MEMORY_OUTBOX", raising=False)
 
     assert cmd_agent_memory(_parse(["agent-memory", "reconcile"])) == 0
 
