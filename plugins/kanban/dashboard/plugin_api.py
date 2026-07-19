@@ -48,7 +48,7 @@ from typing import Annotated, Any, Literal, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_intake
@@ -543,6 +543,19 @@ class WorkInboxAssignedDeliveryBody(BaseModel):
     block_kind: Optional[str] = None
     attempted_resolutions: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def validate_outcome_shape(self) -> "WorkInboxAssignedDeliveryBody":
+        if self.outcome == "blocked":
+            if self.block_kind not in kanban_db.VALID_BLOCK_KINDS:
+                raise ValueError("blocked delivery requires a valid block_kind")
+            if self.result is not None:
+                raise ValueError("blocked delivery cannot include result")
+        elif self.block_kind is not None or self.attempted_resolutions:
+            raise ValueError(
+                "completed delivery cannot include block details"
+            )
+        return self
+
 
 WorkInboxBody = Annotated[
     WorkInboxNewWorkBody | WorkInboxAssignedDeliveryBody,
@@ -572,7 +585,10 @@ def _work_inbox_metadata(metadata: Optional[dict[str, Any]]) -> Optional[dict[st
     try:
         return json.loads(serialized)
     except json.JSONDecodeError:
-        return metadata
+        raise HTTPException(
+            status_code=422,
+            detail="Work Inbox metadata could not be safely processed",
+        ) from None
 
 
 def _require_work_inbox_assignment(
@@ -580,10 +596,11 @@ def _require_work_inbox_assignment(
     payload: WorkInboxAssignedDeliveryBody,
 ) -> None:
     task = kanban_db.get_task(conn, payload.task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
     run = kanban_db.get_run(conn, payload.run_id)
     if (
-        task is None
-        or run is None
+        run is None
         or run.task_id != payload.task_id
         or run.ended_at is not None
         or task.current_run_id != payload.run_id
@@ -627,12 +644,6 @@ def submit_work_inbox(
 
         _require_work_inbox_assignment(conn, payload)
         metadata = _work_inbox_metadata(payload.metadata)
-        if (
-            payload.outcome == "blocked"
-            and payload.block_kind is not None
-            and payload.block_kind not in kanban_db.VALID_BLOCK_KINDS
-        ):
-            raise HTTPException(status_code=422, detail="unknown block kind")
         summary = redact_sensitive_text(payload.summary, force=True)
         result = (
             redact_sensitive_text(payload.result, force=True)
@@ -666,11 +677,18 @@ def submit_work_inbox(
             kanban_db.ProductProvenanceError,
             kanban_db.ProductWorkflowStateError,
             kanban_db.ReleaseEvidenceError,
-        ) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="handover policy rejected this delivery",
+            ) from None
         if not ok:
             raise HTTPException(status_code=409, detail="assigned delivery could not be applied")
-        return {"status": "handover_applied"}
+        return {
+            "task_id": payload.task_id,
+            "run_id": payload.run_id,
+            "status": "handover_applied" if payload.outcome == "completed" else "blocked",
+        }
     finally:
         conn.close()
 

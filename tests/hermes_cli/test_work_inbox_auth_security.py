@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import secrets
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -219,7 +220,11 @@ def test_exact_assigned_completion_uses_normal_handover(
     )
 
     assert response.status_code == 200, response.text
-    assert response.json()["status"] == "handover_applied"
+    assert response.json() == {
+        "task_id": task_id,
+        "run_id": run_id,
+        "status": "handover_applied",
+    }
     with kb.connect(board=board) as conn:
         assert kb.get_task(conn, task_id).current_step_key == "test"
 
@@ -241,7 +246,11 @@ def test_exact_assigned_blocking_uses_normal_handover(
     )
 
     assert response.status_code == 200, response.text
-    assert response.json()["status"] == "handover_applied"
+    assert response.json() == {
+        "task_id": task_id,
+        "run_id": run_id,
+        "status": "blocked",
+    }
     with kb.connect(board=board) as conn:
         assert kb.get_run(conn, run_id).ended_at is not None
 
@@ -282,16 +291,21 @@ def test_ineligible_assigned_delivery_does_not_mutate_task_or_events(
 
 
 @pytest.mark.parametrize(
-    "mutate",
+    "mutate, expected_status",
     [
-        lambda body: body.update(run_id=999999),
-        lambda body: body.update(work_contract_id="wc_wrong"),
-        lambda body: body.update(metadata={"private": "no"}),
-        lambda body: body.update(unexpected=True),
+        (lambda body: body.update(run_id=999999), 409),
+        (lambda body: body.update(work_contract_id="wc_wrong"), 409),
+        (lambda body: body.update(metadata={"private": "no"}), 422),
+        (lambda body: body.update(unexpected=True), 422),
+        (lambda body: body.update(outcome="blocked"), 422),
+        (lambda body: body.update(outcome="blocked", block_kind="needs_input", result="not allowed"), 422),
+        (lambda body: body.update(block_kind="needs_input"), 422),
+        (lambda body: body.update(attempted_resolutions=["not allowed"]), 422),
+        (lambda body: body.update(outcome="blocked", block_kind="not_a_kind"), 422),
     ],
 )
 def test_rejected_assigned_delivery_does_not_mutate_task_or_events(
-    app_client, strict_board, strong_secret, mutate, tmp_path,
+    app_client, strict_board, strong_secret, mutate, expected_status, tmp_path,
 ):
     board, task_id, run_id, contract_id = _contracted_running_card(strict_board, tmp_path)
     with kb.connect(board=board) as conn:
@@ -305,7 +319,7 @@ def test_rejected_assigned_delivery_does_not_mutate_task_or_events(
         headers={"Authorization": f"Bearer {strong_secret}"}, json=body,
     )
 
-    assert response.status_code in {409, 422}
+    assert response.status_code == expected_status
     with kb.connect(board=board) as conn:
         after = kb.get_task(conn, task_id)
         assert after == before
@@ -333,6 +347,89 @@ def test_task_mismatched_assignment_does_not_mutate_task_or_events(
         assert len(kb.list_events(conn, other_task_id)) == before_events
         assert kb.get_task(conn, task_id).current_run_id == run_id
         assert kb.get_task(conn, task_id).work_contract_id == contract_id
+
+
+def test_unknown_task_assignment_returns_not_found_without_mutation(
+    app_client, strict_board, strong_secret, tmp_path,
+):
+    board, task_id, run_id, contract_id = _contracted_running_card(strict_board, tmp_path)
+    with kb.connect(board=board) as conn:
+        before = kb.get_task(conn, task_id)
+        before_events = len(kb.list_events(conn, task_id))
+
+    response = app_client.post(
+        f"/api/plugins/kanban/work-inbox?board={board}",
+        headers={"Authorization": f"Bearer {strong_secret}"},
+        json=_assigned_completion_body("t_unknown", run_id, contract_id),
+    )
+
+    assert response.status_code == 404
+    with kb.connect(board=board) as conn:
+        assert kb.get_task(conn, task_id) == before
+        assert len(kb.list_events(conn, task_id)) == before_events
+
+
+def test_malformed_redacted_metadata_is_rejected_without_persisting_secret(
+    app_client, strict_board, strong_secret, tmp_path, monkeypatch,
+):
+    board, task_id, run_id, contract_id = _contracted_running_card(strict_board, tmp_path)
+    secret = "unredacted-metadata-secret"
+    with kb.connect(board=board) as conn:
+        before = kb.get_task(conn, task_id)
+        before_events = len(kb.list_events(conn, task_id))
+    monkeypatch.setattr(
+        sys.modules["hermes_dashboard_plugin_kanban"],
+        "redact_sensitive_text",
+        lambda *_args, **_kwargs: "{",
+    )
+    body = _assigned_completion_body(task_id, run_id, contract_id)
+    body["metadata"] = {"tests_run": [secret]}
+
+    response = app_client.post(
+        f"/api/plugins/kanban/work-inbox?board={board}",
+        headers={"Authorization": f"Bearer {strong_secret}"}, json=body,
+    )
+
+    assert response.status_code == 422
+    assert secret not in response.text
+    with kb.connect(board=board) as conn:
+        assert kb.get_task(conn, task_id) == before
+        assert len(kb.list_events(conn, task_id)) == before_events
+
+
+@pytest.mark.parametrize(
+    "error_factory",
+    [
+        lambda: kb.ArtifactPreservationError("private artifact path"),
+        lambda: kb.ProductProvenanceError("private provenance detail", "t_other", "development"),
+        lambda: kb.ProductWorkflowStateError("t_other", "development", "private workflow detail"),
+        lambda: kb.ReleaseEvidenceError("t_other", ["private evidence detail"]),
+    ],
+)
+def test_handover_policy_errors_use_bounded_public_detail(
+    app_client, strict_board, strong_secret, tmp_path, monkeypatch, error_factory,
+):
+    board, task_id, run_id, contract_id = _contracted_running_card(strict_board, tmp_path)
+    with kb.connect(board=board) as conn:
+        before = kb.get_task(conn, task_id)
+        before_events = len(kb.list_events(conn, task_id))
+
+    def reject_policy(*_args, **_kwargs):
+        raise error_factory()
+
+    monkeypatch.setattr(kb, "complete_task", reject_policy)
+    response = app_client.post(
+        f"/api/plugins/kanban/work-inbox?board={board}",
+        headers={"Authorization": f"Bearer {strong_secret}"},
+        json=_assigned_completion_body(task_id, run_id, contract_id),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "handover policy rejected this delivery"
+    assert "private" not in response.text
+    with kb.connect(board=board) as conn:
+        assert kb.get_task(conn, task_id) == before
+        assert len(kb.list_events(conn, task_id)) == before_events
 
 
 def test_ended_run_assignment_does_not_mutate_task_or_events(

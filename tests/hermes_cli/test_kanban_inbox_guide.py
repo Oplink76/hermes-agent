@@ -30,6 +30,13 @@ def test_guide_names_one_minimal_work_inbox_route():
     )
     assert set(body["submission"]["kinds"]) == {"new_work", "assigned_delivery"}
     assert body["submission"]["scope"] == "work_inbox:submit"
+    assert body["submission"]["authentication"] == {
+        "required": True,
+        "type": "bearer",
+        "authorization_header": "Authorization: Bearer <machine credential>",
+        "credential_included": False,
+    }
+    assert body["submission"]["examples"]["assigned_delivery"]["run_id"] == 123
     assert guide_url in body["copy_ready_prompt"]
     assert body["retry"]["automatic_retry"] is False
     assert "receipt" not in body

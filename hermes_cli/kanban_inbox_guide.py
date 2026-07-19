@@ -55,7 +55,8 @@ def build_inbox_guide(
             "kinds": ["new_work", "assigned_delivery"],
             "authentication": {
                 "required": True,
-                "type": "authenticated Hermes API context",
+                "type": "bearer",
+                "authorization_header": "Authorization: Bearer <machine credential>",
                 "credential_included": False,
             },
             "examples": {
@@ -64,7 +65,7 @@ def build_inbox_guide(
                     "version": 2,
                     "kind": "assigned_delivery",
                     "task_id": "<assigned task id>",
-                    "run_id": "<assigned run id>",
+                    "run_id": 123,
                     "work_contract_id": "<assigned Work Contract id>",
                     "outcome": "completed",
                     "summary": "<delivery summary>",
