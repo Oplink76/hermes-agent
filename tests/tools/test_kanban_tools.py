@@ -469,8 +469,9 @@ def test_resolve_schema_is_strict_and_bounded():
     assert "fix_task_id" not in params["properties"]
     assert set(params["properties"]) == {
         "task_id", "board", "decision", "fault_domain", "diagnosis",
-        "reason", "expected", "repair",
+        "reason", "expected", "repair", "metadata",
     }
+    assert params["properties"]["metadata"]["type"] == "object"
 
 
 def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):

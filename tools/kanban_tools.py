@@ -144,6 +144,14 @@ def _stamp_worker_session_metadata(
     return stamped
 
 
+def _agent_memory_handover_error(action: str) -> str:
+    return tool_error(
+        f"{action}: kanban handover is still in-flight. Complete Agent Memory "
+        "recall/write, then retry the same kanban_complete or kanban_block call. "
+        "A queued write is accepted; the external vault need not be available."
+    )
+
+
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     """Reject worker-driven destructive calls on foreign task IDs.
 
@@ -836,6 +844,8 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
                 )
+            except kb.AgentMemoryHandoverError:
+                return _agent_memory_handover_error("kanban_complete")
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the
@@ -907,7 +917,7 @@ def _handle_resolve(args: dict, **kw) -> str:
 
     allowed_fields = {
         "task_id", "board", "decision", "fault_domain", "diagnosis",
-        "reason", "expected", "repair",
+        "reason", "expected", "repair", "metadata",
     }
     unexpected = sorted(set(args) - allowed_fields)
     if unexpected:
@@ -921,6 +931,16 @@ def _handle_resolve(args: dict, **kw) -> str:
         "repair",
     )
     request = {field: args[field] for field in request_fields if field in args}
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error("kanban_resolve: metadata must be an object/dict")
+    if metadata is not None:
+        meta_json = redact_sensitive_text(json.dumps(metadata), force=True)
+        try:
+            metadata = json.loads(meta_json)
+        except json.JSONDecodeError:
+            pass
+    metadata = _stamp_worker_session_metadata(tid, metadata)
     resolver_model = (
         os.environ.get("HERMES_INFERENCE_MODEL")
         or os.environ.get("HERMES_MODEL")
@@ -934,6 +954,7 @@ def _handle_resolve(args: dict, **kw) -> str:
                 tid,
                 board=board or os.environ.get("HERMES_KANBAN_BOARD"),
                 request=request,
+                metadata=metadata,
                 resolver_profile=resolver_profile,
                 resolver_model=resolver_model,
             )
@@ -946,6 +967,8 @@ def _handle_resolve(args: dict, **kw) -> str:
         return tool_error(
             "kanban_resolve conflict: task changed; refresh with kanban_show"
         )
+    except kb_module.AgentMemoryHandoverError:
+        return _agent_memory_handover_error("kanban_resolve")
     except ValueError as e:
         return tool_error(f"kanban_resolve: {e}")
     except Exception as e:
@@ -955,6 +978,8 @@ def _handle_resolve(args: dict, **kw) -> str:
 
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
+    from hermes_cli import kanban_db as kb_module
+
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -977,6 +1002,16 @@ def _handle_block(args: dict, **kw) -> str:
             "what you already tried before asking for human input"
         )
     attempted_resolutions = _normalize_attempted_resolutions(attempted_resolutions_raw)
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error("metadata must be an object/dict")
+    if metadata is not None:
+        meta_json = redact_sensitive_text(json.dumps(metadata), force=True)
+        try:
+            metadata = json.loads(meta_json)
+        except json.JSONDecodeError:
+            pass
+    metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1028,6 +1063,7 @@ def _handle_block(args: dict, **kw) -> str:
                 reason=reason,
                 kind=kind,
                 attempted_resolutions=attempted_resolutions,
+                metadata=metadata,
                 expected_run_id=_worker_run_id(tid),
                 board=board,
                 human_escalation_assignee=_product_human_escalation_profile(board),
@@ -1062,6 +1098,8 @@ def _handle_block(args: dict, **kw) -> str:
             conn.close()
     except ValueError as e:
         return tool_error(f"kanban_block: {e}")
+    except kb_module.AgentMemoryHandoverError:
+        return _agent_memory_handover_error("kanban_block")
     except Exception as e:
         logger.exception("kanban_block failed")
         return tool_error(f"kanban_block: {e}")
@@ -1758,6 +1796,14 @@ KANBAN_RESOLVE_SCHEMA = {
             },
             "diagnosis": {"type": "string"},
             "reason": {"type": "string"},
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Existing structured handover metadata. For governed Agent "
+                    "Memory work, include agent_memory.recall and "
+                    "agent_memory.write receipts."
+                ),
+            },
             "expected": {
                 "type": "object",
                 "properties": {
@@ -1863,6 +1909,14 @@ KANBAN_BLOCK_SCHEMA = {
                     "for needs_input/capability/legacy human blocks on product "
                     "boards. Examples: checked docs, searched repo, tried "
                     "fallback API, asked another agent via comment."
+                ),
+            },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Existing structured handover metadata. For governed Agent "
+                    "Memory work, include agent_memory.recall and "
+                    "agent_memory.write receipts."
                 ),
             },
             "board": _board_schema_prop(),
