@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_cli import agent_memory_protocol as memory_protocol
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_qualifier as qualifier
 from hermes_cli.agent_memory_protocol import (
@@ -129,6 +130,19 @@ def _configured_product_board(
     metadata["qualification"]["work_types"] = list(qualifier.DEFAULT_WORK_TYPES)
     kb.board_metadata_path(board).write_text(json.dumps(metadata), encoding="utf-8")
     return board, vault
+
+
+def _dispatch_governance_state(task: kb.Task) -> dict[str, object]:
+    return {
+        "status": task.status,
+        "assignee": task.assignee,
+        "current_step_key": task.current_step_key,
+        "workflow_template_id": task.workflow_template_id,
+        "work_contract_id": task.work_contract_id,
+        "failure_count": task.consecutive_failures,
+        "running": task.running,
+        "blocked": task.blocked,
+    }
 
 
 def _worker_metadata(
@@ -984,6 +998,71 @@ def test_corrupt_outbox_entry_does_not_change_card_or_break_dispatch(
     assert task.consecutive_failures == 0
     assert corrupt.exists()
     assert configured_outbox_status().attention_required is True
+
+
+def test_dry_run_dispatch_skips_reconcile_and_preserves_card_routing(
+    tmp_path, monkeypatch
+):
+    board, _vault = _configured_product_board(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        memory_protocol,
+        "reconcile_configured_outbox",
+        lambda: calls.append("reconcile"),
+    )
+
+    with kb.connect(board=board) as conn:
+        task_id = _qualified_task(
+            conn,
+            board=board,
+            title="Dry-run memory recovery stays advisory",
+        )
+        before = _dispatch_governance_state(kb.get_task(conn, task_id))
+
+        result = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            max_spawn=0,
+            board=board,
+        )
+        after = _dispatch_governance_state(kb.get_task(conn, task_id))
+
+    assert calls == []
+    assert result.spawned == []
+    assert after == before
+
+
+def test_reconcile_exception_is_swallowed_and_preserves_card_routing(
+    tmp_path, monkeypatch, caplog
+):
+    board, _vault = _configured_product_board(tmp_path, monkeypatch)
+    calls = []
+
+    def fail_reconcile() -> None:
+        calls.append("reconcile")
+        raise OSError("outbox unavailable")
+
+    monkeypatch.setattr(
+        memory_protocol,
+        "reconcile_configured_outbox",
+        fail_reconcile,
+    )
+
+    with kb.connect(board=board) as conn:
+        task_id = _qualified_task(
+            conn,
+            board=board,
+            title="Recovery failure leaves routing unchanged",
+        )
+        before = _dispatch_governance_state(kb.get_task(conn, task_id))
+
+        result = kb.dispatch_once(conn, max_spawn=0, board=board)
+        after = _dispatch_governance_state(kb.get_task(conn, task_id))
+
+    assert calls == ["reconcile"]
+    assert result.spawned == []
+    assert after == before
+    assert "Agent Memory reconcile failed; work continues" in caplog.text
 
 
 def test_stored_and_already_stored_gists_allow_handoff(tmp_path, monkeypatch):
