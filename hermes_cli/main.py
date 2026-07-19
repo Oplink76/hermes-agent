@@ -294,6 +294,10 @@ from hermes_cli.subcommands.login import build_login_parser
 from hermes_cli.subcommands.logout import build_logout_parser
 from hermes_cli.subcommands.auth import build_auth_parser
 from hermes_cli.subcommands.status import build_status_parser
+from hermes_cli.subcommands.agent_memory import (
+    build_agent_memory_parser,
+    cmd_agent_memory,
+)
 from hermes_cli.subcommands.webhook import build_webhook_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
@@ -13216,6 +13220,8 @@ def main():
     # =========================================================================
     # kanban command — multi-profile collaboration board
     # =========================================================================
+    build_agent_memory_parser(subparsers, cmd_agent_memory=cmd_agent_memory)
+
     from hermes_cli.kanban import build_parser as _build_kanban_parser
 
     kanban_parser = _build_kanban_parser(subparsers)
