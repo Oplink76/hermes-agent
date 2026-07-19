@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+from hermes_cli import agent_memory_vault as memory_vault
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_qualifier as qualifier
 from hermes_cli import main as main_module
-from hermes_cli.agent_memory_vault import recall
 
 
 SURFACES = (
@@ -23,6 +24,38 @@ SURFACES = (
     "claude-code-cli",
     "cowork-mcp",
 )
+AGENT_IDS = {
+    "hermes-direct": "hermes",
+    "hermes-child": "hermes-child",
+    "codex-cli": "codex",
+    "claude-code-cli": "claude-code",
+    "cowork-mcp": "claude-code",
+}
+
+
+def _persisted_gist(vault, gist_id: str):
+    entries = [
+        entry
+        for entry in memory_vault._recent_valid_entries(vault)
+        if entry.gist_id == gist_id
+    ]
+    assert len(entries) == 1
+    return entries[0]
+
+
+def _assert_executor(
+    executor: dict,
+    *,
+    surface: str,
+    run_id: int,
+    hermes_role: str,
+    responsibility: str,
+) -> None:
+    assert executor["surface"] == surface
+    assert executor["agent_id"] == AGENT_IDS[surface]
+    assert executor["execution_id"] == f"execution-{surface}-{run_id}"
+    assert executor["hermes_role"] == hermes_role
+    assert executor["responsibility"] == responsibility
 
 
 def _development_decision(title: str) -> dict:
@@ -73,6 +106,25 @@ def _development_decision(title: str) -> dict:
     }
 
 
+def _git(repo, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _init_git_repo(repo) -> None:
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "worker@example.com")
+    _git(repo, "config", "user.name", "Worker Protocol")
+    (repo / "README.md").write_text("worker protocol\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "test fixture")
+
+
 @pytest.fixture
 def protocol_board(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
@@ -80,6 +132,8 @@ def protocol_board(tmp_path, monkeypatch):
     vault = tmp_path / "Agent Memory"
     vault.mkdir()
     outbox = tmp_path / "outbox"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(vault))
     monkeypatch.setenv("HERMES_AGENT_MEMORY_OUTBOX", str(outbox))
@@ -118,6 +172,10 @@ def protocol_board(tmp_path, monkeypatch):
         )
         assert qualified["status"] == "qualified"
         task_id = qualified["task_id"]
+        kb.set_workspace_path(conn, task_id, repo)
+        (repo / "worker-result.txt").write_text(
+            "bounded worker result\n", encoding="utf-8"
+        )
         claimed = kb.claim_task(conn, task_id, board=board)
         assert claimed is not None and claimed.current_run_id is not None
         run_id = claimed.current_run_id
@@ -130,7 +188,6 @@ def protocol_board(tmp_path, monkeypatch):
                 metadata=worker_metadata,
                 expected_run_id=run_id,
                 board=board,
-                product_workflow_enabled=False,
             )
 
         yield SimpleNamespace(
@@ -169,13 +226,7 @@ def run_fake_delegated_worker(
     assert recall_payload["run_id"] == run_id
     assert write_payload["context"] == f"board={board}; task={task_id}; run={run_id}"
 
-    agent_id = {
-        "hermes-direct": "hermes",
-        "hermes-child": "hermes-child",
-        "codex-cli": "codex",
-        "claude-code-cli": "claude-code",
-        "cowork-mcp": "claude-code",
-    }[surface]
+    agent_id = AGENT_IDS[surface]
     executor = {
         **recall_payload["executor"],
         "agent_id": agent_id,
@@ -220,11 +271,26 @@ def run_fake_delegated_worker(
             "write": write_result["receipt"],
         },
     }
+    role = executor["hermes_role"]
+    provenance_key = {
+        "developer": "writer",
+        "tester": "tester",
+        "reviewer": "reviewer",
+    }[role]
+    metadata["ai_provenance"] = {
+        provenance_key: {
+            "agent": agent_id,
+            "model": executor["model"],
+        }
+    }
+    if role == "tester":
+        metadata["workflow_outcome"] = {"verdict": "passed"}
+    elif role == "reviewer":
+        metadata["workflow_outcome"] = {"verdict": "approved"}
 
     return SimpleNamespace(
         recall_receipt=recall_result["receipt"],
         write_receipt=write_result["receipt"],
-        executor=executor,
         function_id=write_payload["function_id"],
         metadata=metadata,
     )
@@ -244,17 +310,63 @@ def test_each_surface_recalls_and_writes(surface, protocol_board, capsys):
     )
 
     assert outcome.recall_receipt["operation"] == "recall"
-    assert outcome.write_receipt["status"] in {
-        "stored",
-        "already_stored",
-        "queued",
-    }
-    assert outcome.executor["surface"] == surface
+    receipt_executor = outcome.write_receipt["executor"]
+    assert outcome.recall_receipt["executor"] == receipt_executor
+    _assert_executor(
+        receipt_executor,
+        surface=surface,
+        run_id=protocol_board.run_id,
+        hermes_role="developer",
+        responsibility="writer",
+    )
     assert protocol_board.complete(outcome.metadata) is True
     if surface == "cowork-mcp":
         assert outcome.recall_receipt["status"] == "unavailable"
         assert outcome.write_receipt["status"] == "queued"
-        assert list(protocol_board.outbox.glob("gist-*.json"))
+        path = protocol_board.outbox / f"gist-{outcome.write_receipt['gist_id']}.json"
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+        assert envelope["receipt"] == outcome.write_receipt
+        assert envelope["gist"]["executor"] == receipt_executor
+    else:
+        assert outcome.write_receipt["status"] in {"stored", "already_stored"}
+        entry = _persisted_gist(
+            protocol_board.vault, outcome.write_receipt["gist_id"]
+        )
+        assert json.loads(entry.fields["Executor"]) == receipt_executor
+        assert entry.function_id == outcome.function_id
+    task = kb.get_task(protocol_board.conn, protocol_board.task_id)
+    assert task is not None and task.current_step_key == "test"
+
+
+def test_receipt_gate_rejects_missing_and_mismatched_before_accepting_cli_receipts(
+    protocol_board, capsys
+):
+    outcome = run_fake_delegated_worker(
+        surface="hermes-child",
+        conn=protocol_board.conn,
+        task_id=protocol_board.task_id,
+        run_id=protocol_board.run_id,
+        board=protocol_board.slug,
+        capsys=capsys,
+    )
+
+    with pytest.raises(kb.AgentMemoryHandoverError) as missing:
+        protocol_board.complete({})
+    assert missing.value.missing == ("recall", "write")
+    task = kb.get_task(protocol_board.conn, protocol_board.task_id)
+    assert task is not None and task.status == "running"
+
+    mismatched = json.loads(json.dumps(outcome.metadata))
+    mismatched["agent_memory"]["write"]["run_id"] += 1
+    with pytest.raises(kb.AgentMemoryHandoverError) as invalid:
+        protocol_board.complete(mismatched)
+    assert invalid.value.invalid == ("write",)
+    task = kb.get_task(protocol_board.conn, protocol_board.task_id)
+    assert task is not None and task.status == "running"
+
+    assert protocol_board.complete(outcome.metadata) is True
+    task = kb.get_task(protocol_board.conn, protocol_board.task_id)
+    assert task is not None and task.current_step_key == "test"
 
 
 def test_writer_and_reviewer_have_distinct_execution_and_gist_ids(
@@ -269,14 +381,35 @@ def test_writer_and_reviewer_have_distinct_execution_and_gist_ids(
         capsys=capsys,
     )
     assert protocol_board.complete(writer.metadata) is True
+    task = kb.get_task(protocol_board.conn, protocol_board.task_id)
+    assert task is not None and task.current_step_key == "test"
 
-    with kb.authorized_governance_write(), kb.write_txn(protocol_board.conn):
-        protocol_board.conn.execute(
-            "UPDATE tasks SET status='review', assignee='reviewer', "
-            "current_step_key='review', running=0, blocked=0, "
-            "claim_lock=NULL, claim_expires=NULL WHERE id=?",
-            (protocol_board.task_id,),
-        )
+    tester_claimed = kb.claim_task(
+        protocol_board.conn,
+        protocol_board.task_id,
+        board=protocol_board.slug,
+        claimer="protocol-tester",
+    )
+    assert tester_claimed is not None and tester_claimed.current_run_id is not None
+    tester = run_fake_delegated_worker(
+        surface="hermes-direct",
+        conn=protocol_board.conn,
+        task_id=protocol_board.task_id,
+        run_id=tester_claimed.current_run_id,
+        board=protocol_board.slug,
+        capsys=capsys,
+    )
+    assert kb.complete_task(
+        protocol_board.conn,
+        protocol_board.task_id,
+        summary="The bounded worker task passed verification",
+        metadata=tester.metadata,
+        expected_run_id=tester_claimed.current_run_id,
+        board=protocol_board.slug,
+    ) is True
+    task = kb.get_task(protocol_board.conn, protocol_board.task_id)
+    assert task is not None and task.current_step_key == "review"
+
     claimed = kb.claim_review_task(
         protocol_board.conn,
         protocol_board.task_id,
@@ -293,22 +426,38 @@ def test_writer_and_reviewer_have_distinct_execution_and_gist_ids(
         capsys=capsys,
     )
 
-    assert writer.executor["responsibility"] == "writer"
-    assert reviewer.executor["responsibility"] == "reviewer"
-    assert writer.executor["execution_id"] != reviewer.executor["execution_id"]
+    writer_executor = writer.write_receipt["executor"]
+    reviewer_executor = reviewer.write_receipt["executor"]
+    _assert_executor(
+        writer_executor,
+        surface="codex-cli",
+        run_id=protocol_board.run_id,
+        hermes_role="developer",
+        responsibility="writer",
+    )
+    _assert_executor(
+        reviewer_executor,
+        surface="claude-code-cli",
+        run_id=claimed.current_run_id,
+        hermes_role="reviewer",
+        responsibility="reviewer",
+    )
+    assert writer_executor["execution_id"] != reviewer_executor["execution_id"]
     assert writer.recall_receipt["delegation_id"] != reviewer.recall_receipt[
         "delegation_id"
     ]
     assert writer.recall_receipt["run_id"] != reviewer.recall_receipt["run_id"]
     assert writer.write_receipt["gist_id"] != reviewer.write_receipt["gist_id"]
     assert writer.function_id == reviewer.function_id
-    writer_entry = recall(
-        protocol_board.vault, writer.write_receipt["gist_id"], limit=1
-    )[0]
-    reviewer_entry = recall(
-        protocol_board.vault, reviewer.write_receipt["gist_id"], limit=1
-    )[0]
+    writer_entry = _persisted_gist(
+        protocol_board.vault, writer.write_receipt["gist_id"]
+    )
+    reviewer_entry = _persisted_gist(
+        protocol_board.vault, reviewer.write_receipt["gist_id"]
+    )
     assert writer_entry.function_id == reviewer_entry.function_id == writer.function_id
+    assert json.loads(writer_entry.fields["Executor"]) == writer_executor
+    assert json.loads(reviewer_entry.fields["Executor"]) == reviewer_executor
     assert kb.complete_task(
         protocol_board.conn,
         protocol_board.task_id,
@@ -316,5 +465,6 @@ def test_writer_and_reviewer_have_distinct_execution_and_gist_ids(
         metadata=reviewer.metadata,
         expected_run_id=claimed.current_run_id,
         board=protocol_board.slug,
-        product_workflow_enabled=False,
     ) is True
+    task = kb.get_task(protocol_board.conn, protocol_board.task_id)
+    assert task is not None and task.current_step_key == "release_measure"
