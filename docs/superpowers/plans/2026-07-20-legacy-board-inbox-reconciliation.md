@@ -62,7 +62,7 @@ assert reconcile.json()["items"][0]["source"] == "hermes-reconcile"
 
 - [ ] **Step 2: Run the focused test and verify the new assertion fails**
 
-Run: `pytest -q tests/plugins/test_kanban_dashboard_plugin.py::test_official_intake_api_returns_receipt_filtered_inbox_and_detail`
+Run: `scripts/run_tests.sh tests/plugins/test_kanban_dashboard_plugin.py::test_official_intake_api_returns_receipt_filtered_inbox_and_detail -q`
 
 Expected: FAIL because the unfiltered response includes both internal sources.
 
@@ -87,7 +87,7 @@ else:
 
 - [ ] **Step 4: Run the focused plugin tests**
 
-Run: `pytest -q tests/plugins/test_kanban_dashboard_plugin.py`
+Run: `scripts/run_tests.sh tests/plugins/test_kanban_dashboard_plugin.py -q`
 
 Expected: PASS.
 
@@ -186,7 +186,7 @@ The fixture manifest uses this exact entry shape:
 
 - [ ] **Step 2: Run the new tests and verify import failure**
 
-Run: `pytest -q tests/hermes_cli/test_kanban_legacy_reconcile.py -k 'audit or invalid'`
+Run: `scripts/run_tests.sh tests/hermes_cli/test_kanban_legacy_reconcile.py -q -k 'audit or invalid'`
 
 Expected: FAIL because `kanban_legacy_reconcile` does not exist.
 
@@ -225,7 +225,7 @@ Use `PRAGMA query_only=ON`; do not call `kb.init_db()` or any schema-migrating c
 
 - [ ] **Step 4: Run dry-run tests and lint the new module**
 
-Run: `pytest -q tests/hermes_cli/test_kanban_legacy_reconcile.py -k 'audit or invalid'`
+Run: `scripts/run_tests.sh tests/hermes_cli/test_kanban_legacy_reconcile.py -q -k 'audit or invalid'`
 
 Run: `ruff check hermes_cli/kanban_legacy_reconcile.py tests/hermes_cli/test_kanban_legacy_reconcile.py`
 
@@ -295,7 +295,7 @@ def test_later_board_failure_restores_earlier_board(..., monkeypatch):
 
 - [ ] **Step 2: Run apply tests and verify failure**
 
-Run: `pytest -q tests/hermes_cli/test_kanban_legacy_reconcile.py -k 'apply or active or restores'`
+Run: `scripts/run_tests.sh tests/hermes_cli/test_kanban_legacy_reconcile.py -q -k 'apply or active or restores'`
 
 Expected: FAIL because `apply_manifest` has no mutation implementation.
 
@@ -362,7 +362,7 @@ After every board, verify expected states inside a read-only connection. On any 
 
 - [ ] **Step 4: Run the complete reconciliation test file**
 
-Run: `pytest -q tests/hermes_cli/test_kanban_legacy_reconcile.py`
+Run: `scripts/run_tests.sh tests/hermes_cli/test_kanban_legacy_reconcile.py -q`
 
 Run: `ruff check hermes_cli/kanban_legacy_reconcile.py tests/hermes_cli/test_kanban_legacy_reconcile.py`
 
@@ -411,7 +411,7 @@ Also assert `--apply` without `--approval` is rejected by argparse and that this
 
 - [ ] **Step 2: Run CLI tests and verify parser failure**
 
-Run: `pytest -q tests/hermes_cli/test_kanban_legacy_reconcile.py -k cli`
+Run: `scripts/run_tests.sh tests/hermes_cli/test_kanban_legacy_reconcile.py -q -k cli`
 
 Expected: FAIL because `legacy-reconcile` is not registered.
 
@@ -435,7 +435,7 @@ Expected JSON: `ready_to_apply: true`, six boards, 82 cards, dispositions `47/10
 
 - [ ] **Step 5: Run focused and adjacent tests**
 
-Run: `pytest -q tests/hermes_cli/test_kanban_legacy_reconcile.py tests/hermes_cli/test_kanban_qualification_migrate.py tests/plugins/test_kanban_dashboard_plugin.py`
+Run: `scripts/run_tests.sh tests/hermes_cli/test_kanban_legacy_reconcile.py tests/hermes_cli/test_kanban_qualification_migrate.py tests/plugins/test_kanban_dashboard_plugin.py -q`
 
 Run: `ruff check hermes_cli/kanban.py hermes_cli/kanban_legacy_reconcile.py plugins/kanban/dashboard/plugin_api.py tests/hermes_cli/test_kanban_legacy_reconcile.py tests/plugins/test_kanban_dashboard_plugin.py`
 
@@ -465,7 +465,7 @@ Use `superpowers:subagent-driven-development` task review after each implementat
 
 - [ ] **Step 2: Run final local verification**
 
-Run the focused/adjacent pytest and ruff commands from Task 4, then the repository's standard non-integration test command used by CI. Record exact commands and counts on the Default-board card.
+Run the focused/adjacent tests through `scripts/run_tests.sh` and the ruff commands from Task 4, then the repository's standard non-integration test command used by CI. Record exact commands and counts on the Default-board card.
 
 - [ ] **Step 3: Push, open a PR, pass CI, and merge to `main`**
 
