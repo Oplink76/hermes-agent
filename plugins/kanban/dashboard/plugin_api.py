@@ -59,6 +59,10 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
+_INTERNAL_QUALIFICATION_SOURCES = frozenset(
+    {"hermes-migration", "hermes-reconcile"}
+)
+
 
 # ---------------------------------------------------------------------------
 # Auth helper — WebSocket only (HTTP routes live behind the dashboard's
@@ -736,7 +740,12 @@ def list_intake(
     conn = _conn(board=board)
     try:
         items = kanban_db.list_qualification_intakes(conn, status=status)
-        if source is not None:
+        if source is None:
+            items = [
+                item for item in items
+                if item["source"] not in _INTERNAL_QUALIFICATION_SOURCES
+            ]
+        else:
             items = [item for item in items if item["source"] == source]
         return {"items": items, "count": len(items)}
     finally:

@@ -517,11 +517,38 @@ def test_official_intake_api_returns_receipt_filtered_inbox_and_detail(client):
     assert receipt["status"] == "qualification_required"
     intake_id = receipt["intake_id"]
 
+    with kb.connect(board="strict") as conn:
+        intake.submit_intake(
+            conn,
+            request={"title": "Migrated intake"},
+            source="hermes-migration",
+        )
+        intake.submit_intake(
+            conn,
+            request={"title": "Reconciled intake"},
+            source="hermes-reconcile",
+        )
+
     inbox = client.get(
         "/api/plugins/kanban/intake?board=strict&status=pending"
     )
     assert inbox.status_code == 200
     assert [item["id"] for item in inbox.json()["items"]] == [intake_id]
+
+    normal = client.get("/api/plugins/kanban/intake?board=strict")
+    assert [item["source"] for item in normal.json()["items"]] == ["dashboard-api"]
+
+    migration = client.get(
+        "/api/plugins/kanban/intake?board=strict&source=hermes-migration"
+    )
+    assert migration.json()["count"] == 1
+    assert migration.json()["items"][0]["source"] == "hermes-migration"
+
+    reconcile = client.get(
+        "/api/plugins/kanban/intake?board=strict&source=hermes-reconcile"
+    )
+    assert reconcile.json()["count"] == 1
+    assert reconcile.json()["items"][0]["source"] == "hermes-reconcile"
 
     detail = client.get(
         f"/api/plugins/kanban/intake/{intake_id}?board=strict"
