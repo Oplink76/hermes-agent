@@ -218,7 +218,9 @@ def _load_and_validate_approval(
         raise ReconciliationBlocked("approval authority must be break-glass")
     if approval["scope"] != RECONCILIATION_SCOPE:
         raise ReconciliationBlocked("approval scope is not approved")
-    for field in ("approved_by", "approved_at", "evidence"):
+    if approval["approved_by"] != "Ole Ørum-Petersen":
+        raise ReconciliationBlocked("approval must be from Ole Ørum-Petersen")
+    for field in ("approved_at", "evidence"):
         if not isinstance(approval[field], str) or not approval[field]:
             raise ReconciliationBlocked(f"approval {field} must be a non-empty string")
     if approval["manifest_sha256"] != manifest_digest:
@@ -272,7 +274,7 @@ def _read_board_query_only(board: str) -> dict[str, Any]:
         active_run_ids = {
             int(row["id"])
             for row in conn.execute(
-                "SELECT id FROM task_runs WHERE status = 'running'"
+                "SELECT id FROM task_runs WHERE ended_at IS NULL"
             )
         }
         all_intake_ids = {
@@ -446,6 +448,30 @@ def audit_manifest(manifest_path: Path) -> dict[str, Any]:
     }
 
 
+def _expected_event_payload(
+    entry: dict[str, Any], kind: str, digest: str
+) -> dict[str, Any]:
+    if kind == "qualification_history_corrected":
+        return {
+            "manifest_sha256": digest,
+            "actor": "hermes/default",
+            "reason": (
+                "Legacy migration/reconciliation was not "
+                "Qualification or Requalification"
+            ),
+            **entry["qualification_lineage"],
+        }
+    return {
+        "manifest_sha256": digest,
+        "actor": "hermes/default",
+        "reason": (
+            "Approved evidence proves this externally orchestrated "
+            "legacy work is complete"
+        ),
+        "evidence": entry["evidence"],
+    }
+
+
 def _append_once(
     conn: sqlite3.Connection,
     task_id: str,
@@ -484,38 +510,28 @@ def _apply_board(
                     entry["qualification_disposition"]
                     == "migration_artifact_not_qualification"
                 ):
+                    payload = _expected_event_payload(
+                        entry, "qualification_history_corrected", digest
+                    )
                     if _append_once(
                         conn,
                         task_id,
                         "qualification_history_corrected",
-                        {
-                            "manifest_sha256": digest,
-                            "actor": "hermes/default",
-                            "reason": (
-                                "Legacy migration/reconciliation was not "
-                                "Qualification or Requalification"
-                            ),
-                            **entry["qualification_lineage"],
-                        },
+                        payload,
                         digest=digest,
                     ):
                         changed["qualification_history_corrected"] += 1
 
                 disposition = entry["card_disposition"]
                 if disposition == "legacy_reconciled":
+                    payload = _expected_event_payload(
+                        entry, "legacy_reconciled", digest
+                    )
                     if _append_once(
                         conn,
                         task_id,
                         "legacy_reconciled",
-                        {
-                            "manifest_sha256": digest,
-                            "actor": "hermes/default",
-                            "reason": (
-                                "Approved evidence proves this externally "
-                                "orchestrated legacy work is complete"
-                            ),
-                            "evidence": entry["evidence"],
-                        },
+                        payload,
                         digest=digest,
                     ):
                         changed["legacy_reconciled"] += 1
@@ -540,8 +556,49 @@ def _apply_board(
 
 def _integrity(board: str) -> str:
     path = kb.kanban_db_path(board)
-    with contextlib.closing(sqlite3.connect(str(path))) as conn:
+    with contextlib.closing(
+        sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    ) as conn:
+        conn.execute("PRAGMA query_only=ON")
         return str(conn.execute("PRAGMA integrity_check").fetchone()[0])
+
+
+def _matching_event_count(
+    manifest: dict[str, Any], digest: str, *, exact_payload: bool
+) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for board in manifest["boards"]:
+        entries = [card for card in manifest["cards"] if card["board"] == board]
+        path = kb.kanban_db_path(board)
+        with contextlib.closing(
+            sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        ) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+            for entry in entries:
+                kinds: list[str] = []
+                if (
+                    entry["qualification_disposition"]
+                    == "migration_artifact_not_qualification"
+                ):
+                    kinds.append("qualification_history_corrected")
+                if entry["card_disposition"] == "legacy_reconciled":
+                    kinds.append("legacy_reconciled")
+                for kind in kinds:
+                    expected = _expected_event_payload(entry, kind, digest)
+                    for row in conn.execute(
+                        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+                        (entry["task_id"], kind),
+                    ):
+                        try:
+                            payload = json.loads(row["payload"] or "{}")
+                        except json.JSONDecodeError:
+                            continue
+                        if payload.get("manifest_sha256") == digest and (
+                            not exact_payload or payload == expected
+                        ):
+                            counts[kind] += 1
+    return counts
 
 
 def _find_successful_receipt(
@@ -570,11 +627,19 @@ def _find_successful_receipt(
 def _verify_post_state(
     manifest: dict[str, Any],
     digest: str,
-) -> dict[str, str]:
+    *,
+    boards: list[str] | None = None,
+) -> tuple[dict[str, str], Counter[str]]:
     integrity: dict[str, str] = {}
-    for board in manifest["boards"]:
+    event_counts: Counter[str] = Counter()
+    for board in boards or manifest["boards"]:
         entries = [card for card in manifest["cards"] if card["board"] == board]
-        with kb.connect_closing(board=board) as conn:
+        path = kb.kanban_db_path(board)
+        with contextlib.closing(
+            sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        ) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
             for entry in entries:
                 row = conn.execute(
                     """
@@ -629,35 +694,52 @@ def _verify_post_state(
                             payload = json.loads(event["payload"] or "{}")
                         except json.JSONDecodeError:
                             continue
-                        matches += payload.get("manifest_sha256") == digest
+                        expected_payload = _expected_event_payload(
+                            entry, kind, digest
+                        )
+                        matches += payload == expected_payload
                     if matches != 1:
                         raise ReconciliationBlocked(
                             f"post-apply {kind} event mismatch: {board}/{entry['task_id']}"
                         )
+                    event_counts[kind] += matches
         integrity[board] = _integrity(board)
         if integrity[board] != "ok":
             raise ReconciliationBlocked(
                 f"post-apply integrity check failed for {board}: {integrity[board]}"
             )
-    return integrity
+    return integrity, event_counts
 
 
-def _restore_snapshots(snapshots: dict[str, Any]) -> dict[str, str]:
+def _restore_snapshots(
+    snapshots: dict[str, Any],
+) -> tuple[dict[str, str], dict[str, str]]:
     integrity: dict[str, str] = {}
+    errors: dict[str, str] = {}
     for board, record in snapshots.items():
-        snapshot_path = Path(record["snapshot"]["snapshot"]["db"])
-        live_path = kb.kanban_db_path(board)
-        snapshot_uri = f"file:{snapshot_path}?mode=ro&immutable=1"
-        with contextlib.closing(
-            sqlite3.connect(snapshot_uri, uri=True)
-        ) as source, contextlib.closing(sqlite3.connect(str(live_path))) as target:
-            source.backup(target)
-        integrity[board] = _integrity(board)
-        if integrity[board] != "ok":
-            raise ReconciliationBlocked(
-                f"restored integrity check failed for {board}: {integrity[board]}"
-            )
-    return integrity
+        try:
+            snapshot_path = Path(record["snapshot"]["snapshot"]["db"])
+            live_path = kb.kanban_db_path(board)
+            snapshot_uri = f"file:{snapshot_path}?mode=ro&immutable=1"
+            with contextlib.closing(
+                sqlite3.connect(snapshot_uri, uri=True)
+            ) as source, contextlib.closing(sqlite3.connect(str(live_path))) as target:
+                source.backup(target)
+            integrity[board] = _integrity(board)
+            if integrity[board] != "ok":
+                errors[board] = f"integrity={integrity[board]}"
+        except Exception as exc:
+            errors[board] = str(exc)
+    return integrity, errors
+
+
+def _status_counts(observed: dict[str, dict[str, Any]]) -> dict[str, int]:
+    counts = Counter(
+        task["status"]
+        for board_state in observed.values()
+        for task in board_state["tasks"].values()
+    )
+    return dict(sorted(counts.items()))
 
 
 def apply_manifest(
@@ -696,20 +778,28 @@ def apply_manifest(
         _validate_exact_inventory(manifest["cards"], observed)
         if prior is not None:
             prior_path, prior_receipt = prior
-            integrity = _verify_post_state(manifest, digest)
+            integrity, event_counts = _verify_post_state(manifest, digest)
             return {
                 "status": "applied",
                 "manifest_sha256": digest,
                 "counts": prior_receipt["counts"],
                 "receipt_path": str(prior_path),
                 "integrity": integrity,
+                "event_counts": dict(event_counts),
                 "already_applied": True,
             }
         _validate_guards_and_lineage(manifest["cards"], observed)
+        if _matching_event_count(manifest, digest, exact_payload=False):
+            raise ReconciliationBlocked(
+                "partial reconciliation state exists without a successful receipt"
+            )
+        before_counts = _status_counts(observed)
         mutation_entries = [
             card
             for card in manifest["cards"]
             if card["card_disposition"] in {"legacy_reconciled", "archive"}
+            or card["qualification_disposition"]
+            == "migration_artifact_not_qualification"
         ]
         for entry in mutation_entries:
             task = observed[entry["board"]]["tasks"][entry["task_id"]]
@@ -723,31 +813,40 @@ def apply_manifest(
                 )
 
         snapshots: dict[str, Any] = {}
-        for board in manifest["boards"]:
-            receipt_dir, snapshot = migration._snapshot_board(
-                board,
-                recovery_root=run_dir,
-                audit={
-                    "scope": manifest["scope"],
-                    "manifest_sha256": digest,
-                    "cards": sum(card["board"] == board for card in manifest["cards"]),
-                },
-            )
-            snapshots[board] = {
-                "receipt_dir": str(receipt_dir),
-                "snapshot": snapshot,
-            }
-
         changed: Counter[str] = Counter()
         now = int(time.time())
         try:
+            for board in manifest["boards"]:
+                receipt_dir, snapshot = migration._snapshot_board(
+                    board,
+                    recovery_root=run_dir,
+                    audit={
+                        "scope": manifest["scope"],
+                        "manifest_sha256": digest,
+                        "cards": sum(
+                            card["board"] == board for card in manifest["cards"]
+                        ),
+                    },
+                )
+                snapshots[board] = {
+                    "receipt_dir": str(receipt_dir),
+                    "snapshot": snapshot,
+                }
+
+            integrity: dict[str, str] = {}
+            event_counts: Counter[str] = Counter()
             for board in manifest["boards"]:
                 entries = [
                     card for card in manifest["cards"] if card["board"] == board
                 ]
                 changed.update(_apply_board(board, entries, digest, now))
+                board_integrity, board_events = _verify_post_state(
+                    manifest, digest, boards=[board]
+                )
+                integrity.update(board_integrity)
+                event_counts.update(board_events)
 
-            integrity = _verify_post_state(manifest, digest)
+            after_observed = _read_boards_query_only(manifest["boards"])
             counts = {
                 "legacy_reconciled": changed["legacy_reconciled"],
                 "archived": changed["archived"],
@@ -762,6 +861,9 @@ def apply_manifest(
                 "manifest_sha256": digest,
                 "approval": approval,
                 "counts": counts,
+                "before_status_counts": before_counts,
+                "after_status_counts": _status_counts(after_observed),
+                "event_counts": dict(event_counts),
                 "snapshots": snapshots,
                 "integrity": integrity,
                 "created_at": now,
@@ -773,29 +875,24 @@ def apply_manifest(
                 + "\n",
                 encoding="utf-8",
             )
+            migration._make_read_only(run_dir)
+            run_dir.chmod(0o500)
         except Exception as exc:
-            try:
-                restored_integrity = _restore_snapshots(snapshots)
-                status = "restored"
-                restore_error = None
-            except Exception as restore_exc:
-                restored_integrity = {
-                    board: _integrity(board) for board in manifest["boards"]
-                }
-                status = "restore_failed"
-                restore_error = str(restore_exc)
+            restored_integrity, restore_errors = _restore_snapshots(snapshots)
+            status = "restore_failed" if restore_errors else "restored"
             failure_receipt = {
                 "version": 1,
                 "status": status,
                 "scope": manifest["scope"],
                 "manifest_sha256": digest,
                 "error": str(exc),
-                "restore_error": restore_error,
+                "restore_errors": restore_errors,
                 "snapshots": snapshots,
                 "integrity": restored_integrity,
                 "created_at": int(time.time()),
             }
             failure_path = run_dir / "failure-receipt.json"
+            run_dir.mkdir(parents=True, exist_ok=True)
             failure_path.write_text(
                 json.dumps(
                     failure_receipt,
@@ -807,20 +904,21 @@ def apply_manifest(
                 encoding="utf-8",
             )
             migration._make_read_only(run_dir)
+            run_dir.chmod(0o500)
             if status == "restored":
                 raise ReconciliationBlocked(
                     f"reconciliation failed and all boards were restored: {exc}"
                 ) from exc
             raise ReconciliationBlocked(
-                f"reconciliation failed and snapshot restore failed: {restore_error}"
+                f"reconciliation failed and snapshot restore failed: {restore_errors}"
             ) from exc
 
-        migration._make_read_only(run_dir)
         return {
             "status": "applied",
             "manifest_sha256": digest,
             "counts": counts,
             "receipt_path": str(receipt_path),
             "integrity": integrity,
+            "event_counts": dict(event_counts),
             "already_applied": False,
         }

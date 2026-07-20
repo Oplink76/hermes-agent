@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -377,6 +378,18 @@ def test_apply_requires_approval_bound_to_manifest_hash(exact_manifest, tmp_path
         reconcile.apply_manifest(manifest_path, approval_path)
 
 
+def test_apply_requires_ole_as_break_glass_approver(exact_manifest, tmp_path: Path):
+    manifest_path, _manifest = exact_manifest
+    approval_path = tmp_path / "approval.json"
+    _write_approval(approval_path, manifest_path)
+    approval = json.loads(approval_path.read_text(encoding="utf-8"))
+    approval["approved_by"] = "Someone Else"
+    approval_path.write_text(json.dumps(approval), encoding="utf-8")
+
+    with pytest.raises(reconcile.ReconciliationBlocked, match="Ole Ørum-Petersen"):
+        reconcile.apply_manifest(manifest_path, approval_path)
+
+
 def test_apply_writes_only_approved_state_and_events(exact_manifest, tmp_path: Path):
     manifest_path, manifest = exact_manifest
     approval_path = tmp_path / "approval.json"
@@ -420,7 +433,16 @@ def test_apply_writes_only_approved_state_and_events(exact_manifest, tmp_path: P
     assert result["manifest_sha256"] == _sha(manifest_path)
     receipt_path = Path(result["receipt_path"])
     assert receipt_path.is_file()
-    assert receipt_path.stat().st_mode & 0o222 == 0
+    if os.name != "nt":
+        assert receipt_path.stat().st_mode & 0o222 == 0
+        assert receipt_path.parent.stat().st_mode & 0o222 == 0
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["before_status_counts"]
+    assert receipt["after_status_counts"]
+    assert receipt["event_counts"] == {
+        "legacy_reconciled": 1,
+        "qualification_history_corrected": 2,
+    }
     assert {
         (card["board"], card["task_id"]): _task_row(card["board"], card["task_id"])
         for card in no_op_cards
@@ -534,6 +556,117 @@ def test_active_mutation_target_blocks_before_snapshots_or_writes(
     assert _event_payloads(
         target["board"], target["task_id"], "legacy_reconciled"
     ) == []
+
+
+@pytest.mark.parametrize("active_state", ["qualification_only", "unended_run"])
+def test_every_written_card_with_an_active_state_blocks_before_snapshots(
+    exact_manifest,
+    tmp_path: Path,
+    active_state: str,
+):
+    manifest_path, original = exact_manifest
+    manifest = copy.deepcopy(original)
+    target = next(
+        card
+        for card in manifest["cards"]
+        if card["card_disposition"] == "keep_open"
+        and card["qualification_disposition"]
+        == "migration_artifact_not_qualification"
+    )
+    with kb.connect_closing(board=target["board"]) as conn:
+        with kb.write_txn(conn):
+            if active_state == "qualification_only":
+                conn.execute(
+                    "UPDATE tasks SET running = 1 WHERE id = ?",
+                    (target["task_id"],),
+                )
+                target["expected"]["running"] = 1
+            else:
+                cursor = conn.execute(
+                    "INSERT INTO task_runs (task_id, profile, status, started_at) "
+                    "VALUES (?, 'default', 'done', 1)",
+                    (target["task_id"],),
+                )
+                run_id = int(cursor.lastrowid)
+                conn.execute(
+                    "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+                    (run_id, target["task_id"]),
+                )
+                target["expected"]["current_run_id"] = run_id
+    _write_manifest(manifest_path, manifest)
+    approval_path = tmp_path / "approval.json"
+    recovery_root = tmp_path / "recovery"
+    _write_approval(approval_path, manifest_path)
+
+    with pytest.raises(reconcile.ReconciliationBlocked, match="active run"):
+        reconcile.apply_manifest(
+            manifest_path, approval_path, recovery_root=recovery_root
+        )
+
+    assert not recovery_root.exists()
+
+
+def test_partial_event_without_success_receipt_fails_closed(
+    exact_manifest, tmp_path: Path
+):
+    manifest_path, manifest = exact_manifest
+    target = next(
+        card
+        for card in manifest["cards"]
+        if card["card_disposition"] == "legacy_reconciled"
+    )
+    digest = _sha(manifest_path)
+    with kb.connect_closing(board=target["board"]) as conn:
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                target["task_id"],
+                "legacy_reconciled",
+                {"manifest_sha256": digest, "actor": "interrupted-apply"},
+            )
+    approval_path = tmp_path / "approval.json"
+    recovery_root = tmp_path / "recovery"
+    _write_approval(approval_path, manifest_path)
+
+    with pytest.raises(reconcile.ReconciliationBlocked, match="partial"):
+        reconcile.apply_manifest(
+            manifest_path, approval_path, recovery_root=recovery_root
+        )
+
+    assert not recovery_root.exists()
+
+
+def test_repeat_rejects_tampered_canonical_event(exact_manifest, tmp_path: Path):
+    manifest_path, manifest = exact_manifest
+    approval_path = tmp_path / "approval.json"
+    recovery_root = tmp_path / "recovery"
+    _write_approval(approval_path, manifest_path)
+    reconcile.apply_manifest(
+        manifest_path, approval_path, recovery_root=recovery_root
+    )
+    target = next(
+        card
+        for card in manifest["cards"]
+        if card["card_disposition"] == "legacy_reconciled"
+    )
+    with kb.connect_closing(board=target["board"]) as conn:
+        with kb.write_txn(conn):
+            row = conn.execute(
+                "SELECT id, payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'legacy_reconciled'",
+                (target["task_id"],),
+            ).fetchone()
+            payload = json.loads(row["payload"])
+            payload["actor"] = "tampered"
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (json.dumps(payload), row["id"]),
+            )
+
+    with pytest.raises(reconcile.ReconciliationBlocked, match="event mismatch"):
+        reconcile.apply_manifest(
+            manifest_path, approval_path, recovery_root=recovery_root
+        )
 
 
 def test_later_board_failure_restores_earlier_board(
