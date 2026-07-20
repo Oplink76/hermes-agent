@@ -114,7 +114,9 @@ git commit -m "fix(kanban): hide internal qualification intake"
 
 - [ ] **Step 1: Write failing tests for the manifest contract**
 
-Create small two-board fixtures and an exact manifest. Cover:
+Create all six approved board fixtures under a temporary `HERMES_HOME`, with
+cards on two boards and the other four empty, then create an exact manifest.
+Cover:
 
 ```python
 def test_audit_is_read_only_and_reports_exact_counts(...):
@@ -153,9 +155,16 @@ The fixture manifest uses this exact entry shape:
 {
   "version": 1,
   "scope": "legacy-board-inbox-reconciliation-2026-07-20",
-  "boards": ["alpha", "beta"],
+  "boards": [
+    "agentic-os-cockpit",
+    "the-trading-company",
+    "llm-memory-wiki-bridge",
+    "handoff-lab",
+    "ready-console",
+    "useful-tool"
+  ],
   "cards": [{
-    "board": "alpha",
+    "board": "agentic-os-cockpit",
     "task_id": "t_example",
     "expected": {
       "status": "ready",
