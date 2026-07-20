@@ -105,12 +105,11 @@ git commit -m "fix(kanban): hide internal qualification intake"
 - Create: `tests/hermes_cli/test_kanban_legacy_reconcile.py`
 
 **Interfaces:**
-- Consumes: `kb.kanban_db_path(board)`, read-only SQLite connections, `kb._dispatch_tick_lock(path)`, and `migration._snapshot_board(board, recovery_root=..., audit=...)`.
+- Consumes: `kb.kanban_db_path(board)` and read-only SQLite connections.
 - Produces:
   - `class ReconciliationBlocked(RuntimeError)`
   - `manifest_sha256(path: Path) -> str`
   - `audit_manifest(manifest_path: Path) -> dict[str, Any]`
-  - `apply_manifest(manifest_path: Path, approval_path: Path, *, recovery_root: Path | None = None) -> dict[str, Any]`
 
 - [ ] **Step 1: Write failing tests for the manifest contract**
 
@@ -246,8 +245,8 @@ git commit -m "feat(kanban): validate legacy reconciliation manifests"
 - Modify: `tests/hermes_cli/test_kanban_legacy_reconcile.py`
 
 **Interfaces:**
-- Consumes: Task 2's validated manifest and digest; `kb.authorized_governance_write()`, `kb.write_txn(conn)`, `kb._append_event(...)`, and `kb.archive_task(...)`.
-- Produces: the complete `apply_manifest(...)` contract and an immutable `receipt.json` beneath `~/.hermes/recovery/legacy-reconciliation/` (or the injected test recovery root).
+- Consumes: Task 2's validated manifest and digest; `kb._dispatch_tick_lock(path)`, `migration._snapshot_board(board, recovery_root=..., audit=...)`, `kb.authorized_governance_write()`, `kb.write_txn(conn)`, `kb._append_event(...)`, and `kb.archive_task(...)`.
+- Produces: `apply_manifest(manifest_path: Path, approval_path: Path, *, recovery_root: Path | None = None) -> dict[str, Any]` and an immutable `receipt.json` beneath `~/.hermes/recovery/legacy-reconciliation/` (or the injected test recovery root).
 
 - [ ] **Step 1: Write failing tests for authority, mutation, rollback, and re-run**
 
