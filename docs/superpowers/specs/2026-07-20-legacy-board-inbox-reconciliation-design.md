@@ -2,7 +2,7 @@
 
 **Status:** Design approved; written specification awaiting review
 **Date:** 2026-07-20
-**Scope:** All six live Hermes boards
+**Scope:** All six target boards, orchestrated from the Default board
 
 ## Intent
 
@@ -95,6 +95,32 @@ to expose either source for audit.
 The intake rows, decisions, Work Contracts, and existing events are not
 deleted or rewritten.
 
+## Authority and Execution
+
+This cleanup is a **Framework Maintenance Task**, not project work. Ole's
+direct approval authorizes Hermes to create one bounded card on the non-strict
+Default board. That card tracks implementation, tests, review, merge,
+deployment, dry-run, live apply, and final evidence without Product Owner
+qualification or a v2 product workflow.
+
+The Hermes `default` profile owns and executes the maintenance card. Any
+delegation remains subordinate to that card and its recorded run evidence.
+
+The Default-board card does not grant general mutation authority over the six
+target boards. The live apply is a separate **Governed Reconciliation**:
+
+1. Hermes produces the exact dry-run manifest and its hash.
+2. Ole's Break-glass Override approves that exact manifest.
+3. The Hermes-owned reconciliation command validates and applies only it.
+4. The command writes correction events and an immutable receipt.
+5. The receipt is attached to the Default-board card before it closes.
+
+External AI may supply the approved specification as evidence, but it does not
+create, route, complete, or directly mutate target-board cards.
+Work Inbox and v2 Qualification remain the path for external or project work;
+the Default-board maintenance path is limited to directly approved internal
+Hermes operations.
+
 ## Card and Qualification Linkage
 
 Every manifest entry has two independent decisions:
@@ -124,6 +150,7 @@ hides the earlier category error but does not route cards.
 - No physical deletion of immutable qualification or contract evidence.
 - No change to product repositories, preserved worktrees, or Git refs.
 - No Trading jobs, keys, orders, capital, or operating automation touched.
+- No mutation of any unrelated Default-board card.
 - No lifecycle mutation for any card whose evidence or live state is uncertain.
 - A snapshot failure, manifest mismatch, active run, transaction error, or
   failed integrity check stops the affected board before further writes.
@@ -154,6 +181,8 @@ After live apply:
 - all 52 affected cards have explicit correction evidence;
 - all six databases pass integrity checks and API/UI counts agree;
 - product repositories, preserved worktrees, and Trading runtime are unchanged.
+- the single Default-board maintenance card contains the manifest hash, apply
+  receipt, and final verification evidence.
 
 ## Non-goals
 
@@ -163,6 +192,7 @@ After live apply:
 - No inference that merged code is deployed when deployment is part of a card's
   acceptance criteria.
 - No automatic decision for the ten cards requiring individual judgment.
+- No use of the Default-board maintenance path for project feature work.
 - No stale-run, orphan-run, or dangling-link repair beyond behavior already
   performed by the existing archive operation.
 - No removal of migration recovery bundles.
