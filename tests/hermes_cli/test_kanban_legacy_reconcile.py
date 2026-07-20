@@ -12,6 +12,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_legacy_reconcile as reconcile
+from hermes_cli import kanban as kc
 
 
 BOARDS = [
@@ -701,3 +702,59 @@ def test_later_board_failure_restores_earlier_board(
     failure = json.loads(failure_receipts[0].read_text(encoding="utf-8"))
     assert failure["status"] == "restored"
     assert failure["integrity"] == {board: "ok" for board in BOARDS}
+
+
+def test_cli_dry_run_bypasses_database_initialization(
+    exact_manifest,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    manifest_path, _manifest = exact_manifest
+    monkeypatch.setattr(
+        kb,
+        "init_db",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy reconciliation owns database initialization")
+        ),
+    )
+
+    result = json.loads(
+        kc.run_slash(f"legacy-reconcile --manifest {manifest_path} --json")
+    )
+
+    assert result["mode"] == "dry-run"
+    assert result["ready_to_apply"] is True
+
+
+def test_cli_apply_uses_manifest_bound_approval(exact_manifest, tmp_path: Path):
+    manifest_path, _manifest = exact_manifest
+    approval_path = tmp_path / "approval.json"
+    _write_approval(approval_path, manifest_path)
+
+    result = json.loads(
+        kc.run_slash(
+            f"legacy-reconcile --manifest {manifest_path} "
+            f"--apply --approval {approval_path} --json"
+        )
+    )
+
+    assert result["status"] == "applied"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "--apply",
+        "--approval approval.json",
+    ],
+)
+def test_cli_rejects_unpaired_apply_and_approval_flags(
+    exact_manifest,
+    arguments: str,
+):
+    manifest_path, _manifest = exact_manifest
+
+    result = kc.run_slash(
+        f"legacy-reconcile --manifest {manifest_path} {arguments} --json"
+    )
+
+    assert result.startswith("⚠ /kanban usage error")

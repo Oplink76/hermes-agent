@@ -191,6 +191,14 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
 # Argparse builder
 # ---------------------------------------------------------------------------
 
+class _ValidateLegacyReconcileMode(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        if namespace.apply and not namespace.approval:
+            parser.error("--apply requires --approval")
+        if namespace.approval and not namespace.apply:
+            parser.error("--approval requires --apply")
+
+
 def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     """Attach the ``kanban`` subcommand tree under an existing subparsers.
 
@@ -246,6 +254,37 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_qualification_migrate.add_argument(
         "--json", action="store_true", help="Emit the full machine-readable result"
+    )
+
+    # --- legacy-reconcile ---
+    p_legacy_reconcile = sub.add_parser(
+        "legacy-reconcile",
+        help="Audit or apply the approved exact legacy reconciliation manifest",
+    )
+    p_legacy_reconcile.add_argument(
+        "--manifest",
+        required=True,
+        metavar="<manifest.json>",
+        help="Exact reviewed reconciliation manifest",
+    )
+    p_legacy_reconcile.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the manifest after snapshots and full validation",
+    )
+    p_legacy_reconcile.add_argument(
+        "--approval",
+        metavar="<approval.json>",
+        help="Break-glass approval bound to the exact manifest hash",
+    )
+    p_legacy_reconcile.add_argument(
+        "--json", action="store_true", help="Emit the full machine-readable result"
+    )
+    p_legacy_reconcile.add_argument(
+        "_validate_mode",
+        nargs=0,
+        action=_ValidateLegacyReconcileMode,
+        help=argparse.SUPPRESS,
     )
 
     # --- boards (new in v2: multi-project support) ---
@@ -969,10 +1008,10 @@ def kanban_command(args: argparse.Namespace) -> int:
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
     with board_scope:
-        # Qualification migration owns its full safety boundary: dry-run must
-        # be byte-for-byte read-only, while apply must snapshot before any
-        # schema migration. Its implementation opens the board itself.
-        if action != "qualification-migrate":
+        # These migrations own their full safety boundaries: dry-run must be
+        # byte-for-byte read-only, while apply must snapshot before any schema
+        # migration. Their implementations open the boards themselves.
+        if action not in {"qualification-migrate", "legacy-reconcile"}:
             try:
                 kb.init_db()
             except Exception as exc:
@@ -982,6 +1021,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "qualification-migrate": _cmd_qualification_migrate,
+            "legacy-reconcile": _cmd_legacy_reconcile,
             "create":   _cmd_create,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
@@ -1357,6 +1397,37 @@ def _cmd_qualification_migrate(args: argparse.Namespace) -> int:
             f"{counts['running']} running, {counts['ambiguous']} ambiguous."
         )
         print("Ready to apply." if result["strict_ready"] else "Not safe to apply.")
+    return 0
+
+
+def _cmd_legacy_reconcile(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_legacy_reconcile as reconcile
+
+    result = (
+        reconcile.apply_manifest(Path(args.manifest), Path(args.approval))
+        if args.apply
+        else reconcile.audit_manifest(Path(args.manifest))
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    elif args.apply:
+        state = "already applied" if result["already_applied"] else "applied"
+        print(
+            f"Legacy reconciliation {state}; manifest "
+            f"{result['manifest_sha256']}. Receipt: {result['receipt_path']}"
+        )
+    else:
+        counts = result["counts"]
+        print(
+            "Legacy reconciliation dry-run: "
+            f"{counts['cards']} cards, {counts['verify']} verify, "
+            f"{counts['legacy_reconciled']} legacy reconciled, "
+            f"{counts['keep_open']} keep open, {counts['review']} review, "
+            f"{counts['archive']} archive, "
+            f"{counts['qualification_corrections']} qualification corrections."
+        )
+        print(f"Manifest SHA-256: {result['manifest_sha256']}")
+        print("Ready to apply." if result["ready_to_apply"] else "Not safe to apply.")
     return 0
 
 
