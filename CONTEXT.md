@@ -32,12 +32,20 @@ _Avoid_: Admission approval, recovery, requalification, client tag, direct board
 Hermes issues a successor Work Contract for an existing card, then returns that card to the normal handover flow.
 _Avoid_: Override, separate recovery lifecycle
 
+**Framework Maintenance Task**:
+A bounded Hermes-internal operation initiated directly by Ole and tracked on the non-strict Default board. It uses lightweight Hermes ownership and evidence rather than Product Owner qualification or a product workflow.
+_Avoid_: Project work, Work Inbox submission, untracked admin edit
+
+**Governed Reconciliation**:
+An exact, manifest-bound correction of legacy Hermes state authorized by Ole and applied through a narrow audited Hermes operation.
+_Avoid_: Qualification, Requalification, normal delivery, general admin edit
+
 **Break-glass Override**:
-An authenticated, audited instruction from Ole directly to Hermes that may bypass ordinary qualification policy.
+An authenticated, audited instruction from Ole directly to Hermes that may authorize one Governed Reconciliation or another explicit policy bypass.
 _Avoid_: Requalification, admin edit
 
 **Work Contract**:
-The immutable, signed execution authority defining a card's scope, routing, handover, and operating rules.
+The immutable, signed execution authority defining a qualified project card's scope, routing, handover, and operating rules. A Framework Maintenance Task instead uses Ole's direct authorization recorded on the Default board.
 _Avoid_: Editable metadata, label
 
 **Normal Handover**:

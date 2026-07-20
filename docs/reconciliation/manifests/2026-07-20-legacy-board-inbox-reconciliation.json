@@ -1,0 +1,2033 @@
+{
+  "version": 1,
+  "scope": "legacy-board-inbox-reconciliation-2026-07-20",
+  "boards": [
+    "agentic-os-cockpit",
+    "the-trading-company",
+    "llm-memory-wiki-bridge",
+    "handoff-lab",
+    "ready-console",
+    "useful-tool"
+  ],
+  "cards": [
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_048e12a4",
+      "expected": {
+        "status": "ready",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_bb9421b68b7541946841a5fc"
+      },
+      "card_disposition": "legacy_reconciled",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_7f23f9e20d990ab5",
+          "qi_cb79fe6c745b131f",
+          "qi_migrate_02b6092aedead8d8bb8b"
+        ],
+        "contract_ids": [
+          "wc_bb9421b68b7541946841a5fc",
+          "wc_ee4b65088318c8ed6e30d49c"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Commits `9d36f9da8` and `069d2773e` are in current Hermes main through PR #41.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_0b2b3602",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "development",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Implementation is merged/deployed at `21c07c5`; archive correction is already recorded."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_0be02eae",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "architecture",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Auxiliary implementation work was reconciled into `t_175d085d`."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_0eb9e62e",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_d996458f75abd37769cddc8e"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_219f85261ae43e863258"
+        ],
+        "contract_ids": [
+          "wc_d996458f75abd37769cddc8e"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Implemented behavior is on Cockpit main.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_147a350c",
+      "expected": {
+        "status": "archived",
+        "current_step_key": null,
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Auxiliary tester card."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_1514f6e3",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "backlog",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Explicit disposable acceptance card."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_175d085d",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Ole-approved shipped-by-supersession record merged in PR #7. Repair stale run `8` separately."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_1840b220",
+      "expected": {
+        "status": "archived",
+        "current_step_key": null,
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Auxiliary verification card superseded by the completed product story."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_1a219a0b",
+      "expected": {
+        "status": "todo",
+        "current_step_key": "backlog",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_d5468c1c4113801f65bafa56"
+      },
+      "card_disposition": "keep_open",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_abf4f088a8f56fa3f8b1"
+        ],
+        "contract_ids": [
+          "wc_d5468c1c4113801f65bafa56"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Product work has not started.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_1b11de39",
+      "expected": {
+        "status": "todo",
+        "current_step_key": "backlog",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_a66d22c4847c303bdda74fba"
+      },
+      "card_disposition": "keep_open",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_18a129b20eb7cea52fec"
+        ],
+        "contract_ids": [
+          "wc_a66d22c4847c303bdda74fba"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Final integration/acceptance remains downstream of unfinished stories.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_1e19b2ed",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "architecture",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Auxiliary implementation card superseded by `t_2bb9fbd8`."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_21765b29",
+      "expected": {
+        "status": "archived",
+        "current_step_key": null,
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Auxiliary reviewer card."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_22391b05",
+      "expected": {
+        "status": "blocked",
+        "current_step_key": "development",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 1,
+        "work_contract_id": "wc_127190ea71af9871cdb0b036"
+      },
+      "card_disposition": "review",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_fc88cea72ac2a8538380"
+        ],
+        "contract_ids": [
+          "wc_127190ea71af9871cdb0b036"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Duplicates/overlaps `t_d3f6806d` in the same workspace; it contains valuable approval evidence. Collapse evidence into one canonical story rather than running both.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_24819d78",
+      "expected": {
+        "status": "todo",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_5b313c413eb62e47dffc5aa8"
+      },
+      "card_disposition": "keep_open",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_ad6c4d71b4f0b78af2cb"
+        ],
+        "contract_ids": [
+          "wc_5b313c413eb62e47dffc5aa8"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Reviewed source diverged from finance main; it explicitly waits on governed reconciliation.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_27c5138a",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "backlog",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Deliberate governance canary."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_2bb9fbd8",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_c6809bf7a7e6d46f0504dd02"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_88cc0b3ed18d8159a0bc"
+        ],
+        "contract_ids": [
+          "wc_c6809bf7a7e6d46f0504dd02"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Shipped in PR #3.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_2d7e8829",
+      "expected": {
+        "status": "ready",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_9ea0ce594c4f614788730b06"
+      },
+      "card_disposition": "review",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_98c2fb3d7b281529",
+          "qi_af4729bdce7ebedd",
+          "qi_migrate_a433628997c8e7289f66"
+        ],
+        "contract_ids": [
+          "wc_9ea0ce594c4f614788730b06",
+          "wc_e3aa1ae6b3babc5a347f25ca"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Initial `61dcc64a` is shipped, but the preserved workspace has two uncommitted files fixing Epic-membership cleanup on hard delete. Do not close or delete the workspace.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_3977b659",
+      "expected": {
+        "status": "ready",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_ee433cee708adcd8f36cfb41"
+      },
+      "card_disposition": "legacy_reconciled",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_528284d733f46f05",
+          "qi_fdd7dfc6798714c4",
+          "qi_migrate_c8a16d9de30364679880"
+        ],
+        "contract_ids": [
+          "wc_96a8c9591475b5d5c89651ba",
+          "wc_ee433cee708adcd8f36cfb41"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Hermes PR #35 merged as `3d50a50d`; installed behavior is present. Historical card lacks modern Test/Review run shape.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_3d68114c",
+      "expected": {
+        "status": "done",
+        "current_step_key": "review",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_9083d976de5d7e0ba9d3ee20"
+      },
+      "card_disposition": "review",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_59300fbb49fb6e05aaac"
+        ],
+        "contract_ids": [
+          "wc_9083d976de5d7e0ba9d3ee20"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: False-Done. Preserved implementation branch is not merged. Reopen to Review/Release after preserving exact handoff SHA.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_3dad1da8",
+      "expected": {
+        "status": "todo",
+        "current_step_key": "development",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_d224fd2af126102fcf293f5c"
+      },
+      "card_disposition": "review",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_3a7350bf71d26913",
+          "qi_bd980b7c7e159e82",
+          "qi_migrate_9a5259da65923b9fc81e"
+        ],
+        "contract_ids": [
+          "wc_078b36591aaa9e47634cc5a8",
+          "wc_d224fd2af126102fcf293f5c"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Mixed umbrella linked to product and framework cards; still typed as executable `card`, not an explicit non-executable Epic. Preserve as historical plan or convert structurally only after child adjudication.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_4242c2e7",
+      "expected": {
+        "status": "todo",
+        "current_step_key": "development",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_07956d2b36fcd7232d886ea5"
+      },
+      "card_disposition": "keep_open",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_f82ef66f6088054e00b6"
+        ],
+        "contract_ids": [
+          "wc_07956d2b36fcd7232d886ea5"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Preserved seven-file dirty tree still needs reconciliation before implementation continues.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_45e3d9d4",
+      "expected": {
+        "status": "ready",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_7472e924cb397f1debf14e14"
+      },
+      "card_disposition": "legacy_reconciled",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_ce61203e3fa76acf",
+          "qi_d687b5cc59e5672d",
+          "qi_migrate_2fdbf9e04afdadb50ef8"
+        ],
+        "contract_ids": [
+          "wc_7472e924cb397f1debf14e14",
+          "wc_dbfddf11c7f7d70475b4adf2"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Base `c19ce0832` and the later strict `/tasks/bulk` guard are on current Hermes main (`ab04c2f2` introduced the guard).",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_4f7ac61b",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "backlog",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Explicit disposable acceptance card."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_55027d54",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_648152fc68df6bdbb5d66575"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_09892b9fdd1311da8e89"
+        ],
+        "contract_ids": [
+          "wc_648152fc68df6bdbb5d66575"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Brief and governed work breakdown were produced.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_5864d0b0",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_e653d4cea5bb9b5ca7c80d47"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_f6c22c4a8a1b169cbabb"
+        ],
+        "contract_ids": [
+          "wc_e653d4cea5bb9b5ca7c80d47"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Product and Hermes compatibility shipped in PRs #3/#2. Repair stale run `9` separately.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_64d84656",
+      "expected": {
+        "status": "todo",
+        "current_step_key": "test",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_3cdf1fe1d48c576540706484"
+      },
+      "card_disposition": "review",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_0aa97623f01024f681ae"
+        ],
+        "contract_ids": [
+          "wc_3cdf1fe1d48c576540706484"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Auxiliary gate with zero runs; testing evidence already exists elsewhere in the same chain. Decide whether to supersede or execute once against the canonical SHA.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_65c31cde",
+      "expected": {
+        "status": "ready",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_61b7c21d78429e1bc3394930"
+      },
+      "card_disposition": "legacy_reconciled",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_e2e81ed8bd4ee76b",
+          "qi_fdee3389fea16edb",
+          "qi_migrate_d8b5b1b0791ab9736a27"
+        ],
+        "contract_ids": [
+          "wc_326cfb59c995a7c6cad32da7",
+          "wc_61b7c21d78429e1bc3394930"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: The reviewed work-contract projection is content-equivalent on Cockpit `origin/main` through PR #12. This needs supersession closure because the reviewed source was an unstaged diff, not the eventual merge SHA.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_76ee2d1d",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Historical design helper."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_8995eb9d",
+      "expected": {
+        "status": "done",
+        "current_step_key": null,
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_6e6a6fe0d7ad16d62c91db4a"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_9f08ff9c0436d23d7a4c"
+        ],
+        "contract_ids": [
+          "wc_6e6a6fe0d7ad16d62c91db4a"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Operational prerequisite completed; no product workflow template was assigned.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_9009edc0",
+      "expected": {
+        "status": "blocked",
+        "current_step_key": "backlog",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 1,
+        "work_contract_id": "wc_766880e97eadc15f5be9bf95"
+      },
+      "card_disposition": "review",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_d8d6e8c22179c874",
+          "qi_migrate_9356eeacbc998a373106"
+        ],
+        "contract_ids": [
+          "wc_260991483b64fa426c7e8d44",
+          "wc_766880e97eadc15f5be9bf95"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Strict qualification and contract coverage are already live, but final migration/cleanup scope overlaps this audit. Replace with explicit remediation tasks or close by supersession after the cleanup design is approved.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_904fc837",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "backlog",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Historical product-intent source; archive is intentional. Preserve its 25 comments."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_95340c94",
+      "expected": {
+        "status": "todo",
+        "current_step_key": "review",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_530303f0ac2a4c216d2894ca"
+      },
+      "card_disposition": "review",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_a176081ab484767bb7d0"
+        ],
+        "contract_ids": [
+          "wc_530303f0ac2a4c216d2894ca"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Auxiliary gate with zero runs; same duplicate-chain decision as above.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_9950f811",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_029648a9cb359eb9a25bc490"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_45947f0d0f249d5c1b5f"
+        ],
+        "contract_ids": [
+          "wc_029648a9cb359eb9a25bc490"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Recovered in Cockpit PR #6 (`60f5ad5`).",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_9fcf9ae8",
+      "expected": {
+        "status": "ready",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_c07fdeb02a276a1281c4b5c7"
+      },
+      "card_disposition": "legacy_reconciled",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_0fb5dec70a8aa72d",
+          "qi_1f181ff191629b0a",
+          "qi_1fffbc34bc89b6db",
+          "qi_377e776e1eda6221",
+          "qi_46669a13af77bfa5",
+          "qi_466bd883fb0bd251",
+          "qi_51286bce7d3d6503",
+          "qi_53e5ac2d8a2d5ea5",
+          "qi_83a1eaef74251759",
+          "qi_b56185a22968c2ed",
+          "qi_ed67b6a80e16b8dc",
+          "qi_migrate_62d529ca51606a10b7fd"
+        ],
+        "contract_ids": [
+          "wc_be76642c50edb0c0a8236cec",
+          "wc_c07fdeb02a276a1281c4b5c7"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Reviewed `809ccc08` is an ancestor of current Hermes main.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_abeba772",
+      "expected": {
+        "status": "ready",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_4de421109a57f28867698734"
+      },
+      "card_disposition": "legacy_reconciled",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_03458c02052ba19a",
+          "qi_a5390a98d13e36c2",
+          "qi_migrate_126f56098167b49768a3"
+        ],
+        "contract_ids": [
+          "wc_4de421109a57f28867698734",
+          "wc_fc62a7b0e6e3a53ec557ee38"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Reviewed implementation range is included in merged Hermes PR #41/current main.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_b106cec1",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_f501600f92218e09dfb4991a"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_ce0c3489d1820bd2f59b"
+        ],
+        "contract_ids": [
+          "wc_f501600f92218e09dfb4991a"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Current Cockpit detail surfaces contain the delivered capability.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_b3f82ee1",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_4a97ff12df84f10c69aadff4"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_6d5e6cbc43de45f6da51"
+        ],
+        "contract_ids": [
+          "wc_4a97ff12df84f10c69aadff4"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Shipped in PR #3.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_bd3b408c",
+      "expected": {
+        "status": "archived",
+        "current_step_key": null,
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Auxiliary reviewer card."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_c081f057",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_36d65bafebb7d548c8cce6ea"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_337d5a0596308ad337c6"
+        ],
+        "contract_ids": [
+          "wc_36d65bafebb7d548c8cce6ea"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Shipped in PR #3.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_c11f798b",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "backlog",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Early/superseded story."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_c3eae4c0",
+      "expected": {
+        "status": "todo",
+        "current_step_key": "backlog",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_dae33ee2a4b11f842e601e53"
+      },
+      "card_disposition": "keep_open",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_98f8c194b64de4faca9f"
+        ],
+        "contract_ids": [
+          "wc_dae33ee2a4b11f842e601e53"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Documentation boundary remains uncompleted.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_c6577110",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_832ccd4f941ff5f456fa3bc0"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_322815bfa99e6c16165d"
+        ],
+        "contract_ids": [
+          "wc_832ccd4f941ff5f456fa3bc0"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. The card's old result says “not pushed,” but token-refresh code is now on `origin/main` through later integration.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_c91e1eaf",
+      "expected": {
+        "status": "blocked",
+        "current_step_key": "review",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 1,
+        "work_contract_id": "wc_40270c69a8b5ac3aa8e001af"
+      },
+      "card_disposition": "keep_open",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Preserved branch/worktree is not on Cockpit `origin/main`; review/merge remains real work."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_cc3450ac",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_9d3f213740d96124d3eaf149"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_56d0599ea80a200325ae"
+        ],
+        "contract_ids": [
+          "wc_9d3f213740d96124d3eaf149"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Current main contains the redirect behavior and safety boundary.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_d3f6806d",
+      "expected": {
+        "status": "todo",
+        "current_step_key": "development",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_2e9e3f0d12f91fa2a613e662"
+      },
+      "card_disposition": "keep_open",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_f615617d2a7d899ee0ad"
+        ],
+        "contract_ids": [
+          "wc_2e9e3f0d12f91fa2a613e662"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Reconciliation branch/evidence exists, but the workflow chain has not reached reviewed remote-main delivery.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_d4e6d43f",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_bccdf5756605baaf80751d0c"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_dfc6516b2866aad7f8f7"
+        ],
+        "contract_ids": [
+          "wc_bccdf5756605baaf80751d0c"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Product Owner helper completed.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_d5619b17",
+      "expected": {
+        "status": "blocked",
+        "current_step_key": "development",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 1,
+        "work_contract_id": "wc_c2ab5581b0840d8c7f60d5eb"
+      },
+      "card_disposition": "legacy_reconciled",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_0cfcbc9fb4bcfc6d5501"
+        ],
+        "contract_ids": [
+          "wc_c2ab5581b0840d8c7f60d5eb"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: PR #34 merged as `c99baf2e`; installed gateway was restarted and canaried. The remaining block is card-state evidence, not missing code.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_d7d61ccb",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_58be7d4fdf3411ea5dea1b6a"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_444eaf3dcfa4ec069cce"
+        ],
+        "contract_ids": [
+          "wc_58be7d4fdf3411ea5dea1b6a"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Completed design helper.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_dbe5585c",
+      "expected": {
+        "status": "blocked",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 1,
+        "work_contract_id": "wc_7c2b1c8186e50027d2901089"
+      },
+      "card_disposition": "keep_open",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_acc23aa533a4003e9ac6"
+        ],
+        "contract_ids": [
+          "wc_7c2b1c8186e50027d2901089"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: `73716a71` exists only on divergent local history, is not on Cockpit `origin/main`, and the healthy Test container lacks `paperclip.py`. Not shipped.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_df2f487c",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Disposable/superseded validation card."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_e3565818",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_ec300dd6bbec97e9ca4ff860"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_bdd5710f45db441a2cdd"
+        ],
+        "contract_ids": [
+          "wc_ec300dd6bbec97e9ca4ff860"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Recovered in PR #6. Repair stale run `10` separately.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_f79667c5",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "review",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Qualification-migration canary/legacy residue, not product delivery. Preserve its single run/comment, then archive as lab evidence."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_fa0daa5a",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_5507c538242de92ec3bb280b"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_3650c036a55584f67d30"
+        ],
+        "contract_ids": [
+          "wc_5507c538242de92ec3bb280b"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Shipped-by-supersession in Cockpit PR #3 (`c8c4035`).",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_fc6fdaa5",
+      "expected": {
+        "status": "done",
+        "current_step_key": "development",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_3da2d8d973883b7c54eac908"
+      },
+      "card_disposition": "review",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_b48d43b06999a229f093"
+        ],
+        "contract_ids": [
+          "wc_3da2d8d973883b7c54eac908"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: False-Done. Result only proves a local-main merge (`dd2c06f`); source is absent from remote main and deployed Test. Reopen or supersede into the active Paperclip reconciliation chain.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "agentic-os-cockpit",
+      "task_id": "t_ff743bab",
+      "expected": {
+        "status": "blocked",
+        "current_step_key": "review",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 1,
+        "work_contract_id": "wc_11f1c39274dbce6f5f8b33c6"
+      },
+      "card_disposition": "keep_open",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_a18b02981cc61361",
+          "qi_migrate_1e95e58b705e5fdebdd6"
+        ],
+        "contract_ids": [
+          "wc_0075cbae1c72a89b197fca85",
+          "wc_11f1c39274dbce6f5f8b33c6"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Worktree `1b5e4a70` is ahead/behind Cockpit main and not merged; review finalization failed after rework.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "the-trading-company",
+      "task_id": "t_09dc238c",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_97496c504cef035289be9fba"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_4581485dc12a1046c023"
+        ],
+        "contract_ids": [
+          "wc_97496c504cef035289be9fba"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Recovered outcome is on current remote main.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "the-trading-company",
+      "task_id": "t_1ac59082",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "architecture",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Brief decomposed into downstream stories."
+      ]
+    },
+    {
+      "board": "the-trading-company",
+      "task_id": "t_3bb56621",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_7a91f1757b862f65367b9137"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_45f1298f6be7cabd803b"
+        ],
+        "contract_ids": [
+          "wc_7a91f1757b862f65367b9137"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Integrated pipeline behavior is on current remote main.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "the-trading-company",
+      "task_id": "t_422dc68d",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "development",
+        "current_run_id": 123,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed as superseded. Repair stale run/pointer `123` separately."
+      ]
+    },
+    {
+      "board": "the-trading-company",
+      "task_id": "t_45030a97",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Shipped/superseded; content equivalence was recorded."
+      ]
+    },
+    {
+      "board": "the-trading-company",
+      "task_id": "t_4c80fabe",
+      "expected": {
+        "status": "ready",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_2b8104b8dd78e3199aa471d3"
+      },
+      "card_disposition": "legacy_reconciled",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_d4310d2c47e913bc6966"
+        ],
+        "contract_ids": [
+          "wc_2b8104b8dd78e3199aa471d3"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Exact reviewed recovery merged in Trading PR #6 (`6f5f8a8` → `317cbe0c`). Normal closeout was correctly refused because old Release fields are missing.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "the-trading-company",
+      "task_id": "t_5eaf5022",
+      "expected": {
+        "status": "ready",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_0f6e065939663523aaec64c8"
+      },
+      "card_disposition": "legacy_reconciled",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_35ee1713599c2f2c33ab"
+        ],
+        "contract_ids": [
+          "wc_0f6e065939663523aaec64c8"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Same PR #6 recovery and evidence gap.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "the-trading-company",
+      "task_id": "t_6077344f",
+      "expected": {
+        "status": "ready",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_ef2ed7e4cf92b9d0aa9593f7"
+      },
+      "card_disposition": "keep_open",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_2c9296cbd1e8214b9fc6"
+        ],
+        "contract_ids": [
+          "wc_ef2ed7e4cf92b9d0aa9593f7"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: PR #3 merged and Test contains the current `ops_api.py`, but Preprod lacks the module/route. Release/deployment remains real work.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "the-trading-company",
+      "task_id": "t_6a3a456c",
+      "expected": {
+        "status": "ready",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_05e5e1a262be207fff9536b4"
+      },
+      "card_disposition": "legacy_reconciled",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_e1487bc1de52af41b59c"
+        ],
+        "contract_ids": [
+          "wc_05e5e1a262be207fff9536b4"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Same PR #6 recovery and evidence gap.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "the-trading-company",
+      "task_id": "t_83cbf37c",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_21ecaffd5b83c4d7085ef499"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_b2fd85c38f5f997f253c"
+        ],
+        "contract_ids": [
+          "wc_21ecaffd5b83c4d7085ef499"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Integrated and independently verified.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "the-trading-company",
+      "task_id": "t_99c16d3b",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "architecture",
+        "current_run_id": 115,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed as superseded. Repair stale run/pointer `115` separately."
+      ]
+    },
+    {
+      "board": "the-trading-company",
+      "task_id": "t_b3349fd1",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_00a3e89f26395923d062662f"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_06da3e7fa2b326055be9"
+        ],
+        "contract_ids": [
+          "wc_00a3e89f26395923d062662f"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Corrective recovery merged in PR #6; original dirty worktree evidence is preserved.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "the-trading-company",
+      "task_id": "t_c3ec91d7",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_37f468b79cad0e1035991ced"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_e88a3950b671c0f67d23"
+        ],
+        "contract_ids": [
+          "wc_37f468b79cad0e1035991ced"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Follow-up provenance gap was recovered on main.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "the-trading-company",
+      "task_id": "t_c42205f4",
+      "expected": {
+        "status": "ready",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_a90b746b54e5ef7968ae3aa1"
+      },
+      "card_disposition": "keep_open",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_ab4200fcacb54e1320ec"
+        ],
+        "contract_ids": [
+          "wc_a90b746b54e5ef7968ae3aa1"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Preprod lacks `/api/ops/run`; current live scheduler wrappers still invoke repository Python directly.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "the-trading-company",
+      "task_id": "t_ef5c8b27",
+      "expected": {
+        "status": "ready",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_e0c0719d5f2b5218039ce723"
+      },
+      "card_disposition": "keep_open",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_6577b31ae18a92274dc1"
+        ],
+        "contract_ids": [
+          "wc_e0c0719d5f2b5218039ce723"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Repository wrappers use `ops_api_cron`, but the active `~/.hermes/scripts` copies materially differ and still use direct imports/subprocess calls. Cutover/token provisioning remains outstanding.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "the-trading-company",
+      "task_id": "t_ff82bd1f",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_a30abf1625c7521205de5222"
+      },
+      "card_disposition": "review",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_49120281f800577deb8e"
+        ],
+        "contract_ids": [
+          "wc_a30abf1625c7521205de5222"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Ambiguous closure. CIO code `e58e0e3` is on remote and isolated CIO tests pass, but the last blocking review requested a real backtest-producer→CIO integration test. Current remote tests still construct `backtest_evidence` through a fixture rather than calling the producer. Preserve reviewer comment `126` and adjudicate or add the missing integration proof before accepting Done as fully evidenced.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "llm-memory-wiki-bridge",
+      "task_id": "t_0c26cf8f",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed as throwaway, but retain as evidence of a historical Review→Release transition with no handoff event."
+      ]
+    },
+    {
+      "board": "llm-memory-wiki-bridge",
+      "task_id": "t_41734a0b",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Superseded badge request."
+      ]
+    },
+    {
+      "board": "llm-memory-wiki-bridge",
+      "task_id": "t_629860be",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Explicit throwaway."
+      ]
+    },
+    {
+      "board": "llm-memory-wiki-bridge",
+      "task_id": "t_744f9a6f",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_908e58855d316c8a790ada08"
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_ec871f27f6d48142850d"
+        ],
+        "contract_ids": [
+          "wc_908e58855d316c8a790ada08"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Bridge PR #4 merged as `07be76d`.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "llm-memory-wiki-bridge",
+      "task_id": "t_cf3ef5ee",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Badge outcome merged in Bridge PR #3 (`7aab8f2`); archive is acceptable supersession, not an open story."
+      ]
+    },
+    {
+      "board": "llm-memory-wiki-bridge",
+      "task_id": "t_d4a9182e",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Explicit throwaway."
+      ]
+    },
+    {
+      "board": "llm-memory-wiki-bridge",
+      "task_id": "t_fa2dcdef",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "backlog",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Duplicate/superseded."
+      ]
+    },
+    {
+      "board": "llm-memory-wiki-bridge",
+      "task_id": "t_fd692aab",
+      "expected": {
+        "status": "archived",
+        "current_step_key": "architecture",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "verify",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Keep closed. Explicit throwaway."
+      ]
+    },
+    {
+      "board": "handoff-lab",
+      "task_id": "t_9e53eb70",
+      "expected": {
+        "status": "ready",
+        "current_step_key": "release_measure",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_f49b1b792d8bdefeeda60e2b"
+      },
+      "card_disposition": "archive",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Archive lab evidence after preserving the review/handoff proof; it is a validation canary, not a product deliverable."
+      ]
+    },
+    {
+      "board": "handoff-lab",
+      "task_id": "t_c264bc0a",
+      "expected": {
+        "status": "done",
+        "current_step_key": "done",
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": "wc_c6ed7965ff66b1de227a2128"
+      },
+      "card_disposition": "archive",
+      "qualification_disposition": "migration_artifact_not_qualification",
+      "qualification_lineage": {
+        "intake_ids": [
+          "qi_migrate_fcee045db72e31a4ed9d"
+        ],
+        "contract_ids": [
+          "wc_c6ed7965ff66b1de227a2128"
+        ]
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Archive lab evidence after a snapshot. A dangling link still points from deleted `t_1ac681d2` to this card.",
+        "2026-07-20 cleanup audit: internal migration/reconciliation lineage, not a genuine new-work submission."
+      ]
+    },
+    {
+      "board": "ready-console",
+      "task_id": "t_f6d2420e",
+      "expected": {
+        "status": "blocked",
+        "current_step_key": null,
+        "current_run_id": null,
+        "running": 0,
+        "blocked": 0,
+        "work_contract_id": null
+      },
+      "card_disposition": "archive",
+      "qualification_disposition": "legitimate_or_none",
+      "qualification_lineage": {
+        "intake_ids": [],
+        "contract_ids": []
+      },
+      "evidence": [
+        "2026-07-19 reconciliation audit: Abandoned/orphan candidate. The configured temporary workdir exists but is empty; no deliverable repository or successor was found. Preserve its one run/comment, then archive the card and board if approved."
+      ]
+    }
+  ]
+}
