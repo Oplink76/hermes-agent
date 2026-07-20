@@ -20,10 +20,14 @@ def build_inbox_guide(
     guide_url = f"{origin}/.well-known/hermes-inbox?{query}"
     inbox_url = f"{origin}/api/plugins/kanban/work-inbox?{query}"
     copy_ready_prompt = (
+        "You are a local AI outside the Hermes-managed framework. "
         f"Read {guide_url} before doing any work. Treat it as the authority "
-        "for how to deliver development work to Hermes. Use the fixed Work "
-        "Inbox submission route exactly as documented. Do not create, edit, "
-        "assign, route, qualify, or override Kanban cards directly."
+        "for how to deliver development work to Hermes. Submit new work only "
+        "after Ole has approved it to enter Hermes. Admission does not "
+        "authorize execution; Hermes qualification and a signed Work Contract "
+        "remain required. Use the fixed Work Inbox submission route exactly as "
+        "documented. Do not create, edit, assign, route, qualify, or override "
+        "Kanban cards directly."
     )
     example_request = {
         "version": 2,
@@ -37,9 +41,15 @@ def build_inbox_guide(
         "name": "Hermes Work Inbox",
         "board": board,
         "qualification_required": True,
-        "purpose": "Submit new work for qualification or hand over an exact assigned delivery.",
+        "purpose": (
+            "Submit Ole-approved local work for framework qualification or hand "
+            "over an exact assigned delivery."
+        ),
         "authority": {
-            "allowed": ["submit inert work intent", "hand over assigned delivery"],
+            "allowed": [
+                "submit Ole-approved work for framework processing",
+                "hand over assigned delivery",
+            ],
             "forbidden": [
                 "direct card creation or mutation",
                 "phase or assignee selection",

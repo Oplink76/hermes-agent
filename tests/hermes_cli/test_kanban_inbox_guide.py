@@ -24,6 +24,18 @@ def test_guide_names_one_minimal_work_inbox_route():
     assert body["name"] == "Hermes Work Inbox"
     assert body["board"] == "strict"
     assert body["qualification_required"] is True
+    assert body["purpose"] == (
+        "Submit Ole-approved local work for framework qualification or hand "
+        "over an exact assigned delivery."
+    )
+    assert body["authority"]["allowed"][0] == (
+        "submit Ole-approved work for framework processing"
+    )
+    prompt = body["copy_ready_prompt"]
+    assert "local AI outside the Hermes-managed framework" in prompt
+    assert "Ole has approved it to enter Hermes" in prompt
+    assert "Admission does not authorize execution" in prompt
+    assert "qualification and a signed Work Contract remain required" in prompt
     assert body["submission"]["method"] == "POST"
     assert body["submission"]["url"] == (
         "https://hermes.example/api/plugins/kanban/work-inbox?board=strict"
