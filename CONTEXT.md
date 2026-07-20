@@ -5,7 +5,7 @@ This context defines how development work gains authority and moves through Herm
 ## Language
 
 **Work Inbox**:
-The authenticated Hermes boundary through which a Local External AI submits Ole-approved new work or returns a Hermes-assigned delivery. A submission grants admission to the framework, but no authority to change project state or execute work.
+The authenticated Hermes boundary through which a Local External AI submits Ole-approved new work or returns a Hermes-assigned delivery. A submission attests that Ole has approved admission to the framework, but grants no authority to change project state or execute work.
 _Avoid_: Qualification Inbox, Qualified Work Inbox
 
 **Local External AI**:
