@@ -1,6 +1,6 @@
 # Legacy Board and Work Inbox Reconciliation Design
 
-**Status:** Design approved; written specification awaiting review
+**Status:** Approved for execution
 **Date:** 2026-07-20
 **Scope:** All six target boards, orchestrated from the Default board
 
