@@ -2,21 +2,34 @@
 
 **Status:** Approved
 **Date:** 2026-07-19
+**Admission semantics clarified:** 2026-07-20
 **Supersedes:** The earlier durable-receipt design on the abandoned
 `design/work-inbox-delivery-boundary` implementation branch.
 
 ## Intent
 
-Hermes Work Inbox is the authenticated door through which an external AI
-either submits genuinely new work or returns work Hermes assigned. It is not a
-new workflow and it does not own qualification, requalification, routing, or
-handover.
+Hermes Work Inbox is the authenticated local door through which an AI outside
+the Hermes-managed framework either submits genuinely new work or returns work
+Hermes assigned. New work is submitted only after Ole approves its admission
+to Hermes. That approval means the work may enter the framework; it does not
+authorize immediate execution or bypass Product Owner, qualification, Work
+Contract, evidence, routing, or handover rules.
+
+The submitted payload remains technically untrusted input and cannot mutate
+project state directly. Qualification is the framework step that structures
+the approved intent, reconciles current work, resolves decisions within its
+authority or returns them to Ole, and issues a signed Work Contract.
+Requalification remains the correction path for an existing misqualified or
+stuck card.
 
 The smallest correct implementation is one thin POST adapter over behavior
 Hermes already has:
 
 ```text
-external AI
+Ole admission approval
+    |
+    v
+local external AI
     |
     v
 POST Hermes Work Inbox
@@ -34,19 +47,21 @@ existing stuck card ------> existing Hermes-only requalification
 
 ## Non-Negotiable Boundaries
 
-1. External callers submit evidence; they never choose phase, assignee,
+1. Work Inbox submission attests that Ole approved admission to the framework;
+   it does not attest that the work is ready for immediate execution.
+2. External callers submit intent and evidence; they never choose phase, assignee,
    dependency, Epic membership, next role, qualification path, release,
    override, or break glass.
-2. `new_work` creates only an existing qualification intake. It creates no
+3. `new_work` creates only an existing qualification intake. It creates no
    task directly.
-3. `assigned_delivery` is valid only for the exact currently running task,
+4. `assigned_delivery` is valid only for the exact currently running task,
    run, and Work Contract already supplied by Hermes.
-4. Assigned completion and blocking call the existing run-scoped
+5. Assigned completion and blocking call the existing run-scoped
    `complete_task` or `block_task` functions with `expected_run_id`. No second
    handover implementation is allowed.
-5. Work produced without an active Hermes assignment is `new_work` with
+6. Work produced without an active Hermes assignment is `new_work` with
    evidence. It cannot be attached to an arbitrary existing card.
-6. Requalification remains Hermes-only, preserves the existing card, and does
+7. Requalification remains Hermes-only, preserves the existing card, and does
    not appear as an external submission kind.
 
 ## Public Surface
@@ -65,6 +80,12 @@ Authorization: Bearer <machine credential>
 ```
 
 The route accepts exactly two closed request shapes.
+
+The guide must say that the caller is local but outside the framework, that Ole
+has already approved admission before submission, and that qualification still
+performs the normal framework process before any Work Contract authorizes
+execution. The machine credential authenticates the narrow Inbox caller; it is
+not a general Hermes or board credential.
 
 ### New work
 
@@ -94,7 +115,11 @@ The route accepts exactly two closed request shapes.
 Hermes passes `request`, `session_id`, and `attachments` unchanged to the
 existing `kanban_intake.submit_intake` service and returns its existing
 `qi_...` receipt. The existing qualifier remains the only component that may
-create and route a card.
+create and route a card. A rich discovery handoff may carry verified current
+state, desired outcomes, constraints, unresolved decisions, proposed sequence,
+and document evidence. One submission does not automatically materialize that
+sequence as executable cards; the Product Owner and qualifier decide the
+correct Epic/story decomposition through the normal framework.
 
 ### Assigned delivery
 
@@ -149,7 +174,9 @@ requalification, release, or general card-mutation routes.
 ## Response and Retry Semantics
 
 - Valid `new_work`: return the existing `202 qualification_required` response
-  and `qi_...` intake id.
+  and `qi_...` intake id. Here `qualification_required` means framework
+  structuring and contracting are pending, not that Ole's admission approval is
+  pending.
 - Valid assigned completion/block: return the resulting task id, submitted run
   id, and `handover_applied` or `blocked` outcome after the existing operation
   commits.
@@ -174,6 +201,8 @@ task events.
 - Existing workers, tools, qualification, requalification, Work Contracts,
   task events, and Normal Handover remain unchanged.
 - The Work Inbox adapter is an additional authenticated entry point only.
+- Existing `qualification_required` response compatibility remains unchanged;
+  its clarified meaning is framework processing after approved admission.
 - Agent Memory remains advisory and outside this authority boundary.
 
 ## Explicit Non-Goals
@@ -206,12 +235,14 @@ turns a boundary correction into a new subsystem.
 The minimal change is complete when behavior tests prove:
 
 1. the guide says **Hermes Work Inbox** and explains both request kinds;
-2. only a valid bearer token can POST to the exact route;
-3. `new_work` produces one existing qualification intake and no task;
-4. exact assigned completion/block uses the existing run-scoped operation and
+2. the guide states that local Inbox submissions are Ole-approved admissions
+   that still require the framework process and a Work Contract before execution;
+3. only a valid bearer token can POST to the exact route;
+4. `new_work` produces one existing qualification intake and no task;
+5. exact assigned completion/block uses the existing run-scoped operation and
    Normal Handover;
-5. stale task/run/contract and forbidden routing/private metadata produce no
+6. stale task/run/contract and forbidden routing/private metadata produce no
    task mutation;
-6. unassigned existing patches must use `new_work` with evidence;
-7. requalification remains internal and same-card; and
-8. the diff adds no persistence or background processing mechanism.
+7. unassigned existing patches must use `new_work` with evidence;
+8. requalification remains internal and same-card; and
+9. the diff adds no persistence or background processing mechanism.
