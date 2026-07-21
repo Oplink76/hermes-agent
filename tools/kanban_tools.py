@@ -1021,21 +1021,53 @@ def _resolver_agent_memory_identity(board_arg: Optional[str]):
     if ownership_err:
         return ownership_err
 
-    kb, conn = _connect(board=board_arg)
-    try:
-        board = (
-            board_arg
-            or os.environ.get("HERMES_KANBAN_BOARD")
-            or kb._board_slug_for_connection(conn)
+    # Board identity is derived/pinned from the env, never trusted from the
+    # caller. An explicit board is only honoured when it matches the pinned
+    # HERMES_KANBAN_BOARD; otherwise we refuse *before* connecting so a foreign
+    # board is never opened or operated on.
+    env_board = os.environ.get("HERMES_KANBAN_BOARD")
+    if board_arg is not None and board_arg != env_board:
+        return tool_error(
+            f"explicit board {board_arg!r} differs from the pinned board "
+            f"{env_board!r}: board identity is derived/pinned and a foreign "
+            "board is refused (board mismatch)"
         )
+
+    # The dispatcher pins the active run so a stale resolver process can be told
+    # it is out of date. Require the pin to exist and parse as an int before we
+    # touch the DB; equality with task.current_run_id is enforced below.
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    try:
+        pinned_run_id = int(raw_run_id) if raw_run_id is not None else None
+    except (TypeError, ValueError):
+        pinned_run_id = None
+    if pinned_run_id is None:
+        return tool_error(
+            "the dispatcher run pin HERMES_KANBAN_RUN_ID is missing or invalid; "
+            "refusing to mint receipts (run pin required)"
+        )
+
+    kb, conn = _connect(board=env_board)
+    try:
+        board = env_board or kb._board_slug_for_connection(conn)
         task = kb.get_task(conn, tid)
         if task is None or task.current_run_id is None:
+            conn.close()
             return tool_error("no active run for this resolver task")
+        if pinned_run_id != task.current_run_id:
+            conn.close()
+            return tool_error(
+                f"pinned run id {pinned_run_id} is stale: the current run is "
+                f"{task.current_run_id} (run mismatch — refusing to mint "
+                "receipts)"
+            )
         run = kb.get_run(conn, task.current_run_id)
         if run is None or run.ended_at is not None or run.profile != "resolver":
+            conn.close()
             return tool_error("the active run is not a resolver run")
         identity = kb._agent_memory_governed_identity(conn, tid, board=board)
         if identity is None:
+            conn.close()
             return tool_error(
                 "Agent Memory handoff is not required for this board/task"
             )

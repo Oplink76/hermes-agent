@@ -2868,7 +2868,7 @@ def test_board_param_rejects_invalid_slug(multi_board_env):
 
 
 def test_board_param_in_all_schemas():
-    """All nine kanban_* tool schemas must expose an optional ``board``
+    """Every kanban_* tool schema must expose an optional ``board``
     parameter. This pins the contract surfaced to the LLM — adding a
     new kanban tool without ``board`` will fail CI immediately."""
     from tools import kanban_tools as kt
@@ -2883,6 +2883,8 @@ def test_board_param_in_all_schemas():
         kt.KANBAN_CREATE_SCHEMA,
         kt.KANBAN_UNBLOCK_SCHEMA,
         kt.KANBAN_LINK_SCHEMA,
+        kt.KANBAN_AGENT_MEMORY_RECALL_SCHEMA,
+        kt.KANBAN_AGENT_MEMORY_WRITE_SCHEMA,
     ]
     for schema in schemas:
         props = schema["parameters"]["properties"]

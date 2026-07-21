@@ -48,6 +48,32 @@ def _function_ids(history: str) -> list[str]:
     ]
 
 
+def _agent_memory_file_counts(vault: Path, outbox: Path) -> tuple[int, int]:
+    """Count durable vault gist files and queued outbox gists.
+
+    Either identity gate closing early must leave both stores untouched.
+    """
+    memory = vault / "memory"
+    vault_files = len(list(memory.glob("*.md"))) if memory.exists() else 0
+    outbox_files = len(list(outbox.glob("gist-*.json"))) if outbox.exists() else 0
+    return vault_files, outbox_files
+
+
+def _run_identity_mismatch(error: str) -> bool:
+    lowered = error.lower()
+    return "run" in lowered and any(
+        token in lowered for token in ("stale", "current", "mismatch", "pin")
+    )
+
+
+def _board_pin_mismatch(error: str) -> bool:
+    lowered = error.lower()
+    return "board" in lowered and any(
+        token in lowered
+        for token in ("mismatch", "pin", "derived", "foreign", "differ")
+    )
+
+
 def _decision(
     title: str,
     outcome: str = "Operators can export governed release evidence",
@@ -1686,6 +1712,92 @@ def test_resolver_memory_tools_produce_receipts_that_satisfy_resolve(
     ))
     assert resolved["ok"] is True
     assert resolved["decision"] == "resume"
+
+
+def test_resolver_memory_tools_reject_stale_env_run_id(tmp_path, monkeypatch):
+    """A Resolver pinned (via env) to an older run must not mint receipts.
+
+    The dispatcher pins ``HERMES_KANBAN_RUN_ID`` so a stale Resolver process
+    can be told it is out of date. The memory tools derive the active run from
+    ``task.current_run_id`` alone; without also requiring equality with the
+    pinned env run id, a stale process can forge receipts for a newer run.
+    """
+    from tools import kanban_tools as kt
+
+    board, vault = _configured_product_board(tmp_path, monkeypatch)
+    outbox = tmp_path / "outbox"
+    with kb.connect(board=board) as conn:
+        task_id, resolver_run_id = _route_task_to_resolver(
+            conn, board, "Resolver stale run handoff"
+        )
+
+    # Model a stale Resolver still pinned to an older run than the current one.
+    stale_run_id = resolver_run_id - 1
+    assert stale_run_id >= 1
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(stale_run_id))
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    monkeypatch.setenv("HERMES_INFERENCE_MODEL", "resolver-e2e")
+
+    before = _agent_memory_file_counts(vault, outbox)
+
+    recall_out = json.loads(kt._handle_agent_memory_recall({}))
+    assert recall_out.get("ok") is not True
+    assert _run_identity_mismatch(recall_out.get("error", "")), recall_out
+
+    write_out = json.loads(kt._handle_agent_memory_write({
+        "summary": "Diagnosed recoverable task-local state.",
+        "result": "Resumed the ordinary worker.",
+        "evidence": "kanban_show preflight snapshot",
+    }))
+    assert write_out.get("ok") is not True
+    assert _run_identity_mismatch(write_out.get("error", "")), write_out
+
+    assert _agent_memory_file_counts(vault, outbox) == before
+
+
+def test_resolver_memory_tools_reject_foreign_explicit_board(tmp_path, monkeypatch):
+    """Board identity is derived/pinned; a caller-supplied board is rejected.
+
+    The contract derives board identity from the active task/run/DB, so a
+    Resolver passing an explicit foreign ``board`` must fail closed with a
+    board-mismatch error rather than have its argument silently honoured.
+    """
+    from tools import kanban_tools as kt
+
+    board, vault = _configured_product_board(tmp_path, monkeypatch)
+    outbox = tmp_path / "outbox"
+    with kb.connect(board=board) as conn:
+        task_id, resolver_run_id = _route_task_to_resolver(
+            conn, board, "Resolver foreign board handoff"
+        )
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resolver_run_id))
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    monkeypatch.setenv("HERMES_INFERENCE_MODEL", "resolver-e2e")
+
+    before = _agent_memory_file_counts(vault, outbox)
+
+    recall_out = json.loads(
+        kt._handle_agent_memory_recall({"board": "some-other-board"})
+    )
+    assert recall_out.get("ok") is not True
+    assert _board_pin_mismatch(recall_out.get("error", "")), recall_out
+
+    write_out = json.loads(kt._handle_agent_memory_write({
+        "summary": "Diagnosed recoverable task-local state.",
+        "result": "Resumed the ordinary worker.",
+        "evidence": "kanban_show preflight snapshot",
+        "board": "some-other-board",
+    }))
+    assert write_out.get("ok") is not True
+    assert _board_pin_mismatch(write_out.get("error", "")), write_out
+
+    assert _agent_memory_file_counts(vault, outbox) == before
 
 
 def test_resolver_worker_context_uses_kanban_memory_tools(tmp_path, monkeypatch):
