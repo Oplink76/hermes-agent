@@ -98,7 +98,11 @@ def test_resolver_worker_gets_only_readonly_surface_and_resolve(monkeypatch, tmp
     kanban = {n for n in names if n and n.startswith("kanban_")}
     assert kanban == {
         "kanban_show", "kanban_heartbeat", "kanban_comment", "kanban_resolve",
-    }, f"resolver kanban surface must be inspect/heartbeat/comment/resolve, got {kanban}"
+        "kanban_agent_memory_recall", "kanban_agent_memory_write",
+    }, (
+        "resolver kanban surface must be inspect/heartbeat/comment/resolve plus "
+        f"the narrow Agent Memory handoff tools, got {kanban}"
+    )
     for readonly in ("read_file", "search_files", "web_search", "web_extract"):
         assert readonly in names, f"resolver evidence tool missing: {readonly}"
     forbidden = {
@@ -108,6 +112,36 @@ def test_resolver_worker_gets_only_readonly_surface_and_resolve(monkeypatch, tmp
     }
     leaked = forbidden & names
     assert not leaked, f"mutation tools leaked into resolver surface: {leaked}"
+
+
+def test_ordinary_developer_worker_hides_resolver_memory_tools(monkeypatch, tmp_path):
+    """The narrow Agent Memory handoff tools are resolver-only.
+
+    An ordinary dispatcher-spawned worker (developer profile) must never see
+    ``kanban_agent_memory_recall`` / ``kanban_agent_memory_write`` — those exist
+    solely so the read-only Resolver can produce canonical receipts. Ordinary
+    workers use the ``hermes agent-memory`` CLI instead.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_dev")
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools  # ensure registered
+    from model_tools import _clear_tool_defs_cache, get_tool_definitions
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+    schema = get_tool_definitions(
+        enabled_toolsets=["terminal"],
+        quiet_mode=True,
+    )
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    assert "kanban_complete" in names
+    assert "kanban_agent_memory_recall" not in names
+    assert "kanban_agent_memory_write" not in names
 
 
 def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_path):

@@ -1537,6 +1537,174 @@ def test_resolver_requires_same_receipts_before_applying_decision(
         )
 
 
+def _route_task_to_resolver(conn, board: str, title: str) -> tuple[str, int]:
+    """Qualify a card, run it once, block it to the Resolver, and claim it."""
+    task_id = _qualified_task(conn, board=board, title=title)
+    with kb.authorized_governance_write(), kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status='ready', assignee='developer', "
+            "current_step_key='development', running=0, blocked=0 WHERE id=?",
+            (task_id,),
+        )
+    worker = kb.claim_task(conn, task_id, board=board)
+    assert worker is not None and worker.current_run_id is not None
+    worker_metadata = _worker_metadata(
+        conn, task_id, worker.current_run_id, board=board
+    )
+    assert kb.block_task(
+        conn,
+        task_id,
+        reason="Need a bounded decision",
+        kind="needs_input",
+        attempted_resolutions=["checked the current contract"],
+        metadata=worker_metadata,
+        expected_run_id=worker.current_run_id,
+        board=board,
+        human_escalation_assignee="resolver",
+    )
+    resolver = kb.claim_task(conn, task_id, board=board)
+    assert resolver is not None and resolver.current_run_id is not None
+    return task_id, resolver.current_run_id
+
+
+def _resolver_request(conn, task_id: str, run_id: int) -> dict:
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    preflight = [
+        event for event in kb.list_events(conn, task_id)
+        if event.kind == kb.PRODUCT_WORKFLOW_PRECHECK_EVENT
+    ][-1]
+    return {
+        "decision": "resume",
+        "fault_domain": "task_state",
+        "diagnosis": "The task-local state is recoverable",
+        "reason": "Resume the ordinary worker",
+        "expected": {
+            "run_id": run_id,
+            "preflight_event_id": preflight.id,
+            "status": task.status,
+            "phase": task.current_step_key,
+            "assignee": task.assignee,
+            "project_id": task.project_id,
+            "workflow_template_id": task.workflow_template_id,
+            "workspace_kind": task.workspace_kind,
+            "workspace_path": task.workspace_path,
+            "branch_name": task.branch_name,
+            "running": task.running,
+            "blocked": task.blocked,
+        },
+    }
+
+
+def _task_snapshot(conn, task_id: str) -> dict:
+    return {
+        "task": tuple(conn.execute(
+            "SELECT * FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()),
+        "runs": [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_runs WHERE task_id=? ORDER BY id", (task_id,)
+        )],
+        "events": [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (task_id,)
+        )],
+    }
+
+
+def test_resolver_memory_tools_produce_receipts_that_satisfy_resolve(
+    tmp_path, monkeypatch
+):
+    from tools import kanban_tools as kt
+
+    board, _vault = _configured_product_board(tmp_path, monkeypatch)
+    with kb.connect(board=board) as conn:
+        task_id, resolver_run_id = _route_task_to_resolver(
+            conn, board, "Resolver memory handoff"
+        )
+        request = _resolver_request(conn, task_id, resolver_run_id)
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resolver_run_id))
+    monkeypatch.setenv("HERMES_PROFILE", "resolver")
+    monkeypatch.setenv("HERMES_INFERENCE_MODEL", "resolver-e2e")
+
+    def snapshot() -> dict:
+        with kb.connect(board=board) as conn:
+            return _task_snapshot(conn, task_id)
+
+    # 1. Before any receipts, the gate fails closed and nothing changes.
+    before = snapshot()
+    blocked = json.loads(kt._handle_resolve({**request, "task_id": task_id}))
+    assert blocked.get("ok") is not True
+    assert "handover is still in-flight" in blocked.get("error", "")
+    assert snapshot() == before
+
+    # 2. The resolver produces canonical recall/write receipts for its own run.
+    recall_out = json.loads(kt._handle_agent_memory_recall({}))
+    assert recall_out["ok"] is True
+    assert recall_out["receipt"]["operation"] == "recall"
+    assert recall_out["receipt"]["executor"]["hermes_role"] == "resolver"
+
+    write_out = json.loads(kt._handle_agent_memory_write({
+        "summary": "Diagnosed recoverable task-local state.",
+        "result": "Resumed the ordinary worker.",
+        "evidence": "kanban_show preflight snapshot",
+    }))
+    assert write_out["ok"] is True
+    assert write_out["receipt"]["operation"] == "write"
+    # Same executor identity across recall and write for this resolver run.
+    assert (
+        write_out["receipt"]["executor"] == recall_out["receipt"]["executor"]
+    )
+
+    # 3. A forged receipt (foreign task_id) still fails closed and changes
+    #    nothing — receipt validation stays strict.
+    forged_write = dict(write_out["receipt"])
+    forged_write["task_id"] = "t_forged"
+    forged_metadata = {
+        "agent_memory": {
+            "recall": recall_out["receipt"],
+            "write": forged_write,
+        }
+    }
+    before_forged = snapshot()
+    forged = json.loads(kt._handle_resolve(
+        {**request, "task_id": task_id, "metadata": forged_metadata}
+    ))
+    assert forged.get("ok") is not True
+    assert snapshot() == before_forged
+
+    # 4. The real same-run receipts satisfy the resolve gate.
+    metadata = {
+        "agent_memory": {
+            "recall": recall_out["receipt"],
+            "write": write_out["receipt"],
+        }
+    }
+    resolved = json.loads(kt._handle_resolve(
+        {**request, "task_id": task_id, "metadata": metadata}
+    ))
+    assert resolved["ok"] is True
+    assert resolved["decision"] == "resume"
+
+
+def test_resolver_worker_context_uses_kanban_memory_tools(tmp_path, monkeypatch):
+    board, _vault = _configured_product_board(tmp_path, monkeypatch)
+    with kb.connect(board=board) as conn:
+        task_id, _run_id = _route_task_to_resolver(
+            conn, board, "Resolver context handoff"
+        )
+        context = kb.build_worker_context(conn, task_id)
+
+    assert "## Agent Memory recall" in context
+    assert "kanban_agent_memory_recall" in context
+    assert "kanban_agent_memory_write" in context
+    # The Resolver runs read-only and cannot shell out; it must not be told
+    # to run the ordinary-worker CLI protocol.
+    assert "hermes agent-memory recall" not in context
+    assert "hermes agent-memory write" not in context
+
+
 def test_missing_root_legacy_fallback_queues_one_gist(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
