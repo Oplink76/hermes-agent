@@ -3009,7 +3009,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_ATTACH_SCHEMA,
     handler=_handle_attach,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_ordinary_worker_mode,
     emoji="📎",
 )
 
@@ -3018,7 +3018,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_ATTACH_URL_SCHEMA,
     handler=_handle_attach_url,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_ordinary_worker_mode,
     emoji="📎",
 )
 
@@ -3027,7 +3027,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_ATTACHMENTS_SCHEMA,
     handler=_handle_attachments,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_ordinary_worker_mode,
     emoji="📎",
 )
 

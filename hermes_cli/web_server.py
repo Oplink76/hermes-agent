@@ -16480,7 +16480,7 @@ def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
 
 @app.get("/api/analytics/usage")
 async def get_usage_analytics(days: int = 30, profile: Optional[str] = None):
-    return await _run_session_db_io(lambda: _get_usage_analytics(days, profile))
+    return await _run_session_db_io(_get_usage_analytics, days, profile)
 
 
 def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
@@ -16657,7 +16657,7 @@ def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
 @app.get("/api/analytics/models")
 async def get_models_analytics(days: int = 30, profile: Optional[str] = None):
     """Return model analytics without blocking the serving event loop."""
-    return await _run_session_db_io(lambda: _get_models_analytics(days, profile))
+    return await _run_session_db_io(_get_models_analytics, days, profile)
 
 
 # ---------------------------------------------------------------------------

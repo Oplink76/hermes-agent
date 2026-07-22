@@ -3763,7 +3763,7 @@ def test_run_prompt_submit_prefers_origin_ui_session_id(monkeypatch, tmp_path):
         process_registry._completion_consumed.discard(event["session_id"])
 
 
-
+def test_session_create_does_not_persist_empty_row(monkeypatch):
     """session.create must NOT eagerly write a DB row.
 
     Every TUI/desktop launch opens a session here just to paint the composer;

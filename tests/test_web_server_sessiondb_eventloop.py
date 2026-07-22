@@ -53,7 +53,7 @@ def test_sessiondb_handlers_open_connections_inside_executor_helpers():
             arg.id
             for node in ast.walk(handler)
             if isinstance(node, ast.Call)
-            and _call_name(node) == "to_thread"
+            and _call_name(node) in {"to_thread", "_run_session_db_io"}
             for arg in node.args[:1]
             if isinstance(arg, ast.Name)
         }
