@@ -73,19 +73,6 @@ def test_agent_memory_delegation_identity_is_stable_per_task_run():
     assert first != kb._agent_memory_delegation_id("default", "t_other", 7)
 
 
-def test_agent_memory_tool_correction_is_focused_and_fail_open():
-    from tools import kanban_tools
-
-    payload = json.loads(
-        kanban_tools._agent_memory_handover_error("kanban_complete")
-    )
-
-    assert "kanban handover is still in-flight" in payload["error"]
-    assert "retry the same kanban_complete or kanban_block call" in payload["error"]
-    assert "queued write is accepted" in payload["error"]
-    assert "vault need not be available" in payload["error"]
-
-
 def test_init_creates_expected_tables(kanban_home):
     with kb.connect() as conn:
         rows = conn.execute(

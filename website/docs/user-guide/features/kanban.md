@@ -339,6 +339,26 @@ kanban_complete(
 )
 ```
 
+### Agent Memory is advisory
+
+When governed Agent Memory is enabled, workers should attempt the bounded
+recall-before-work and write-after-work protocol. Valid receipts from the
+current task run are retained, and trusted Hermes pre-delegation recall remains
+available as historical evidence.
+
+Agent Memory never decides the task outcome. Functional evidence, lifecycle
+ownership, provenance, workflow verdicts, and artifact checks remain the gates
+for `kanban_complete`, `kanban_block`, `kanban_resolve`, and handoff. Missing,
+malformed, mismatched, stale, conflicting, or unavailable receipts are
+sanitized into a bounded advisory status with `continue_work=true`; they do not
+change task status, run outcome, attempt/failure counts, or dispatcher
+eligibility. Invalid receipts are not trusted or persisted, and Hermes never
+fabricates a successful receipt for them.
+
+A memory problem must not cause implementation, tests, or review to be rerun and
+must not replay or reclaim the full role task. If recovery is needed later, it
+is detached, idempotent, and limited to the existing memory/outbox operation.
+
 An **orchestrator** worker fans out instead:
 
 ```

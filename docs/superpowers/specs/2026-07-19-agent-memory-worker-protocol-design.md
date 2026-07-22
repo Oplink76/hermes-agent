@@ -107,8 +107,10 @@ inbox guide.
    delivery continues.
 4. **Functionality first:** `function_id` continues to come from the stable Work
    Contract boundary, never from a mutable card title.
-5. **Existing engine only:** missing memory handover returns through the normal
-   worker correction/retry path. It does not introduce a memory phase or card.
+5. **Existing engine only:** missing or invalid memory handover is sanitized by
+   the existing lifecycle call. It never enters a correction/retry path for the
+   role task, and it does not introduce a memory phase or card. A later retry,
+   if needed, is detached and limited to the memory/outbox operation.
 6. **Pending files are the flag:** the durable outbox itself is the source of
    truth for pending recovery. No separate flag can drift out of sync.
 
@@ -233,15 +235,20 @@ the storage boundary. `queued` never blocks the development handover.
 
 ### 4. Normal handover enforcement
 
-The Hermes role includes the worker's recall and write receipts in existing run
-handover metadata. For governed v2 delegated work, Hermes checks that the
-receipts match the current task/run/delegation and that the gist exists in the
-vault or outbox.
+The Hermes role includes any worker recall and write receipts in existing run
+handover metadata. For governed v2 delegated work, Hermes retains receipts only
+when they match the current task/run/delegation and the gist is present in the
+vault or outbox. Missing, malformed, mismatched, stale, conflicting, or
+unavailable receipts are omitted and replaced with a bounded advisory status;
+they are never persisted as trusted receipts and never raise into lifecycle
+code.
 
-If the worker omitted the protocol, Hermes returns the same task through the
-normal correction/retry mechanism with a focused instruction to complete the
-memory handover. It does not create a card, memory phase, scheduled dependency,
-or break-glass event.
+The lifecycle transition remains determined by functional evidence, workflow
+verdicts, provenance, ownership, and artifact checks. A memory problem cannot
+change task status, run outcome, attempt/failure counts, dispatcher eligibility,
+or handoff/resolver decisions. It also cannot create, reclaim, or replay the
+role task. Any later retry is detached, idempotent, and limited to the existing
+memory/outbox operation.
 
 The existing post-commit Hermes transition capture becomes a compatibility
 fallback for legacy or non-delegated transitions. It does not append a second
@@ -351,7 +358,8 @@ the alert until the state materially changes. Ole remains the last resort.
 - Hermes-direct, native child, Codex CLI, Claude Code CLI, and Cowork MCP paths
   produce actual-worker identities and receipts.
 - Vault failure does not change worker execution or Kanban routing.
-- Missing worker receipts use the normal correction path.
+- Missing, malformed, mismatched, stale, and conflicting worker receipts allow
+  the normal lifecycle transition without replaying the task.
 - A worker gist suppresses duplicate Hermes fallback capture.
 - Legacy fallback capture remains explicit and functional.
 

@@ -509,11 +509,11 @@ def test_resolve_schema_is_strict_and_bounded():
     }
     metadata = params["properties"]["metadata"]
     assert metadata["type"] == "object"
-    assert metadata["required"] == ["agent_memory"]
+    assert metadata.get("required", []) == []
     assert metadata["additionalProperties"] is False
     assert set(metadata["properties"]) == {"agent_memory"}
     agent_memory = metadata["properties"]["agent_memory"]
-    assert agent_memory["required"] == ["recall", "write"]
+    assert agent_memory.get("required", []) == []
     assert agent_memory["additionalProperties"] is False
     assert set(agent_memory["properties"]) == {"recall", "write"}
     receipt_keys = {
@@ -580,42 +580,73 @@ def _canonical_memory_metadata_for_tools(task_id="t_owned", run_id=7):
     }
 
 
-@pytest.mark.parametrize("extra_level", ("metadata", "agent_memory", "receipt", "executor"))
-def test_block_rejects_noncanonical_memory_metadata_before_database_access(
-    monkeypatch, extra_level
-):
+def test_block_rejects_nonmemory_metadata_before_database_access(monkeypatch):
     from tools import kanban_tools as kt
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_owned")
     metadata = _canonical_memory_metadata_for_tools()
-    if extra_level == "metadata":
-        metadata["private"] = True
-    elif extra_level == "agent_memory":
-        metadata["agent_memory"]["private"] = True
-    elif extra_level == "receipt":
-        metadata["agent_memory"]["write"]["private"] = True
-    else:
-        metadata["agent_memory"]["write"]["executor"]["private"] = True
+    metadata["private"] = True
     monkeypatch.setattr(
         kt,
         "_connect",
-        lambda **_kwargs: pytest.fail("noncanonical metadata reached the database"),
+        lambda **_kwargs: pytest.fail("nonmemory metadata reached the database"),
     )
 
     result = json.loads(
         kt._handle_block({"reason": "blocked", "metadata": metadata})
     )
 
-    assert "canonical recall and write receipts" in result["error"]
+    assert result["error"] == (
+        "kanban_block: metadata must contain only agent_memory"
+    )
+    assert "canonical recall and write receipts" not in result["error"]
 
 
-def test_block_canonicalizes_memory_metadata_before_persistence(worker_env):
+@pytest.mark.parametrize("extra_level", ("agent_memory", "receipt", "executor"))
+def test_memory_metadata_sanitizer_omits_untrusted_fields(extra_level):
+    from tools import kanban_tools as kt
+
+    metadata = _canonical_memory_metadata_for_tools()
+    if extra_level == "agent_memory":
+        metadata["agent_memory"]["private"] = True
+    elif extra_level == "receipt":
+        metadata["agent_memory"]["write"]["private"] = True
+    else:
+        metadata["agent_memory"]["write"]["executor"]["private"] = True
+    canonical = kt._canonical_agent_memory_metadata(metadata)
+
+    assert canonical is not None
+    assert set(canonical) == {"agent_memory"}
+    assert "recall" in canonical["agent_memory"]
+    if extra_level == "agent_memory":
+        assert "write" in canonical["agent_memory"]
+    else:
+        assert canonical["agent_memory"]["write"] == {}
+    assert "private" not in json.dumps(canonical)
+
+
+def test_memory_metadata_sanitizer_fails_open_when_receipt_module_unavailable(
+    monkeypatch,
+):
+    from tools import kanban_tools as kt
+
+    def broken_receipt_class():
+        raise ImportError("optional Agent Memory module unavailable")
+
+    monkeypatch.setattr(kt, "_agent_memory_receipt_class", broken_receipt_class)
+
+    assert kt._canonical_agent_memory_metadata(
+        _canonical_memory_metadata_for_tools()
+    ) == {"agent_memory": {"recall": {}, "write": {}}}
+
+
+def test_block_sanitizes_malformed_memory_before_persistence(
+    monkeypatch, worker_env
+):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
-    with kb.connect() as conn:
-        run_id = kb.get_task(conn, worker_env).current_run_id
-    metadata = _canonical_memory_metadata_for_tools(worker_env, run_id)
+    metadata = {"agent_memory": {"write": {"not": "a receipt"}}}
 
     result = json.loads(
         kt._handle_block({"reason": "blocked", "metadata": metadata})
@@ -624,7 +655,8 @@ def test_block_canonicalizes_memory_metadata_before_persistence(worker_env):
     assert result["ok"] is True
     with kb.connect() as conn:
         run = kb.latest_run(conn, worker_env)
-    assert run.metadata == metadata
+    assert run is not None
+    assert "write" not in run.metadata.get("agent_memory", {})
 
 
 def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
@@ -1169,6 +1201,66 @@ def _make_product_worker_env(monkeypatch, tmp_path):
         )
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     return tid
+
+
+def _make_product_memory_worker_env(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+
+    tid = _make_product_worker_env(monkeypatch, tmp_path)
+    kb.ensure_product_board_defaults("prod")
+    vault = tmp_path / "Agent Memory"
+    vault.mkdir()
+    monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(vault))
+    with kb.connect(board="prod") as conn:
+        with kb.authorized_governance_write(), kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET idempotency_key=? WHERE id=?",
+                (f"memory-{tid}", tid),
+            )
+        claimed = kb.claim_task(conn, tid, board="prod")
+        assert claimed is not None and claimed.current_run_id is not None
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    return tid
+
+
+@pytest.mark.parametrize("malformed_field", ("recall", "write"))
+def test_block_classifies_malformed_memory_without_replay(
+    monkeypatch, tmp_path, malformed_field
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = _make_product_memory_worker_env(monkeypatch, tmp_path)
+    with kb.connect(board="prod") as conn:
+        before = [run.id for run in kb.list_runs(conn, tid, include_active=True)]
+
+    result = json.loads(kt._handle_block({
+        "reason": "waiting for a bounded decision",
+        "kind": "dependency",
+        "metadata": {
+            "agent_memory": {
+                malformed_field: {"untrusted": "payload"},
+            }
+        },
+    }))
+
+    assert result["ok"] is True
+    serialized = json.dumps(result).lower()
+    assert "retry" not in serialized
+    assert "replay" not in serialized
+    with kb.connect(board="prod") as conn:
+        task = kb.get_task(conn, tid)
+        after = [run.id for run in kb.list_runs(conn, tid, include_active=True)]
+        run = kb.latest_run(conn, tid)
+
+    assert task is not None and task.status == "todo"
+    assert after == before
+    assert run is not None
+    memory = run.metadata["agent_memory"]
+    assert memory["advisory"]["continue_work"] is True
+    assert memory["advisory"]["invalid"] == [malformed_field]
+    assert malformed_field not in memory
+    assert "untrusted" not in json.dumps(memory)
 
 
 def test_product_block_requires_attempted_resolutions(monkeypatch, tmp_path):
@@ -2027,29 +2119,16 @@ def test_resolver_tool_rejects_legacy_fields_before_database_call(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("metadata", "expected_error"),
+    "metadata",
     [
-        (
-            {
-                "agent_memory": {"recall": {}, "write": {}},
-                "private_notes": "must not cross the Resolver boundary",
-            },
-            "metadata must contain only agent_memory",
-        ),
-        (
-            {
-                "agent_memory": {
-                    "recall": {},
-                    "write": {},
-                    "hermes_recall": {"forged": True},
-                }
-            },
-            "metadata.agent_memory must contain exactly recall and write",
-        ),
+        {
+            "agent_memory": {"recall": {}, "write": {}},
+            "private_notes": "must not cross the Resolver boundary",
+        },
     ],
 )
 def test_resolver_tool_rejects_unbounded_metadata_before_database_call(
-    monkeypatch, metadata, expected_error
+    monkeypatch, metadata
 ):
     from tools import kanban_tools as kt
 
@@ -2071,7 +2150,20 @@ def test_resolver_tool_rejects_unbounded_metadata_before_database_call(
         "metadata": metadata,
     }))
 
-    assert expected_error in out["error"]
+    assert "metadata must contain only agent_memory" in out["error"]
+
+
+def test_resolver_memory_metadata_sanitizer_drops_forged_hermes_recall():
+    from tools import kanban_tools as kt
+
+    metadata = _canonical_memory_metadata_for_tools()
+    metadata["agent_memory"]["hermes_recall"] = {"forged": True}
+
+    canonical = kt._canonical_agent_memory_metadata(metadata)
+
+    assert canonical is not None
+    assert "hermes_recall" not in canonical["agent_memory"]
+    assert set(canonical["agent_memory"]) == {"recall", "write"}
 
 
 def test_product_block_prefers_board_resolver_profile(monkeypatch, tmp_path):

@@ -33,6 +33,7 @@ from agent.prompt_builder import (
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
+    RESOLVER_KANBAN_GUIDANCE,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
@@ -53,6 +54,15 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_resolver_memory_receipts_are_advisory_when_unavailable(self):
+        assert "receipts when available" in RESOLVER_KANBAN_GUIDANCE
+        assert "Missing or failed memory is advisory" in RESOLVER_KANBAN_GUIDANCE
+        assert (
+            "still call `kanban_resolve` without replaying diagnosis"
+            in RESOLVER_KANBAN_GUIDANCE
+        )
+        assert "pass both receipts" not in RESOLVER_KANBAN_GUIDANCE
 
 
 # =========================================================================
@@ -1704,5 +1714,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
