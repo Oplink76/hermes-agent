@@ -2,6 +2,10 @@ name: Contributor Attribution Check
 
 on:
   workflow_call:
+    outputs:
+      review_status:
+        description: "JSON array of review status objects"
+        value: ${{ jobs.check-attribution.outputs.review_status }}
 
 permissions:
   contents: read
@@ -9,6 +13,9 @@ permissions:
 jobs:
   check-attribution:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      review_status: ${{ steps.check-emails.outputs.review_status }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:

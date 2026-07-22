@@ -31,6 +31,15 @@ def _default_cron_test_model(monkeypatch, _hermetic_environment):
     monkeypatch.setattr(jobs_mod, "JOBS_FILE", cron_dir / "jobs.json")
     monkeypatch.setattr(
         jobs_mod,
+        "_IMPORT_STORE",
+        jobs_mod._CronStorePaths(
+            cron_dir,
+            cron_dir / "jobs.json",
+            cron_dir / "output",
+        ),
+    )
+    monkeypatch.setattr(
+        jobs_mod,
         "TICKER_HEARTBEAT_FILE",
         cron_dir / "ticker_heartbeat",
     )
