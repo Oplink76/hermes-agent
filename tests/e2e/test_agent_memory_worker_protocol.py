@@ -338,7 +338,40 @@ def test_each_surface_recalls_and_writes(surface, protocol_board, capsys):
     assert task is not None and task.current_step_key == "test"
 
 
-def test_receipt_gate_rejects_missing_and_mismatched_before_accepting_cli_receipts(
+def test_missing_receipts_complete_without_replaying_task(protocol_board):
+    run_ids_before = [
+        run.id
+        for run in kb.list_runs(
+            protocol_board.conn, protocol_board.task_id, include_active=True
+        )
+    ]
+
+    assert protocol_board.complete(
+        {
+            "ai_provenance": {
+                "writer": {"agent": "hermes-child", "model": "test-model"},
+            },
+        }
+    ) is True
+    task = kb.get_task(protocol_board.conn, protocol_board.task_id)
+    assert task is not None and task.current_step_key == "test"
+    assert task.consecutive_failures == 0
+    assert [
+        run.id
+        for run in kb.list_runs(
+            protocol_board.conn, protocol_board.task_id, include_active=True
+        )
+    ] == run_ids_before
+    run = kb.get_run(protocol_board.conn, protocol_board.run_id)
+    assert run is not None
+    assert run.outcome == "advanced"
+    memory = run.metadata["agent_memory"]
+    assert memory["advisory"]["continue_work"] is True
+    assert "recall" not in memory
+    assert "write" not in memory
+
+
+def test_mismatched_receipt_is_ignored_without_replaying_task(
     protocol_board, capsys
 ):
     outcome = run_fake_delegated_worker(
@@ -349,24 +382,20 @@ def test_receipt_gate_rejects_missing_and_mismatched_before_accepting_cli_receip
         board=protocol_board.slug,
         capsys=capsys,
     )
-
-    with pytest.raises(kb.AgentMemoryHandoverError) as missing:
-        protocol_board.complete({})
-    assert missing.value.missing == ("recall", "write")
-    task = kb.get_task(protocol_board.conn, protocol_board.task_id)
-    assert task is not None and task.status == "running"
-
     mismatched = json.loads(json.dumps(outcome.metadata))
     mismatched["agent_memory"]["write"]["run_id"] += 1
-    with pytest.raises(kb.AgentMemoryHandoverError) as invalid:
-        protocol_board.complete(mismatched)
-    assert invalid.value.invalid == ("write",)
-    task = kb.get_task(protocol_board.conn, protocol_board.task_id)
-    assert task is not None and task.status == "running"
 
-    assert protocol_board.complete(outcome.metadata) is True
+    assert protocol_board.complete(mismatched) is True
     task = kb.get_task(protocol_board.conn, protocol_board.task_id)
     assert task is not None and task.current_step_key == "test"
+    assert task.consecutive_failures == 0
+    run = kb.get_run(protocol_board.conn, protocol_board.run_id)
+    assert run is not None
+    assert run.outcome == "advanced"
+    memory = run.metadata["agent_memory"]
+    assert memory["advisory"]["continue_work"] is True
+    assert memory["advisory"]["invalid"] == ["write"]
+    assert "write" not in memory
 
 
 def test_writer_and_reviewer_have_distinct_execution_and_gist_ids(

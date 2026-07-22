@@ -144,14 +144,6 @@ def _stamp_worker_session_metadata(
     return stamped
 
 
-def _agent_memory_handover_error(action: str) -> str:
-    return tool_error(
-        f"{action}: kanban handover is still in-flight. Complete Agent Memory "
-        "recall/write, then retry the same kanban_complete or kanban_block call. "
-        "A queued write is accepted; the external vault need not be available."
-    )
-
-
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     """Reject worker-driven destructive calls on foreign task IDs.
 
@@ -849,8 +841,6 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
                 )
-            except kb.AgentMemoryHandoverError:
-                return _agent_memory_handover_error("kanban_complete")
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the
@@ -904,33 +894,49 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(f"kanban_complete: {e}")
 
 
+def _agent_memory_receipt_class():
+    from hermes_cli.agent_memory_protocol import MemoryReceipt
+
+    return MemoryReceipt
+
+
 def _canonical_agent_memory_metadata(metadata: object) -> dict | None:
     if metadata is None:
         return None
     if not isinstance(metadata, dict):
         raise ValueError("metadata must be an object/dict")
+    if not metadata:
+        return None
     if set(metadata) != {"agent_memory"}:
         raise ValueError("metadata must contain only agent_memory")
     agent_memory = metadata.get("agent_memory")
-    if not isinstance(agent_memory, dict) or set(agent_memory) != {
-        "recall", "write",
-    }:
-        raise ValueError(
-            "metadata.agent_memory must contain exactly recall and write"
-        )
-    from hermes_cli.agent_memory_protocol import MemoryReceipt
-
+    if not isinstance(agent_memory, dict):
+        return {"agent_memory": {}}
     try:
+        MemoryReceipt = _agent_memory_receipt_class()
+    except Exception:
         return {
             "agent_memory": {
-                name: MemoryReceipt.from_mapping(agent_memory[name]).to_mapping()
+                name: {}
                 for name in ("recall", "write")
+                if name in agent_memory
             }
         }
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "metadata.agent_memory must contain canonical recall and write receipts"
-        ) from exc
+
+    canonical: dict[str, dict] = {}
+    for name in ("recall", "write"):
+        if name not in agent_memory:
+            continue
+        try:
+            canonical[name] = MemoryReceipt.from_mapping(
+                agent_memory[name]
+            ).to_mapping()
+        except Exception:
+            # The Kanban database records a bounded advisory and continues the
+            # functional Resolver transition. Invalid worker evidence is never
+            # passed through this boundary as trusted metadata.
+            canonical[name] = {}
+    return {"agent_memory": canonical}
 
 
 def _handle_resolve(args: dict, **kw) -> str:
@@ -996,8 +1002,6 @@ def _handle_resolve(args: dict, **kw) -> str:
         return tool_error(
             "kanban_resolve conflict: task changed; refresh with kanban_show"
         )
-    except kb_module.AgentMemoryHandoverError:
-        return _agent_memory_handover_error("kanban_resolve")
     except ValueError as e:
         return tool_error(f"kanban_resolve: {e}")
     except Exception as e:
@@ -1246,8 +1250,6 @@ def _handle_agent_memory_write(args: dict, **kw) -> str:
 
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
-    from hermes_cli import kanban_db as kb_module
-
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -1274,11 +1276,8 @@ def _handle_block(args: dict, **kw) -> str:
     if metadata is not None:
         try:
             metadata = _canonical_agent_memory_metadata(metadata)
-        except ValueError:
-            return tool_error(
-                "kanban_block: metadata.agent_memory must contain canonical "
-                "recall and write receipts"
-            )
+        except ValueError as exc:
+            return tool_error(f"kanban_block: {exc}")
     else:
         metadata = _stamp_worker_session_metadata(tid, None)
     board = args.get("board")
@@ -1367,8 +1366,6 @@ def _handle_block(args: dict, **kw) -> str:
             conn.close()
     except ValueError as e:
         return tool_error(f"kanban_block: {e}")
-    except kb_module.AgentMemoryHandoverError:
-        return _agent_memory_handover_error("kanban_block")
     except Exception as e:
         logger.exception("kanban_block failed")
         return tool_error(f"kanban_block: {e}")
@@ -2310,12 +2307,13 @@ def _agent_memory_receipt_schema(operation: str) -> dict:
 
 
 def _agent_memory_metadata_schema() -> dict:
-    """Shared strict handover envelope for Resolver and worker exits."""
+    """Shared bounded handover envelope for Resolver and worker exits."""
     return {
         "type": "object",
         "description": (
             "Shared governed handover envelope containing only the actual "
-            "worker's Agent Memory recall and write receipts."
+            "worker's Agent Memory recall and write receipts when available; "
+            "missing or invalid receipts remain advisory."
         ),
         "properties": {
             "agent_memory": {
@@ -2324,11 +2322,9 @@ def _agent_memory_metadata_schema() -> dict:
                     "recall": _agent_memory_receipt_schema("recall"),
                     "write": _agent_memory_receipt_schema("write"),
                 },
-                "required": ["recall", "write"],
                 "additionalProperties": False,
             },
         },
-        "required": ["agent_memory"],
         "additionalProperties": False,
     }
 

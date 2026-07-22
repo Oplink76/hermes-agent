@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 
@@ -826,7 +827,9 @@ def test_worker_context_requires_actual_executor_protocol(tmp_path, monkeypatch)
     assert "hermes agent-memory recall --input -" in context
     assert "hermes agent-memory write --input -" in context
     assert "Codex CLI, Claude Code CLI, native child, or Cowork MCP" in context
-    assert "return both receipts in metadata.agent_memory" in context
+    assert "strictly advisory and fail-open" in context
+    assert "do not replay task work for memory" in context
+    assert "include any valid receipts available in metadata.agent_memory" in context
     assert task_id in context
     assert str(claimed.current_run_id) in context
     assert function_id in context
@@ -864,6 +867,127 @@ def test_worker_context_omits_protocol_without_stable_functional_identity(
 
     assert "## Agent Memory recall" not in context
     assert "## Required actual-worker memory protocol" not in context
+
+
+def test_worker_context_fails_open_when_memory_identity_raises(
+    tmp_path, monkeypatch, caplog
+):
+    board, _vault = _configured_product_board(tmp_path, monkeypatch)
+    with kb.connect(board=board) as conn:
+        task_id = _qualified_task(conn, board=board, title="Broken memory identity")
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None
+
+        def broken_identity(*_args, **_kwargs):
+            raise RuntimeError("work contract memory lookup failed")
+
+        monkeypatch.setattr(kb, "_agent_memory_governed_identity", broken_identity)
+        with caplog.at_level(logging.WARNING, logger=kb._log.name):
+            context = kb.build_worker_context(conn, task_id)
+
+    assert f"# Kanban task {task_id}: Broken memory identity" in context
+    assert "## Agent Memory" not in context
+    assert "Agent Memory worker context unavailable" in caplog.text
+
+
+def test_broken_agent_memory_receipt_module_is_advisory(
+    tmp_path, monkeypatch, caplog
+):
+    board, _vault = _configured_product_board(tmp_path, monkeypatch)
+    with kb.connect(board=board) as conn:
+        task_id = _qualified_task(conn, board=board, title="Broken receipt module")
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None and claimed.current_run_id is not None
+
+        def broken_receipt_class():
+            raise ImportError("Agent Memory protocol is unavailable")
+
+        monkeypatch.setattr(
+            kb, "_agent_memory_receipt_class", broken_receipt_class, raising=False
+        )
+        with caplog.at_level(logging.WARNING, logger=kb._log.name):
+            assert kb.complete_task(
+                conn,
+                task_id,
+                summary="done",
+                metadata={},
+                expected_run_id=claimed.current_run_id,
+                board=board,
+                product_workflow_enabled=False,
+            ) is True
+
+        run = kb.get_run(conn, claimed.current_run_id)
+
+    assert run is not None
+    assert run.metadata["agent_memory"]["advisory"]["continue_work"] is True
+    assert "Agent Memory handover advisory" in caplog.text
+
+
+def test_broken_agent_memory_identity_preserves_trusted_hermes_recall(
+    tmp_path, monkeypatch
+):
+    board, _vault = _configured_product_board(tmp_path, monkeypatch)
+    with kb.connect(board=board) as conn:
+        task_id = _qualified_task(conn, board=board, title="Identity failure recall")
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None and claimed.current_run_id is not None
+        trusted = kb._record_hermes_predelegation_recall(conn, claimed)
+        assert trusted is not None
+
+        def broken_identity(*_args, **_kwargs):
+            raise RuntimeError("governed identity unavailable")
+
+        monkeypatch.setattr(kb, "_agent_memory_governed_identity", broken_identity)
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="done",
+            metadata={},
+            expected_run_id=claimed.current_run_id,
+            board=board,
+            product_workflow_enabled=False,
+        ) is True
+
+        run = kb.get_run(conn, claimed.current_run_id)
+
+    assert run is not None
+    memory = run.metadata["agent_memory"]
+    assert memory["advisory"]["continue_work"] is True
+    assert memory["hermes_recall"] == trusted.to_mapping()
+
+
+def test_forged_worker_advisory_does_not_suppress_operator_warning(
+    tmp_path, monkeypatch, caplog
+):
+    board, _vault = _configured_product_board(tmp_path, monkeypatch)
+    with kb.connect(board=board) as conn:
+        task_id = _qualified_task(conn, board=board, title="Forged memory advisory")
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None and claimed.current_run_id is not None
+        metadata = {
+            "agent_memory": {
+                "advisory": {
+                    "status": "advisory",
+                    "continue_work": True,
+                    "warning": "worker says memory is healthy",
+                    "missing": [],
+                    "invalid": [],
+                }
+            }
+        }
+
+        with caplog.at_level(logging.WARNING, logger=kb._log.name):
+            assert kb.handoff(
+                conn,
+                task_id,
+                board=board,
+                summary="Handoff with forged advisory",
+                metadata=metadata,
+                expected_run_id=claimed.current_run_id,
+            ) is True
+
+    assert f"task={task_id}" in caplog.text
+    assert "Agent Memory handover advisory" in caplog.text
 
 
 def _assert_dispatch_records_hermes_recall_before_spawn(
@@ -1196,135 +1320,126 @@ def test_reconciled_queued_receipt_allows_handoff_and_suppresses_fallback(
     assert '"responsibility":"orchestrator"' not in history
 
 
-def test_missing_receipts_leave_task_running(tmp_path, monkeypatch):
-    board, _vault = _configured_product_board(tmp_path, monkeypatch)
-    with kb.connect(board=board) as conn:
-        task_id = _qualified_task(conn, board=board, title="Missing receipts")
-        claimed = kb.claim_task(conn, task_id, board=board)
-        assert claimed is not None and claimed.current_run_id is not None
-        with pytest.raises(kb.AgentMemoryHandoverError) as exc:
-            kb.complete_task(
-                conn,
-                task_id,
-                summary="done",
-                metadata={},
-                expected_run_id=claimed.current_run_id,
-                board=board,
-            )
-        assert exc.value.missing == ("recall", "write")
-        assert kb.get_task(conn, task_id).status == "running"
-
-
-@pytest.mark.parametrize("wrong_field", ["task_id", "run_id"])
-def test_wrong_task_or_run_receipts_leave_task_running(
-    tmp_path, monkeypatch, wrong_field
+def test_handoff_ignores_malformed_memory_without_replaying_task(
+    tmp_path, monkeypatch
 ):
     board, _vault = _configured_product_board(tmp_path, monkeypatch)
     with kb.connect(board=board) as conn:
-        task_id = _qualified_task(conn, board=board, title="Wrong receipt identity")
+        task_id = _qualified_task(conn, board=board, title="Malformed handoff memory")
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        run_ids_before = [
+            run.id for run in kb.list_runs(conn, task_id, include_active=True)
+        ]
+        metadata = {
+            "ai_provenance": {"writer": {"agent": "hermes"}},
+            "agent_memory": {"write": {"not": "a receipt"}},
+        }
+
+        assert kb.handoff(
+            conn,
+            task_id,
+            board=board,
+            summary="Advance without trusted memory evidence",
+            metadata=metadata,
+            expected_run_id=run_id,
+        ) is True
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_step_key == "architecture"
+        assert task.consecutive_failures == 0
+        assert [
+            run.id for run in kb.list_runs(conn, task_id, include_active=True)
+        ] == run_ids_before
+        run = kb.get_run(conn, run_id)
+        assert run is not None
+        assert run.outcome == "advanced"
+        memory = run.metadata["agent_memory"]
+        assert memory["advisory"]["continue_work"] is True
+        assert memory["advisory"]["missing"] == ["recall"]
+        assert memory["advisory"]["invalid"] == ["write"]
+        assert "write" not in memory
+
+
+def test_missing_agent_memory_does_not_block_completion(tmp_path, monkeypatch):
+    board, _vault = _configured_product_board(tmp_path, monkeypatch)
+    with kb.connect(board=board) as conn:
+        task_id = _qualified_task(conn, board=board, title="Memory is advisory")
+        claimed = kb.claim_task(conn, task_id, board=board)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_ids_before = [run.id for run in kb.list_runs(conn, task_id)]
+        failures_before = claimed.consecutive_failures
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="done",
+            metadata={},
+            expected_run_id=claimed.current_run_id,
+            board=board,
+            product_workflow_enabled=False,
+        ) is True
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "done"
+        assert task.consecutive_failures == failures_before
+        assert [run.id for run in kb.list_runs(conn, task_id)] == run_ids_before
+        run = kb.get_run(conn, claimed.current_run_id)
+        assert run is not None
+        assert run.outcome == "completed"
+        advisory = run.metadata["agent_memory"]["advisory"]
+        assert advisory["status"] == "advisory"
+        assert advisory["continue_work"] is True
+        assert advisory["missing"] == ["recall", "write"]
+        assert "recall" not in run.metadata["agent_memory"]
+        assert "write" not in run.metadata["agent_memory"]
+
+
+@pytest.mark.parametrize("corruption", ["task_id", "run_id", "malformed"])
+def test_invalid_receipts_are_ignored_without_replaying_completion(
+    tmp_path, monkeypatch, corruption
+):
+    board, _vault = _configured_product_board(tmp_path, monkeypatch)
+    with kb.connect(board=board) as conn:
+        task_id = _qualified_task(conn, board=board, title="Invalid memory evidence")
         claimed = kb.claim_task(conn, task_id, board=board)
         assert claimed is not None and claimed.current_run_id is not None
         metadata = _worker_metadata(
             conn, task_id, claimed.current_run_id, board=board
         )
-        bad_value = "t_wrong" if wrong_field == "task_id" else claimed.current_run_id + 1
-        metadata["agent_memory"]["recall"][wrong_field] = bad_value
-        metadata["agent_memory"]["write"][wrong_field] = bad_value
-        with pytest.raises(kb.AgentMemoryHandoverError) as exc:
-            kb.complete_task(
-                conn,
-                task_id,
-                summary="done",
-                metadata=metadata,
-                expected_run_id=claimed.current_run_id,
-                board=board,
-            )
-        assert set(exc.value.invalid) == {"recall", "write"}
-        assert kb.get_task(conn, task_id).status == "running"
+        if corruption == "task_id":
+            metadata["agent_memory"]["recall"]["task_id"] = "t_wrong"
+            metadata["agent_memory"]["write"]["task_id"] = "t_wrong"
+        elif corruption == "run_id":
+            metadata["agent_memory"]["recall"]["run_id"] += 1
+            metadata["agent_memory"]["write"]["run_id"] += 1
+        else:
+            metadata["agent_memory"]["write"] = {"not": "a receipt"}
 
-
-def test_wrong_function_receipts_leave_task_running(tmp_path, monkeypatch):
-    board, _vault = _configured_product_board(tmp_path, monkeypatch)
-    with kb.connect(board=board) as conn:
-        task_id = _qualified_task(conn, board=board, title="Wrong memory function")
-        claimed = kb.claim_task(conn, task_id, board=board)
-        assert claimed is not None and claimed.current_run_id is not None
-        metadata = _worker_metadata(
+        run_ids_before = [run.id for run in kb.list_runs(conn, task_id)]
+        assert kb.complete_task(
             conn,
             task_id,
-            claimed.current_run_id,
+            summary="done",
+            metadata=metadata,
+            expected_run_id=claimed.current_run_id,
             board=board,
-            function_id_override="function-wrong-contract",
-        )
-
-        with pytest.raises(kb.AgentMemoryHandoverError) as exc:
-            kb.complete_task(
-                conn,
-                task_id,
-                summary="done",
-                metadata=metadata,
-                expected_run_id=claimed.current_run_id,
-                board=board,
-            )
-
-        assert set(exc.value.invalid) == {"recall", "write"}
-        assert kb.get_task(conn, task_id).status == "running"
-
-
-def test_wrong_recall_function_receipt_leaves_task_running(tmp_path, monkeypatch):
-    board, _vault = _configured_product_board(tmp_path, monkeypatch)
-    with kb.connect(board=board) as conn:
-        task_id = _qualified_task(conn, board=board, title="Wrong recall function")
-        claimed = kb.claim_task(conn, task_id, board=board)
-        assert claimed is not None and claimed.current_run_id is not None
-        metadata = _worker_metadata(
-            conn,
-            task_id,
-            claimed.current_run_id,
-            board=board,
-            recall_function_id_override="function-wrong-recall-contract",
-        )
-
-        with pytest.raises(kb.AgentMemoryHandoverError) as exc:
-            kb.complete_task(
-                conn,
-                task_id,
-                summary="done",
-                metadata=metadata,
-                expected_run_id=claimed.current_run_id,
-                board=board,
-            )
-
-        assert exc.value.invalid == ("recall",)
-        assert kb.get_task(conn, task_id).status == "running"
-
-
-def test_wrong_delegation_receipts_leave_task_running(tmp_path, monkeypatch):
-    board, _vault = _configured_product_board(tmp_path, monkeypatch)
-    with kb.connect(board=board) as conn:
-        task_id = _qualified_task(conn, board=board, title="Wrong delegation")
-        claimed = kb.claim_task(conn, task_id, board=board)
-        assert claimed is not None and claimed.current_run_id is not None
-        metadata = _worker_metadata(
-            conn,
-            task_id,
-            claimed.current_run_id,
-            board=board,
-            delegation_id_override="kanban:wrong-delegation",
-        )
-
-        with pytest.raises(kb.AgentMemoryHandoverError) as exc:
-            kb.complete_task(
-                conn,
-                task_id,
-                summary="done",
-                metadata=metadata,
-                expected_run_id=claimed.current_run_id,
-                board=board,
-            )
-
-        assert set(exc.value.invalid) == {"recall", "write"}
-        assert kb.get_task(conn, task_id).status == "running"
+            product_workflow_enabled=False,
+        ) is True
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "done"
+        assert task.consecutive_failures == 0
+        assert [run.id for run in kb.list_runs(conn, task_id)] == run_ids_before
+        run = kb.get_run(conn, claimed.current_run_id)
+        assert run is not None
+        memory = run.metadata["agent_memory"]
+        assert memory["advisory"]["continue_work"] is True
+        if corruption == "malformed":
+            assert "recall" in memory
+            assert "write" not in memory
+        else:
+            assert "recall" not in memory
+            assert "write" not in memory
 
 
 @pytest.mark.parametrize("wrong_identity", ["function_id", "delegation_id"])
@@ -1365,23 +1480,64 @@ def test_wrong_worker_identity_does_not_suppress_fallback(
     assert history.count('"responsibility":"orchestrator"') == 1
 
 
-def test_block_requires_receipts_and_preserves_them(tmp_path, monkeypatch):
+def test_block_allows_missing_memory_and_preserves_valid_receipts(
+    tmp_path, monkeypatch
+):
     board, _vault = _configured_product_board(tmp_path, monkeypatch)
     with kb.connect(board=board) as conn:
         missing_id = _qualified_task(conn, board=board, title="Blocked missing memory")
         missing = kb.claim_task(conn, missing_id, board=board)
         assert missing is not None and missing.current_run_id is not None
-        with pytest.raises(kb.AgentMemoryHandoverError):
-            kb.block_task(
-                conn,
-                missing_id,
-                reason="Waiting",
-                kind="dependency",
-                metadata={},
-                expected_run_id=missing.current_run_id,
-                board=board,
+        run_ids_before = [run.id for run in kb.list_runs(conn, missing_id)]
+        assert kb.block_task(
+            conn,
+            missing_id,
+            reason="Waiting",
+            kind="dependency",
+            metadata={},
+            expected_run_id=missing.current_run_id,
+            board=board,
+        )
+        blocked = kb.get_task(conn, missing_id)
+        assert blocked is not None and blocked.status == "todo"
+        assert blocked.consecutive_failures == 0
+        assert [run.id for run in kb.list_runs(conn, missing_id)] == run_ids_before
+        blocked_run = kb.get_run(conn, missing.current_run_id)
+        assert blocked_run is not None
+        assert blocked_run.outcome == "blocked"
+        assert blocked_run.metadata["agent_memory"]["advisory"]["continue_work"] is True
+
+        malformed_id = _qualified_task(
+            conn, board=board, title="Blocked malformed memory"
+        )
+        malformed = kb.claim_task(conn, malformed_id, board=board)
+        assert malformed is not None and malformed.current_run_id is not None
+        malformed_run_ids = [
+            run.id for run in kb.list_runs(conn, malformed_id, include_active=True)
+        ]
+        assert kb.block_task(
+            conn,
+            malformed_id,
+            reason="Waiting",
+            kind="dependency",
+            metadata={"agent_memory": {"write": {"not": "a receipt"}}},
+            expected_run_id=malformed.current_run_id,
+            board=board,
+        )
+        malformed_task = kb.get_task(conn, malformed_id)
+        assert malformed_task is not None and malformed_task.status == "todo"
+        assert malformed_task.consecutive_failures == 0
+        assert [
+            run.id
+            for run in kb.list_runs(
+                conn, malformed_id, include_active=True
             )
-        assert kb.get_task(conn, missing_id).status == "running"
+        ] == malformed_run_ids
+        malformed_run = kb.get_run(conn, malformed.current_run_id)
+        assert malformed_run is not None
+        malformed_memory = malformed_run.metadata["agent_memory"]
+        assert malformed_memory["advisory"]["continue_work"] is True
+        assert "write" not in malformed_memory
 
         task_id = _qualified_task(conn, board=board, title="Blocked with memory")
         claimed = kb.claim_task(conn, task_id, board=board)
@@ -1401,37 +1557,6 @@ def test_block_requires_receipts_and_preserves_them(tmp_path, monkeypatch):
         run = kb.get_run(conn, claimed.current_run_id)
         assert run is not None
         assert run.metadata["agent_memory"]["write"] == metadata["agent_memory"]["write"]
-
-
-def test_terminal_completion_requires_receipts(tmp_path, monkeypatch):
-    board, _vault = _configured_product_board(tmp_path, monkeypatch)
-    with kb.connect(board=board) as conn:
-        task_id = _qualified_task(conn, board=board, title="Terminal completion")
-        claimed = kb.claim_task(conn, task_id, board=board)
-        assert claimed is not None and claimed.current_run_id is not None
-        with pytest.raises(kb.AgentMemoryHandoverError):
-            kb.complete_task(
-                conn,
-                task_id,
-                summary="done",
-                metadata={},
-                expected_run_id=claimed.current_run_id,
-                board=board,
-                product_workflow_enabled=False,
-            )
-        metadata = _worker_metadata(
-            conn, task_id, claimed.current_run_id, board=board
-        )
-        assert kb.complete_task(
-            conn,
-            task_id,
-            summary="done",
-            metadata=metadata,
-            expected_run_id=claimed.current_run_id,
-            board=board,
-            product_workflow_enabled=False,
-        )
-        assert kb.get_task(conn, task_id).status == "done"
 
 
 def test_trusted_hermes_recall_is_preserved_and_worker_cannot_replace_it(
@@ -1461,7 +1586,7 @@ def test_trusted_hermes_recall_is_preserved_and_worker_cannot_replace_it(
         assert run.metadata["agent_memory"]["hermes_recall"] == trusted.to_mapping()
 
 
-def test_resolver_requires_same_receipts_before_applying_decision(
+def test_resolver_allows_missing_memory_before_applying_decision(
     tmp_path, monkeypatch
 ):
     board, _vault = _configured_product_board(tmp_path, monkeypatch)
@@ -1519,48 +1644,67 @@ def test_resolver_requires_same_receipts_before_applying_decision(
             "expected": expected,
         }
 
-        def state():
-            return {
-                "task": tuple(conn.execute(
-                    "SELECT * FROM tasks WHERE id=?", (task_id,)
-                ).fetchone()),
-                "runs": [tuple(row) for row in conn.execute(
-                    "SELECT * FROM task_runs WHERE task_id=? ORDER BY id", (task_id,)
-                )],
-                "events": [tuple(row) for row in conn.execute(
-                    "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (task_id,)
-                )],
-            }
-
-        before = state()
-        with pytest.raises(kb.AgentMemoryHandoverError):
-            kb.resolve_product_preflight(
-                conn,
-                task_id,
-                board=board,
-                request=request,
-                metadata={},
-                resolver_profile="resolver",
-                resolver_model="test-model",
-            )
-        assert state() == before
-
-        resolver_metadata = _worker_metadata(
-            conn,
-            task_id,
-            resolver.current_run_id,
-            board=board,
-            hermes_role="resolver",
-        )
+        run_ids_before = [run.id for run in kb.list_runs(conn, task_id)]
         assert kb.resolve_product_preflight(
             conn,
             task_id,
             board=board,
             request=request,
-            metadata=resolver_metadata,
+            metadata={},
             resolver_profile="resolver",
             resolver_model="test-model",
         )
+        resolved = kb.get_task(conn, task_id)
+        assert resolved is not None and resolved.status == "ready"
+        assert resolved.consecutive_failures == 0
+        assert [run.id for run in kb.list_runs(conn, task_id)] == run_ids_before
+        resolver_run = kb.get_run(conn, resolver.current_run_id)
+        assert resolver_run is not None
+        assert resolver_run.outcome == "preflight_resolved"
+        assert resolver_run.metadata["agent_memory"]["advisory"]["continue_work"] is True
+
+
+def test_resolver_ignores_mismatched_memory_without_replaying_task(
+    tmp_path, monkeypatch
+):
+    board, _vault = _configured_product_board(tmp_path, monkeypatch)
+    with kb.connect(board=board) as conn:
+        task_id, resolver_run_id = _route_task_to_resolver(
+            conn, board, "Resolver mismatched memory"
+        )
+        request = _resolver_request(conn, task_id, resolver_run_id)
+        metadata = _worker_metadata(
+            conn,
+            task_id,
+            resolver_run_id,
+            board=board,
+            hermes_role="resolver",
+        )
+        metadata["agent_memory"]["write"]["run_id"] += 1
+        run_ids_before = [run.id for run in kb.list_runs(conn, task_id)]
+
+        assert kb.resolve_product_preflight(
+            conn,
+            task_id,
+            board=board,
+            request=request,
+            metadata=metadata,
+            resolver_profile="resolver",
+            resolver_model="test-model",
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        assert task.consecutive_failures == 0
+        assert [run.id for run in kb.list_runs(conn, task_id)] == run_ids_before
+        resolver_run = kb.get_run(conn, resolver_run_id)
+        assert resolver_run is not None
+        assert resolver_run.outcome == "preflight_resolved"
+        memory = resolver_run.metadata["agent_memory"]
+        assert memory["advisory"]["continue_work"] is True
+        assert memory["advisory"]["invalid"] == ["write"]
+        assert "recall" in memory
+        assert "write" not in memory
 
 
 def _route_task_to_resolver(conn, board: str, title: str) -> tuple[str, int]:
@@ -1622,20 +1766,6 @@ def _resolver_request(conn, task_id: str, run_id: int) -> dict:
     }
 
 
-def _task_snapshot(conn, task_id: str) -> dict:
-    return {
-        "task": tuple(conn.execute(
-            "SELECT * FROM tasks WHERE id=?", (task_id,)
-        ).fetchone()),
-        "runs": [tuple(row) for row in conn.execute(
-            "SELECT * FROM task_runs WHERE task_id=? ORDER BY id", (task_id,)
-        )],
-        "events": [tuple(row) for row in conn.execute(
-            "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (task_id,)
-        )],
-    }
-
-
 def test_resolver_memory_tools_produce_receipts_that_satisfy_resolve(
     tmp_path, monkeypatch
 ):
@@ -1654,18 +1784,7 @@ def test_resolver_memory_tools_produce_receipts_that_satisfy_resolve(
     monkeypatch.setenv("HERMES_PROFILE", "resolver")
     monkeypatch.setenv("HERMES_INFERENCE_MODEL", "resolver-e2e")
 
-    def snapshot() -> dict:
-        with kb.connect(board=board) as conn:
-            return _task_snapshot(conn, task_id)
-
-    # 1. Before any receipts, the gate fails closed and nothing changes.
-    before = snapshot()
-    blocked = json.loads(kt._handle_resolve({**request, "task_id": task_id}))
-    assert blocked.get("ok") is not True
-    assert "handover is still in-flight" in blocked.get("error", "")
-    assert snapshot() == before
-
-    # 2. The resolver produces canonical recall/write receipts for its own run.
+    # The resolver produces canonical recall/write receipts for its own run.
     recall_out = json.loads(kt._handle_agent_memory_recall({}))
     assert recall_out["ok"] is True
     assert recall_out["receipt"]["operation"] == "recall"
@@ -1683,24 +1802,7 @@ def test_resolver_memory_tools_produce_receipts_that_satisfy_resolve(
         write_out["receipt"]["executor"] == recall_out["receipt"]["executor"]
     )
 
-    # 3. A forged receipt (foreign task_id) still fails closed and changes
-    #    nothing — receipt validation stays strict.
-    forged_write = dict(write_out["receipt"])
-    forged_write["task_id"] = "t_forged"
-    forged_metadata = {
-        "agent_memory": {
-            "recall": recall_out["receipt"],
-            "write": forged_write,
-        }
-    }
-    before_forged = snapshot()
-    forged = json.loads(kt._handle_resolve(
-        {**request, "task_id": task_id, "metadata": forged_metadata}
-    ))
-    assert forged.get("ok") is not True
-    assert snapshot() == before_forged
-
-    # 4. The real same-run receipts satisfy the resolve gate.
+    # Valid same-run receipts remain trusted and satisfy the resolve gate.
     metadata = {
         "agent_memory": {
             "recall": recall_out["receipt"],
@@ -1811,6 +1913,9 @@ def test_resolver_worker_context_uses_kanban_memory_tools(tmp_path, monkeypatch)
     assert "## Agent Memory recall" in context
     assert "kanban_agent_memory_recall" in context
     assert "kanban_agent_memory_write" in context
+    assert "strictly advisory and fail-open" in context
+    assert "Do not rerun diagnosis or replay the role task" in context
+    assert "must not trigger a retry" in context
     # The Resolver runs read-only and cannot shell out; it must not be told
     # to run the ordinary-worker CLI protocol.
     assert "hermes agent-memory recall" not in context
