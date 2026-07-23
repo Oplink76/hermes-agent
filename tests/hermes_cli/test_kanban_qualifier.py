@@ -99,6 +99,55 @@ def _decision(**overrides):
     return decision
 
 
+def _epic_decision():
+    decision = _decision()
+    decision["work"] = {
+        "item_kind": "epic",
+        "work_type": "story",
+        "title": "Reliable customer notifications",
+        "outcome": "Customers receive and can inspect delivery notifications",
+        "scope": ["Notification delivery", "Delivery history"],
+        "out_of_scope": ["Marketing campaigns"],
+    }
+    decision["routing"] = {
+        "entry_phase": None,
+        "assignee": None,
+        "epic_id": None,
+        "dependencies": [],
+    }
+    decision["handover"] = {
+        "deliverables": ["The complete notification outcome"],
+        "required_evidence": ["Evidence from every member story"],
+        "done_when": ["All member stories are released"],
+        "next_phase": None,
+        "next_role": None,
+    }
+    decision["classification"] = [
+        "framework:epic",
+        "path:hermes",
+        "intake:plan",
+    ]
+    decision["stories"] = [
+        {
+            "title": "Send a delivery notification",
+            "outcome": "A customer receives a notification after delivery",
+            "scope": ["Notification sending"],
+            "out_of_scope": ["Notification history"],
+            "done_when": ["A delivered order produces one customer notification"],
+            "depends_on": [],
+        },
+        {
+            "title": "Inspect notification history",
+            "outcome": "A customer can inspect previously sent notifications",
+            "scope": ["Notification history"],
+            "out_of_scope": ["Notification sending"],
+            "done_when": ["The customer sees sent notifications in time order"],
+            "depends_on": [0],
+        },
+    ]
+    return decision
+
+
 def _late_assessment(*phases, provenance=None):
     value = {
         "reason": "Earlier phases are already satisfied",
@@ -135,8 +184,58 @@ def test_qualification_prompt_includes_exact_card_and_epic_output_shapes(conn, p
     assert '"classification":[' in prompt
     assert "EPIC OUTPUT SHAPE" in prompt
     assert '"item_kind":"epic"' in prompt
+    assert '"stories":[' in prompt
+    assert '"depends_on":[]' in prompt
+    assert "determine whether the intake is an idea, plan, epic, or bug" in prompt.lower()
+    assert "external analysis is advisory" in prompt.lower()
+    assert "earliest unfinished phase" in prompt.lower()
     assert "PO PATH ADDITION" in prompt
     assert '"po_evidence":{"run_id":123' in prompt
+
+
+def test_new_epic_requires_valid_story_decomposition(conn, policy):
+    decision = _epic_decision()
+    decision["stories"] = []
+
+    with pytest.raises(
+        qualifier.QualificationValidationError,
+        match="Epic qualification requires at least one story",
+    ):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=_intake(conn),
+            decision=decision,
+        )
+
+    decision = _epic_decision()
+    decision["stories"][0]["depends_on"] = [0]
+    with pytest.raises(
+        qualifier.QualificationValidationError,
+        match="earlier story",
+    ):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=_intake(conn),
+            decision=decision,
+        )
+
+
+def test_standalone_card_cannot_smuggle_story_decomposition(conn, policy):
+    decision = _decision()
+    decision["stories"] = _epic_decision()["stories"]
+
+    with pytest.raises(
+        qualifier.QualificationValidationError,
+        match="Only an Epic can contain stories",
+    ):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=_intake(conn),
+            decision=decision,
+        )
 
 
 def test_qualification_prompt_includes_bounded_advisory_agent_memory(
@@ -576,6 +675,71 @@ def test_standalone_work_is_valid_without_a_synthetic_epic(conn, policy):
     )
 
     assert validated["routing"]["epic_id"] is None
+
+
+def test_epic_qualification_materializes_signed_member_stories_and_dependencies(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    board = "strict"
+    kb.ensure_product_board_defaults(board)
+    metadata = kb.read_board_metadata(board)
+    metadata["qualification"]["required"] = True
+    kb.board_metadata_path(board).write_text(json.dumps(metadata), encoding="utf-8")
+
+    with kb.connect(board=board) as connection:
+        receipt = qualifier.submit_request(
+            connection,
+            request={
+                "functional_intent": {
+                    "title": "Reliable customer notifications",
+                    "outcome": "Customers receive and can inspect notifications",
+                }
+            },
+            source="work-inbox:test",
+        )
+        result = qualifier.qualify_intake(
+            connection,
+            board=board,
+            intake_id=receipt["intake_id"],
+            model_call=lambda _prompt: _epic_decision(),
+            secret=b"test-only-secret",
+            issued_at=100,
+        )
+
+        assert result["status"] == "qualified"
+        assert len(result["story_task_ids"]) == 2
+        epic = kb.get_task(connection, result["task_id"])
+        assert epic.work_item_kind == "epic"
+        assert kb.list_epic_members(connection, epic.id) == result["story_task_ids"]
+
+        members = {
+            task.title: task
+            for task_id in result["story_task_ids"]
+            if (task := kb.get_task(connection, task_id)) is not None
+        }
+        first = members["Send a delivery notification"]
+        second = members["Inspect notification history"]
+        assert first.work_item_kind == second.work_item_kind == "card"
+        assert first.current_step_key == second.current_step_key == "backlog"
+        assert first.assignee == second.assignee == "productowner"
+        assert kb.parent_ids(connection, first.id) == []
+        assert kb.parent_ids(connection, second.id) == [first.id]
+
+        rows = connection.execute(
+            """
+            SELECT wc.request_id, t.work_contract_id
+              FROM tasks t
+              JOIN work_contracts wc ON wc.id = t.work_contract_id
+             WHERE t.id IN (?, ?, ?)
+            """,
+            (epic.id, first.id, second.id),
+        ).fetchall()
+        assert len(rows) == 3
+        assert {row["request_id"] for row in rows} == {receipt["intake_id"]}
+        assert all(row["work_contract_id"] for row in rows)
 
 
 def test_invalid_model_decision_retries_once_then_stores_rejection_without_card(

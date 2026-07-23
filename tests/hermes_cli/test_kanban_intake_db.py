@@ -471,6 +471,38 @@ def test_epic_contract_materializes_as_non_executable_container(tmp_path, monkey
         connection.close()
 
 
+def test_qualified_epic_does_not_authorize_unrelated_child_contract(
+    tmp_path, monkeypatch
+):
+    board = "strict"
+    _strict_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        epic_id = _materialized_epic(connection, board)
+        epic = kb.get_task(connection, epic_id)
+        root_contract = kb.get_work_contract(connection, epic.work_contract_id)
+        rogue = _signed_contract(root_contract["request_id"])
+        rogue_contract_id = kb.store_work_contract(
+            connection,
+            rogue,
+            secret=b"test-only-secret",
+        )
+
+        with kb.authorized_governance_write():
+            with pytest.raises(sqlite3.IntegrityError, match="qualification"):
+                kb.create_task(
+                    connection,
+                    title="Unrelated child",
+                    body="Must remain inert",
+                    assignee="developer",
+                    board=board,
+                    workflow_template_id="product",
+                    current_step_key="development",
+                    work_contract_id=rogue_contract_id,
+                    work_item_kind="card",
+                )
+
+
 def test_materialization_rolls_back_contract_and_decision_on_invalid_relationship(
     tmp_path, monkeypatch
 ):

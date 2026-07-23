@@ -1,4 +1,4 @@
-"""Fixed-scope bearer auth for Hermes Work Inbox submissions."""
+"""Fixed-scope bearer auth for Hermes Work Inbox submission and status."""
 from __future__ import annotations
 
 import hmac
@@ -15,11 +15,12 @@ from plugins.dashboard_auth.drain import assess_secret_strength
 
 
 WORK_INBOX_ROUTE_PATH = "/api/plugins/kanban/work-inbox"
+WORK_INBOX_STATUS_ROUTE_PATH = "/api/plugins/kanban/work-inbox/status"
 WORK_INBOX_SCOPE = "work_inbox:submit"
 
 
 class WorkInboxSecretProvider(DashboardAuthProvider):
-    """Non-interactive credential for the one Work Inbox route."""
+    """Non-interactive credential for the two Work Inbox routes."""
 
     name = "work-inbox-secret"
     display_name = "Work Inbox (service credential)"
@@ -73,3 +74,4 @@ def register(ctx) -> None:
     from hermes_cli.dashboard_auth.token_auth import register_token_route
 
     register_token_route(WORK_INBOX_ROUTE_PATH)
+    register_token_route(WORK_INBOX_STATUS_ROUTE_PATH)

@@ -617,6 +617,39 @@ def _require_work_inbox_assignment(
         raise HTTPException(status_code=409, detail="assigned delivery no longer matches its active Work Contract run")
 
 
+def _materialized_intake_items(
+    conn: sqlite3.Connection,
+    intake_id: str,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT t.id
+          FROM tasks t
+          JOIN work_contracts wc ON wc.id = t.work_contract_id
+         WHERE wc.request_id = ?
+         ORDER BY CASE WHEN t.work_item_kind = 'epic' THEN 0 ELSE 1 END,
+                  t.created_at, t.id
+        """,
+        (intake_id,),
+    ).fetchall()
+    items = []
+    for row in rows:
+        task = kanban_db.get_task(conn, row["id"])
+        if task is None:
+            continue
+        items.append(
+            {
+                "id": task.id,
+                "title": task.title,
+                "work_item_kind": task.work_item_kind,
+                "status": task.status,
+                "phase": task.current_step_key,
+                "epic_id": kanban_db.epic_id_for_task(conn, task.id),
+            }
+        )
+    return items
+
+
 @router.post("/work-inbox")
 def submit_work_inbox(
     request: Request,
@@ -697,6 +730,46 @@ def submit_work_inbox(
         conn.close()
 
 
+@router.get("/work-inbox/status")
+def get_work_inbox_status(
+    request: Request,
+    board: str = Query(...),
+    intake_id: str = Query(...),
+):
+    """Return a bounded status view for work submitted by this credential."""
+
+    from plugins.dashboard_auth.work_inbox import WORK_INBOX_SCOPE
+
+    principal = getattr(request.state, "token_principal", None)
+    if principal is None or WORK_INBOX_SCOPE not in principal.scopes:
+        raise HTTPException(status_code=403, detail="Work Inbox scope required")
+    board = _resolve_board(board)
+    metadata = kanban_db.read_board_metadata(board)
+    if not kanban_intake.qualification_required(metadata):
+        raise HTTPException(
+            status_code=409,
+            detail="This board does not require qualified intake",
+        )
+    conn = _conn(board=board)
+    try:
+        record = kanban_db.get_qualification_intake(conn, intake_id)
+        expected_source = (
+            f"work-inbox:{principal.provider}:{principal.principal}"
+        )
+        if record is None or record["source"] != expected_source:
+            raise HTTPException(status_code=404, detail="intake not found")
+        decisions = kanban_db.list_qualification_decisions(conn, intake_id)
+        decision = decisions[-1] if decisions else None
+        return {
+            "intake_id": intake_id,
+            "status": record["status"],
+            "reason": decision.get("reason") if decision else None,
+            "items": _materialized_intake_items(conn, intake_id),
+        }
+    finally:
+        conn.close()
+
+
 @router.post("/intake", status_code=202)
 def submit_intake(payload: IntakeBody, board: Optional[str] = Query(None)):
     """Persist one inert request through Hermes' official intake boundary."""
@@ -766,6 +839,7 @@ def get_intake(intake_id: str, board: Optional[str] = Query(None)):
         decision = decisions[-1] if decisions else None
         contract_id = decision.get("contract_id") if decision else None
         contract_summary = _work_contract_summary(conn, contract_id)
+        materialized_items = _materialized_intake_items(conn, intake_id)
         materialized_item = None
         if contract_id:
             row = conn.execute(
@@ -781,6 +855,7 @@ def get_intake(intake_id: str, board: Optional[str] = Query(None)):
             "decisions": decisions,
             "contract_summary": contract_summary,
             "materialized_item": materialized_item,
+            "materialized_items": materialized_items,
         }
     finally:
         conn.close()

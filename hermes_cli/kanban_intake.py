@@ -728,6 +728,138 @@ def _apply_requalification(
     return target_task_id
 
 
+def _epic_story_contract(
+    *,
+    epic_contract: Mapping[str, Any],
+    story: Mapping[str, Any],
+    epic_id: str,
+    dependencies: list[str],
+    board_metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build one first-phase story contract from a signed Epic decomposition."""
+
+    policy = board_metadata["qualification"]
+    phase_assignees = policy["phase_assignees"]
+    phases = list(phase_assignees)
+    if not phases:
+        raise WorkContractError("strict board has no workflow phases")
+    entry_phase = phases[0]
+    assignee = phase_assignees[entry_phase]
+    if assignee is None:
+        raise WorkContractError("the first workflow phase must have an assignee")
+    next_phase = phases[1] if len(phases) > 1 else "done"
+    next_role = phase_assignees.get(next_phase)
+    intake_labels = [
+        label
+        for label in epic_contract["classification"]
+        if isinstance(label, str) and label.startswith("intake:")
+    ]
+    contract = {
+        "version": epic_contract["version"],
+        "policy_version": epic_contract["policy_version"],
+        "qualification_path": epic_contract["qualification_path"],
+        "request_id": epic_contract["request_id"],
+        "work": {
+            "item_kind": "card",
+            "work_type": "story",
+            "title": story["title"],
+            "outcome": story["outcome"],
+            "scope": copy.deepcopy(story["scope"]),
+            "out_of_scope": copy.deepcopy(story["out_of_scope"]),
+        },
+        "routing": {
+            "entry_phase": entry_phase,
+            "assignee": assignee,
+            "epic_id": epic_id,
+            "dependencies": dependencies,
+        },
+        "entry_assessment": {
+            "reason": "Qualified Epic member starts at the first workflow phase",
+            "skipped_phases": [],
+            "evidence": [],
+        },
+        "handover": {
+            "deliverables": [story["outcome"]],
+            "required_evidence": copy.deepcopy(story["done_when"]),
+            "done_when": copy.deepcopy(story["done_when"]),
+            "next_phase": next_phase,
+            "next_role": next_role,
+        },
+        "rules": {
+            "allowed": ["Deliver only this qualified story through the normal workflow"],
+            "forbidden": [
+                "Bypass Hermes-owned workflow routing",
+                "Expand beyond the qualified Epic outcome",
+            ],
+        },
+        "classification": [
+            "framework:story",
+            f"path:{epic_contract['qualification_path']}",
+            "epic-member",
+            *intake_labels,
+        ],
+        "issuer": copy.deepcopy(epic_contract["issuer"]),
+    }
+    for field in ("po_evidence", "override_authority"):
+        if field in epic_contract:
+            contract[field] = copy.deepcopy(epic_contract[field])
+    return contract
+
+
+def _create_materialized_task(
+    conn: Any,
+    *,
+    board: str,
+    board_metadata: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    contract_id: str,
+    fields: Mapping[str, Any],
+) -> str:
+    from hermes_cli import kanban_db
+
+    workspace_kind = (
+        "worktree"
+        if (
+            fields["work_item_kind"] == "card"
+            and isinstance(board_metadata.get("product_workflow"), dict)
+            and board_metadata["product_workflow"].get("handoff_v2") is True
+        )
+        else "scratch"
+    )
+    task_id = kanban_db.create_task(
+        conn,
+        title=str(fields["title"]),
+        body=str(fields["body"]),
+        assignee=fields["assignee"],
+        created_by="hermes-qualification",
+        parents=tuple(fields["parents"]),
+        board=board,
+        workflow_template_id=fields["workflow_template_id"],
+        current_step_key=fields["current_step_key"],
+        work_contract_id=contract_id,
+        work_item_kind=fields["work_item_kind"],
+        workspace_kind=workspace_kind,
+    )
+    epic_id = fields.get("epic_id")
+    if epic_id:
+        kanban_db.add_epic_membership(
+            conn, epic_id=str(epic_id), task_id=task_id
+        )
+    kanban_db._append_event(
+        conn,
+        task_id,
+        "contract_materialized",
+        {
+            "request_id": contract["request_id"],
+            "work_contract_id": contract_id,
+            "contract_digest": fields["contract_digest"],
+            "qualification_path": contract["qualification_path"],
+            "classification": fields["classification"],
+        },
+    )
+    return task_id
+
+
 def materialize_contract(
     conn: Any,
     *,
@@ -736,7 +868,7 @@ def materialize_contract(
     secret: Optional[bytes] = None,
     hermes_home: Optional[Path] = None,
 ) -> str:
-    """Atomically turn one valid Work Contract into exactly one work item."""
+    """Atomically materialize a standalone card or an Epic and its stories."""
 
     from hermes_cli import kanban_db
 
@@ -830,44 +962,71 @@ def materialize_contract(
                     fields=fields,
                 )
             else:
-                workspace_kind = (
-                    "worktree"
-                    if (
-                        fields["work_item_kind"] == "card"
-                        and isinstance(metadata.get("product_workflow"), dict)
-                        and metadata["product_workflow"].get("handoff_v2") is True
-                    )
-                    else "scratch"
-                )
-                task_id = kanban_db.create_task(
+                task_id = _create_materialized_task(
                     conn,
-                    title=str(fields["title"]),
-                    body=str(fields["body"]),
-                    assignee=fields["assignee"],
-                    created_by="hermes-qualification",
-                    parents=tuple(fields["parents"]),
                     board=board,
-                    workflow_template_id=fields["workflow_template_id"],
-                    current_step_key=fields["current_step_key"],
-                    work_contract_id=contract_id,
-                    work_item_kind=fields["work_item_kind"],
-                    workspace_kind=workspace_kind,
+                    board_metadata=metadata,
+                    contract=contract,
+                    contract_id=contract_id,
+                    fields=fields,
                 )
-                epic_id = fields.get("epic_id")
-                if epic_id:
-                    kanban_db.add_epic_membership(
-                        conn, epic_id=str(epic_id), task_id=task_id
+                story_task_ids: list[str] = []
+                for story in contract.get("stories", []):
+                    dependency_ids = [
+                        story_task_ids[index] for index in story["depends_on"]
+                    ]
+                    story_contract = _epic_story_contract(
+                        epic_contract=contract,
+                        story=story,
+                        epic_id=task_id,
+                        dependencies=dependency_ids,
+                        board_metadata=metadata,
                     )
-        kanban_db._append_event(
-            conn,
-            task_id,
-            "contract_materialized",
-            {
-                "request_id": request_id,
-                "work_contract_id": contract_id,
-                "contract_digest": fields["contract_digest"],
-                "qualification_path": contract["qualification_path"],
-                "classification": fields["classification"],
-            },
-        )
+                    signed_story = sign_work_contract(
+                        story_contract,
+                        secret=secret,
+                        hermes_home=hermes_home,
+                    )
+                    story_fields = materialization_fields(
+                        metadata,
+                        signed_contract=signed_story,
+                        secret=secret,
+                        hermes_home=hermes_home,
+                    )
+                    story_contract_id = kanban_db.store_work_contract(
+                        conn,
+                        signed_story,
+                        secret=secret,
+                        hermes_home=hermes_home,
+                    )
+                    story_task_ids.append(
+                        _create_materialized_task(
+                            conn,
+                            board=board,
+                            board_metadata=metadata,
+                            contract=story_contract,
+                            contract_id=story_contract_id,
+                            fields=story_fields,
+                        )
+                    )
+                if story_task_ids:
+                    kanban_db._append_event(
+                        conn,
+                        task_id,
+                        "epic_decomposed",
+                        {"story_task_ids": story_task_ids},
+                    )
+        if is_requalification:
+            kanban_db._append_event(
+                conn,
+                task_id,
+                "contract_materialized",
+                {
+                    "request_id": request_id,
+                    "work_contract_id": contract_id,
+                    "contract_digest": fields["contract_digest"],
+                    "qualification_path": contract["qualification_path"],
+                    "classification": fields["classification"],
+                },
+            )
     return task_id

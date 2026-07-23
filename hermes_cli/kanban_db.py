@@ -5477,7 +5477,8 @@ def _ensure_qualification_boundary_objects(conn: sqlite3.Connection) -> None:
         return
     conn.executescript(
         """
-        CREATE TRIGGER IF NOT EXISTS strict_tasks_require_qualification
+        DROP TRIGGER IF EXISTS strict_tasks_require_qualification;
+        CREATE TRIGGER IF NOT EXISTS strict_tasks_require_qualification_v2
         BEFORE INSERT ON tasks
         WHEN (SELECT qualification_required FROM board_governance WHERE id = 1) = 1
          AND (
@@ -5486,14 +5487,28 @@ def _ensure_qualification_boundary_objects(conn: sqlite3.Connection) -> None:
                  SELECT 1
                  FROM work_contracts wc
                  JOIN qualification_intake_decisions qd
-                   ON qd.contract_id = wc.id
-                  AND qd.intake_id = wc.request_id
+                   ON qd.intake_id = wc.request_id
                  WHERE wc.id = NEW.work_contract_id
                    AND qd.decision IN ('qualified', 'overridden')
                    AND qd.id = (
                        SELECT MAX(latest.id)
                        FROM qualification_intake_decisions latest
                        WHERE latest.intake_id = wc.request_id
+                   )
+                   AND (
+                       qd.contract_id = wc.id
+                       OR (
+                           json_extract(wc.canonical_json, '$.work.item_kind') = 'card'
+                           AND EXISTS (
+                               SELECT 1
+                               FROM tasks epic
+                               WHERE epic.id = json_extract(
+                                   wc.canonical_json, '$.routing.epic_id'
+                               )
+                                 AND epic.work_item_kind = 'epic'
+                                 AND epic.work_contract_id = qd.contract_id
+                           )
+                       )
                    )
              )
          )
