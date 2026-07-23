@@ -830,6 +830,15 @@ def materialize_contract(
                     fields=fields,
                 )
             else:
+                workspace_kind = (
+                    "worktree"
+                    if (
+                        fields["work_item_kind"] == "card"
+                        and isinstance(metadata.get("product_workflow"), dict)
+                        and metadata["product_workflow"].get("handoff_v2") is True
+                    )
+                    else "scratch"
+                )
                 task_id = kanban_db.create_task(
                     conn,
                     title=str(fields["title"]),
@@ -842,6 +851,7 @@ def materialize_contract(
                     current_step_key=fields["current_step_key"],
                     work_contract_id=contract_id,
                     work_item_kind=fields["work_item_kind"],
+                    workspace_kind=workspace_kind,
                 )
                 epic_id = fields.get("epic_id")
                 if epic_id:

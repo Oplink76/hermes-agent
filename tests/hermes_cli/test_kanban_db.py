@@ -8241,10 +8241,10 @@ def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
         assert kb.get_task(conn, t).status == "review"
 
 
-def test_dispatch_review_spawns_with_correct_skills(
+def test_dispatch_review_does_not_force_profile_scoped_skill(
     kanban_home, all_assignees_spawnable,
 ):
-    """Review tasks get sdlc-review skill set before spawning."""
+    """Review lifecycle guidance comes from the reviewer profile."""
     spawned_tasks = []
 
     def capture_spawn(task, workspace, board=None):
@@ -8257,7 +8257,7 @@ def test_dispatch_review_spawns_with_correct_skills(
         res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
     assert len(res.spawned) == 1
     assert len(spawned_tasks) == 1
-    assert spawned_tasks[0].skills == ["sdlc-review"]
+    assert spawned_tasks[0].skills is None
 
 
 def test_dispatch_review_skips_unassigned(kanban_home):

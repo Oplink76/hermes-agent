@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -154,7 +155,22 @@ def _configured_product_board(
     if create_vault:
         vault.mkdir()
     board = "agent-memory"
-    kb.ensure_product_board_defaults(board)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test"], check=True
+    )
+    (repo / "README.md").write_text("test\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "initial"], check=True
+    )
+    kb.ensure_product_board_defaults(board, default_workdir=str(repo))
     metadata = kb.read_board_metadata(board)
     metadata["qualification"]["required"] = True
     metadata["qualification"]["work_types"] = list(qualifier.DEFAULT_WORK_TYPES)

@@ -1895,6 +1895,59 @@ def test_worker_product_complete_uses_env_board_for_backlog_handoff(monkeypatch,
     assert task.current_step_key == "architecture"
 
 
+def test_development_source_handoff_reports_canonical_workspace_failure(
+    monkeypatch, tmp_path,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    board = "product-tool-workspace-failure"
+    kb.create_board(board, name="Workspace Failure", preset="product")
+    board_metadata = kb.read_board_metadata(board)
+    board_metadata.setdefault("product_workflow", {})["handoff_v2"] = True
+    kb.board_metadata_path(board).write_text(json.dumps(board_metadata))
+    outer_workspace = tmp_path / "task-workspace"
+    _init_git_repo(outer_workspace / "agentic-os-cockpit")
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: use the canonical workspace",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="scratch",
+            workspace_path=str(outer_workspace),
+        )
+        claimed = kb.claim_task(conn, tid, board=board)
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+
+    out = json.loads(kt._handle_complete({
+        "summary": "Implementation is ready.",
+        "metadata": {"ai_provenance": {"writer": {"agent": "claude-code"}}},
+    }))
+
+    assert "Development source handoff" in out["error"]
+    assert "canonical workspace" in out["error"]
+    assert "unknown id" not in out["error"]
+    with kb.connect(board=board) as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "running"
+    assert task.current_step_key == "development"
+
+
 def test_worker_product_complete_uses_db_connection_board_for_handoff(
     monkeypatch, tmp_path,
 ):
