@@ -334,7 +334,7 @@ def test_requalification_prompt_matches_late_entry_validator_contract(conn, poli
     )
     assert "copy each evidence reference exactly" in prompt.lower()
     assert "raw_intake or submitted_evidence only" in prompt
-    assert "current_task_graph cannot be used as phase evidence" in prompt
+    assert "advisory_handoffs cannot be used" in prompt
     assert (
         '"entry_assessment":{"reason":"<why Review is the correct entry>",'
         '"skipped_phases":[{"phase":"<skipped phase>"' in prompt
@@ -570,6 +570,31 @@ def test_late_entry_accepts_exact_non_ascii_attachment_evidence(conn, policy):
     )
 
     assert validated["routing"]["entry_phase"] == "architecture"
+
+
+def test_late_entry_rejects_handoff_document_as_phase_evidence(conn, policy):
+    decision = _decision()
+    decision["routing"].update(
+        {"entry_phase": "architecture", "assignee": "architect"}
+    )
+    decision["handover"].update(next_phase="development", next_role="developer")
+    decision["entry_assessment"] = _late_assessment("backlog")
+
+    with pytest.raises(qualifier.QualificationValidationError, match="not grounded"):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=_intake(
+                conn,
+                attachments=(
+                    {
+                        "kind": "handoff_document",
+                        "content": "backlog-artifact",
+                    },
+                ),
+            ),
+            decision=decision,
+        )
 
 
 def test_late_entry_cannot_reuse_evidence_from_an_unrelated_card(conn, policy):

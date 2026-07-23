@@ -218,14 +218,24 @@ def _validate_po_evidence(
         errors.append("Product Owner artifact is not referenced by the run or intake")
 
 
+def _is_advisory_handoff(attachment: Any) -> bool:
+    return (
+        isinstance(attachment, Mapping)
+        and attachment.get("kind") == "handoff_document"
+    )
+
+
 def _evidence_corpus(intake: Mapping[str, Any]) -> str:
     """Return only evidence submitted with this intake."""
 
     parts = [str(intake.get("raw_request") or "")]
+    attachments = [
+        attachment
+        for attachment in intake.get("attachments") or []
+        if not _is_advisory_handoff(attachment)
+    ]
     parts.append(
-        json.dumps(
-            intake.get("attachments") or [], ensure_ascii=False, default=str
-        )
+        json.dumps(attachments, ensure_ascii=False, default=str)
     )
     return "\n".join(parts)
 
@@ -561,7 +571,8 @@ earlier phase in policy order as
 {"entry_assessment":{"reason":"<why this phase is the correct entry>","skipped_phases":[{"phase":"<skipped phase>","reason":"<why it is complete>","evidence":["<exact substring copied from intake evidence>"]}],"evidence":["<same exact evidence references>"]}}.
 Use [] only when no phase is skipped. Copy each evidence reference exactly from
 raw_intake or submitted_evidence only; do not paraphrase it. Board policy,
-repository_instructions, and current_task_graph cannot be used as phase evidence.
+repository_instructions, current_task_graph, and advisory_handoffs cannot be used
+as phase evidence.
 
 REVIEW ENTRY OBJECT SHAPE: Add independent writer and tester evidence inside the
 complete entry_assessment object as
@@ -579,11 +590,21 @@ def build_qualification_prompt(
 ) -> str:
     """Build the one structured qualification prompt from authoritative inputs."""
 
+    attachments = list(intake.get("attachments") or [])
     payload = {
         "board_workflow_and_policy": dict(board_metadata),
         "operating_rules": board_metadata.get("operating_rules", []),
         "raw_intake": intake.get("raw_request"),
-        "submitted_evidence": intake.get("attachments", []),
+        "submitted_evidence": [
+            attachment
+            for attachment in attachments
+            if not _is_advisory_handoff(attachment)
+        ],
+        "advisory_handoffs": [
+            attachment
+            for attachment in attachments
+            if _is_advisory_handoff(attachment)
+        ],
         "repository_instructions": _repository_instructions(board_metadata),
         "current_task_graph": _task_graph(conn),
         "agent_memory_recall": recall_for_qualification(intake.get("raw_request")),
