@@ -60,6 +60,38 @@ def test_guide_names_one_minimal_work_inbox_route():
     assert str(get_hermes_home()) not in serialized
 
 
+def test_guide_explains_full_handoff_submission_without_external_decomposition():
+    body = build_inbox_guide(
+        board="strict",
+        origin="https://hermes.example",
+    )
+
+    instructions = body["submission"]["new_work_instructions"]
+    assert "Submit the complete handoff document once" in instructions
+    assert "attachments[].content" in instructions
+    assert "Do not split the document into cards" in instructions
+    assert "Hermes owns qualification and decomposition" in instructions
+    assert "assigned_delivery" in instructions
+    assert "handoff, work brief, or design specification" in instructions
+    assert "not Product Owner evidence" in instructions
+
+    example = body["submission"]["examples"]["new_work"]
+    assert example["request"]["functional_intent"]["outcome"]
+    assert example["attachments"] == [
+        {
+            "kind": "handoff_document",
+            "name": "handoff.md",
+            "media_type": "text/markdown",
+            "content": "<complete handoff document text>",
+        }
+    ]
+
+    prompt = body["copy_ready_prompt"]
+    assert "Submit the complete handoff document once" in prompt
+    assert "Do not split it into cards" in prompt
+    assert "Hermes owns qualification and decomposition" in prompt
+
+
 @pytest.fixture
 def strict_board() -> str:
     kanban_db.ensure_product_board_defaults("strict")
