@@ -25,16 +25,43 @@ def build_inbox_guide(
         "for how to deliver development work to Hermes. Submit new work only "
         "after Ole has approved it to enter Hermes. Admission does not "
         "authorize execution; Hermes qualification and a signed Work Contract "
-        "remain required. Use the fixed Work Inbox submission route exactly as "
-        "documented. Do not create, edit, assign, route, qualify, or override "
-        "Kanban cards directly."
+        "remain required. Submit the complete handoff document once "
+        "and include its full text in attachments[].content. Do not split it into "
+        "cards or choose phases, assignees, Epics, or dependencies; Hermes owns "
+        "qualification and decomposition. Use assigned_delivery only when Hermes "
+        "provided the exact task, run, and Work Contract identifiers. Use the "
+        "fixed Work Inbox submission route exactly as documented. Do not create, "
+        "edit, assign, route, qualify, or override Kanban cards directly."
+    )
+    new_work_instructions = (
+        "Submit the complete handoff document once as one new_work request. "
+        "Include the full document text in attachments[].content; a path or URL "
+        "alone is not sufficient. Do not split the document into cards or choose "
+        "phases, assignees, Epics, or dependencies. Hermes owns qualification and "
+        "decomposition. You may include suggested segments inside the document as "
+        "advisory context only. Attach an externally authored handoff, work brief, "
+        "or design specification as source evidence; external authorship is not "
+        "Product Owner evidence. Use assigned_delivery only for an exact active "
+        "Hermes assignment with task_id, run_id, and work_contract_id."
     )
     example_request = {
         "version": 2,
         "kind": "new_work",
-        "request": {"functional_intent": {"title": "<short capability title>"}},
+        "request": {
+            "functional_intent": {
+                "title": "<short capability title>",
+                "outcome": "<measurable user or operational outcome>",
+            }
+        },
         "session_id": "<external session id>",
-        "attachments": [],
+        "attachments": [
+            {
+                "kind": "handoff_document",
+                "name": "handoff.md",
+                "media_type": "text/markdown",
+                "content": "<complete handoff document text>",
+            }
+        ],
     }
     return {
         "guide_version": GUIDE_VERSION,
@@ -63,6 +90,7 @@ def build_inbox_guide(
             "content_type": "application/json",
             "scope": "work_inbox:submit",
             "kinds": ["new_work", "assigned_delivery"],
+            "new_work_instructions": new_work_instructions,
             "authentication": {
                 "required": True,
                 "type": "bearer",
