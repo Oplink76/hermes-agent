@@ -2,7 +2,8 @@
 
 The model judges meaning and proposes a route.  This module owns the smaller,
 deterministic boundary: it validates that proposal against the board policy,
-mints the signed Work Contract, and materializes exactly one work item.
+mints signed Work Contracts, and materializes a standalone card or an Epic
+with its member stories.
 """
 
 from __future__ import annotations
@@ -116,6 +117,66 @@ def _non_empty_strings(value: Any) -> bool:
     )
 
 
+def _validate_story_decomposition(
+    decision: Mapping[str, Any],
+    *,
+    item_kind: Any,
+    is_requalification: bool,
+    errors: list[str],
+) -> None:
+    stories = decision.get("stories", [])
+    if not isinstance(stories, list):
+        errors.append("stories must be a list")
+        return
+    if item_kind != "epic":
+        if stories:
+            errors.append("Only an Epic can contain stories")
+        return
+    if is_requalification:
+        if stories:
+            errors.append("Epic requalification cannot create new stories")
+        return
+    if not stories:
+        errors.append("Epic qualification requires at least one story")
+        return
+
+    for index, story in enumerate(stories):
+        if not isinstance(story, Mapping):
+            errors.append(f"stories[{index}] must be an object")
+            continue
+        for field in ("title", "outcome"):
+            value = story.get(field)
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"stories[{index}].{field} is required")
+        for field in ("scope", "out_of_scope"):
+            value = story.get(field)
+            if value != [] and not _non_empty_strings(value):
+                errors.append(
+                    f"stories[{index}].{field} must be a list of non-empty strings"
+                )
+        if not _non_empty_strings(story.get("done_when")):
+            errors.append(
+                f"stories[{index}].done_when must contain at least one item"
+            )
+        dependencies = story.get("depends_on")
+        if not isinstance(dependencies, list):
+            errors.append(f"stories[{index}].depends_on must be a list")
+            continue
+        if any(
+            type(dependency) is not int
+            or dependency < 0
+            or dependency >= index
+            for dependency in dependencies
+        ):
+            errors.append(
+                f"stories[{index}].depends_on must reference an earlier story"
+            )
+        elif len(set(dependencies)) != len(dependencies):
+            errors.append(
+                f"stories[{index}].depends_on cannot contain duplicates"
+            )
+
+
 def _artifact_references(intake: Mapping[str, Any], run: Mapping[str, Any]) -> str:
     pieces = [str(run.get("summary") or ""), str(run.get("metadata") or "")]
     for attachment in intake.get("attachments") or ():
@@ -157,14 +218,24 @@ def _validate_po_evidence(
         errors.append("Product Owner artifact is not referenced by the run or intake")
 
 
+def _is_advisory_handoff(attachment: Any) -> bool:
+    return (
+        isinstance(attachment, Mapping)
+        and attachment.get("kind") == "handoff_document"
+    )
+
+
 def _evidence_corpus(intake: Mapping[str, Any]) -> str:
     """Return only evidence submitted with this intake."""
 
     parts = [str(intake.get("raw_request") or "")]
+    attachments = [
+        attachment
+        for attachment in intake.get("attachments") or []
+        if not _is_advisory_handoff(attachment)
+    ]
     parts.append(
-        json.dumps(
-            intake.get("attachments") or [], ensure_ascii=False, default=str
-        )
+        json.dumps(attachments, ensure_ascii=False, default=str)
     )
     return "\n".join(parts)
 
@@ -326,6 +397,12 @@ def validate_decision(
     if item_kind not in {"card", "epic"}:
         errors.append("work item kind must be card or epic")
     target_task_id = kanban_intake.requalification_target_id(intake)
+    _validate_story_decomposition(
+        normalized,
+        item_kind=item_kind,
+        is_requalification=isinstance(target_task_id, str),
+        errors=errors,
+    )
     if isinstance(target_task_id, str):
         target = conn.execute(
             "SELECT work_item_kind FROM tasks WHERE id = ?", (target_task_id,)
@@ -479,10 +556,13 @@ def _repository_instructions(board_metadata: Mapping[str, Any]) -> dict[str, str
 
 _QUALIFICATION_OUTPUT_SHAPES = """
 CARD OUTPUT SHAPE:
-{"qualification_path":"hermes","work":{"item_kind":"card","work_type":"<allowed type>","title":"Required concise title","outcome":"Required measurable outcome","scope":["Included work"],"out_of_scope":["Unrelated work"]},"routing":{"entry_phase":"<allowed phase>","assignee":"<that phase's profile or null>","epic_id":null,"dependencies":[]},"entry_assessment":{"reason":"<reason>","skipped_phases":[],"evidence":[]},"handover":{"deliverables":["Required deliverable"],"required_evidence":["Required verification evidence"],"done_when":["The measurable outcome is verified"],"next_phase":"<next phase or done>","next_role":"<next phase's profile or null>"},"rules":{"allowed":["Work only inside the qualified scope"],"forbidden":["Bypass Hermes-owned workflow routing"]},"classification":["framework:<allowed type>","path:hermes"]}
+{"qualification_path":"hermes","work":{"item_kind":"card","work_type":"<allowed type>","title":"Required concise title","outcome":"Required measurable outcome","scope":["Included work"],"out_of_scope":["Unrelated work"]},"routing":{"entry_phase":"<allowed phase>","assignee":"<that phase's profile or null>","epic_id":null,"dependencies":[]},"entry_assessment":{"reason":"<reason>","skipped_phases":[],"evidence":[]},"handover":{"deliverables":["Required deliverable"],"required_evidence":["Required verification evidence"],"done_when":["The measurable outcome is verified"],"next_phase":"<next phase or done>","next_role":"<next phase's profile or null>"},"rules":{"allowed":["Work only inside the qualified scope"],"forbidden":["Bypass Hermes-owned workflow routing"]},"classification":["framework:<allowed type>","path:hermes","intake:<idea or bug>"],"stories":[]}
 
 EPIC OUTPUT SHAPE:
-{"qualification_path":"hermes","work":{"item_kind":"epic","work_type":"<allowed type>","title":"Required concise Epic title","outcome":"Required measurable Epic outcome","scope":["Included body of work"],"out_of_scope":["Unrelated work"]},"routing":{"entry_phase":null,"assignee":null,"epic_id":null,"dependencies":[]},"entry_assessment":{"reason":"<reason>","skipped_phases":[],"evidence":[]},"handover":{"deliverables":["Required Epic result"],"required_evidence":["Evidence supplied by member cards"],"done_when":["The Epic outcome is verified"],"next_phase":null,"next_role":null},"rules":{"allowed":["Organize qualified member cards"],"forbidden":["Execute the Epic as a card"]},"classification":["framework:epic","path:hermes"]}
+{"qualification_path":"hermes","work":{"item_kind":"epic","work_type":"story","title":"Required concise Epic title","outcome":"Required measurable Epic outcome","scope":["Included body of work"],"out_of_scope":["Unrelated work"]},"routing":{"entry_phase":null,"assignee":null,"epic_id":null,"dependencies":[]},"entry_assessment":{"reason":"<reason>","skipped_phases":[],"evidence":[]},"handover":{"deliverables":["Required Epic result"],"required_evidence":["Evidence supplied by member cards"],"done_when":["The Epic outcome is verified"],"next_phase":null,"next_role":null},"rules":{"allowed":["Organize qualified member cards"],"forbidden":["Execute the Epic as a card"]},"classification":["framework:epic","path:hermes","intake:<plan or epic>"],"stories":[{"title":"Required user-story title","outcome":"Required independently deliverable outcome","scope":["Included story work"],"out_of_scope":["Unrelated story work"],"done_when":["Measurable acceptance condition"],"depends_on":[]}]}
+
+List stories in dependency order. Each depends_on value is the zero-based index
+of an earlier story in the same list. Never return an empty Epic.
 
 PO PATH ADDITION: Set qualification_path to "po", use "path:po", and add only grounded evidence in "po_evidence":{"run_id":123,"artifact":"<referenced artifact>"}.
 
@@ -491,7 +571,8 @@ earlier phase in policy order as
 {"entry_assessment":{"reason":"<why this phase is the correct entry>","skipped_phases":[{"phase":"<skipped phase>","reason":"<why it is complete>","evidence":["<exact substring copied from intake evidence>"]}],"evidence":["<same exact evidence references>"]}}.
 Use [] only when no phase is skipped. Copy each evidence reference exactly from
 raw_intake or submitted_evidence only; do not paraphrase it. Board policy,
-repository_instructions, and current_task_graph cannot be used as phase evidence.
+repository_instructions, current_task_graph, and advisory_handoffs cannot be used
+as phase evidence.
 
 REVIEW ENTRY OBJECT SHAPE: Add independent writer and tester evidence inside the
 complete entry_assessment object as
@@ -509,11 +590,21 @@ def build_qualification_prompt(
 ) -> str:
     """Build the one structured qualification prompt from authoritative inputs."""
 
+    attachments = list(intake.get("attachments") or [])
     payload = {
         "board_workflow_and_policy": dict(board_metadata),
         "operating_rules": board_metadata.get("operating_rules", []),
         "raw_intake": intake.get("raw_request"),
-        "submitted_evidence": intake.get("attachments", []),
+        "submitted_evidence": [
+            attachment
+            for attachment in attachments
+            if not _is_advisory_handoff(attachment)
+        ],
+        "advisory_handoffs": [
+            attachment
+            for attachment in attachments
+            if _is_advisory_handoff(attachment)
+        ],
         "repository_instructions": _repository_instructions(board_metadata),
         "current_task_graph": _task_graph(conn),
         "agent_memory_recall": recall_for_qualification(intake.get("raw_request")),
@@ -537,9 +628,16 @@ def build_qualification_prompt(
         )
     return (
         requalification
-        + "Qualify this inert work request for Hermes. Decide meaning; do not invent "
+        + "Qualify this inert work request for Hermes. Determine whether the intake "
+        "is an idea, plan, Epic, or bug; the submitter does not need to classify it. "
+        "An idea or bug normally becomes one card. A multi-part plan or Epic becomes "
+        "one non-executable Epic with the needed independently deliverable user "
+        "stories. External analysis is advisory: a complete handoff may guide "
+        "decomposition but does not prove that framework phases are complete. "
+        "Choose the earliest unfinished phase unless exact submitted evidence proves "
+        "each earlier phase complete. Decide meaning; do not invent "
         "evidence. Return one JSON object containing qualification_path, work, "
-        "routing, entry_assessment, handover, rules, classification, and po_evidence "
+        "routing, entry_assessment, handover, rules, classification, stories, and po_evidence "
         "only for the PO path. Use only phases, profiles, work types, task ids, and "
         "Epic ids present below. Epics are non-executable containers; dependencies "
         "and Epic membership are separate. Late entry must explain every skipped "
@@ -693,6 +791,8 @@ def qualify_intake(
         }
         if qualification_path == "po":
             contract["po_evidence"] = copy.deepcopy(decision["po_evidence"])
+        if decision["work"]["item_kind"] == "epic":
+            contract["stories"] = copy.deepcopy(decision["stories"])
         if override_authority is not None:
             contract["override_authority"] = {
                 "reason": override_authority.reason,
@@ -713,10 +813,16 @@ def qualify_intake(
             secret=secret,
             hermes_home=hermes_home,
         )
+        story_task_ids = (
+            kanban_db.list_epic_members(conn, task_id)
+            if decision["work"]["item_kind"] == "epic"
+            else []
+        )
         return {
             "status": "overridden" if override_authority is not None else "qualified",
             "intake_id": intake_id,
             "task_id": task_id,
+            "story_task_ids": story_task_ids,
             "contract_digest": signed["digest"],
         }
 

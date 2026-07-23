@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_intake as intake
+from hermes_cli import kanban_qualifier as qualifier
 from hermes_cli import plugins, web_server
 from hermes_cli.dashboard_auth import clear_providers, token_auth
 
@@ -130,6 +131,44 @@ def _assigned_completion_body(
     }
 
 
+def _backlog_decision() -> dict:
+    return {
+        "qualification_path": "hermes",
+        "work": {
+            "item_kind": "card",
+            "work_type": "story",
+            "title": "Observe this intake",
+            "outcome": "The intake result is observable",
+            "scope": ["Work Inbox"],
+            "out_of_scope": [],
+        },
+        "routing": {
+            "entry_phase": "backlog",
+            "assignee": "productowner",
+            "epic_id": None,
+            "dependencies": [],
+        },
+        "entry_assessment": {
+            "reason": "New work starts at backlog",
+            "skipped_phases": [],
+            "evidence": [],
+        },
+        "handover": {
+            "deliverables": ["A refined user story"],
+            "required_evidence": ["Product Owner acceptance"],
+            "done_when": ["The story is ready for architecture"],
+            "next_phase": "architecture",
+            "next_role": "architect",
+        },
+        "rules": {
+            "allowed": ["Refine the qualified intent"],
+            "forbidden": ["Bypass Hermes workflow routing"],
+        },
+        "classification": ["framework:story", "path:hermes", "intake:idea"],
+        "stories": [],
+    }
+
+
 def test_exact_work_inbox_route_uses_real_bearer_middleware(
     app_client, strict_board, strong_secret,
 ):
@@ -170,6 +209,81 @@ def test_new_work_delegates_to_existing_intake(app_client, strict_board, strong_
     with kb.connect(board=strict_board) as conn:
         assert len(kb.list_qualification_intakes(conn, status="pending")) == 1
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_work_inbox_credential_can_observe_its_intake_status_only(
+    app_client, strict_board, strong_secret,
+):
+    response = app_client.post(
+        f"/api/plugins/kanban/work-inbox?board={strict_board}",
+        headers={"Authorization": f"Bearer {strong_secret}"},
+        json={
+            "version": 2,
+            "kind": "new_work",
+            "request": {"functional_intent": {"title": "Observe this intake"}},
+        },
+    )
+    intake_id = response.json()["intake_id"]
+
+    status = app_client.get(
+        "/api/plugins/kanban/work-inbox/status",
+        params={"board": strict_board, "intake_id": intake_id},
+        headers={"Authorization": f"Bearer {strong_secret}"},
+    )
+
+    assert status.status_code == 200, status.text
+    assert status.json() == {
+        "intake_id": intake_id,
+        "status": "pending",
+        "reason": None,
+        "items": [],
+    }
+
+    with kb.connect(board=strict_board) as conn:
+        result = qualifier.qualify_intake(
+            conn,
+            board=strict_board,
+            intake_id=intake_id,
+            model_call=lambda _prompt: _backlog_decision(),
+            secret=b"test-only-secret",
+        )
+    assert result["status"] == "qualified"
+    qualified = app_client.get(
+        "/api/plugins/kanban/work-inbox/status",
+        params={"board": strict_board, "intake_id": intake_id},
+        headers={"Authorization": f"Bearer {strong_secret}"},
+    )
+    assert qualified.status_code == 200
+    assert qualified.json()["status"] == "qualified"
+    assert qualified.json()["reason"] == "Work Contract validated and materialized"
+    assert qualified.json()["items"] == [
+        {
+            "id": result["task_id"],
+            "title": "Observe this intake",
+            "work_item_kind": "card",
+            "status": "ready",
+            "phase": "backlog",
+            "epic_id": None,
+        }
+    ]
+
+    assert app_client.get(
+        "/api/plugins/kanban/work-inbox/status",
+        params={"board": strict_board, "intake_id": intake_id},
+        headers={"Authorization": "Bearer wrong"},
+    ).status_code == 401
+
+    with kb.connect(board=strict_board) as conn:
+        private_intake = kb.create_qualification_intake(
+            conn,
+            raw_request="private",
+            source="dashboard-api",
+        )
+    assert app_client.get(
+        "/api/plugins/kanban/work-inbox/status",
+        params={"board": strict_board, "intake_id": private_intake},
+        headers={"Authorization": f"Bearer {strong_secret}"},
+    ).status_code == 404
 
 
 def test_new_work_patch_evidence_creates_only_pending_intake(

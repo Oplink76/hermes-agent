@@ -42,6 +42,12 @@ def test_guide_names_one_minimal_work_inbox_route():
     )
     assert set(body["submission"]["kinds"]) == {"new_work", "assigned_delivery"}
     assert body["submission"]["scope"] == "work_inbox:submit"
+    assert body["submission"]["accepted_shapes"] == [
+        "idea",
+        "plan",
+        "epic",
+        "bug",
+    ]
     assert body["submission"]["authentication"] == {
         "required": True,
         "type": "bearer",
@@ -50,6 +56,13 @@ def test_guide_names_one_minimal_work_inbox_route():
     }
     assert body["submission"]["examples"]["assigned_delivery"]["run_id"] == 123
     assert guide_url in body["copy_ready_prompt"]
+    assert body["status"]["method"] == "GET"
+    assert body["status"]["url"] == (
+        "https://hermes.example/api/plugins/kanban/work-inbox/status"
+        "?board=strict&intake_id=<qi_...>"
+    )
+    assert "qualification" in body["lifecycle"]
+    assert "skipped-phase evidence" in body["common_rejections"]
     assert body["retry"]["automatic_retry"] is False
     assert "receipt" not in body
     serialized = json.dumps(body)
@@ -74,6 +87,10 @@ def test_guide_explains_full_handoff_submission_without_external_decomposition()
     assert "assigned_delivery" in instructions
     assert "handoff, work brief, or design specification" in instructions
     assert "not Product Owner evidence" in instructions
+    assert "idea, plan, Epic, or bug" in instructions
+    assert "Hermes determines the shape" in instructions
+    assert "creates the needed user-story cards" in instructions
+    assert "does not prove that framework phases are complete" in instructions
 
     example = body["submission"]["examples"]["new_work"]
     assert example["request"]["functional_intent"]["outcome"]
@@ -90,6 +107,7 @@ def test_guide_explains_full_handoff_submission_without_external_decomposition()
     assert "Submit the complete handoff document once" in prompt
     assert "Do not split it into cards" in prompt
     assert "Hermes owns qualification and decomposition" in prompt
+    assert "Hermes determines whether it is an idea, plan, Epic, or bug" in prompt
 
 
 @pytest.fixture
