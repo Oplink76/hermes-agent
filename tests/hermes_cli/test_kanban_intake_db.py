@@ -409,6 +409,23 @@ def test_strict_board_rejects_direct_task_insert_and_materializes_atomically(
         connection.close()
 
 
+def test_handoff_v2_materializes_executable_card_with_canonical_worktree(
+    tmp_path, monkeypatch
+):
+    board = "strict-v2-worktree"
+    _strict_v2_product_board(tmp_path, monkeypatch, board)
+
+    connection = kb.connect(board=board)
+    try:
+        task_id = _materialized_card(connection, board)
+        task = kb.get_task(connection, task_id)
+
+        assert task.workspace_kind == "worktree"
+        assert task.workspace_path is None
+    finally:
+        connection.close()
+
+
 def test_epic_contract_materializes_as_non_executable_container(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()

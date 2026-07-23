@@ -15202,12 +15202,6 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
-        # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        claimed.skills = ["sdlc-review"]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect

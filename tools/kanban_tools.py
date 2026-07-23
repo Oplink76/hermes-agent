@@ -880,6 +880,19 @@ def _handle_complete(args: dict, **kw) -> str:
                     "reviewer AI different from the writer AI."
                 )
             if not ok:
+                task = kb.get_task(conn, tid)
+                if (
+                    task is not None
+                    and task.status == "running"
+                    and task.current_step_key == "development"
+                    and task.current_run_id == _worker_run_id(tid)
+                ):
+                    return tool_error(
+                        "Development source handoff could not create the "
+                        "required Git commit from the canonical workspace. "
+                        "Keep source changes in HERMES_KANBAN_WORKSPACE and "
+                        "retry; the task is still in-flight."
+                    )
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
