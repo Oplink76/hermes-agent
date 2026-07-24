@@ -1196,6 +1196,8 @@ class CreateTaskBody(BaseModel):
     project_id: Optional[str] = None
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
+    model_override: Optional[str] = None
+    provider_override: Optional[str] = None
 
 
 @router.post("/tasks")
@@ -1250,6 +1252,8 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             project_id=payload.project_id,
             workflow_template_id=payload.workflow_template_id,
             current_step_key=payload.current_step_key,
+            model_override=payload.model_override,
+            provider_override=payload.provider_override,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -1485,6 +1489,13 @@ class UpdateTaskBody(_ExpectedTaskSnapshotBody):
     # complete --summary ... --metadata ...``.
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    # Per-task model/provider override (the board's model dropdown).
+    # ``model_override=""`` clears both. ``clear_model_override=True`` is
+    # the explicit clear signal — needed because Optional[str]=None means
+    # "field not sent" in a PATCH, not "set to NULL".
+    model_override: Optional[str] = None
+    provider_override: Optional[str] = None
+    clear_model_override: bool = False
 
 
 @router.patch("/tasks/{task_id}")
@@ -1868,6 +1879,24 @@ def _patch_task(
             values.append(task_id)
             conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", values)
             _insert_task_event(conn, task_id, "edited", None)
+
+        if payload.clear_model_override or payload.model_override is not None:
+            model_override = (
+                None
+                if payload.clear_model_override
+                else (payload.model_override or "").strip() or None
+            )
+            try:
+                ok = kanban_db.set_model_override(
+                    conn,
+                    task_id,
+                    model_override,
+                    provider=payload.provider_override,
+                )
+            except (ValueError, RuntimeError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if not ok:
+                return None
 
         refreshed = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         return kanban_db.Task.from_row(refreshed) if refreshed else None
@@ -2264,6 +2293,10 @@ class BulkTaskBody(BaseModel):
     metadata: Optional[dict] = None
     reclaim_first: bool = False
     expected_snapshots: dict[str, _ExpectedTaskSnapshotBody]
+    # Bulk model/provider override — same semantics as UpdateTaskBody.
+    model_override: Optional[str] = None
+    provider_override: Optional[str] = None
+    clear_model_override: bool = False
 
 
 @router.post("/tasks/bulk")
@@ -2350,6 +2383,9 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
+                    model_override=payload.model_override,
+                    provider_override=payload.provider_override,
+                    clear_model_override=payload.clear_model_override,
                 )
                 if _patch_task(
                     conn,
@@ -3153,6 +3189,49 @@ def dispatch(
             return {"result": str(result)}
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Model options (the board's per-task model-override dropdown)
+# ---------------------------------------------------------------------------
+
+@router.get("/model-options")
+def model_options():
+    """Authenticated providers + curated model lists for the task drawer's
+    model-override dropdown.
+
+    Thin wrapper around ``hermes_cli.inventory.build_models_payload`` — the
+    same substrate the dashboard Models page and the TUI picker use, so the
+    dropdown can never offer a model/provider pair the rest of Hermes
+    wouldn't accept. Deliberately skips pricing/capability enrichment and
+    custom-provider probes: the dropdown needs names fast, not $/Mtok
+    columns (a slow/offline local endpoint must not hang the drawer).
+    """
+    try:
+        from hermes_cli.inventory import build_models_payload, load_picker_context
+
+        payload = build_models_payload(
+            load_picker_context(),
+            explicit_only=True,
+            canonical_order=True,
+            probe_custom_providers=False,
+        )
+        return {
+            "providers": [
+                {
+                    "slug": row.get("slug", ""),
+                    "label": row.get("label") or row.get("slug", ""),
+                    "models": list(row.get("models") or []),
+                }
+                for row in payload.get("providers", [])
+                if row.get("models")
+            ],
+        }
+    except Exception:
+        log.exception("kanban model-options failed")
+        # Degrade to an empty catalog — the UI falls back to a free-text
+        # input so the feature still works without the inventory module.
+        return {"providers": []}
 
 
 # ---------------------------------------------------------------------------
