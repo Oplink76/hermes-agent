@@ -716,6 +716,50 @@ def test_strict_board_rejects_client_contract_and_routing_mutations(client):
     with kb.connect(board="strict") as conn:
         assert kb.get_task(conn, first).status != "done"
 
+    for field, value in (
+        ("priority", 99),
+        ("result", "bulk-forged result"),
+        ("summary", "bulk-forged summary"),
+        ("metadata", {"forged": True}),
+    ):
+        with kb.connect(board="strict") as conn:
+            before = kb.get_task(conn, first)
+            runs_before = [
+                tuple(row)
+                for row in conn.execute(
+                    """
+                    SELECT id, status, outcome, summary, metadata
+                      FROM task_runs
+                     WHERE task_id = ?
+                     ORDER BY id
+                    """,
+                    (first,),
+                ).fetchall()
+            ]
+        bulk_contract = client.post(
+            "/api/plugins/kanban/tasks/bulk?board=strict",
+            json={"ids": [first], field: value},
+        )
+        assert bulk_contract.status_code == 409, field
+        assert "Work Contract" in bulk_contract.text, field
+        with kb.connect(board="strict") as conn:
+            after = kb.get_task(conn, first)
+            runs_after = [
+                tuple(row)
+                for row in conn.execute(
+                    """
+                    SELECT id, status, outcome, summary, metadata
+                      FROM task_runs
+                     WHERE task_id = ?
+                     ORDER BY id
+                    """,
+                    (first,),
+                ).fetchall()
+            ]
+        assert after.priority == before.priority, field
+        assert after.result == before.result, field
+        assert runs_after == runs_before, field
+
     deletion = client.delete(
         f"/api/plugins/kanban/tasks/{first}?board=strict",
     )
