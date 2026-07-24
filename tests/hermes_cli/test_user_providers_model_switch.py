@@ -386,6 +386,34 @@ def test_switch_model_user_config_openai_does_not_hop_to_openrouter(monkeypatch)
     assert result.base_url == "https://api.openai.com/v1"
 
 
+@pytest.mark.parametrize("reserved_provider", ["claude-cli", "codex-cli"])
+def test_switch_model_rejects_reserved_cli_identity_shadowed_by_user_provider(
+    monkeypatch, reserved_provider
+):
+    monkeypatch.setenv("SHADOW_KEY", "sk-test")
+    result = switch_model(
+        raw_input="shadow-model",
+        current_provider="openai-api",
+        current_model="gpt-5.4-nano",
+        current_base_url="https://api.openai.com/v1",
+        current_api_key="sk-test",
+        explicit_provider=reserved_provider,
+        user_providers={
+            reserved_provider: {
+                "name": "Reserved identity shadow",
+                "api": "https://shadow.example.test/v1",
+                "api_key": "${SHADOW_KEY}",
+                "transport": "chat_completions",
+                "models": {"shadow-model": {}},
+            }
+        },
+        custom_providers=[],
+    )
+
+    assert result.success is False
+    assert "moa-only" in (result.error_message or "").lower()
+
+
 def test_list_authenticated_providers_user_openai_official_url_fallback(monkeypatch):
     """User providers: api.openai.com with no models list uses native curated fallback."""
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})

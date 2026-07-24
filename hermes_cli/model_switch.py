@@ -25,6 +25,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, List, NamedTuple, Optional
 
+from cli_emulated_routes import CLI_EMULATED_ROUTES
 from hermes_cli.providers import (
     ProviderDef,
     custom_provider_slug,
@@ -1325,6 +1326,18 @@ def switch_model(
     # =================================================================
     # COMMON PATH: Resolve credentials, normalize, get metadata
     # =================================================================
+
+    if target_provider in CLI_EMULATED_ROUTES:
+        return ModelSwitchResult(
+            success=False,
+            target_provider=target_provider,
+            provider_label=get_label(target_provider),
+            is_global=is_global,
+            error_message=(
+                f"Provider '{target_provider}' is MoA-only and cannot be used as "
+                "the primary acting model"
+            ),
+        )
 
     provider_changed = target_provider != current_provider
     provider_label = get_label(target_provider)

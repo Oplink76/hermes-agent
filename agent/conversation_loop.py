@@ -6367,6 +6367,9 @@ def run_conversation(
             _hit_api = bool(tb_module_names & _API_CALL_MODULES)
 
             _is_local_processing_error = _hit_local and not _hit_api
+            from agent.cli_emulated_provider import CliInvocationError
+
+            _is_terminal_cli_error = isinstance(e, CliInvocationError)
 
             if _is_local_processing_error:
                 error_msg = (
@@ -6426,11 +6429,15 @@ def run_conversation(
             # rather than retrying until the budget is exhausted.
             if (
                 _is_local_processing_error
+                or _is_terminal_cli_error
                 or api_call_count >= agent.max_iterations - 1
             ):
                 if _is_local_processing_error:
                     _turn_exit_reason = f"local_processing_error({error_msg[:80]})"
                     final_response = f"I apologize, but I encountered an error while processing the model response: {error_msg}"
+                elif _is_terminal_cli_error:
+                    _turn_exit_reason = f"cli_invocation_error({error_msg[:80]})"
+                    final_response = f"CLI-backed MoA invocation failed: {e}"
                 else:
                     _turn_exit_reason = f"error_near_max_iterations({error_msg[:80]})"
                     final_response = f"I apologize, but I encountered repeated errors: {error_msg}"

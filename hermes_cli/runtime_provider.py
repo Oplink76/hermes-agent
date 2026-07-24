@@ -1589,6 +1589,14 @@ def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
+    from cli_emulated_routes import CLI_EMULATED_ROUTES
+
+    if requested_provider in CLI_EMULATED_ROUTES:
+        raise ValueError(
+            f"provider {requested_provider!r} is MoA-only and cannot be used "
+            "as a primary runtime"
+        )
+
     # Azure Anthropic short-circuit: when explicitly targeting an Azure endpoint
     # with provider="anthropic", bypass _resolve_named_custom_runtime (which would
     # return provider="custom" with chat_completions api_mode and no valid key).

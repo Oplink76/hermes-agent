@@ -44,6 +44,249 @@ def _jwt_with_claims(claims: dict) -> str:
     return f"{header}.{payload}.sig"
 
 
+def test_call_llm_short_circuits_cli_provider_before_http_client(monkeypatch):
+    import agent.auxiliary_client as ac
+
+    sentinel = object()
+    cancelled = lambda: False
+    captured = {}
+    monkeypatch.setattr(
+        ac,
+        "_resolve_task_provider_model",
+        lambda *args, **kwargs: (
+            "claude-cli",
+            "default",
+            "cli://claude",
+            "",
+            "chat_completions",
+        ),
+    )
+    monkeypatch.setattr(
+        ac,
+        "_get_cached_client",
+        lambda *args, **kwargs: pytest.fail("CLI routes must bypass cached HTTP clients"),
+    )
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(
+        "agent.cli_emulated_provider.create_cli_completion",
+        fake_create,
+    )
+
+    response = call_llm(
+        task="moa_reference",
+        provider="claude-cli",
+        model="default",
+        base_url="cli://claude",
+        messages=[{"role": "user", "content": "Advise."}],
+        timeout=9,
+        is_cancelled=cancelled,
+    )
+
+    assert response is sentinel
+    assert captured["timeout"] == 9.0
+    assert captured["cancel_check"] is cancelled
+    assert captured["provider"] == "claude-cli"
+    assert captured["base_url"] == "cli://claude"
+
+
+def test_cli_provider_identity_survives_task_resolution() -> None:
+    from agent.auxiliary_client import _resolve_task_provider_model
+
+    resolved = _resolve_task_provider_model(
+        "moa_reference",
+        "claude-cli",
+        "default",
+        "cli://claude",
+        "",
+    )
+
+    assert resolved[:3] == ("claude-cli", "default", "cli://claude")
+
+
+def test_cli_route_rejects_noncanonical_provider_before_http_client(monkeypatch):
+    import agent.auxiliary_client as ac
+
+    monkeypatch.setattr(
+        ac,
+        "_resolve_task_provider_model",
+        lambda *args, **kwargs: (
+            "custom",
+            "default",
+            "cli://claude",
+            "",
+            "chat_completions",
+        ),
+    )
+    monkeypatch.setattr(
+        ac,
+        "_get_cached_client",
+        lambda *args, **kwargs: pytest.fail("mismatched CLI routes must fail closed"),
+    )
+
+    with pytest.raises(RuntimeError, match="does not match a canonical CLI provider"):
+        call_llm(
+            task="moa_reference",
+            provider="custom",
+            model="default",
+            base_url="cli://claude",
+            messages=[{"role": "user", "content": "Advise."}],
+        )
+
+
+def test_call_llm_cli_timeout_uses_the_tighter_provider_limit(monkeypatch):
+    import agent.auxiliary_client as ac
+
+    captured = {}
+    monkeypatch.setattr(
+        ac,
+        "_resolve_task_provider_model",
+        lambda *args, **kwargs: (
+            "claude-cli",
+            "default",
+            "cli://claude",
+            "",
+            "chat_completions",
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.timeouts.get_provider_request_timeout",
+        lambda provider, model: 4.0,
+    )
+    monkeypatch.setattr(
+        "agent.cli_emulated_provider.create_cli_completion",
+        lambda **kwargs: captured.update(kwargs) or object(),
+    )
+
+    call_llm(
+        task="moa_reference",
+        provider="claude-cli",
+        model="default",
+        base_url="cli://claude",
+        messages=[{"role": "user", "content": "Advise."}],
+    )
+
+    assert captured["timeout"] == 4.0
+
+
+def test_call_llm_cli_uses_adapter_default_without_explicit_or_provider_timeout(
+    monkeypatch,
+):
+    import agent.auxiliary_client as ac
+
+    captured = {}
+    monkeypatch.setattr(
+        ac,
+        "_resolve_task_provider_model",
+        lambda *args, **kwargs: (
+            "claude-cli",
+            "default",
+            "cli://claude",
+            "",
+            "chat_completions",
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.timeouts.get_provider_request_timeout",
+        lambda provider, model: None,
+    )
+    monkeypatch.setattr(
+        "agent.cli_emulated_provider.create_cli_completion",
+        lambda **kwargs: captured.update(kwargs) or object(),
+    )
+
+    call_llm(
+        task="moa_reference",
+        provider="claude-cli",
+        model="default",
+        base_url="cli://claude",
+        messages=[{"role": "user", "content": "Advise."}],
+    )
+
+    assert captured["timeout"] is None
+
+
+def test_call_llm_cli_normalizes_httpx_timeout_for_streaming_facade(monkeypatch):
+    import httpx
+
+    import agent.auxiliary_client as ac
+
+    captured = {}
+    monkeypatch.setattr(
+        ac,
+        "_resolve_task_provider_model",
+        lambda *args, **kwargs: (
+            "codex-cli",
+            "default",
+            "cli://codex",
+            "",
+            "chat_completions",
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.timeouts.get_provider_request_timeout",
+        lambda provider, model: None,
+    )
+    monkeypatch.setattr(
+        "agent.cli_emulated_provider.create_cli_completion",
+        lambda **kwargs: captured.update(kwargs) or object(),
+    )
+
+    call_llm(
+        task="moa_aggregator",
+        provider="codex-cli",
+        model="default",
+        base_url="cli://codex",
+        messages=[{"role": "user", "content": "Synthesize."}],
+        stream=True,
+        timeout=httpx.Timeout(12.0, connect=2.0),
+    )
+
+    assert captured["timeout"] == 12.0
+
+
+def test_call_llm_cli_failure_bypasses_http_retry_and_fallback(monkeypatch):
+    import agent.auxiliary_client as ac
+    from agent.cli_emulated_provider import CliInvocationError
+
+    failure = CliInvocationError("CLI failed")
+    monkeypatch.setattr(
+        ac,
+        "_resolve_task_provider_model",
+        lambda *args, **kwargs: (
+            "claude-cli",
+            "default",
+            "cli://claude",
+            "",
+            "chat_completions",
+        ),
+    )
+    monkeypatch.setattr(ac, "_effective_aux_timeout", lambda task, timeout: 5.0)
+    monkeypatch.setattr(
+        "agent.cli_emulated_provider.create_cli_completion",
+        lambda **kwargs: (_ for _ in ()).throw(failure),
+    )
+    monkeypatch.setattr(
+        ac,
+        "_is_transient_transport_error",
+        lambda _exc: pytest.fail("CLI failures must bypass HTTP retry classifiers"),
+    )
+
+    with pytest.raises(CliInvocationError) as exc_info:
+        call_llm(
+            task="moa_reference",
+            provider="claude-cli",
+            model="default",
+            base_url="cli://claude",
+            messages=[{"role": "user", "content": "Advise."}],
+        )
+
+    assert exc_info.value is failure
+
+
 class _FakeAnthropicStream:
     def __init__(self, final_message):
         self._final_message = final_message

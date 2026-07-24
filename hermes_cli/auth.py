@@ -1931,6 +1931,21 @@ def resolve_provider(
         return "custom"
     if normalized in PROVIDER_REGISTRY:
         return normalized
+    # Hermes-only external-process profiles live in the canonical provider
+    # overlay registry rather than the legacy API-key registry above.
+    try:
+        from cli_emulated_routes import CLI_EMULATED_ROUTES
+        from hermes_cli.providers import get_provider as _get_provider
+
+        _provider_def = _get_provider(normalized)
+        if (
+            normalized in CLI_EMULATED_ROUTES
+            and _provider_def is not None
+            and _provider_def.auth_type == "external_process"
+        ):
+            return normalized
+    except Exception:
+        pass
     if normalized != "auto":
         # Check for common config.yaml issues that cause this error
         _config_hint = _get_config_hint_for_unknown_provider(normalized)
