@@ -11319,28 +11319,31 @@ async def get_session_stats(profile: Optional[str] = None):
     Registered before ``/api/sessions/{session_id}`` so the literal ``stats``
     path isn't captured as a session id by the parameterized route.
     """
-    db = _open_session_db_for_profile(profile)
-    try:
-        total = db.session_count(include_archived=True)
-        active_store = db.session_count(include_archived=False)
-        archived = db.session_count(archived_only=True)
-        messages = db.message_count()
-        by_source: Dict[str, int] = {}
+    def _stats():
+        db = _open_session_db_for_profile(profile)
         try:
-            for s in db.list_sessions_rich(limit=10000, include_archived=True, compact_rows=True):
-                src = str(s.get("source") or "cli")
-                by_source[src] = by_source.get(src, 0) + 1
-        except Exception:
-            pass
-        return {
-            "total": total,
-            "active_store": active_store,
-            "archived": archived,
-            "messages": messages,
-            "by_source": by_source,
-        }
-    finally:
-        db.close()
+            total = db.session_count(include_archived=True)
+            active_store = db.session_count(include_archived=False)
+            archived = db.session_count(archived_only=True)
+            messages = db.message_count()
+            by_source: Dict[str, int] = {}
+            try:
+                for s in db.list_sessions_rich(limit=10000, include_archived=True, compact_rows=True):
+                    src = str(s.get("source") or "cli")
+                    by_source[src] = by_source.get(src, 0) + 1
+            except Exception:
+                pass
+            return {
+                "total": total,
+                "active_store": active_store,
+                "archived": archived,
+                "messages": messages,
+                "by_source": by_source,
+            }
+        finally:
+            db.close()
+
+    return await _run_session_db_io(_stats)
 
 
 def _open_session_db_for_profile(profile: Optional[str]):
