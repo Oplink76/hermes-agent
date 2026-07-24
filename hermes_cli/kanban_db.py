@@ -984,6 +984,79 @@ def _legacy_status(row: Any) -> str:
     return "ready"
 
 
+def _v2_board(conn: sqlite3.Connection) -> bool:
+    """Return True when ``conn`` is attached to a v2-opted-in product board."""
+    meta = product_board_metadata(_board_slug_for_connection(conn))
+    return bool(meta) and _handoff_v2_enabled(meta)
+
+
+def _refresh_legacy_status(conn: sqlite3.Connection, task_id: str) -> None:
+    """Recompute and persist the derived ``status`` column for a task."""
+    row = conn.execute(
+        "SELECT current_step_key, running, blocked FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+    conn.execute(
+        "UPDATE tasks SET status = ? WHERE id = ?", (_legacy_status(row), task_id)
+    )
+
+
+def set_phase(conn: sqlite3.Connection, task_id: str, phase: str) -> None:
+    """Set the v2 ``current_step_key`` phase and refresh derived status.
+
+    No-op on non-v2 (legacy) boards -- see module docs on the v2 state model.
+    """
+    if not _v2_board(conn):
+        return
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET current_step_key = ? WHERE id = ?", (phase, task_id)
+        )
+        _refresh_legacy_status(conn, task_id)
+
+
+def set_running(conn: sqlite3.Connection, task_id: str, value: bool) -> None:
+    """Set the v2 ``running`` flag and refresh derived status.
+
+    No-op on non-v2 (legacy) boards -- see module docs on the v2 state model.
+    """
+    if not _v2_board(conn):
+        return
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET running = ? WHERE id = ?", (1 if value else 0, task_id)
+        )
+        _refresh_legacy_status(conn, task_id)
+
+
+def set_blocked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    value: bool,
+    reason: Optional[str] = None,
+) -> None:
+    """Set the v2 ``blocked`` flag and refresh derived status.
+
+    When ``value`` is True and ``reason`` is not None, also records ``reason``
+    in ``last_failure_error``. No-op on non-v2 (legacy) boards -- see module
+    docs on the v2 state model.
+    """
+    if not _v2_board(conn):
+        return
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET blocked = ? WHERE id = ?", (1 if value else 0, task_id)
+        )
+        if value and reason is not None:
+            conn.execute(
+                "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                (reason, task_id),
+            )
+        _refresh_legacy_status(conn, task_id)
+
+
 def _product_ai_provenance_required(meta: Optional[dict]) -> bool:
     wf = _product_workflow_dict(meta)
     for key in ("ai_provenance_required", "require_ai_provenance"):

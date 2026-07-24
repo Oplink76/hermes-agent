@@ -2687,6 +2687,85 @@ def test_legacy_status_maps_phase_and_flags_by_precedence():
     assert kb._legacy_status({"current_step_key": "development", "running": None, "blocked": None}) == "ready"
 
 
+def _make_v2_product_board(board: str, monkeypatch) -> None:
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    kb.create_board(board, name="V2 Product", preset="product")
+    meta_path = kb.board_metadata_path(board)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta.setdefault("product_workflow", {})["handoff_v2"] = True
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+
+def _make_legacy_product_board(board: str, monkeypatch) -> None:
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    kb.create_board(board, name="Legacy Product", preset="product")
+
+
+def _read_state(conn, tid):
+    return conn.execute(
+        "SELECT status, running, blocked, current_step_key, last_failure_error "
+        "FROM tasks WHERE id = ?",
+        (tid,),
+    ).fetchone()
+
+
+def test_set_running_set_phase_set_blocked_v2_board(kanban_home, monkeypatch):
+    board = "v2-writers-product"
+    _make_v2_product_board(board, monkeypatch)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(conn, title="Story: v2 writers", current_step_key="development")
+
+        kb.set_running(conn, tid, True)
+        row = _read_state(conn, tid)
+        assert row["running"] == 1
+        assert row["status"] == "running"
+
+        kb.set_running(conn, tid, False)
+        row = _read_state(conn, tid)
+        assert row["running"] == 0
+        assert row["status"] == "ready"
+
+        kb.set_phase(conn, tid, "review")
+        row = _read_state(conn, tid)
+        assert row["current_step_key"] == "review"
+        assert row["status"] == "review"
+
+        kb.set_blocked(conn, tid, True, reason="needs API key")
+        row = _read_state(conn, tid)
+        assert row["blocked"] == 1
+        assert row["status"] == "blocked"
+        assert row["last_failure_error"] == "needs API key"
+
+        kb.set_blocked(conn, tid, False)
+        row = _read_state(conn, tid)
+        assert row["blocked"] == 0
+        assert row["status"] != "blocked"
+
+
+def test_set_running_set_phase_set_blocked_legacy_board_is_noop(kanban_home, monkeypatch):
+    board = "legacy-writers-product"
+    _make_legacy_product_board(board, monkeypatch)
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(conn, title="Story: legacy writers", current_step_key="development")
+        before = _read_state(conn, tid)
+
+        kb.set_running(conn, tid, True)
+        kb.set_blocked(conn, tid, True, reason="x")
+        kb.set_phase(conn, tid, "review")
+
+        after = _read_state(conn, tid)
+
+    assert after["running"] == before["running"] == 0
+    assert after["blocked"] == before["blocked"] == 0
+    assert after["status"] == before["status"]
+    assert after["current_step_key"] == before["current_step_key"]
+    assert after["last_failure_error"] == before["last_failure_error"]
+
+
 def test_product_completion_advances_card_to_next_role(kanban_home):
     kb.create_board("prod", preset="product")
     with kb.connect(board="prod") as conn:
