@@ -422,7 +422,7 @@ def _terminate_process_tree(
     else:
         group_deadline = time.monotonic() + 0.5
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            os.killpg(process.pid, signal.SIGTERM)  # windows-footgun: ok
         except (ProcessLookupError, PermissionError):
             pass
         try:
@@ -432,13 +432,13 @@ def _terminate_process_tree(
 
         while time.monotonic() < group_deadline:
             try:
-                os.killpg(process.pid, 0)
+                os.killpg(process.pid, 0)  # windows-footgun: ok
             except (ProcessLookupError, PermissionError):
                 break
             time.sleep(_PROCESS_POLL_SECONDS)
         else:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                os.killpg(process.pid, signal.SIGKILL)  # windows-footgun: ok
             except (ProcessLookupError, PermissionError):
                 pass
     try:
