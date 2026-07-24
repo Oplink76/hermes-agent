@@ -1,6 +1,6 @@
 # Fork Sync Recommendation Handover Design
 
-**Status:** Approved direction; written-spec review pending
+**Status:** Approved
 
 **Date:** 2026-07-24
 
