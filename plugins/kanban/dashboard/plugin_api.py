@@ -2285,7 +2285,15 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
     results: list[dict] = []
     board = _resolve_board(board)
     if kanban_intake.qualification_required(kanban_db.read_board_metadata(board)):
-        if payload.status is not None or payload.archive or payload.assignee is not None:
+        if (
+            payload.status is not None
+            or payload.archive
+            or payload.assignee is not None
+            or payload.priority is not None
+            or payload.result is not None
+            or payload.summary is not None
+            or payload.metadata is not None
+        ):
             raise HTTPException(
                 status_code=409,
                 detail=(
