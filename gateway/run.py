@@ -9446,6 +9446,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 return "Could not start /learn — please try again."
 
+        if canonical in {"project-create", "project-import"}:
+            from hermes_cli.project_workflows import (
+                build_project_create_prompt,
+                build_project_import_prompt,
+                project_workflow_usage,
+            )
+
+            _project_req = event.get_command_args().strip()
+            if not _project_req:
+                return project_workflow_usage()
+            try:
+                if canonical == "project-create":
+                    event.text = build_project_create_prompt(_project_req)
+                    _ack = "Starting project creation workflow…"
+                else:
+                    event.text = build_project_import_prompt(_project_req)
+                    _ack = "Starting project import workflow…"
+                try:
+                    adapter = self.adapters.get(source.platform)
+                    if adapter:
+                        _ack_meta = self._thread_metadata_for_source(source)
+                        await adapter.send(str(source.chat_id), _ack, metadata=_ack_meta)
+                except Exception:
+                    logger.debug("project workflow ack send failed", exc_info=True)
+                # fall through to normal agent processing so clarify/tool use works
+            except Exception:
+                return "Could not start project workflow — please try again."
+
         if canonical == "fast":
             return await self._handle_fast_command(event)
 
