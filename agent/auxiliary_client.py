@@ -46,14 +46,17 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import threading
 import time
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
+
+from cli_emulated_routes import CLI_EMULATED_ROUTES
 
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # openai SDK pulls a large type tree (~240 ms cold, including responses/*,
@@ -6476,7 +6479,7 @@ def _resolve_task_provider_model(
         except Exception:
             # Keep the high-risk provider-backed routes safe even if provider
             # catalog loading is unavailable during early import/test paths.
-            return normalized in {
+            return normalized in CLI_EMULATED_ROUTES or normalized in {
                 "anthropic",
                 "copilot",
                 "copilot-acp",
@@ -6616,6 +6619,30 @@ def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
     if timeout is None and task == "compression":
         effective = max(effective, _COMPRESSION_TIMEOUT_FLOOR_SECONDS)
     return effective
+
+
+def _cli_timeout(timeout: Any, provider_timeout: Any) -> Optional[float]:
+    """Resolve a finite CLI deadline without inheriting the generic 30s default."""
+
+    candidate = timeout
+    if candidate is not None and not isinstance(candidate, (int, float)):
+        # Streaming callers can carry an httpx.Timeout intended for the HTTP
+        # transport.  Its read budget is the closest bounded equivalent for a
+        # blocking CLI completion.
+        candidate = getattr(candidate, "read", None)
+
+    values: list[float] = []
+    for raw in (candidate, provider_timeout):
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("CLI completion timeout must be numeric") from exc
+        if not math.isfinite(value) or value <= 0:
+            raise RuntimeError("CLI completion timeout must be finite and positive")
+        values.append(value)
+    return min(values) if values else None
 
 
 def _get_task_extra_body(task: str) -> Dict[str, Any]:
@@ -7123,6 +7150,7 @@ def call_llm(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
+    is_cancelled: Optional[Callable[[], bool]] = None,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -7154,6 +7182,8 @@ def call_llm(
             output can stream to the user.
         stream_options: Passed through to the request when stream is True
             (e.g. {"include_usage": True}).
+        is_cancelled: Optional owner-scoped cancellation check for blocking
+            CLI-backed MoA calls. HTTP providers ignore it.
 
     Returns:
         Response object with .choices[0].message.content, OR — when stream=True —
@@ -7173,6 +7203,41 @@ def call_llm(
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    normalized_cli_route = str(resolved_base_url or "").rstrip("/")
+    if resolved_provider in CLI_EMULATED_ROUTES or normalized_cli_route.startswith("cli://"):
+        if CLI_EMULATED_ROUTES.get(resolved_provider) != normalized_cli_route:
+            raise RuntimeError(
+                "Private cli:// route does not match a canonical CLI provider"
+            )
+        if task not in {"moa_reference", "moa_aggregator"}:
+            raise RuntimeError(
+                f"Provider '{resolved_provider}' is available only to MoA "
+                "reference and aggregator slots"
+            )
+        if tools:
+            raise RuntimeError(
+                f"Provider '{resolved_provider}' does not support Hermes tool payloads"
+            )
+        from agent.cli_emulated_provider import create_cli_completion
+        from hermes_cli.timeouts import get_provider_request_timeout
+
+        provider_timeout = get_provider_request_timeout(
+            resolved_provider,
+            resolved_model,
+        )
+        cli_timeout = _cli_timeout(timeout, provider_timeout)
+
+        return create_cli_completion(
+            provider=resolved_provider,
+            base_url=resolved_base_url or base_url or "",
+            model=resolved_model or model or "default",
+            messages=messages,
+            stream=stream,
+            timeout=cli_timeout,
+            cancel_check=is_cancelled,
+        )
+
+    effective_timeout = _effective_aux_timeout(task, timeout)
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -7242,8 +7307,6 @@ def call_llm(
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
-
-    effective_timeout = _effective_aux_timeout(task, timeout)
 
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")

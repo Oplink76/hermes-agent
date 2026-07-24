@@ -1177,6 +1177,112 @@ def test_references_parallel_interrupt_aborts_wait(monkeypatch):
         release_wedged.set()  # don't leak a blocked thread past the test
 
 
+def test_reference_call_receives_owner_scoped_cancel_check(monkeypatch):
+    from agent import moa_loop
+
+    fake_agent = SimpleNamespace(_interrupt_requested=False)
+    captured = []
+
+    def fake_call_llm(**kwargs):
+        captured.append(kwargs)
+        return _response("advice")
+
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+    moa_loop._run_references_parallel(
+        [
+            {"provider": "claude-cli", "model": "default"},
+            {"provider": "claude-cli", "model": "sonnet"},
+        ],
+        [{"role": "user", "content": "hi"}],
+        agent=fake_agent,
+    )
+
+    check = captured[0]["is_cancelled"]
+    assert captured[1]["is_cancelled"] is check
+    assert check() is False
+    fake_agent._interrupt_requested = True
+    assert check() is True
+
+
+def test_disabled_cli_reference_fails_before_completion_dispatch(monkeypatch):
+    from agent import moa_loop
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"providers": {"claude-cli": {"enabled": False}}},
+    )
+    monkeypatch.setattr(
+        moa_loop,
+        "call_llm",
+        lambda **_kwargs: pytest.fail("disabled provider must not dispatch"),
+    )
+
+    _label, output, accounting = moa_loop._run_reference(
+        {"provider": "claude-cli", "model": "default"},
+        [{"role": "user", "content": "hi"}],
+    )
+
+    assert output == "[failed: claude-cli provider is disabled]"
+    assert accounting.usage.request_count == 0
+
+
+def test_one_shot_aggregator_receives_owner_scoped_cancel_check(monkeypatch):
+    from agent import moa_loop
+
+    fake_agent = SimpleNamespace(_interrupt_requested=False)
+    captured = []
+    monkeypatch.setattr(
+        moa_loop,
+        "_run_references_parallel",
+        lambda *args, **kwargs: [("advisor", "advice", None)],
+    )
+
+    def fake_call_llm(**kwargs):
+        captured.append(kwargs)
+        return _response("synthesis")
+
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+    moa_loop.aggregate_moa_context(
+        user_prompt="question",
+        api_messages=[{"role": "user", "content": "question"}],
+        reference_models=[{"provider": "claude-cli", "model": "default"}],
+        aggregator={"provider": "claude-cli", "model": "default"},
+        agent=fake_agent,
+    )
+
+    check = captured[0]["is_cancelled"]
+    assert check() is False
+    fake_agent._interrupt_requested = True
+    assert check() is True
+
+
+def test_facade_aggregator_receives_owner_scoped_cancel_check(monkeypatch, tmp_path):
+    from agent import moa_loop
+
+    home = tmp_path / ".hermes"
+    _ref_config(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    fake_agent = SimpleNamespace(_interrupt_requested=False)
+    captured = []
+
+    def fake_call_llm(**kwargs):
+        captured.append(kwargs)
+        content = "advice" if kwargs["task"] == "moa_reference" else "answer"
+        return _response(content)
+
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+    facade = moa_loop.MoAChatCompletions("review", agent=fake_agent)
+    facade.create(messages=[{"role": "user", "content": "question"}], tools=[])
+
+    aggregator_call = next(
+        call for call in captured if call["task"] == "moa_aggregator"
+    )
+    check = aggregator_call["is_cancelled"]
+    assert check() is False
+    fake_agent._interrupt_requested = True
+    assert check() is True
+
+
 def _ref_config(home, fanout: str | None = None):
     home.mkdir()
     fanout_line = f"\n      fanout: {fanout}" if fanout else ""
@@ -1462,12 +1568,14 @@ moa:
     # Two advisors × (1000 input, 100 output) = 2000 input, 200 output.
     assert usage.input_tokens == 2000
     assert usage.output_tokens == 200
+    assert usage.request_count == 2
     # Two advisors × $0.01 each = $0.02.
     assert cost == pytest.approx(0.02)
 
     # consume clears — a second consume with no new create() is zeroed.
     usage2, cost2 = facade.consume_reference_usage()
     assert usage2.input_tokens == 0
+    assert usage2.request_count == 0
     assert cost2 is None
 
     # A repeat create() with the SAME advisory view is a cache HIT: advisors
@@ -2315,6 +2423,38 @@ def test_moa_facade_acts_aggregator_alone_when_all_references_fail_silent(
     assert "Mixture of Agents reference context" not in prompt
 
 
+def test_agent_cancel_check_latches_owner_interrupt() -> None:
+    from agent.moa_loop import _agent_cancel_check
+
+    fake_agent = SimpleNamespace(_interrupt_requested=False)
+    cancel_check = _agent_cancel_check(fake_agent)
+
+    assert cancel_check is not None
+    assert cancel_check() is False
+    fake_agent._interrupt_requested = True
+    assert cancel_check() is True
+    fake_agent._interrupt_requested = False
+    assert cancel_check() is True
+
+
+def test_pre_cancelled_fanout_does_not_start_references(monkeypatch):
+    from agent import moa_loop
+
+    monkeypatch.setattr(
+        moa_loop,
+        "_run_reference",
+        lambda *args, **kwargs: pytest.fail("pre-cancelled fanout must not start"),
+    )
+
+    out = moa_loop._run_references_parallel(
+        [{"provider": "claude-cli", "model": "default"}],
+        [{"role": "user", "content": "hi"}],
+        agent=SimpleNamespace(_interrupt_requested=True),
+    )
+
+    assert out[0][1] == moa_loop._INTERRUPTED_REFERENCE_NOTE
+
+
 def test_interrupted_but_completed_reference_keeps_real_accounting(monkeypatch):
     """A reference that finishes between the interrupt check and the reap
     must keep its REAL output and accounting — the call billed."""
@@ -2325,7 +2465,7 @@ def test_interrupted_but_completed_reference_keeps_real_accounting(monkeypatch):
     monkeypatch.setattr(moa_loop, "get_transport", lambda *_a, **_k: None)
     monkeypatch.setattr(moa_loop, "_REFERENCE_POLL_INTERVAL_S", 0.05)
 
-    fake_agent = SimpleNamespace(_interrupt_requested=True)
+    fake_agent = SimpleNamespace(_interrupt_requested=False)
 
     def fake_call_llm(**kwargs):
         return _response_with_usage("slowish output", prompt=11, completion=4)
@@ -2336,6 +2476,7 @@ def test_interrupted_but_completed_reference_keeps_real_accounting(monkeypatch):
     # and keep the real result instead of writing a placeholder.
     def fake_wait(pending, timeout=None):
         real_wait(pending)  # let the call actually finish (it billed)
+        fake_agent._interrupt_requested = True
         return set(), set(pending)  # report it as still pending
 
     monkeypatch.setattr(moa_loop, "_futures_wait", fake_wait)
@@ -2404,9 +2545,9 @@ def test_late_completing_interrupted_reference_feeds_accounting_sink(monkeypatch
         late_accounting_sink=sink,
     )
 
-    # The wedged slot returned a placeholder with zeroed accounting…
+    # The wedged slot returned a placeholder with no counted request.
     assert out[1][1] == moa_loop._INTERRUPTED_REFERENCE_NOTE
-    assert out[1][2].usage.input_tokens == 0
+    assert out[1][2].usage.request_count == 0
 
     # …then completes late; its real billed usage must reach the sink.
     release.set()

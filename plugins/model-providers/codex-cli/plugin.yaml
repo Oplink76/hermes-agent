@@ -1,0 +1,4 @@
+name: codex-cli
+kind: model-provider
+version: 1.0.0
+description: Explicitly opted-in read-only Codex CLI agent for MoA only

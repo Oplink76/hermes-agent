@@ -23,6 +23,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from cli_emulated_routes import CLI_EMULATED_ROUTES
 from utils import base_url_host_matches, base_url_hostname
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,16 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         transport="openai_chat",
         auth_type="virtual",
         base_url_override="moa://local",
+    ),
+    "claude-cli": HermesOverlay(
+        transport="openai_chat",
+        auth_type="external_process",
+        base_url_override=CLI_EMULATED_ROUTES["claude-cli"],
+    ),
+    "codex-cli": HermesOverlay(
+        transport="openai_chat",
+        auth_type="external_process",
+        base_url_override=CLI_EMULATED_ROUTES["codex-cli"],
     ),
     "openrouter": HermesOverlay(
         transport="openai_chat",

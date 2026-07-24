@@ -13,10 +13,11 @@ import logging
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
-from typing import Any
+from typing import Any, Callable
 
 from agent.auxiliary_client import call_llm
 from agent.message_content import flatten_message_text
+from cli_emulated_routes import CLI_EMULATED_ROUTES
 from agent.transports import get_transport
 
 logger = logging.getLogger(__name__)
@@ -330,6 +331,18 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
     provider = str(slot.get("provider") or "").strip()
     model = str(slot.get("model") or "").strip()
     out: dict[str, Any] = {"provider": provider, "model": model}
+    if provider in CLI_EMULATED_ROUTES:
+        from hermes_cli.config import is_provider_enabled, load_config
+
+        provider_config = (load_config().get("providers") or {}).get(provider)
+        if not is_provider_enabled(provider_config):
+            raise RuntimeError(f"{provider} provider is disabled")
+        return {
+            **out,
+            "base_url": CLI_EMULATED_ROUTES[provider],
+            "api_key": "",
+            "api_mode": "chat_completions",
+        }
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -431,6 +444,7 @@ def _run_reference(
     max_tokens: int | None = None,
     reference_timeout: float | None = None,
     context_length_cache: Any = None,
+    is_cancelled: Any = None,
 ) -> tuple[str, str, Any]:
     """Call one reference model and return ``(label, text, accounting)``.
 
@@ -459,8 +473,8 @@ def _run_reference(
     from agent.usage_pricing import CanonicalUsage, estimate_usage_cost, normalize_usage
 
     label = _slot_label(slot)
-    runtime = _slot_runtime(slot)
     try:
+        runtime = _slot_runtime(slot)
         # Prepend the advisory-role system prompt so the reference understands
         # it is analyzing state for an aggregator, not acting on the task. The
         # trimmed view (_reference_messages) already strips the agent's own
@@ -524,9 +538,10 @@ def _run_reference(
             timeout=reference_timeout,
             reasoning_config=_slot_reasoning_config(slot),
             extra_headers=extra_headers,
+            is_cancelled=is_cancelled,
             **runtime,
         )
-        usage = CanonicalUsage()
+        usage = CanonicalUsage(request_count=0)
         raw_usage = getattr(response, "usage", None)
         if raw_usage:
             try:
@@ -536,7 +551,7 @@ def _run_reference(
                     api_mode=runtime.get("api_mode"),
                 )
             except Exception:  # pragma: no cover - defensive
-                usage = CanonicalUsage()
+                usage = CanonicalUsage(request_count=0)
         # Price this advisor at ITS OWN model/provider rate (with correct
         # cache-read/cache-write split), not the aggregator's. This is why
         # advisor cost is summed as dollars rather than by folding tokens into
@@ -544,19 +559,20 @@ def _run_reference(
         cost_usd = None
         cost_status = None
         cost_source = None
-        try:
-            cost = estimate_usage_cost(
-                slot.get("model") or "",
-                usage,
-                provider=runtime.get("provider"),
-                base_url=runtime.get("base_url"),
-                api_key=runtime.get("api_key"),
-            )
-            cost_usd = cost.amount_usd
-            cost_status = cost.status
-            cost_source = cost.source
-        except Exception:  # pragma: no cover - defensive
-            pass
+        if usage.request_count:
+            try:
+                cost = estimate_usage_cost(
+                    slot.get("model") or "",
+                    usage,
+                    provider=runtime.get("provider"),
+                    base_url=runtime.get("base_url"),
+                    api_key=runtime.get("api_key"),
+                )
+                cost_usd = cost.amount_usd
+                cost_status = cost.status
+                cost_source = cost.source
+            except Exception:  # pragma: no cover - defensive
+                pass
         _output_text = _extract_text(response) or "(empty response)"
         acct = _RefAccounting(
             usage,
@@ -572,12 +588,13 @@ def _run_reference(
         return label, _output_text, acct
     except Exception as exc:
         logger.warning("MoA reference model %s failed: %s", label, exc)
+        failed_provider = locals().get("runtime", {}).get("provider") or slot.get("provider")
         return label, f"[failed: {exc}]", _RefAccounting(
-            CanonicalUsage(),
+            CanonicalUsage(request_count=0),
             messages=[{"role": "system", "content": _REFERENCE_SYSTEM_PROMPT}, *ref_messages],
             output=f"[failed: {exc}]",
             model=slot.get("model"),
-            provider=runtime.get("provider") or slot.get("provider"),
+            provider=failed_provider,
             temperature=temperature,
         )
 
@@ -722,6 +739,19 @@ def _trim_messages_for_reference(
 
 _REFERENCE_POLL_INTERVAL_S = 5.0
 
+
+def _agent_cancel_check(agent: Any) -> Callable[[], bool] | None:
+    if agent is None:
+        return None
+    cancelled = threading.Event()
+
+    def _is_cancelled() -> bool:
+        if getattr(agent, "_interrupt_requested", False):
+            cancelled.set()
+        return cancelled.is_set()
+
+    return _is_cancelled
+
 # Sentinel text for a reference slot whose wait was aborted by a user
 # interrupt. Shared by _run_references_parallel (which writes it) and the
 # facade cache logic (which must never cache it as real advice).
@@ -790,18 +820,27 @@ def _run_references_parallel(
     completed = 0
     executor = ThreadPoolExecutor(max_workers=workers)
     interrupted = False
+    is_cancelled = _agent_cancel_check(agent)
     # Per-fan-out context-length cache shared by every reference worker, so
     # duplicate (provider, model) slots resolve their window once per turn
     # instead of re-probing metadata sources per reference (dict get/set is
     # GIL-atomic; a rare duplicate probe on a first-use race is harmless).
     _ctx_len_cache: dict[tuple[str, str], int | None] = {}
+    cancelled_before_fanout = is_cancelled is not None and is_cancelled()
     try:
         for idx, slot in enumerate(reference_models):
+            if cancelled_before_fanout:
+                results[idx] = (
+                    _slot_label(slot),
+                    _INTERRUPTED_REFERENCE_NOTE,
+                    _RefAccounting(CanonicalUsage(request_count=0)),
+                )
+                continue
             if slot.get("provider") == "moa":
                 results[idx] = (
                     _slot_label(slot),
                     "[skipped: MoA presets cannot recursively reference MoA]",
-                    _RefAccounting(CanonicalUsage()),
+                    _RefAccounting(CanonicalUsage(request_count=0)),
                 )
                 continue
             futures[
@@ -813,6 +852,7 @@ def _run_references_parallel(
                     max_tokens=max_tokens,
                     reference_timeout=reference_timeout,
                     context_length_cache=_ctx_len_cache,
+                    is_cancelled=is_cancelled,
                 )
             ] = idx
 
@@ -848,7 +888,7 @@ def _run_references_parallel(
                     results[idx] = (
                         _slot_label(reference_models[idx]),
                         _INTERRUPTED_REFERENCE_NOTE,
-                        _RefAccounting(CanonicalUsage()),
+                        _RefAccounting(CanonicalUsage(request_count=0)),
                     )
                 elif future.done():
                     # Finished between the interrupt check and now — the call
@@ -866,7 +906,7 @@ def _run_references_parallel(
                     results[idx] = (
                         label,
                         _INTERRUPTED_REFERENCE_NOTE,
-                        _RefAccounting(CanonicalUsage()),
+                        _RefAccounting(CanonicalUsage(request_count=0)),
                     )
                     if late_accounting_sink is not None:
                         def _record_late(f: Any, _label: str = label) -> None:
@@ -1279,6 +1319,7 @@ def aggregate_moa_context(
             messages=agg_messages,
             temperature=aggregator_temperature,
             reasoning_config=_aggregator_reasoning_config(aggregator),
+            is_cancelled=_agent_cancel_check(agent),
             **agg_runtime,
         )
         synthesis = _extract_text(response)
@@ -1340,6 +1381,8 @@ class MoAChatCompletions:
     """OpenAI-chat-compatible facade where the aggregator is the acting model."""
 
     def __init__(self, preset_name: str, reference_callback: Any = None, agent: Any = None):
+        from agent.usage_pricing import CanonicalUsage
+
         self.preset_name = preset_name or "default"
         # Optional display hook. Called as reference outputs become available so
         # frontends can show each reference model's answer as a labelled block
@@ -1380,9 +1423,7 @@ class MoAChatCompletions:
         # accounting. Set on every create() (zeroed on a cache HIT so per-turn
         # advisor spend is counted exactly once). Consumed via
         # ``consume_reference_usage``.
-        from agent.usage_pricing import CanonicalUsage
-
-        self._pending_reference_usage: Any = CanonicalUsage()
+        self._pending_reference_usage: Any = CanonicalUsage(request_count=0)
         self._pending_reference_cost: Any = None
         # Guards pending usage/cost against concurrent late-accounting
         # callbacks (see _record_late_reference_accounting), which fire on
@@ -1415,15 +1456,15 @@ class MoAChatCompletions:
         Returns ``(CanonicalUsage, cost_usd_or_None)`` for the most recent
         ``create()`` and clears the pending values, so a subsequent read (e.g.
         a streaming retry re-entering accounting) cannot double-count. Usage is
-        always a ``CanonicalUsage`` (zeroed if none); cost is a summed-dollars
-        float or ``None`` when no advisor could be priced.
+        always a ``CanonicalUsage`` (with request_count=0 if none); cost is a
+        summed-dollars float or ``None`` when no advisor could be priced.
         """
         from agent.usage_pricing import CanonicalUsage
 
         with self._accounting_lock:
-            usage = self._pending_reference_usage or CanonicalUsage()
+            usage = self._pending_reference_usage or CanonicalUsage(request_count=0)
             cost = self._pending_reference_cost
-            self._pending_reference_usage = CanonicalUsage()
+            self._pending_reference_usage = CanonicalUsage(request_count=0)
             self._pending_reference_cost = None
         return usage, cost
 
@@ -1446,7 +1487,7 @@ class MoAChatCompletions:
         with self._accounting_lock:
             if isinstance(accounting.usage, CanonicalUsage):
                 self._pending_reference_usage = (
-                    self._pending_reference_usage or CanonicalUsage()
+                    self._pending_reference_usage or CanonicalUsage(request_count=0)
                 ) + accounting.usage
             if accounting.cost_usd is not None:
                 self._pending_reference_cost = (
@@ -1592,6 +1633,12 @@ class MoAChatCompletions:
             if api_kwargs.get("timeout") is not None:
                 stream_kwargs["timeout"] = api_kwargs["timeout"]
         agg_runtime = _slot_runtime(aggregator)
+        # Phase-one CLI aggregators are deliberately text-only. They may write
+        # the final MoA answer, but they cannot emit Hermes tool calls; keeping
+        # tool schemas out of this one request preserves that boundary while
+        # direct CLI acting-model support remains deferred.
+        if str(agg_runtime.get("base_url") or "").startswith("cli://"):
+            tools = None
         # _slot_runtime may carry the provider's request_overrides.extra_body;
         # pop it and merge with the caller's extra_body (caller wins) so the
         # explicit kwarg below never collides with **agg_runtime.
@@ -1609,6 +1656,7 @@ class MoAChatCompletions:
             # Prepared requests must retain the acting aggregator's reasoning
             # policy exactly as the direct create() path does (#64187).
             reasoning_config=_aggregator_reasoning_config(aggregator),
+            is_cancelled=_agent_cancel_check(self._agent),
             **stream_kwargs,
             **agg_runtime,
         )
@@ -1858,7 +1906,7 @@ class MoAChatCompletions:
             # because each advisor was priced at its OWN model rate — advisors
             # may be cheaper/pricier than the aggregator, so their tokens must
             # NOT be repriced at the aggregator's rate.
-            _ref_usage = CanonicalUsage()
+            _ref_usage = CanonicalUsage(request_count=0)
             _ref_cost: Any = None
             for _lbl, _txt, _acct in reference_outputs:
                 if isinstance(_acct, _RefAccounting):
@@ -1871,7 +1919,7 @@ class MoAChatCompletions:
                 # reference from a PREVIOUS turn may have deposited its real
                 # spend here between consume() calls — keep it.
                 self._pending_reference_usage = (
-                    self._pending_reference_usage or CanonicalUsage()
+                    self._pending_reference_usage or CanonicalUsage(request_count=0)
                 ) + _ref_usage
                 if _ref_cost is not None:
                     self._pending_reference_cost = (
