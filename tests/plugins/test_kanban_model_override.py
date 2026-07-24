@@ -215,11 +215,22 @@ def _create(client, **kwargs):
     return r.json()["task"]
 
 
+def _expected_snapshot(task):
+    return {
+        f"expected_{field}": task[field]
+        for field in kb.TASK_SNAPSHOT_FIELDS
+    }
+
+
 def test_patch_sets_model_override(client):
     task = _create(client)
     r = client.patch(
         f"/api/plugins/kanban/tasks/{task['id']}",
-        json={"model_override": "gpt-5.6-sol", "provider_override": "openai"},
+        json={
+            "model_override": "gpt-5.6-sol",
+            "provider_override": "openai",
+            **_expected_snapshot(task),
+        },
     )
     assert r.status_code == 200, r.text
     updated = r.json()["task"]
@@ -234,7 +245,7 @@ def test_patch_clears_model_override(client):
     assert task["model_override"] == "gpt-5.6-sol"
     r = client.patch(
         f"/api/plugins/kanban/tasks/{task['id']}",
-        json={"clear_model_override": True},
+        json={"clear_model_override": True, **_expected_snapshot(task)},
     )
     assert r.status_code == 200, r.text
     updated = r.json()["task"]
@@ -246,7 +257,11 @@ def test_patch_provider_without_model_is_400(client):
     task = _create(client)
     r = client.patch(
         f"/api/plugins/kanban/tasks/{task['id']}",
-        json={"model_override": "", "provider_override": "openai"},
+        json={
+            "model_override": "",
+            "provider_override": "openai",
+            **_expected_snapshot(task),
+        },
     )
     assert r.status_code == 400
 
@@ -268,6 +283,10 @@ def test_bulk_model_override(client):
             "ids": [t1["id"], t2["id"]],
             "model_override": "fallback-model",
             "provider_override": "nous",
+            "expected_snapshots": {
+                t1["id"]: _expected_snapshot(t1),
+                t2["id"]: _expected_snapshot(t2),
+            },
         },
     )
     assert r.status_code == 200, r.text
