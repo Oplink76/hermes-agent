@@ -21,6 +21,12 @@ from ops.cloudadvisor.hermes_ops.runtime import (
 )
 
 
+requires_posix_symlinks = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="runtime identity fixture requires POSIX symlinks",
+)
+
+
 @dataclass(frozen=True)
 class Call:
     argv: tuple[str, ...]
@@ -76,11 +82,11 @@ class PlutilRunner:
         )
 
 
-def _runtime_fixture(tmp_path: Path):
+def _runtime_fixture(tmp_path: Path, *, venv_name: str = ".venv"):
     if sys.platform == "win32":
         pytest.skip("runtime identity fixture requires POSIX symlinks")
     install_root = tmp_path / "hermes-agent"
-    venv_python = install_root / ".venv" / "bin" / "python"
+    venv_python = install_root / venv_name / "bin" / "python"
     venv_python.parent.mkdir(parents=True)
     venv_python.symlink_to(Path(sys.executable).resolve())
 
@@ -113,7 +119,7 @@ def _runtime_fixture(tmp_path: Path):
                 ],
                 "EnvironmentVariables": {
                     "HERMES_HOME": str(home),
-                    "VIRTUAL_ENV": str(install_root / ".venv"),
+                    "VIRTUAL_ENV": str(install_root / venv_name),
                 },
             },
             handle,
@@ -232,6 +238,241 @@ def test_inventory_uses_immutable_deployment_sha_not_checkout_head(tmp_path: Pat
 
     assert observation.healthy is True
     assert observation.expected_sha == "deployed-sha"
+
+
+@requires_posix_symlinks
+def test_inventory_accepts_standard_venv_without_dot_prefix(tmp_path: Path):
+    """A managed install may use venv/ instead of .venv/ - both are approved."""
+    install_root, target, _, responses = _runtime_fixture(tmp_path, venv_name="venv")
+
+    observation = inventory(
+        [target],
+        install_root=install_root,
+        expected_sha="deployed-sha",
+        uid=501,
+        runner=FakeRunner(responses),
+    )[0]
+
+    assert observation.healthy is True
+    assert all(_checks(observation).values())
+
+
+@requires_posix_symlinks
+def test_inventory_rejects_sibling_python_binary_in_plist(tmp_path: Path):
+    """A sibling executable (python3) alongside the approved interpreter must
+    never be trusted merely for living under the same venv root."""
+    install_root, target, _, responses = _runtime_fixture(tmp_path)
+    sibling = install_root / ".venv" / "bin" / "python3"
+    sibling.symlink_to(Path(sys.executable).resolve())
+    with target.plist_path.open("rb") as handle:
+        plist = plistlib.load(handle)
+    plist["ProgramArguments"][0] = str(sibling)
+    with target.plist_path.open("wb") as handle:
+        plistlib.dump(plist, handle)
+
+    observation = inventory(
+        [target],
+        install_root=install_root,
+        expected_sha="deployed-sha",
+        uid=501,
+        runner=FakeRunner(responses),
+    )[0]
+
+    checks = _checks(observation)
+    assert checks["plist_uses_dot_venv"] is False
+    assert observation.healthy is False
+
+
+@requires_posix_symlinks
+def test_inventory_rejects_nested_descendant_executable_in_plist(tmp_path: Path):
+    """A file merely nested somewhere under the venv root (not bin/python
+    itself) must never be trusted, however deep the nesting."""
+    install_root, target, _, responses = _runtime_fixture(tmp_path)
+    descendant = (
+        install_root / ".venv" / "lib" / "python3.11" / "site-packages" / "evil"
+    )
+    descendant.parent.mkdir(parents=True)
+    descendant.symlink_to(Path(sys.executable).resolve())
+    with target.plist_path.open("rb") as handle:
+        plist = plistlib.load(handle)
+    plist["ProgramArguments"][0] = str(descendant)
+    with target.plist_path.open("wb") as handle:
+        plistlib.dump(plist, handle)
+
+    observation = inventory(
+        [target],
+        install_root=install_root,
+        expected_sha="deployed-sha",
+        uid=501,
+        runner=FakeRunner(responses),
+    )[0]
+
+    checks = _checks(observation)
+    assert checks["plist_uses_dot_venv"] is False
+    assert observation.healthy is False
+
+
+@requires_posix_symlinks
+def test_inventory_rejects_sibling_python_binary_in_process_command(tmp_path: Path):
+    """The observed running process must be the exact approved interpreter,
+    not merely a sibling executable resolving to the same real binary."""
+    install_root, target, _, responses = _runtime_fixture(tmp_path)
+    sibling = install_root / ".venv" / "bin" / "python3"
+    sibling.symlink_to(Path(sys.executable).resolve())
+    responses[("ps", "-p", "4321", "-o", "command=")] = (
+        0,
+        f"{sibling} -m hermes_cli.main gateway run\n",
+        "",
+    )
+
+    observation = inventory(
+        [target],
+        install_root=install_root,
+        expected_sha="deployed-sha",
+        uid=501,
+        runner=FakeRunner(responses),
+    )[0]
+
+    checks = _checks(observation)
+    assert checks["process_uses_expected_python"] is False
+    assert observation.healthy is False
+
+
+@requires_posix_symlinks
+def test_inventory_rejects_mixed_managed_interpreters(tmp_path: Path):
+    """Plist, process, and manifest must agree on one allow-listed member."""
+    install_root, target, _, responses = _runtime_fixture(tmp_path)
+    plain_python = install_root / "venv" / "bin" / "python"
+    plain_python.parent.mkdir(parents=True)
+    plain_python.symlink_to(Path(sys.executable).resolve())
+    responses[("ps", "-p", "4321", "-o", "command=")] = (
+        0,
+        f"{plain_python} -m hermes_cli.main gateway run\n",
+        "",
+    )
+
+    observation = inventory(
+        [target],
+        install_root=install_root,
+        expected_sha="deployed-sha",
+        uid=501,
+        runner=FakeRunner(responses),
+    )[0]
+
+    checks = _checks(observation)
+    assert checks["plist_uses_dot_venv"] is True
+    assert checks["manifest_uses_expected_python"] is True
+    assert checks["process_uses_expected_python"] is False
+    assert observation.healthy is False
+
+    controller = LaunchdServiceController(
+        services=[
+            LaunchdService(
+                label="ai.hermes.gateway-tradingastrid",
+                plist_path=target.plist_path,
+            )
+        ],
+        install_root=install_root,
+        uid=501,
+        runner=FakeRunner(responses),
+    )
+    service = controller.inventory()[0]
+    assert service.plist_uses_dot_venv is True
+    assert service.process_uses_dot_venv is False
+    assert service.healthy is False
+
+
+@requires_posix_symlinks
+def test_inventory_rejects_nested_descendant_in_process_and_controller(
+    tmp_path: Path,
+):
+    install_root, target, _, responses = _runtime_fixture(tmp_path)
+    descendant = install_root / ".venv" / "bin" / "tools" / "python"
+    descendant.parent.mkdir(parents=True)
+    descendant.symlink_to(Path(sys.executable).resolve())
+    responses[("ps", "-p", "4321", "-o", "command=")] = (
+        0,
+        f"{descendant} -m hermes_cli.main gateway run\n",
+        "",
+    )
+
+    observation = inventory(
+        [target],
+        install_root=install_root,
+        expected_sha="deployed-sha",
+        uid=501,
+        runner=FakeRunner(responses),
+    )[0]
+    assert _checks(observation)["process_uses_expected_python"] is False
+    assert observation.healthy is False
+
+    controller = LaunchdServiceController(
+        services=[
+            LaunchdService(
+                label="ai.hermes.gateway-tradingastrid",
+                plist_path=target.plist_path,
+            )
+        ],
+        install_root=install_root,
+        uid=501,
+        runner=FakeRunner(responses),
+    )
+    service = controller.inventory()[0]
+    assert service.process_uses_dot_venv is False
+    assert service.healthy is False
+
+
+@requires_posix_symlinks
+def test_inventory_accepts_tilde_in_declared_executable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    install_root, target, _, responses = _runtime_fixture(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    with target.plist_path.open("rb") as handle:
+        plist = plistlib.load(handle)
+    plist["ProgramArguments"][0] = str(
+        Path("~") / install_root.relative_to(tmp_path) / ".venv" / "bin" / "python"
+    )
+    with target.plist_path.open("wb") as handle:
+        plistlib.dump(plist, handle)
+
+    observation = inventory(
+        [target],
+        install_root=install_root,
+        expected_sha="deployed-sha",
+        uid=501,
+        runner=FakeRunner(responses),
+    )[0]
+
+    assert _checks(observation)["plist_uses_dot_venv"] is True
+    assert observation.healthy is True
+
+
+@requires_posix_symlinks
+def test_inventory_accepts_declared_executable_with_relative_path_segments(
+    tmp_path: Path,
+):
+    """Lexical .. segments in the declared path must normalize to the same
+    exact identity - normalization must not be confused with resolving
+    through the interpreter symlink itself."""
+    install_root, target, _, responses = _runtime_fixture(tmp_path)
+    messy = install_root / ".venv" / "bin" / ".." / "bin" / "python"
+    with target.plist_path.open("rb") as handle:
+        plist = plistlib.load(handle)
+    plist["ProgramArguments"][0] = str(messy)
+    with target.plist_path.open("wb") as handle:
+        plistlib.dump(plist, handle)
+
+    observation = inventory(
+        [target],
+        install_root=install_root,
+        expected_sha="deployed-sha",
+        uid=501,
+        runner=FakeRunner(responses),
+    )[0]
+
+    assert _checks(observation)["plist_uses_dot_venv"] is True
 
 
 def test_launchd_controller_operates_only_on_configured_services(tmp_path: Path):
@@ -355,6 +596,58 @@ def test_launchd_controller_reports_loaded_job_without_pid(tmp_path: Path):
     assert observation.healthy is False
     assert controller.loaded_services() == (label,)
     assert controller.running_services() == ()
+
+
+@requires_posix_symlinks
+def test_launchd_controller_accepts_standard_venv_without_dot_prefix(tmp_path: Path):
+    """A managed install may use venv/ instead of .venv/ - both are approved."""
+    install_root, target, _, responses = _runtime_fixture(tmp_path, venv_name="venv")
+    label = "ai.hermes.gateway-tradingastrid"
+    controller = LaunchdServiceController(
+        services=[LaunchdService(label=label, plist_path=target.plist_path)],
+        install_root=install_root,
+        uid=501,
+        runner=FakeRunner(responses),
+    )
+
+    observation = controller.inventory()[0]
+
+    assert observation.plist_uses_dot_venv is True
+    assert observation.process_uses_dot_venv is True
+    assert observation.healthy is True
+
+
+@requires_posix_symlinks
+def test_launchd_controller_rejects_sibling_python_binary(tmp_path: Path):
+    """A sibling executable (python3) must satisfy neither the declared plist
+    identity nor the observed process identity, even though the old substring
+    check would have matched on the shared .venv path segment."""
+    install_root, target, _, responses = _runtime_fixture(tmp_path)
+    sibling = install_root / ".venv" / "bin" / "python3"
+    sibling.symlink_to(Path(sys.executable).resolve())
+    label = "ai.hermes.gateway-tradingastrid"
+    with target.plist_path.open("rb") as handle:
+        plist = plistlib.load(handle)
+    plist["ProgramArguments"][0] = str(sibling)
+    with target.plist_path.open("wb") as handle:
+        plistlib.dump(plist, handle)
+    responses[("ps", "-p", "4321", "-o", "command=")] = (
+        0,
+        f"{sibling} -m hermes_cli.main gateway run\n",
+        "",
+    )
+    controller = LaunchdServiceController(
+        services=[LaunchdService(label=label, plist_path=target.plist_path)],
+        install_root=install_root,
+        uid=501,
+        runner=FakeRunner(responses),
+    )
+
+    observation = controller.inventory()[0]
+
+    assert observation.plist_uses_dot_venv is False
+    assert observation.process_uses_dot_venv is False
+    assert observation.healthy is False
 
 
 def test_runtime_health_checker_uses_approved_sha_and_one_shot_canary(

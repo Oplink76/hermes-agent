@@ -137,7 +137,6 @@ class LaunchdServiceController:
 
     def inventory(self) -> tuple[ServiceObservation, ...]:
         observations = []
-        dot_venv = self.install_root / ".venv"
         for service in self.services.values():
             plist = _load_plist(service.plist_path)
             arguments = plist.get("ProgramArguments") if plist else None
@@ -160,6 +159,10 @@ class LaunchdServiceController:
                     ["ps", "-p", str(pid), "-o", "command="],
                     cwd=self.install_root,
                 )
+            approved_executable = _managed_python_executable(
+                plist_executable, self.install_root
+            )
+            process_executable = _lexical_path(_command_executable(command))
             observations.append(
                 ServiceObservation(
                     label=service.label,
@@ -169,11 +172,11 @@ class LaunchdServiceController:
                     plist_executable=(
                         str(plist_executable) if plist_executable is not None else None
                     ),
-                    plist_uses_dot_venv=_lexically_within(
-                        plist_executable,
-                        dot_venv,
+                    plist_uses_dot_venv=approved_executable is not None,
+                    process_uses_dot_venv=(
+                        approved_executable is not None
+                        and process_executable == approved_executable
                     ),
-                    process_uses_dot_venv=bool(command and str(dot_venv) in command),
                 )
             )
         return tuple(observations)
@@ -411,16 +414,34 @@ def _resolved(value: object) -> str | None:
     return str(Path(value).expanduser().resolve(strict=False))
 
 
-def _lexically_within(path: object, parent: Path) -> bool:
-    if not isinstance(path, str) or not path.strip():
-        return False
-    candidate = Path(os.path.abspath(os.path.expanduser(path)))
-    expected_parent = Path(os.path.abspath(parent))
-    try:
-        candidate.relative_to(expected_parent)
-    except ValueError:
-        return False
-    return True
+def _lexical_path(value: object) -> Path | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return Path(os.path.abspath(os.path.expanduser(value)))
+
+
+def _managed_python_executables(install_root: Path) -> tuple[Path, ...]:
+    """The only trusted interpreter identities for an install: ``bin/python``
+    directly under a top-level ``.venv`` or ``venv`` directory.
+
+    A sibling executable (``python3``, ``pip``) or any other descendant
+    nested under the venv root is never trusted, however plausible its
+    location - identity is exact, not lexical containment.
+    """
+    root = Path(install_root).expanduser().resolve(strict=False)
+    return tuple(
+        root / venv_name / "bin" / "python" for venv_name in (".venv", "venv")
+    )
+
+
+def _managed_python_executable(
+    value: object,
+    install_root: Path,
+) -> Path | None:
+    candidate = _lexical_path(value)
+    if candidate in _managed_python_executables(install_root):
+        return candidate
+    return None
 
 
 def _check(
@@ -444,7 +465,6 @@ def inventory(
 ) -> tuple[RuntimeObservation, ...]:
     """Compare launchd, plist, process, Git, and runtime-manifest identity."""
     root = Path(install_root).expanduser().resolve(strict=False)
-    expected_python = str((root / ".venv" / "bin" / "python").resolve(strict=False))
     expected_sha = str(expected_sha).strip()
     if not expected_sha:
         raise ValueError("expected_sha must come from an immutable deployment record")
@@ -459,6 +479,12 @@ def inventory(
         arguments = plist.get("ProgramArguments") if plist else None
         arguments = arguments if isinstance(arguments, list) else []
         plist_executable = arguments[0] if arguments else None
+        expected_python = _managed_python_executable(plist_executable, root)
+        expected_python_resolved = (
+            str(expected_python.resolve(strict=False))
+            if expected_python is not None
+            else None
+        )
         environment = plist.get("EnvironmentVariables") if plist else None
         environment = environment if isinstance(environment, dict) else {}
         plist_home = _resolved(environment.get("HERMES_HOME"))
@@ -500,8 +526,8 @@ def inventory(
             ),
             _check(
                 "plist_uses_dot_venv",
-                _lexically_within(plist_executable, root / ".venv"),
-                expected=str(root / ".venv"),
+                expected_python is not None,
+                expected=tuple(str(path) for path in _managed_python_executables(root)),
                 actual=plist_executable,
             ),
             _check(
@@ -518,8 +544,9 @@ def inventory(
             ),
             _check(
                 "manifest_uses_expected_python",
-                manifest_executable == expected_python,
-                expected=expected_python,
+                expected_python_resolved is not None
+                and manifest_executable == expected_python_resolved,
+                expected=expected_python_resolved,
                 actual=manifest_executable,
             ),
             _check(
@@ -541,9 +568,10 @@ def inventory(
             ),
             _check(
                 "process_uses_expected_python",
-                _resolved(process_executable) == expected_python,
-                expected=expected_python,
-                actual=_resolved(process_executable),
+                expected_python is not None
+                and _lexical_path(process_executable) == expected_python,
+                expected=str(expected_python) if expected_python is not None else None,
+                actual=process_executable,
             ),
         )
         required_checks = (

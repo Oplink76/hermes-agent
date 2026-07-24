@@ -12,6 +12,7 @@ TARGET_HANDLERS = {
     "delete_empty_sessions_endpoint",
     "get_session_latest_descendant",
     "get_session_messages",
+    "get_session_stats",
     "delete_session_endpoint",
     "export_session_endpoint",
     "prune_sessions_endpoint",
@@ -92,5 +93,97 @@ def test_bulk_delete_sessiondb_work_runs_off_event_loop(monkeypatch):
     )
 
     assert result == {"ok": True, "deleted": 2}
+    assert db_threads
+    assert all(thread_id != loop_thread for thread_id in db_threads)
+
+
+def test_get_session_stats_sessiondb_work_runs_off_event_loop(monkeypatch):
+    loop_thread = threading.get_ident()
+    db_threads: list[int] = []
+
+    class _DB:
+        def session_count(self, include_archived=False, archived_only=False):
+            db_threads.append(threading.get_ident())
+            if archived_only:
+                return 2
+            if include_archived:
+                return 9
+            return 7
+
+        def message_count(self):
+            db_threads.append(threading.get_ident())
+            return 41
+
+        def list_sessions_rich(self, limit=None, include_archived=None, compact_rows=None):
+            db_threads.append(threading.get_ident())
+            assert limit == 10000
+            assert include_archived is True
+            assert compact_rows is True
+            return [{"source": "cli"}, {"source": "web"}, {"source": None}]
+
+        def close(self):
+            db_threads.append(threading.get_ident())
+
+    def _open(profile=None):
+        db_threads.append(threading.get_ident())
+        return _DB()
+
+    monkeypatch.setattr(web_server, "_open_session_db_for_profile", _open)
+
+    result = asyncio.run(web_server.get_session_stats())
+
+    assert result == {
+        "total": 9,
+        "active_store": 7,
+        "archived": 2,
+        "messages": 41,
+        "by_source": {"cli": 2, "web": 1},
+    }
+    assert db_threads
+    assert all(thread_id != loop_thread for thread_id in db_threads)
+
+
+def test_get_session_stats_swallows_list_sessions_rich_error_off_event_loop(monkeypatch):
+    loop_thread = threading.get_ident()
+    db_threads: list[int] = []
+    closed: list[bool] = []
+
+    class _DB:
+        def session_count(self, include_archived=False, archived_only=False):
+            db_threads.append(threading.get_ident())
+            if archived_only:
+                return 1
+            if include_archived:
+                return 5
+            return 4
+
+        def message_count(self):
+            db_threads.append(threading.get_ident())
+            return 12
+
+        def list_sessions_rich(self, limit=None, include_archived=None, compact_rows=None):
+            db_threads.append(threading.get_ident())
+            raise RuntimeError("boom")
+
+        def close(self):
+            db_threads.append(threading.get_ident())
+            closed.append(True)
+
+    def _open(profile=None):
+        db_threads.append(threading.get_ident())
+        return _DB()
+
+    monkeypatch.setattr(web_server, "_open_session_db_for_profile", _open)
+
+    result = asyncio.run(web_server.get_session_stats())
+
+    assert result == {
+        "total": 5,
+        "active_store": 4,
+        "archived": 1,
+        "messages": 12,
+        "by_source": {},
+    }
+    assert closed == [True]
     assert db_threads
     assert all(thread_id != loop_thread for thread_id in db_threads)
