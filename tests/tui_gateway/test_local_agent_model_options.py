@@ -47,6 +47,15 @@ def test_model_options_returns_all_local_agents(monkeypatch):
         "codex-cli",
         "cowork",
     ]
-    assert all(row["models"] == ["default"] for row in local_rows)
+    # "default" leads every local agent (it omits the CLI's --model flag);
+    # the two CLI agents also offer their curated model ids, Cowork does not
+    # because it selects its own model.
+    assert all(row["models"][0] == "default" for row in local_rows)
+    assert all(
+        len(row["models"]) > 1
+        for row in local_rows
+        if row["slug"] != "cowork"
+    )
+    assert next(r for r in local_rows if r["slug"] == "cowork")["models"] == ["default"]
     assert all(row["authenticated"] is False for row in local_rows)
     assert all(row["auth_type"] == "external_process" for row in local_rows)

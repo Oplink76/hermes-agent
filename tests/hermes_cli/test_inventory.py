@@ -40,6 +40,24 @@ def _cfg(model=None, providers=None, custom_providers=None) -> dict:
     }
 
 
+def _assert_local_agent_catalogs(rows_by_slug: dict) -> None:
+    """Local agents expose their real catalog, "default" first.
+
+    "default" must lead: it omits the CLI's --model flag, so the agent uses
+    its own configured default. Cowork selects its own model, so "default"
+    is its entire catalog; the two CLI agents accept --model and must offer
+    more than that. Asserted by shape, not by model id, so refreshing a
+    curated list does not break these tests.
+    """
+    for slug, row in rows_by_slug.items():
+        assert row["models"][0] == "default", slug
+        assert row["total_models"] == len(row["models"]), slug
+        if slug == "cowork":
+            assert row["models"] == ["default"]
+        else:
+            assert len(row["models"]) > 1, slug
+
+
 def test_load_picker_context_full_dict():
     cfg = _cfg(
         model={
@@ -231,7 +249,7 @@ def test_all_local_agents_remain_visible_to_explicit_desktop_catalog(
     }
 
     assert set(local) == {"claude-cli", "codex-cli", "cowork"}
-    assert all(row["models"] == ["default"] for row in local.values())
+    _assert_local_agent_catalogs(local)
     assert all(row["authenticated"] is False for row in local.values())
     assert all("no API key" in row["warning"] for row in local.values())
 
@@ -459,16 +477,18 @@ def test_include_unconfigured_appends_canonical_skeletons():
     seen_slugs = {r["slug"] for r in payload["providers"]}
     for entry in CANONICAL_PROVIDERS:
         assert entry.slug in seen_slugs, f"missing {entry.slug}"
-    # Skeletons have empty models and source='canonical'.
+    # Skeletons have empty models and source='canonical', except the local
+    # agents, which carry their curated catalog with no credentials needed.
     skeletons = [r for r in payload["providers"]
                  if r.get("source") == "canonical"]
+    local_agents = {"claude-cli", "codex-cli", "cowork"}
     assert all(
-        r["models"] == (["default"] if r["slug"] in {"claude-cli", "codex-cli", "cowork"} else [])
+        r["models"] == [] and r["total_models"] == 0
         for r in skeletons
+        if r["slug"] not in local_agents
     )
-    assert all(
-        r["total_models"] == (1 if r["slug"] in {"claude-cli", "codex-cli", "cowork"} else 0)
-        for r in skeletons
+    _assert_local_agent_catalogs(
+        {r["slug"]: r for r in skeletons if r["slug"] in local_agents}
     )
 
 
@@ -660,7 +680,7 @@ def test_default_catalog_keeps_unavailable_local_agents_visible():
         if row["slug"] in {"claude-cli", "codex-cli", "cowork"}
     ]
     assert all(row["authenticated"] is False for row in local_rows)
-    assert all(row["models"] == ["default"] for row in local_rows)
+    _assert_local_agent_catalogs({row["slug"]: row for row in local_rows})
     assert all("no API key" in row["warning"] for row in local_rows)
 
 

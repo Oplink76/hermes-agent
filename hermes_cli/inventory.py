@@ -332,7 +332,11 @@ def _append_unconfigured_rows(
     """
     from hermes_cli.auth import PROVIDER_REGISTRY
     from hermes_cli.config import is_provider_enabled
-    from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_LABELS
+    from hermes_cli.models import (
+        CANONICAL_PROVIDERS,
+        _PROVIDER_LABELS,
+        _PROVIDER_MODELS,
+    )
 
     seen = {r["slug"].lower() for r in rows}
     cur = (ctx.current_provider or "").lower()
@@ -406,14 +410,18 @@ def _append_unconfigured_rows(
                 "codex-cli": "`codex` executable",
                 "cowork": "configured Cowork MCP `cowork_run` tool",
             }[entry.slug]
+            # Same curated catalog the configured row shows, so an
+            # unavailable agent still advertises what it will offer once
+            # its executable/tool is present.
+            models = list(_PROVIDER_MODELS.get(entry.slug, ["default"]))
             extras.append(
                 {
                     "slug": entry.slug,
                     "name": _PROVIDER_LABELS.get(entry.slug, entry.label),
                     "is_current": False,
                     "is_user_defined": False,
-                    "models": ["default"],
-                    "total_models": 1,
+                    "models": models,
+                    "total_models": len(models),
                     "source": "canonical",
                     "authenticated": False,
                     "auth_type": "external_process",

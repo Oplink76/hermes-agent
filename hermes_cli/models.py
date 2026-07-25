@@ -189,8 +189,11 @@ def _xai_curated_models() -> list[str]:
 
 _PROVIDER_MODELS: dict[str, list[str]] = {
     "moa": ["default"],
-    "claude-cli": ["default"],
-    "codex-cli": ["default"],
+    # "default" stays first for the local agents: it omits the CLI's --model
+    # flag so the agent uses its own configured default, and
+    # get_default_model_for_provider() returns entry [0].
+    "claude-cli": ["default", "fable", "opus", "sonnet"],
+    "codex-cli": ["default", *_codex_curated_models()],
     "cowork": ["default"],
     "nous": [
         # Anthropic
@@ -2106,6 +2109,16 @@ _AGGREGATOR_PROVIDERS = frozenset(
 # away from the model's native vendor). None are currently defined.
 _BORROWED_MODEL_PROVIDERS: frozenset[str] = frozenset()
 
+# Local agent identities. Their catalogs re-expose other vendors' model ids
+# (codex-cli lists the same gpt-* ids as openai-codex, claude-cli the same
+# aliases as anthropic), so a bare model name must never auto-switch INTO one:
+# they run a CLI/MCP agent under its own permissions, outside Hermes per-tool
+# approvals. Selecting one stays explicit — typing the provider name still
+# works, and once selected their catalog resolves normally.
+_LOCAL_AGENT_PROVIDERS: frozenset[str] = frozenset(
+    {"claude-cli", "codex-cli", "cowork"}
+)
+
 # Providers whose live /v1/models endpoint is the authoritative catalog, so the
 # curated list is a discovery-only fallback. For these, the picker merges
 # live-first (live entries lead, curated-only entries append). Every OTHER
@@ -2139,6 +2152,13 @@ def _resolve_static_model_alias(
         models = _PROVIDER_MODELS.get(provider, [])
         if not models:
             return None
+        # A catalog may list the alias verbatim — claude-cli offers the CLI's
+        # own "opus"/"sonnet" aliases rather than dated ids. Prefer that exact
+        # entry so the provider resolves to its own model id instead of being
+        # skipped in favour of the vendor's dated catalog.
+        for model in models:
+            if model.lower() == name_lower:
+                return model
         prefix = (
             f"{vendor}/{family}"
             if provider in _AGGREGATOR_PROVIDERS
@@ -2158,6 +2178,7 @@ def _resolve_static_model_alias(
             provider in current_keys
             or provider in _AGGREGATOR_PROVIDERS
             or provider in _BORROWED_MODEL_PROVIDERS
+            or provider in _LOCAL_AGENT_PROVIDERS
         ):
             continue
         if matched := _match(provider):
@@ -2243,6 +2264,7 @@ def detect_static_provider_for_model(
             pid in current_keys
             or pid in _AGGREGATOR_PROVIDERS
             or pid in _BORROWED_MODEL_PROVIDERS
+            or pid in _LOCAL_AGENT_PROVIDERS
         ):
             continue
         if _is_custom_current:
