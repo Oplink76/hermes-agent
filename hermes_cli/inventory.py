@@ -196,9 +196,22 @@ def build_models_payload(
         # has lost its credential, list_authenticated_providers() omits it;
         # keep that one row visible so the UI can show the saved selection and
         # a re-auth affordance instead of appearing to jump to another provider.
-        rows = list(rows) + _append_unconfigured_rows(
-            rows, ctx, current_only=True
-        )
+        fallback_rows = _append_unconfigured_rows(rows, ctx)
+        rows = list(rows) + [
+            row
+            for row in fallback_rows
+            if row.get("is_current")
+        ]
+
+    # Local agent providers are normal primary choices, even before their
+    # executable/MCP prerequisite is ready. Keep unavailable rows in every
+    # catalog subset so the classic CLI, TUI, Dashboard, and Desktop all show
+    # the same honest setup state.
+    rows = list(rows) + [
+        row
+        for row in _append_unconfigured_rows(rows, ctx)
+        if row.get("slug") in {"claude-cli", "codex-cli", "cowork"}
+    ]
 
     # --- Deduplicate: remove models from aggregators that overlap with
     # user-defined providers.  When a local proxy (e.g. litellm-proxy)
@@ -318,18 +331,32 @@ def _append_unconfigured_rows(
     the saved model so GUI pickers don't silently snap to some other provider.
     """
     from hermes_cli.auth import PROVIDER_REGISTRY
+    from hermes_cli.config import is_provider_enabled
     from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_LABELS
 
     seen = {r["slug"].lower() for r in rows}
     cur = (ctx.current_provider or "").lower()
     cur_model = str(ctx.current_model or "").strip()
+    excluded = {
+        str(slug).strip().lower()
+        for slug in (ctx.excluded_providers or [])
+        if str(slug).strip()
+    }
     extras: list[dict] = []
     for entry in CANONICAL_PROVIDERS:
-        if entry.slug.lower() in seen:
+        slug = entry.slug.lower()
+        if slug in seen or slug in excluded:
             continue
-        if current_only and entry.slug.lower() != cur:
+        provider_cfg = (
+            ctx.user_providers.get(entry.slug)
+            if isinstance(ctx.user_providers, dict)
+            else None
+        )
+        if not is_provider_enabled(provider_cfg):
             continue
-        if entry.slug.lower() == cur:
+        if current_only and slug != cur:
+            continue
+        if slug == cur:
             cfg = PROVIDER_REGISTRY.get(entry.slug)
             auth_type = cfg.auth_type if cfg else "api_key"
             key_env = (
@@ -337,13 +364,26 @@ def _append_unconfigured_rows(
                 if (cfg and cfg.api_key_env_vars)
                 else ""
             )
-            warning = (
-                f"Configured provider missing usable credentials; paste {key_env} to reactivate. "
-                "Showing the saved model only."
-                if auth_type == "api_key" and key_env
-                else "Configured provider is not authenticated; run `hermes model` to reactivate. "
-                "Showing the saved model only."
-            )
+            if entry.slug in {"claude-cli", "codex-cli", "cowork"}:
+                auth_type = "external_process"
+                key_env = ""
+                prerequisite = {
+                    "claude-cli": "`claude` executable",
+                    "codex-cli": "`codex` executable",
+                    "cowork": "configured Cowork MCP `cowork_run` tool",
+                }[entry.slug]
+                warning = (
+                    f"Unavailable: requires {prerequisite}; no API key is used. "
+                    "Showing the saved model only."
+                )
+            else:
+                warning = (
+                    f"Configured provider missing usable credentials; paste {key_env} to reactivate. "
+                    "Showing the saved model only."
+                    if auth_type == "api_key" and key_env
+                    else "Configured provider is not authenticated; run `hermes model` to reactivate. "
+                    "Showing the saved model only."
+                )
             extras.append(
                 {
                     "slug": entry.slug,
@@ -357,6 +397,28 @@ def _append_unconfigured_rows(
                     "auth_type": auth_type,
                     "key_env": key_env,
                     "warning": warning,
+                }
+            )
+            continue
+        if entry.slug in {"claude-cli", "codex-cli", "cowork"}:
+            command = {
+                "claude-cli": "`claude` executable",
+                "codex-cli": "`codex` executable",
+                "cowork": "configured Cowork MCP `cowork_run` tool",
+            }[entry.slug]
+            extras.append(
+                {
+                    "slug": entry.slug,
+                    "name": _PROVIDER_LABELS.get(entry.slug, entry.label),
+                    "is_current": False,
+                    "is_user_defined": False,
+                    "models": ["default"],
+                    "total_models": 1,
+                    "source": "canonical",
+                    "authenticated": False,
+                    "auth_type": "external_process",
+                    "key_env": "",
+                    "warning": f"Unavailable: requires {command}; no API key is used.",
                 }
             )
             continue
@@ -393,6 +455,11 @@ def _filter_explicit_provider_rows(rows: list[dict], ctx: ConfigContext) -> list
             kept.append(row)
             continue
         if current_slug and slug == current_slug:
+            kept.append(row)
+            continue
+        if slug in {"claude-cli", "codex-cli", "cowork"}:
+            # These normal primary providers must stay discoverable even when
+            # their local executable/MCP prerequisite is not ready.
             kept.append(row)
             continue
         if slug == "moa":

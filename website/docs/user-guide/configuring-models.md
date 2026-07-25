@@ -40,7 +40,7 @@ Click **Change** on the Main model row:
 
 The picker has two columns:
 
-- **Left** — authenticated providers. Only providers you've set up (API key set, OAuth'd, or defined as a custom endpoint) show up here. If a provider is missing, head to **Keys** and add its credential.
+- **Left** — configured providers plus the three local agent-backed providers (`claude-cli`, `codex-cli`, and `cowork`). Local agents remain visible when unavailable and show their executable/MCP prerequisite; they never ask for an API key.
 - **Right** — the curated model list for the selected provider. These are the agentic models Hermes recommends for that provider, not the raw `/models` dump (which on OpenRouter includes 400+ models including TTS, image generators, and rerankers).
 
 Type in the filter box to narrow by provider name, slug, or model ID.

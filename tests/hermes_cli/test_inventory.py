@@ -120,13 +120,21 @@ def test_load_picker_context_empty_config():
 # ─── with_overrides ────────────────────────────────────────────────────
 
 
-def _empty_ctx(provider="orig", model="orig-model", base_url="orig-url"):
+def _empty_ctx(
+    provider="orig",
+    model="orig-model",
+    base_url="orig-url",
+    *,
+    user_providers=None,
+    excluded_providers=None,
+):
     return ConfigContext(
         current_provider=provider,
         current_model=model,
         current_base_url=base_url,
-        user_providers={},
+        user_providers=user_providers or {},
         custom_providers=[],
+        excluded_providers=excluded_providers or [],
     )
 
 
@@ -193,7 +201,66 @@ def test_build_models_payload_returns_expected_shape():
     assert payload["provider"] == "openrouter"
     assert payload["providers"][0]["slug"] == "moa"
     assert payload["providers"][0]["models"] == ["default"]
-    assert payload["providers"][1:] == rows
+    assert payload["providers"][1] == rows[0]
+    assert [row["slug"] for row in payload["providers"][2:]] == [
+        "claude-cli",
+        "codex-cli",
+        "cowork",
+    ]
+
+
+def test_all_local_agents_remain_visible_to_explicit_desktop_catalog(
+    monkeypatch,
+):
+    ctx = _empty_ctx(provider="openai-api", model="gpt-test", base_url="")
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.list_authenticated_providers",
+        lambda **_kwargs: [],
+    )
+
+    payload = build_models_payload(
+        ctx,
+        explicit_only=True,
+        include_unconfigured=False,
+        picker_hints=True,
+    )
+    local = {
+        row["slug"]: row
+        for row in payload["providers"]
+        if row["slug"] in {"claude-cli", "codex-cli", "cowork"}
+    }
+
+    assert set(local) == {"claude-cli", "codex-cli", "cowork"}
+    assert all(row["models"] == ["default"] for row in local.values())
+    assert all(row["authenticated"] is False for row in local.values())
+    assert all("no API key" in row["warning"] for row in local.values())
+
+
+def test_local_agent_fallback_honors_disabled_and_excluded_providers(
+    monkeypatch,
+):
+    ctx = _empty_ctx(
+        provider="openai-api",
+        model="gpt-test",
+        user_providers={"cowork": {"enabled": False}},
+        excluded_providers=["codex-cli"],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.list_authenticated_providers",
+        lambda **_kwargs: [],
+    )
+
+    payload = build_models_payload(
+        ctx,
+        explicit_only=True,
+        include_unconfigured=True,
+        picker_hints=True,
+    )
+    slugs = {row["slug"] for row in payload["providers"]}
+
+    assert "claude-cli" in slugs
+    assert "codex-cli" not in slugs
+    assert "cowork" not in slugs
 
 
 def test_build_models_payload_does_not_call_provider_model_ids():
@@ -395,8 +462,14 @@ def test_include_unconfigured_appends_canonical_skeletons():
     # Skeletons have empty models and source='canonical'.
     skeletons = [r for r in payload["providers"]
                  if r.get("source") == "canonical"]
-    assert all(r["models"] == [] for r in skeletons)
-    assert all(r["total_models"] == 0 for r in skeletons)
+    assert all(
+        r["models"] == (["default"] if r["slug"] in {"claude-cli", "codex-cli", "cowork"} else [])
+        for r in skeletons
+    )
+    assert all(
+        r["total_models"] == (1 if r["slug"] in {"claude-cli", "codex-cli", "cowork"} else 0)
+        for r in skeletons
+    )
 
 
 def test_include_unconfigured_skips_already_present_slugs():
@@ -451,6 +524,9 @@ def test_explicit_only_filters_ambient_credentials_but_keeps_current_and_custom_
         "openai-codex",
         "gemini",
         "custom:lab",
+        "claude-cli",
+        "codex-cli",
+        "cowork",
     ]
 
 
@@ -464,7 +540,12 @@ def test_explicit_only_keeps_unauthenticated_current_provider_visible():
             picker_hints=True,
         )
 
-    assert [row["slug"] for row in payload["providers"]] == ["deepseek"]
+    assert [row["slug"] for row in payload["providers"]] == [
+        "deepseek",
+        "claude-cli",
+        "codex-cli",
+        "cowork",
+    ]
     row = payload["providers"][0]
     assert row["source"] == "configured-current"
     assert row["authenticated"] is False
@@ -536,7 +617,13 @@ def test_explicit_only_keeps_moa_when_raw_config_has_enabled_preset():
     ):
         payload = build_models_payload(ctx, explicit_only=True)
 
-    assert [row["slug"] for row in payload["providers"]] == ["moa", "openrouter"]
+    assert [row["slug"] for row in payload["providers"]] == [
+        "moa",
+        "openrouter",
+        "claude-cli",
+        "codex-cli",
+        "cowork",
+    ]
     assert payload["providers"][0]["models"] == ["review"]
     assert payload["providers"][1]["source"] == "configured-current"
     assert payload["providers"][1]["authenticated"] is False
@@ -553,6 +640,28 @@ def test_picker_hints_marks_authed_rows_authenticated():
     with _list_auth_returning(rows):
         payload = build_models_payload(ctx, picker_hints=True)
     assert payload["providers"][0]["authenticated"] is True
+
+
+def test_default_catalog_keeps_unavailable_local_agents_visible():
+    """The classic CLI consumes the default subset, not the full setup list."""
+    ctx = _empty_ctx()
+    with _list_auth_returning([]):
+        payload = build_models_payload(ctx, picker_hints=True)
+
+    assert [row["slug"] for row in payload["providers"]] == [
+        "moa",
+        "claude-cli",
+        "codex-cli",
+        "cowork",
+    ]
+    local_rows = [
+        row
+        for row in payload["providers"]
+        if row["slug"] in {"claude-cli", "codex-cli", "cowork"}
+    ]
+    assert all(row["authenticated"] is False for row in local_rows)
+    assert all(row["models"] == ["default"] for row in local_rows)
+    assert all("no API key" in row["warning"] for row in local_rows)
 
 
 def test_picker_hints_adds_warning_to_skeleton_rows():
@@ -576,6 +685,7 @@ def test_picker_hints_adds_warning_to_skeleton_rows():
         assert (
             row["warning"].startswith("paste ")
             or row["warning"].startswith("run `hermes model`")
+            or row["warning"].startswith("Unavailable: requires ")
         )
 
 

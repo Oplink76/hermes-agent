@@ -1,4 +1,4 @@
 name: claude-cli
 kind: model-provider
 version: 1.0.0
-description: Local Claude Code CLI for MoA advisory and aggregation only
+description: Local Claude Code agent for primary acting and MoA advisory use

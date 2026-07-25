@@ -1327,17 +1327,22 @@ def switch_model(
     # COMMON PATH: Resolve credentials, normalize, get metadata
     # =================================================================
 
-    if target_provider in CLI_EMULATED_ROUTES:
-        return ModelSwitchResult(
-            success=False,
-            target_provider=target_provider,
-            provider_label=get_label(target_provider),
-            is_global=is_global,
-            error_message=(
-                f"Provider '{target_provider}' is MoA-only and cannot be used as "
-                "the primary acting model"
-            ),
-        )
+    reserved_local_agents = {"claude-cli", "codex-cli", "cowork"}
+    if target_provider in reserved_local_agents and isinstance(user_providers, dict):
+        from hermes_cli.providers import resolve_user_provider as _resolve_shadow
+
+        shadow = _resolve_shadow(target_provider, user_providers)
+        if shadow is not None and shadow.base_url:
+            return ModelSwitchResult(
+                success=False,
+                target_provider=target_provider,
+                provider_label=get_label(target_provider),
+                is_global=is_global,
+                error_message=(
+                    f"'{target_provider}' is a reserved provider identity; "
+                    "its endpoint cannot be overridden"
+                ),
+            )
 
     provider_changed = target_provider != current_provider
     provider_label = get_label(target_provider)
@@ -2032,6 +2037,14 @@ def list_authenticated_providers(
             continue
         if pid.lower() in _excluded or hermes_slug.lower() in _excluded:
             continue
+        if isinstance(user_providers, dict):
+            from hermes_cli.config import is_provider_enabled
+
+            configured = user_providers.get(hermes_slug)
+            if configured is None:
+                configured = user_providers.get(pid)
+            if not is_provider_enabled(configured):
+                continue
 
         # Check if credentials exist
         has_creds = False
@@ -2047,6 +2060,27 @@ def list_authenticated_providers(
                 has_creds = has_vertex_credentials()
             except Exception as exc:
                 logger.debug("Vertex credential check failed: %s", exc)
+        elif overlay.auth_type == "external_process" and hermes_slug in {
+            "claude-cli",
+            "codex-cli",
+            "cowork",
+        }:
+            if hermes_slug in {"claude-cli", "codex-cli"}:
+                import shutil
+
+                has_creds = shutil.which(
+                    "claude" if hermes_slug == "claude-cli" else "codex"
+                ) is not None
+            else:
+                try:
+                    from agent.local_agent_provider import COWORK_TOOL_NAME
+                    from tools.registry import registry
+
+                    has_creds = bool(
+                        registry.get_definitions({COWORK_TOOL_NAME}, quiet=True)
+                    )
+                except Exception:
+                    has_creds = False
         elif overlay.extra_env_vars:
             has_creds = any(os.environ.get(ev) for ev in overlay.extra_env_vars)
         # Also check api_key_env_vars from PROVIDER_REGISTRY for api_key auth_type
@@ -2171,6 +2205,8 @@ def list_authenticated_providers(
                 # curated list alone (still correct, just may lag newly
                 # launched models, exactly like an offline CLI run).
                 pass
+        elif hermes_slug in {"claude-cli", "codex-cli", "cowork"}:
+            model_ids = curated.get(hermes_slug, ["default"])
         else:
             # Unified pathway — see Section 1 rationale. Fall back to the
             # curated dict (with models.dev merge for preferred providers)
@@ -2302,6 +2338,11 @@ def list_authenticated_providers(
         ep_groups: "_OD3[tuple, dict]" = _OD3()
         for ep_name, ep_cfg in user_providers.items():
             if not isinstance(ep_cfg, dict):
+                continue
+            # These slugs are product-owned local-agent identities. Their
+            # providers.<id> blocks carry profile settings (enabled, timeout,
+            # MoA consent), never arbitrary HTTP endpoint definitions.
+            if ep_name.lower() in {"claude-cli", "codex-cli", "cowork"}:
                 continue
             # Honour explicit ``providers.<name>.enabled: false`` from
             # config — these are hidden from the picker.

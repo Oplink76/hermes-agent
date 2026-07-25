@@ -15150,6 +15150,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 for p in _providers if isinstance(_providers, list) else []:
                     count = p.get("total_models", len(p.get("models", [])))
                     label = f"{p['name']} ({count} model{'s' if count != 1 else ''})"
+                    if p.get("authenticated") is False:
+                        warning = str(p.get("warning") or "unavailable")
+                        label += f" — {warning}"
                     if p.get("is_current"):
                         label += "  ← current"
                     choices.append(label)

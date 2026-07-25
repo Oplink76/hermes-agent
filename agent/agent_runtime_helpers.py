@@ -2142,7 +2142,23 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 )
 
         # ── Build new client ──
-        if (new_provider or "").strip().lower() == "moa":
+        if (new_provider or "").strip().lower() in {
+            "claude-cli",
+            "codex-cli",
+            "cowork",
+        }:
+            from cli_emulated_routes import CLI_EMULATED_ROUTES
+
+            normalized_local = (new_provider or "").strip().lower()
+            agent.api_key = api_key or "local-agent-virtual-provider"
+            agent.base_url = (
+                CLI_EMULATED_ROUTES[normalized_local]
+                if normalized_local in CLI_EMULATED_ROUTES
+                else "cowork://local"
+            )
+            agent._client_kwargs = {}
+            agent.client = None
+        elif (new_provider or "").strip().lower() == "moa":
             from agent.moa_loop import build_moa_facade
 
             # The MoA virtual provider speaks only chat.completions via the

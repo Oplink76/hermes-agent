@@ -189,6 +189,9 @@ def _xai_curated_models() -> list[str]:
 
 _PROVIDER_MODELS: dict[str, list[str]] = {
     "moa": ["default"],
+    "claude-cli": ["default"],
+    "codex-cli": ["default"],
+    "cowork": ["default"],
     "nous": [
         # Anthropic
         "anthropic/claude-fable-5",
@@ -1112,6 +1115,9 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("bedrock",        "AWS Bedrock",              "AWS Bedrock (Claude, Nova, Llama, DeepSeek; IAM or API key)"),
     ProviderEntry("azure-foundry",  "Azure Foundry",            "Azure Foundry (OpenAI-style or Anthropic-style endpoint, your Azure AI deployment)"),
     ProviderEntry("qwen-oauth",     "Qwen OAuth (Portal)",      "Qwen OAuth (Reuses local Qwen CLI login)"),
+    ProviderEntry("claude-cli",     "Claude Code CLI (local agent)", "Local Claude Code agent in the active project; native actions use Claude permissions, outside Hermes per-tool approvals"),
+    ProviderEntry("codex-cli",      "Codex CLI (local agent)",       "Local Codex agent in the active project; native actions use the Codex sandbox, outside Hermes per-tool approvals"),
+    ProviderEntry("cowork",         "Cowork (local agent)",          "Configured Cowork MCP agent with installed skills; native actions are outside Hermes per-tool approvals"),
 ]
 
 # Auto-extend CANONICAL_PROVIDERS with any provider registered in providers/
@@ -4380,6 +4386,14 @@ def validate_requested_model(
                 "accepted": False, "persist": False, "recognized": False,
                 "message": f"Could not read MoA presets: {exc}",
             }
+
+    if normalized in {"claude-cli", "codex-cli", "cowork"}:
+        return {
+            "accepted": True,
+            "persist": True,
+            "recognized": True,
+            "message": None,
+        }
 
     if any(ch.isspace() for ch in requested):
         return {

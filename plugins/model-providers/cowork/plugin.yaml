@@ -1,0 +1,4 @@
+name: cowork
+kind: model-provider
+version: 1.0.0
+description: Cowork MCP local agent for primary acting use

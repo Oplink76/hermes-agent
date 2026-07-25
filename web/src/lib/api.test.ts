@@ -20,6 +20,27 @@ function jsonFetchMock(body: unknown = { ok: true }) {
 }
 
 describe("api.getModelOptions", () => {
+  it("preserves all local-agent rows returned by the Dashboard backend", async () => {
+    vi.stubGlobal("window", {});
+    const providers = [
+      { name: "Claude", slug: "claude-cli", models: ["default"] },
+      { name: "Codex", slug: "codex-cli", models: ["default"] },
+      { name: "Cowork", slug: "cowork", models: ["default"] },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      jsonFetchMock({ model: "default", provider: "claude-cli", providers }),
+    );
+
+    const result = await api.getModelOptions();
+
+    expect(result.providers.map((provider) => provider.slug)).toEqual([
+      "claude-cli",
+      "codex-cli",
+      "cowork",
+    ]);
+  });
+
   it("requests a live model refresh when asked", async () => {
     vi.stubGlobal("window", {});
 

@@ -41,6 +41,14 @@ const GOOGLE_PROVIDER = {
 
 const MOCK_PROVIDERS = [DEEPSEEK_PROVIDER, GOOGLE_PROVIDER, MOA_PROVIDER]
 
+const UNAVAILABLE_COWORK = {
+  authenticated: false,
+  models: ['default'],
+  name: 'Cowork (local agent)',
+  slug: 'cowork',
+  warning: 'Unavailable: requires configured Cowork MCP `cowork_run` tool; no API key is used.'
+}
+
 beforeEach(() => {
   $activeSessionId.set('runtime-1')
   $currentModel.set('')
@@ -125,6 +133,20 @@ describe('ModelMenuPanel MoA presets', () => {
 })
 
 describe('ModelMenuPanel provider collapse', () => {
+  it('shows local setup status and does not dispatch an unavailable provider', async () => {
+    getGlobalModelOptions.mockResolvedValueOnce({
+      providers: [UNAVAILABLE_COWORK, MOA_PROVIDER]
+    })
+    const { content, onSelectModel } = renderPanel()
+
+    expect(await content.findByText('Cowork (local agent)')).toBeTruthy()
+    expect(await content.findByText(/requires configured Cowork MCP/)).toBeTruthy()
+
+    const model = await content.findByText('Default')
+    fireEvent.click(model)
+    expect(onSelectModel).not.toHaveBeenCalled()
+  })
+
   it('shows all provider models by default (none collapsed)', async () => {
     const { content } = renderPanel()
 

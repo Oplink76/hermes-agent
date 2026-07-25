@@ -100,6 +100,67 @@ async function renderModelSettings() {
 }
 
 describe('ModelSettings', () => {
+  const localProviders = [
+    { authenticated: true, models: ['default'], name: 'Claude CLI (local agent)', slug: 'claude-cli' },
+    { authenticated: true, models: ['default'], name: 'Codex CLI (local agent)', slug: 'codex-cli' },
+    { authenticated: true, models: ['default'], name: 'Cowork (local agent)', slug: 'cowork' }
+  ]
+
+  it('lists every local agent in the normal primary provider selector', async () => {
+    getGlobalModelOptions.mockResolvedValueOnce({ providers: localProviders })
+    await renderModelSettings()
+
+    const providerSelect = (await screen.findAllByRole('combobox'))[0]
+    fireEvent.click(providerSelect)
+
+    expect(await screen.findByRole('option', { name: 'Claude CLI (local agent)' })).toBeTruthy()
+    expect(screen.getByRole('option', { name: 'Codex CLI (local agent)' })).toBeTruthy()
+    expect(screen.getByRole('option', { name: 'Cowork (local agent)' })).toBeTruthy()
+  })
+
+  it.each(localProviders)('applies $slug as the primary provider', async provider => {
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: provider.slug, model: 'default' })
+    getGlobalModelOptions.mockResolvedValueOnce({ providers: localProviders })
+    setModelAssignment.mockResolvedValueOnce({
+      gateway_tools: [],
+      model: 'default',
+      provider: provider.slug
+    })
+    await renderModelSettings()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Apply' }))
+
+    await waitFor(() =>
+      expect(setModelAssignment).toHaveBeenCalledWith({
+        model: 'default',
+        provider: provider.slug,
+        scope: 'main'
+      })
+    )
+  })
+
+  it('renders the local prerequisite warning instead of an OAuth setup flow', async () => {
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: 'cowork', model: 'default' })
+    getGlobalModelOptions.mockResolvedValueOnce({
+      providers: [
+        {
+          authenticated: false,
+          auth_type: 'external_process',
+          models: ['default'],
+          name: 'Cowork (local agent)',
+          slug: 'cowork',
+          warning: 'Unavailable: requires configured Cowork MCP cowork_run tool; no API key is used.'
+        }
+      ]
+    })
+    await renderModelSettings()
+
+    expect(await screen.findByText('Setup required')).toBeTruthy()
+    expect(screen.getByText(/requires configured Cowork MCP/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Set up Cowork/ })).toBeNull()
+    expect(startManualProviderOAuth).not.toHaveBeenCalled()
+  })
+
   it('loads the current main model and lists configured providers only', async () => {
     await renderModelSettings()
 
@@ -344,7 +405,10 @@ describe('ModelSettings MoA preset editor', () => {
           slug: 'openrouter',
           models: ['deepseek/deepseek-v4-pro', 'anthropic/claude-opus-4.8'],
           authenticated: true
-        }
+        },
+        { authenticated: true, name: 'Claude CLI', slug: 'claude-cli', models: ['default'] },
+        { authenticated: true, name: 'Codex CLI', slug: 'codex-cli', models: ['default'] },
+        { authenticated: true, name: 'Cowork', slug: 'cowork', models: ['default'] }
       ]
     })
     getMoaModels.mockResolvedValue(moaConfig())
@@ -364,6 +428,16 @@ describe('ModelSettings MoA preset editor', () => {
 
     return { ref1Provider: all.at(-6)!, ref1Model: all.at(-5)! }
   }
+
+  it('offers Claude/Codex but never Cowork in MoA reference slots', async () => {
+    await openReferenceEditor()
+
+    fireEvent.click(slotSelects().ref1Provider)
+
+    expect(await screen.findByRole('option', { name: 'Claude CLI' })).toBeTruthy()
+    expect(screen.getByRole('option', { name: 'Codex CLI' })).toBeTruthy()
+    expect(screen.queryByRole('option', { name: 'Cowork' })).toBeNull()
+  })
 
   it('holds the autosave while a slot is half-filled (provider changed, model pending)', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })

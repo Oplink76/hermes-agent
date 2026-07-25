@@ -35,6 +35,67 @@ def test_moa_slot_picker_excludes_unconfigured_providers(monkeypatch):
     assert captured["include_unconfigured"] is False
 
 
+def test_moa_slot_picker_excludes_cowork(monkeypatch):
+    from hermes_cli import moa_cmd
+
+    monkeypatch.setattr(moa_cmd, "load_picker_context", lambda: object())
+    monkeypatch.setattr(
+        moa_cmd,
+        "build_models_payload",
+        lambda *_args, **_kwargs: {
+            "providers": [
+                {"slug": "cowork", "models": ["default"]},
+                {"slug": "claude-cli", "models": ["default"]},
+                {"slug": "codex-cli", "models": ["default"]},
+            ]
+        },
+    )
+
+    assert [row["slug"] for row in moa_cmd._model_options()] == [
+        "claude-cli",
+        "codex-cli",
+    ]
+
+
+@pytest.mark.parametrize("kind", ["reference_models", "aggregator"])
+def test_moa_payload_rejects_cowork_slots(kind):
+    from hermes_cli.moa_config import validate_moa_payload
+
+    preset = {
+        "reference_models": [{"provider": "openrouter", "model": "m"}],
+        "aggregator": {"provider": "openrouter", "model": "a"},
+    }
+    if kind == "reference_models":
+        preset[kind] = [{"provider": "cowork", "model": "default"}]
+    else:
+        preset[kind] = {"provider": "cowork", "model": "default"}
+
+    problems = validate_moa_payload({"presets": {"bad": preset}})
+    assert problems
+    assert any("Cowork cannot be used" in problem for problem in problems)
+
+
+@pytest.mark.parametrize("kind", ["reference_models", "aggregator"])
+def test_moa_runtime_rejects_hand_edited_cowork_slot(kind):
+    from agent.moa_loop import _reject_raw_cowork_slots
+
+    preset = {
+        "reference_models": [{"provider": "openrouter", "model": "model"}],
+        "aggregator": {"provider": "openrouter", "model": "model"},
+    }
+    if kind == "reference_models":
+        preset[kind] = {"provider": "cowork", "model": "default"}
+    else:
+        preset[kind] = {"provider": "cowork", "model": "default"}
+    raw = {
+        "default_preset": "bad",
+        "presets": {"bad": preset},
+    }
+
+    with pytest.raises(RuntimeError, match="Cowork cannot be used"):
+        _reject_raw_cowork_slots(raw, "bad")
+
+
 def _enabled_refs(refs):
     return [{**slot, "enabled": True} for slot in refs]
 

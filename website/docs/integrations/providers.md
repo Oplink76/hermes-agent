@@ -18,6 +18,9 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **OpenAI Codex** | `hermes model` (ChatGPT OAuth, uses Codex models) |
 | **GitHub Copilot** | `hermes model` (OAuth device code flow, `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`) |
 | **GitHub Copilot ACP** | `hermes model` (spawns local `copilot --acp --stdio`) |
+| **Claude Code CLI (local agent)** | `hermes model` (provider: `claude-cli`; requires authenticated `claude` executable, no API key) |
+| **Codex CLI (local agent)** | `hermes model` (provider: `codex-cli`; requires authenticated `codex` executable, no API key) |
+| **Cowork (local agent)** | `hermes model` (provider: `cowork`; requires configured `cowork-mcp` server exposing `cowork_run`, no API key) |
 | **Anthropic** | `hermes model` (Claude Max + extra usage credits via OAuth; also supports Anthropic API key or manual setup-token — see note below) |
 | **OpenRouter** | `OPENROUTER_API_KEY` in `~/.hermes/.env` |
 | **Fireworks AI** | `FIREWORKS_API_KEY` in `~/.hermes/.env` (provider: `fireworks`; aliases: `fireworks-ai`, `fw`) |
@@ -103,6 +106,35 @@ Hermes has **two** model commands that serve different purposes:
 | **`/model`** | Inside a Hermes chat session | Quick switch between **already-configured** providers and models |
 
 If you're trying to switch to a provider you haven't set up yet (e.g. you only have OpenRouter configured and want to use Anthropic), you need `hermes model`, not `/model`. Exit your session first (`Ctrl+C` or `/quit`), run `hermes model`, complete the provider setup, then start a new session.
+
+### Local agent-backed providers
+
+`claude-cli`, `codex-cli`, and `cowork` are normal primary providers. They
+appear in the CLI, TUI, Dashboard, and Desktop model pickers even when their
+local prerequisite is unavailable; the picker shows the missing executable or
+MCP tool instead of asking for an API key.
+
+Claude and Codex receive a deterministic text flattening of the Hermes system
+prompt and conversation on stdin. Each Hermes turn starts a fresh native CLI
+agent loop in the active project directory. Claude runs noninteractively with
+its native permission-bypass mode; Codex runs with approvals disabled and a
+`workspace-write` sandbox. Hermes does not proxy or display their internal tool
+calls. Project instruction discovery remains active (including `AGENTS.md`);
+Codex is not passed `--ignore-rules`.
+
+Cowork receives the same flattened prompt plus the active directory through the
+existing generic MCP tool `mcp__cowork_mcp__cowork_run`. Its installed Cowork
+and finance skills remain available. The generic MCP server serializes calls
+and applies its configured RPC timeout. If Hermes itself times out or is
+cancelled, it stops waiting, but MCP has no portable way to cancel an already
+running remote Cowork job; that job may continue until the server-side timeout.
+
+:::warning External permissions govern native actions
+Actions performed inside Claude, Codex, or Cowork are governed by that agent's
+permission model and sandbox, not Hermes per-tool approval settings. Select
+these providers only in a workspace where their native acting permissions are
+appropriate.
+:::
 
 
 ### Anthropic (Native)

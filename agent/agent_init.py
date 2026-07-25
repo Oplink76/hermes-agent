@@ -1061,6 +1061,24 @@ def init_agent(
                     print("🔑 Using credentials: Microsoft Entra ID")
                 elif isinstance(effective_key, str) and len(effective_key) > 12:
                     print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
+    elif agent.provider in {"claude-cli", "codex-cli", "cowork"}:
+        # The conversation loop intercepts these providers before any HTTP
+        # call. Keep a virtual runtime shape for shared status/switch code.
+        from cli_emulated_routes import CLI_EMULATED_ROUTES
+
+        agent.client = None
+        agent._client_kwargs = {}
+        agent.api_key = api_key or "local-agent-virtual-provider"
+        agent.base_url = (
+            CLI_EMULATED_ROUTES[agent.provider]
+            if agent.provider in CLI_EMULATED_ROUTES
+            else "cowork://local"
+        )
+        if not agent.quiet_mode:
+            print(
+                f"🤖 AI Agent initialized with model: {agent.model} "
+                f"({agent.provider}, native local agent)"
+            )
     elif agent.provider == "moa":
         from agent.moa_loop import build_moa_facade
         agent.api_mode = "chat_completions"

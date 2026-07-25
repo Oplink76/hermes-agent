@@ -330,6 +330,10 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
     """
     provider = str(slot.get("provider") or "").strip()
     model = str(slot.get("model") or "").strip()
+    if provider.lower() == "cowork":
+        raise RuntimeError(
+            "Cowork cannot be used as a Mixture of Agents reference or aggregator"
+        )
     out: dict[str, Any] = {"provider": provider, "model": model}
     if provider in CLI_EMULATED_ROUTES:
         from hermes_cli.config import is_provider_enabled, load_config
@@ -1377,6 +1381,41 @@ def _attach_reference_guidance(agg_messages: list[dict[str, Any]], guidance: str
     agg_messages.append({"role": "user", "content": guidance})
 
 
+def _reject_raw_cowork_slots(raw: Any, preset_name: str) -> None:
+    """Reject hand-edited Cowork slots before tolerant normalization drops them."""
+    if not isinstance(raw, dict):
+        return
+    presets = raw.get("presets")
+    if isinstance(presets, dict) and presets:
+        selected_name = (
+            preset_name
+            or str(raw.get("default_preset") or raw.get("active_preset") or "")
+            or next(iter(presets), "")
+        )
+        selected = presets.get(selected_name)
+    else:
+        selected = raw
+    if not isinstance(selected, dict):
+        return
+    refs = selected.get("reference_models")
+    slots: list[Any] = (
+        list(refs)
+        if isinstance(refs, list)
+        else [refs]
+        if isinstance(refs, dict)
+        else []
+    )
+    slots.append(selected.get("aggregator"))
+    if any(
+        isinstance(slot, dict)
+        and str(slot.get("provider") or "").strip().lower() == "cowork"
+        for slot in slots
+    ):
+        raise RuntimeError(
+            "Cowork cannot be used as a Mixture of Agents reference or aggregator"
+        )
+
+
 class MoAChatCompletions:
     """OpenAI-chat-compatible facade where the aggregator is the acting model."""
 
@@ -1688,6 +1727,7 @@ class MoAChatCompletions:
         from hermes_cli.moa_config import resolve_moa_preset
 
         _moa_raw = load_config().get("moa") or {}
+        _reject_raw_cowork_slots(_moa_raw, self.preset_name)
         preset = resolve_moa_preset(_moa_raw, self.preset_name)
         # Privacy filter mode: '' (off, default) | 'display' | 'full'. See
         # coerce_privacy_filter / the pattern block at the top of this module.
@@ -1702,6 +1742,16 @@ class MoAChatCompletions:
             if slot.get("enabled", True)
         ]
         aggregator = preset.get("aggregator") or {}
+        cowork_slots = [
+            slot
+            for slot in [*reference_models, aggregator]
+            if isinstance(slot, dict)
+            and str(slot.get("provider") or "").strip().lower() == "cowork"
+        ]
+        if cowork_slots:
+            raise RuntimeError(
+                "Cowork cannot be used as a Mixture of Agents reference or aggregator"
+            )
         # Expose the resolved aggregator slot so session cost accounting can
         # price the aggregator's acting turn at its REAL model/provider. The
         # agent's model/provider on the MoA path are the virtual preset name

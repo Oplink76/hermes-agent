@@ -1,4 +1,4 @@
-"""Codex CLI profile for explicitly opted-in MoA advisory completions."""
+"""Codex CLI profile for primary acting and explicitly opted-in MoA use."""
 
 from cli_emulated_routes import CLI_EMULATED_ROUTES
 from providers import ProviderProfile, register_provider
@@ -6,10 +6,11 @@ from providers import ProviderProfile, register_provider
 register_provider(
     ProviderProfile(
         name="codex-cli",
-        display_name="Codex CLI (MoA only)",
+        display_name="Codex CLI (local agent)",
         description=(
-            "Local read-only Codex agent advisor/aggregator; requires explicit opt-in "
-            "and is not a primary acting model"
+            "Runs Codex's native workspace-write agent loop in the active project. "
+            "Its actions use the Codex sandbox outside Hermes per-tool approvals. "
+            "MoA use remains read-only and requires explicit agentic consent."
         ),
         auth_type="external_process",
         api_mode="chat_completions",

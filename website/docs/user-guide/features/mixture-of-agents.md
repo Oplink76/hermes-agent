@@ -103,9 +103,9 @@ Default preset:
 ### Use authenticated Claude Code or Codex CLIs
 
 Hermes can use an already authenticated local `claude` or `codex` executable
-inside MoA through the private provider IDs `claude-cli` and `codex-cli`. These
-providers are intentionally excluded from the normal acting-model picker. They
-are valid only as MoA reference/advisor or aggregator slots.
+inside MoA through provider IDs `claude-cli` and `codex-cli`. Both are also
+normal primary local-agent providers; their primary acting mode is separate
+from the advisory-safe MoA path described here.
 
 ```yaml
 providers:
@@ -136,11 +136,10 @@ classified as a **read-only agent**: it may execute read-only commands and read
 files visible to the local account. Hermes denies `codex-cli` unless you set the
 explicit `allow_agentic_advisor: true` acknowledgement shown above.
 
-CLI aggregators are text-only in this phase. Hermes does not forward its tool
+CLI aggregators are text-only. Hermes does not forward its tool
 schemas to them, so they can write the final MoA answer but cannot emit Hermes
 tool calls. Use an HTTP/API model as aggregator when the acting turn must call
-Hermes tools. Direct use of either CLI provider as the primary model is not
-supported and is rejected by runtime resolution.
+Hermes tools.
 
 Each completion starts one bounded process group in a fresh empty working
 directory. Timeout and cancellation terminate that process group. Streaming is
@@ -148,6 +147,10 @@ synthetic: Hermes waits for the CLI to finish and then emits compatible chunks
 rather than exposing token-by-token subprocess output.
 The CLIs do not provide canonical token usage, so usage and cost remain
 unavailable instead of being reported as zero.
+
+Cowork is never a MoA reference or aggregator. It is intentionally absent from
+every MoA slot picker, and hand-written `provider: cowork` slots are rejected
+with an error. Cowork remains available in every normal primary model picker.
 
 When no preset or provider timeout is configured, Hermes uses a 300-second
 Claude deadline and a 600-second Codex deadline. An explicit preset timeout and

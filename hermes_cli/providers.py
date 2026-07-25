@@ -60,6 +60,11 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         auth_type="external_process",
         base_url_override=CLI_EMULATED_ROUTES["codex-cli"],
     ),
+    "cowork": HermesOverlay(
+        transport="openai_chat",
+        auth_type="external_process",
+        base_url_override="cowork://local",
+    ),
     "openrouter": HermesOverlay(
         transport="openai_chat",
         is_aggregator=True,

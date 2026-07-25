@@ -12,6 +12,7 @@ import { createPortal } from "react-dom";
 import { cn, themedBody } from "@/lib/utils";
 import { fuzzyRank } from "@/lib/fuzzy";
 import { queryMatchesProviderOnly } from "@/lib/model-picker-filter";
+import { filterModelOptionProviders } from "@/lib/model-provider-filter";
 
 /**
  * Two-stage model picker modal.
@@ -34,6 +35,7 @@ import { queryMatchesProviderOnly } from "@/lib/model-picker-filter";
  */
 
 interface ModelOptionProvider {
+  authenticated?: boolean;
   name: string;
   slug: string;
   models?: string[];
@@ -87,6 +89,8 @@ interface Props {
   title?: string;
   /** If true, hides "Persist globally" checkbox — always saves to config.yaml. */
   alwaysGlobal?: boolean;
+  /** Provider slugs omitted from this picker only (for example MoA slots). */
+  excludeProviders?: string[];
 }
 
 export function ModelPickerDialog(props: Props) {
@@ -99,6 +103,7 @@ export function ModelPickerDialog(props: Props) {
     onClose,
     title = "Switch Model",
     alwaysGlobal = false,
+    excludeProviders = [],
   } = props;
   const standalone = !!loader && !!onApply;
 
@@ -118,7 +123,7 @@ export function ModelPickerDialog(props: Props) {
   const closedRef = useRef(false);
 
   const applyOptions = (r: ModelOptionsResponse) => {
-    const next = r?.providers ?? [];
+    const next = filterModelOptionProviders(r?.providers ?? [], excludeProviders);
     setProviders(next);
     setCurrentModel(String(r?.model ?? ""));
     setCurrentProviderSlug(String(r?.provider ?? ""));
@@ -253,7 +258,11 @@ export function ModelPickerDialog(props: Props) {
     [models, trimmedQuery, queryMatchesSelectedProviderOnly],
   );
 
-  const canConfirm = !!selectedProvider && !!selectedModel && !applying;
+  const canConfirm =
+    !!selectedProvider &&
+    selectedProvider.authenticated !== false &&
+    !!selectedModel &&
+    !applying;
 
   const applySelection = async (
     confirmExpensiveModel = false,
@@ -607,7 +616,10 @@ function ModelColumn({
               key={m}
               active={active}
               onClick={() => onSelect(m)}
-              onDoubleClick={() => onConfirm(m)}
+              onDoubleClick={() => {
+                if (provider.authenticated !== false) onConfirm(m);
+              }}
+              aria-disabled={provider.authenticated === false}
               className="px-3 py-1.5 text-xs font-mono"
             >
               <Check

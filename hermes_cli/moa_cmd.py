@@ -44,7 +44,7 @@ def _model_options() -> list[dict[str, Any]]:
         p
         for p in providers
         if p.get("slug")
-        and str(p.get("slug")).strip().lower() != "moa"
+        and str(p.get("slug")).strip().lower() not in {"moa", "cowork"}
         and p.get("models")
     ]
 

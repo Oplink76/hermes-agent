@@ -1,6 +1,16 @@
 import { getGlobalModelOptions, type HermesGateway, type ModelOptionsResponse } from '@/hermes'
 import type { ModelOptionProvider } from '@/types/hermes'
 
+const MOA_FORBIDDEN_PROVIDERS = new Set(['moa', 'cowork'])
+
+export function filterMoaSlotProviders(providers: readonly ModelOptionProvider[]): ModelOptionProvider[] {
+  return providers.filter(provider => !MOA_FORBIDDEN_PROVIDERS.has(provider.slug.trim().toLowerCase()))
+}
+
+export function isProviderReady(provider?: ModelOptionProvider): boolean {
+  return !!provider && provider.authenticated !== false && (provider.models?.length ?? 0) > 0
+}
+
 /**
  * True only when a persisted **manual** composer pick has been removed from the
  * catalog (its provider still ships models, but no longer this one) — so a new

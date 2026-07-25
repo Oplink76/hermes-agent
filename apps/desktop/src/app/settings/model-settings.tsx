@@ -25,6 +25,7 @@ import type {
 } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { AlertTriangle, Cpu, Loader2 } from '@/lib/icons'
+import { filterMoaSlotProviders, isProviderReady } from '@/lib/model-options'
 import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
 import { startManualLocalEndpoint, startManualOnboarding, startManualProviderOAuth } from '@/store/onboarding'
@@ -96,14 +97,6 @@ const isFastTier = (tier: unknown): boolean =>
 
 // Reuse the composer's effort labels.
 const effortLabelKey = (v: string) => v as 'high' | 'low' | 'max' | 'medium' | 'minimal' | 'ultra' | 'xhigh'
-
-// A provider row is "ready" to pick a model from when it reports models. The
-// backend now surfaces the full `hermes model` universe (every canonical
-// provider), so unconfigured providers come back with `authenticated:false`
-// and an empty `models` list — those need a setup step before a model exists.
-function isProviderReady(p?: ModelOptionProvider): boolean {
-  return !!p && (p.authenticated !== false || (p.models?.length ?? 0) > 0)
-}
 
 // Mirrors `_AUX_TASK_SLOTS` in hermes_cli/web_server.py. Friendly labels and
 // hints make the assignments readable; raw task keys (vision, mcp, …) are
@@ -308,10 +301,10 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     [providerOptions, providers, selectedProvider]
   )
 
-  // MoA reference/aggregator slots must never be the moa virtual provider —
-  // that would create a recursive MoA tree (the backend rejects it on save).
-  // Hide it from the slot selectors so it isn't offered as a dead choice.
-  const moaSlotProviderOptions = providerOptions.filter(provider => (provider.slug || '').toLowerCase() !== 'moa')
+  // Cowork owns an acting MCP run and is never advisory-safe, while `moa`
+  // would recursively route into itself. Keep both out of reference and
+  // aggregator slots; Claude/Codex remain available under their MoA guards.
+  const moaSlotProviderOptions = filterMoaSlotProviders(providerOptions)
 
   const selectedProviderRow = useMemo(
     () => providers.find(provider => provider.slug === selectedProvider),
@@ -321,10 +314,13 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   const selectedProviderModels = selectedProviderRow?.models ?? []
 
   // An unconfigured provider was picked: no credentials yet, so there are no
-  // models to choose. `api_key` providers can be activated inline (paste key);
-  // OAuth / external flows hand off to the onboarding sign-in.
+  // models to choose. API-key providers activate inline, OAuth providers use
+  // onboarding, and local agents show their executable/MCP prerequisite.
   const needsSetup = !!selectedProvider && !isProviderReady(selectedProviderRow)
   const setupIsApiKey = needsSetup && selectedProviderRow?.auth_type === 'api_key' && !!selectedProviderRow?.key_env
+
+  const setupIsLocalAgent =
+    needsSetup && ['claude-cli', 'codex-cli', 'cowork'].includes(selectedProviderRow?.slug.toLowerCase() ?? '')
 
   // Clear any half-typed key when switching provider so it can't leak across.
   useEffect(() => {
@@ -770,6 +766,8 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                   {activating ? 'Activating...' : 'Activate'}
                 </Button>
               </>
+            ) : setupIsLocalAgent ? (
+              <span className="text-xs text-muted-foreground">Setup required</span>
             ) : (
               <Button onClick={startProviderSetup} size="sm" variant="textStrong">
                 Set up {selectedProviderRow?.name ?? 'provider'}
@@ -802,7 +800,9 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
         </div>
         {needsSetup && !setupIsApiKey && selectedProviderRow && (
           <p className="mt-2 text-xs text-muted-foreground">
-            {selectedProviderRow?.auth_type === 'api_key'
+            {setupIsLocalAgent
+              ? selectedProviderRow.warning || `${selectedProviderRow.name} requires its local agent prerequisite.`
+              : selectedProviderRow?.auth_type === 'api_key'
               ? `${selectedProviderRow?.name} needs an API key — set it up to choose a model.`
               : `${selectedProviderRow?.name} signs in through your browser — Hermes runs the flow for you.`}
           </p>

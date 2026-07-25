@@ -901,6 +901,7 @@ function MoaModelsModal({
       </div>
       {picker && (
         <ModelPickerDialog
+          excludeProviders={["moa", "cowork"]}
           key={`moa-picker-${refreshKey}-${selected}-${picker.kind}-${picker.kind === "reference" ? picker.index : "agg"}`}
           loader={api.getModelOptions}
           alwaysGlobal

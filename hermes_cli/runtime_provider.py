@@ -1592,10 +1592,24 @@ def resolve_runtime_provider(
     from cli_emulated_routes import CLI_EMULATED_ROUTES
 
     if requested_provider in CLI_EMULATED_ROUTES:
-        raise ValueError(
-            f"provider {requested_provider!r} is MoA-only and cannot be used "
-            "as a primary runtime"
-        )
+        return {
+            "provider": requested_provider,
+            "api_mode": "chat_completions",
+            "base_url": CLI_EMULATED_ROUTES[requested_provider],
+            "api_key": "cli-acting-virtual-provider",
+            "source": "cli-acting-virtual-provider",
+            "requested_provider": requested_provider,
+        }
+
+    if requested_provider == "cowork":
+        return {
+            "provider": "cowork",
+            "api_mode": "chat_completions",
+            "base_url": "cowork://local",
+            "api_key": "cowork-virtual-provider",
+            "source": "cowork-virtual-provider",
+            "requested_provider": requested_provider,
+        }
 
     # Azure Anthropic short-circuit: when explicitly targeting an Azure endpoint
     # with provider="anthropic", bypass _resolve_named_custom_runtime (which would

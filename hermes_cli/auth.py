@@ -174,6 +174,24 @@ class ProviderConfig:
 
 
 PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
+    "claude-cli": ProviderConfig(
+        id="claude-cli",
+        name="Claude Code CLI (local agent)",
+        auth_type="external_process",
+        inference_base_url="cli://claude",
+    ),
+    "codex-cli": ProviderConfig(
+        id="codex-cli",
+        name="Codex CLI (local agent)",
+        auth_type="external_process",
+        inference_base_url="cli://codex",
+    ),
+    "cowork": ProviderConfig(
+        id="cowork",
+        name="Cowork (local agent)",
+        auth_type="external_process",
+        inference_base_url="cowork://local",
+    ),
     "nous": ProviderConfig(
         id="nous",
         name="Nous Portal",
@@ -6760,6 +6778,59 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def get_local_agent_provider_status(provider_id: str) -> Dict[str, Any]:
+    """Cheap, honest readiness for reserved no-key local agent providers."""
+    pconfig = PROVIDER_REGISTRY.get(provider_id)
+    if provider_id not in {"claude-cli", "codex-cli", "cowork"} or not pconfig:
+        return {"configured": False, "logged_in": False}
+    try:
+        from hermes_cli.config import is_provider_enabled, load_config
+
+        providers = (load_config() or {}).get("providers") or {}
+        block = providers.get(provider_id)
+        enabled = not isinstance(block, dict) or is_provider_enabled(block)
+    except Exception:
+        enabled = False
+    if not enabled:
+        return {
+            "configured": False,
+            "logged_in": False,
+            "available": False,
+            "provider": provider_id,
+            "name": pconfig.name,
+            "error": f"providers.{provider_id}.enabled is false",
+        }
+    if provider_id in {"claude-cli", "codex-cli"}:
+        command = "claude" if provider_id == "claude-cli" else "codex"
+        resolved = shutil.which(command)
+        return {
+            "configured": bool(resolved),
+            "logged_in": bool(resolved),
+            "available": bool(resolved),
+            "provider": provider_id,
+            "name": pconfig.name,
+            "command": command,
+            "resolved_command": resolved,
+            "requires_api_key": False,
+        }
+    try:
+        from agent.local_agent_provider import COWORK_TOOL_NAME
+        from tools.registry import registry
+
+        ready = bool(registry.get_definitions({COWORK_TOOL_NAME}, quiet=True))
+    except Exception:
+        ready = False
+    return {
+        "configured": ready,
+        "logged_in": ready,
+        "available": ready,
+        "provider": provider_id,
+        "name": pconfig.name,
+        "tool": "mcp__cowork_mcp__cowork_run",
+        "requires_api_key": False,
+    }
+
+
 def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Generic auth status dispatcher."""
     target = (provider_id or get_active_provider() or "").strip().lower()
@@ -6779,6 +6850,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_minimax_oauth_auth_status()
     if target == "copilot-acp":
         return get_external_process_provider_status(target)
+    if target in {"claude-cli", "codex-cli", "cowork"}:
+        return get_local_agent_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
     # API-key providers

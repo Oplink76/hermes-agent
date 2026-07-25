@@ -386,7 +386,7 @@ def test_switch_model_user_config_openai_does_not_hop_to_openrouter(monkeypatch)
     assert result.base_url == "https://api.openai.com/v1"
 
 
-@pytest.mark.parametrize("reserved_provider", ["claude-cli", "codex-cli"])
+@pytest.mark.parametrize("reserved_provider", ["claude-cli", "codex-cli", "cowork"])
 def test_switch_model_rejects_reserved_cli_identity_shadowed_by_user_provider(
     monkeypatch, reserved_provider
 ):
@@ -411,7 +411,89 @@ def test_switch_model_rejects_reserved_cli_identity_shadowed_by_user_provider(
     )
 
     assert result.success is False
-    assert "moa-only" in (result.error_message or "").lower()
+    assert "reserved provider identity" in (result.error_message or "").lower()
+
+
+@pytest.mark.parametrize("provider", ["claude-cli", "codex-cli", "cowork"])
+def test_switch_model_accepts_local_agent_settings_without_endpoint_shadow(
+    provider,
+):
+    result = switch_model(
+        raw_input="default",
+        current_provider="openai-api",
+        current_model="gpt-test",
+        current_base_url="https://api.openai.com/v1",
+        current_api_key="sk-test",
+        explicit_provider=provider,
+        user_providers={
+            provider: {
+                "enabled": True,
+                "timeout": 123,
+                "allow_agentic_advisor": True,
+            }
+        },
+        custom_providers=[],
+    )
+
+    assert result.success, result.error_message
+    assert result.target_provider == provider
+    assert result.new_model == "default"
+
+
+@pytest.mark.parametrize("provider", ["claude-cli", "codex-cli", "cowork"])
+def test_provider_catalog_never_emits_reserved_local_identity_as_endpoint(
+    monkeypatch, provider
+):
+    import shutil
+
+    from hermes_cli.model_switch import list_authenticated_providers
+
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(shutil, "which", lambda _command: None)
+    monkeypatch.setattr(
+        "tools.registry.registry.get_definitions",
+        lambda *_args, **_kwargs: [],
+    )
+
+    rows = list_authenticated_providers(
+        current_provider="nous",
+        user_providers={
+            provider: {
+                "api": "https://shadow.example.test/v1",
+                "api_key": "not-a-real-key",
+                "models": {"shadow-model": {}},
+            }
+        },
+        custom_providers=[],
+    )
+
+    assert all(row["slug"] != provider for row in rows)
+
+
+@pytest.mark.parametrize("provider", ["claude-cli", "codex-cli", "cowork"])
+def test_provider_catalog_hides_explicitly_disabled_local_agent(
+    monkeypatch, provider
+):
+    import shutil
+
+    from hermes_cli.model_switch import list_authenticated_providers
+
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(shutil, "which", lambda _command: "/usr/bin/local-agent")
+    monkeypatch.setattr(
+        "tools.registry.registry.get_definitions",
+        lambda *_args, **_kwargs: [
+            {"function": {"name": "mcp__cowork_mcp__cowork_run"}}
+        ],
+    )
+
+    rows = list_authenticated_providers(
+        current_provider="nous",
+        user_providers={provider: {"enabled": False}},
+        custom_providers=[],
+    )
+
+    assert all(row["slug"] != provider for row in rows)
 
 
 def test_list_authenticated_providers_user_openai_official_url_fallback(monkeypatch):

@@ -329,6 +329,34 @@ def _model_flow_moa(config, current_model=""):
     _print_moa_preset(selected_name, preset)
 
 
+def _model_flow_local_agent_provider(config, provider_id, current_model=""):
+    """Select a no-key local agent provider without erasing its settings."""
+    from hermes_cli.auth import _save_model_choice, deactivate_provider
+    from hermes_cli.config import load_config, save_config
+    from hermes_cli.models import _PROVIDER_LABELS
+
+    cfg = load_config()
+    model = cfg.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+        cfg["model"] = model
+    model["default"] = "default"
+    model["provider"] = provider_id
+    clear_model_endpoint_credentials(model, clear_api_mode=True)
+    model.pop("base_url", None)
+    save_config(cfg)
+    _save_model_choice("default")
+    deactivate_provider()
+
+    label = _PROVIDER_LABELS.get(provider_id, provider_id)
+    print()
+    print(f"Default model set to: default (via {label})")
+    print(
+        "  Native agent actions are governed by the external agent's "
+        "permissions, not Hermes per-tool approvals."
+    )
+
+
 def _model_flow_nous(config, current_model="", args=None):
     """Nous Portal provider: ensure logged in, then pick model."""
     from hermes_cli.auth import (

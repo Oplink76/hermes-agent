@@ -203,7 +203,7 @@ def _clean_slot(slot: Any, *, include_enabled: bool = False) -> dict[str, Any] |
     # (the runtime guards in moa_loop.py skip references / raise on aggregators,
     # but that surfaces only mid-turn). Reject it here so it can never be saved:
     # an invalid slot is dropped, falling back to the preset's defaults.
-    if provider.lower() == "moa":
+    if provider.lower() in {"moa", "cowork"}:
         return None
     clean: dict[str, Any] = {"provider": provider, "model": model}
     effort = _clean_reasoning_effort(slot.get("reasoning_effort"))
@@ -241,6 +241,8 @@ def _slot_problem(slot: Any) -> str | None:
         return f"model is required (provider '{provider}' has no model selected)"
     if provider.lower() == "moa":
         return "the Mixture of Agents provider cannot be used inside a preset (recursive MoA)"
+    if provider.lower() == "cowork":
+        return "Cowork cannot be used as a Mixture of Agents reference or aggregator"
     return None
 
 

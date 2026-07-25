@@ -19,7 +19,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { ChevronDown, ChevronRight } from '@/lib/icons'
-import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
+import { isProviderReady, modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import {
   currentPickerSelection,
   displayModelName,
@@ -246,6 +246,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
         <div className="max-h-[max(150px,30dvh)] overflow-y-auto py-0.5">
           {groups.map(group => {
             const slug = group.provider.slug
+            const providerReady = isProviderReady(group.provider)
 
             // Collapsed when stored + no active search + not the current provider.
             const collapsed = collapsedProviders.includes(slug) && !search && slug !== optionsProvider
@@ -266,6 +267,11 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
                     <ChevronDown className="size-2.5 shrink-0" />
                   )}
                   {group.provider.name}
+                  {!providerReady ? (
+                    <span className="ml-auto truncate text-(--ui-text-tertiary)">
+                      {group.provider.warning || 'Setup required'}
+                    </span>
+                  ) : null}
                 </DropdownMenuItem>
                 {!collapsed &&
                   group.families.map(family => {
@@ -314,6 +320,10 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
                     // edit submenu (reasoning/fast) is reached by HOVER, so you can
                     // still tweak those without the click dismissing everything.
                     const activate = () => {
+                      if (!providerReady) {
+                        return
+                      }
+
                       if (!isCurrent) {
                         void selectFamily(family, group.provider)
                       }
@@ -325,6 +335,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
                       <DropdownMenuSub key={`${group.provider.slug}:${family.id}`}>
                         <DropdownMenuSubTrigger
                           className={dropdownMenuRow}
+                          disabled={!providerReady}
                           hideChevron
                           onClick={activate}
                           onKeyDown={event => {

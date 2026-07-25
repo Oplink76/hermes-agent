@@ -2,7 +2,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { getGlobalModelOptions } from '@/hermes'
 
-import { manualPickRemoved, modelOptionsQueryKey, requestModelOptions } from './model-options'
+import {
+  filterMoaSlotProviders,
+  isProviderReady,
+  manualPickRemoved,
+  modelOptionsQueryKey,
+  requestModelOptions
+} from './model-options'
 
 const globalOptions = { model: 'hermes-4', provider: 'nous', providers: [] }
 
@@ -26,6 +32,26 @@ describe('requestModelOptions', () => {
 
     expect(gateway.request).toHaveBeenCalledWith('model.options', { explicit_only: true })
     expect(getGlobalModelOptions).not.toHaveBeenCalled()
+  })
+
+  it('preserves local-agent rows returned by the shared backend catalog', async () => {
+    const gatewayPayload = {
+      model: 'default',
+      provider: 'claude-cli',
+      providers: [
+        { name: 'Claude', slug: 'claude-cli', models: ['default'] },
+        { name: 'Codex', slug: 'codex-cli', models: ['default'] },
+        { name: 'Cowork', slug: 'cowork', models: ['default'] }
+      ]
+    }
+
+    const gateway = {
+      request: vi.fn(() => Promise.resolve(gatewayPayload))
+    }
+
+    const result = await requestModelOptions({ gateway: gateway as never })
+
+    expect(result.providers?.map(provider => provider.slug)).toEqual(['claude-cli', 'codex-cli', 'cowork'])
   })
 
   it('passes the active session id and refresh flag through the gateway', async () => {
@@ -95,5 +121,35 @@ describe('manualPickRemoved', () => {
 
   it('never clobbers when there is no pick', () => {
     expect(manualPickRemoved(providers, '', '')).toBe(false)
+  })
+})
+
+describe('local-agent picker policy', () => {
+  const providers = [
+    { authenticated: true, models: ['hermes-4'], name: 'Nous', slug: 'nous' },
+    { authenticated: true, models: ['default'], name: 'Claude CLI', slug: 'claude-cli' },
+    { authenticated: true, models: ['default'], name: 'Codex CLI', slug: 'codex-cli' },
+    { authenticated: true, models: ['default'], name: 'Cowork', slug: 'cowork' },
+    { models: ['default'], name: 'Mixture of Agents', slug: 'moa' }
+  ]
+
+  it('keeps Claude and Codex in MoA slots but excludes Cowork and recursive MoA', () => {
+    expect(filterMoaSlotProviders(providers).map(provider => provider.slug)).toEqual([
+      'nous',
+      'claude-cli',
+      'codex-cli'
+    ])
+  })
+
+  it('treats an unavailable local agent as setup-required despite its default model', () => {
+    expect(
+      isProviderReady({
+        authenticated: false,
+        models: ['default'],
+        name: 'Cowork',
+        slug: 'cowork',
+        warning: 'Cowork MCP tool unavailable'
+      })
+    ).toBe(false)
   })
 })

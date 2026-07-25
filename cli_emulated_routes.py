@@ -1,4 +1,4 @@
-"""Reserved provider identities for MoA-only CLI completions."""
+"""Reserved Claude/Codex CLI routes shared by primary and MoA execution."""
 
 from typing import Final
 
