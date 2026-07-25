@@ -190,7 +190,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         id="cowork",
         name="Cowork (local agent)",
         auth_type="external_process",
-        inference_base_url="cowork://local",
+        inference_base_url="cli://cowork",
     ),
     "nous": ProviderConfig(
         id="nous",

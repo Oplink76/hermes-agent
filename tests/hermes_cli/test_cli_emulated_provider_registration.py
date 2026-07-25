@@ -54,10 +54,10 @@ def test_cowork_provider_profile_and_primary_runtime() -> None:
     profile = get_provider_profile("cowork")
     assert profile is not None
     assert profile.auth_type == "external_process"
-    assert profile.base_url == "cowork://local"
+    assert profile.base_url == "cli://cowork"
     runtime = resolve_runtime_provider(requested="cowork")
     assert runtime["provider"] == "cowork"
-    assert runtime["base_url"] == "cowork://local"
+    assert runtime["base_url"] == "cli://cowork"
 
 
 @pytest.mark.parametrize(

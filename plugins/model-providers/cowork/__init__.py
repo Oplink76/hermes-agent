@@ -13,7 +13,7 @@ register_provider(
         ),
         auth_type="external_process",
         api_mode="chat_completions",
-        base_url="cowork://local",
+        base_url="cli://cowork",
         supports_health_check=False,
         fallback_models=("default",),
     )

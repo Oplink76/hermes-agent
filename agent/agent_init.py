@@ -1072,7 +1072,7 @@ def init_agent(
         agent.base_url = (
             CLI_EMULATED_ROUTES[agent.provider]
             if agent.provider in CLI_EMULATED_ROUTES
-            else "cowork://local"
+            else "cli://cowork"
         )
         if not agent.quiet_mode:
             print(

@@ -1605,7 +1605,7 @@ def resolve_runtime_provider(
         return {
             "provider": "cowork",
             "api_mode": "chat_completions",
-            "base_url": "cowork://local",
+            "base_url": "cli://cowork",
             "api_key": "cowork-virtual-provider",
             "source": "cowork-virtual-provider",
             "requested_provider": requested_provider,

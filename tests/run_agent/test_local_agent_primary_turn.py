@@ -14,7 +14,7 @@ def test_local_agent_initialization_bypasses_http_client(provider: str) -> None:
     route = {
         "claude-cli": "cli://claude",
         "codex-cli": "cli://codex",
-        "cowork": "cowork://local",
+        "cowork": "cli://cowork",
     }[provider]
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
@@ -41,7 +41,7 @@ def test_live_session_switches_to_local_agent_without_http_client(provider: str)
     route = {
         "claude-cli": "cli://claude",
         "codex-cli": "cli://codex",
-        "cowork": "cowork://local",
+        "cowork": "cli://cowork",
     }[provider]
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),

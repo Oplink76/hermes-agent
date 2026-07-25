@@ -2154,7 +2154,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent.base_url = (
                 CLI_EMULATED_ROUTES[normalized_local]
                 if normalized_local in CLI_EMULATED_ROUTES
-                else "cowork://local"
+                else "cli://cowork"
             )
             agent._client_kwargs = {}
             agent.client = None
