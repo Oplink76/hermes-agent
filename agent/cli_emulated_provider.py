@@ -316,7 +316,56 @@ def _probe_capability(
     _CAPABILITY_CACHE.add(key)
 
 
-def _argv(executable: str, backend: dict[str, Any], model: str) -> list[str]:
+# Hermes' generic effort ladder is none/minimal/low/medium/high/xhigh/max/
+# ultra. Neither CLI accepts all of it, and neither fails closed: Codex
+# forwards the value straight to the API, which rejects an unknown level with
+# a 400 and kills the turn. Clamp onto each vocabulary instead.
+#
+# claude --effort takes low/medium/high/xhigh/max — no "none", no "minimal",
+# so both floor onto "low".
+_CLAUDE_EFFORT_CLAMP = {"none": "low", "minimal": "low", "ultra": "max"}
+# Codex accepts none/minimal/low/medium/high/xhigh/max — only "ultra" is
+# outside its enum.
+_CODEX_EFFORT_CLAMP = {"ultra": "max"}
+
+
+def resolve_cli_effort(provider: str, reasoning_config: Any) -> str | None:
+    """Return the effort level to hand the CLI, or None to omit the flag.
+
+    None means "no explicit Hermes effort": the flag is left off entirely so
+    the CLI's own configured default wins, mirroring how ``model: default``
+    omits ``--model``. ``{"enabled": False}`` is a deliberate "no reasoning"
+    and is a real level, not an omission.
+    """
+    if not isinstance(reasoning_config, dict):
+        return None
+    if reasoning_config.get("enabled") is False:
+        level = "none"
+    else:
+        level = reasoning_config.get("effort")
+    if not level or not isinstance(level, str):
+        return None
+    clamp = _CLAUDE_EFFORT_CLAMP if provider == "claude-cli" else _CODEX_EFFORT_CLAMP
+    return clamp.get(level, level)
+
+
+def _effort_args(provider: str, effort: str | None) -> list[str]:
+    """Argv fragment carrying ``effort``, or empty when it should be omitted."""
+    if not effort:
+        return []
+    if provider == "claude-cli":
+        return ["--effort", effort]
+    # Codex has no dedicated flag; the documented route is a config override.
+    # Passed unquoted — the value reaches Codex as a bare token.
+    return ["-c", f"model_reasoning_effort={effort}"]
+
+
+def _argv(
+    executable: str,
+    backend: dict[str, Any],
+    model: str,
+    effort: str | None = None,
+) -> list[str]:
     if backend["provider"] == "claude-cli":
         argv = [
             executable,
@@ -345,9 +394,14 @@ def _argv(executable: str, backend: dict[str, Any], model: str) -> list[str]:
             "never",
             "-",
         ]
+    extra = list(_effort_args(str(backend["provider"]), effort))
     if model and model != "default":
+        extra.extend(["--model", model])
+    if extra:
+        # codex-cli's argv ends with the "-" stdin marker; everything must go
+        # before it. claude-cli has no trailing positional, so append.
         insert_at = -1 if backend["provider"] == "codex-cli" else len(argv)
-        argv[insert_at:insert_at] = ["--model", model]
+        argv[insert_at:insert_at] = extra
     return argv
 
 
@@ -587,6 +641,7 @@ def create_cli_completion(
     stream: bool = False,
     timeout: float | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    reasoning_config: dict[str, Any] | None = None,
 ) -> Any:
     """Run one MoA-only CLI completion and return an OpenAI-shaped result."""
     selected = _backend(provider, base_url)
@@ -621,7 +676,12 @@ def create_cli_completion(
     try:
         with tempfile.TemporaryDirectory(prefix="hermes-cli-completion-") as cwd:
             returncode, stdout, stderr = _run_process(
-                _argv(executable, selected, model),
+                _argv(
+                    executable,
+                    selected,
+                    model,
+                    resolve_cli_effort(str(selected["provider"]), reasoning_config),
+                ),
                 prompt=prompt,
                 cwd=cwd,
                 timeout=remaining,

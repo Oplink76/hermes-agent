@@ -6805,3 +6805,48 @@ class TestCustomEndpointApiKeyInheritance:
             )
 
         assert captured.get("api_key") == "no-key-required"
+
+
+def test_call_llm_forwards_reasoning_config_to_cli_provider(monkeypatch):
+    """A MoA slot's reasoning_effort must reach the CLI completion.
+
+    moa_config validates and persists reasoning_effort per slot, so dropping
+    it here made the setting a silent no-op: accepted, saved, never applied.
+    """
+    import agent.auxiliary_client as ac
+
+    sentinel = object()
+    captured = {}
+
+    monkeypatch.setattr(
+        ac,
+        "_resolve_task_provider_model",
+        lambda *args, **kwargs: (
+            "claude-cli",
+            "default",
+            "cli://claude",
+            "",
+            "chat_completions",
+        ),
+    )
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(
+        "agent.cli_emulated_provider.create_cli_completion",
+        fake_create,
+    )
+
+    response = call_llm(
+        task="moa_reference",
+        provider="claude-cli",
+        model="default",
+        base_url="cli://claude",
+        messages=[{"role": "user", "content": "Advise."}],
+        reasoning_config={"enabled": True, "effort": "xhigh"},
+    )
+
+    assert response is sentinel
+    assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}

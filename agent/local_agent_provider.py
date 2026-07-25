@@ -23,11 +23,13 @@ from agent.cli_emulated_provider import (
     CliInvocationError,
     CliProcessError,
     CliTimeoutError,
+    _effort_args,
     _executable_for,
     _parse_output,
     _probe_capability,
     _render_messages,
     _run_process,
+    resolve_cli_effort,
 )
 from tools.mcp_tool import discover_mcp_tools
 from tools.registry import registry
@@ -108,7 +110,12 @@ def provider_timeout(provider: str) -> float:
     return value
 
 
-def _acting_argv(executable: str, provider: str, model: str) -> list[str]:
+def _acting_argv(
+    executable: str,
+    provider: str,
+    model: str,
+    effort: str | None = None,
+) -> list[str]:
     if provider == "claude-cli":
         argv = [
             executable,
@@ -119,6 +126,7 @@ def _acting_argv(executable: str, provider: str, model: str) -> list[str]:
             "--permission-mode",
             "bypassPermissions",
         ]
+        argv.extend(_effort_args(provider, effort))
         if model and model != "default":
             argv.extend(["--model", model])
         return argv
@@ -137,8 +145,12 @@ def _acting_argv(executable: str, provider: str, model: str) -> list[str]:
         "never",
         "-",
     ]
+    extra = list(_effort_args(provider, effort))
     if model and model != "default":
-        argv[-1:-1] = ["--model", model]
+        extra.extend(["--model", model])
+    if extra:
+        # Everything goes before the trailing "-" stdin marker.
+        argv[-1:-1] = extra
     return argv
 
 
@@ -150,6 +162,7 @@ def run_cli_acting(
     cwd: str,
     timeout: float | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    reasoning_config: dict[str, Any] | None = None,
 ) -> str:
     """Run one native Claude/Codex acting turn using bounded subprocess IO."""
     selected = _ACTING_BACKENDS.get(provider)
@@ -176,7 +189,12 @@ def run_cli_acting(
     if remaining <= 0:
         raise CliTimeoutError(f"{provider} invocation timed out")
     returncode, stdout, stderr = _run_process(
-        _acting_argv(executable, provider, model),
+        _acting_argv(
+            executable,
+            provider,
+            model,
+            resolve_cli_effort(provider, reasoning_config),
+        ),
         prompt=prompt,
         cwd=project_cwd,
         timeout=remaining,
@@ -340,6 +358,7 @@ def run_local_agent_turn(
                 cwd=_active_cwd(agent),
                 timeout=provider_timeout(provider),
                 cancel_check=cancel_check,
+                reasoning_config=getattr(agent, "reasoning_config", None),
             )
         elif provider == "cowork":
             final_response = run_cowork(

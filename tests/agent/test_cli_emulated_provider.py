@@ -873,3 +873,41 @@ def test_non_text_payload_fails_before_executable_lookup(
             ],
             timeout=2,
         )
+
+
+# ─── reasoning effort forwarding (MoA advisor/aggregator slots) ─────────
+
+
+def test_moa_argv_omits_effort_when_slot_sets_none() -> None:
+    """No slot reasoning_effort must leave the CLI's own default alone."""
+    from agent.cli_emulated_provider import _argv
+
+    for provider in ("claude-cli", "codex-cli"):
+        argv = _argv("/bin/x", {"provider": provider}, "default", None)
+        assert "--effort" not in argv
+        assert not any(a.startswith("model_reasoning_effort") for a in argv)
+
+
+def test_moa_argv_passes_slot_effort_to_each_cli() -> None:
+    from agent.cli_emulated_provider import _argv
+
+    claude = _argv("/bin/claude", {"provider": "claude-cli"}, "default", "high")
+    assert claude[claude.index("--effort") + 1] == "high"
+
+    codex = _argv("/bin/codex", {"provider": "codex-cli"}, "default", "high")
+    assert codex[codex.index("-c") + 1] == "model_reasoning_effort=high"
+    # The "-" stdin marker must stay last or Codex reads no prompt.
+    assert codex[-1] == "-"
+
+
+def test_moa_argv_carries_effort_and_model_together() -> None:
+    from agent.cli_emulated_provider import _argv
+
+    codex = _argv("/bin/codex", {"provider": "codex-cli"}, "gpt-5.5", "xhigh")
+    assert codex[codex.index("--model") + 1] == "gpt-5.5"
+    assert codex[codex.index("-c") + 1] == "model_reasoning_effort=xhigh"
+    assert codex[-1] == "-"
+
+    claude = _argv("/bin/claude", {"provider": "claude-cli"}, "opus", "xhigh")
+    assert claude[claude.index("--model") + 1] == "opus"
+    assert claude[claude.index("--effort") + 1] == "xhigh"

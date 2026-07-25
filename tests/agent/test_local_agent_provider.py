@@ -408,3 +408,116 @@ def test_cowork_rejects_bad_generic_mcp_results(
             cwd=str(tmp_path),
             timeout=5,
         )
+
+
+# ─── reasoning effort forwarding ────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "provider,reasoning_config,expected",
+    [
+        # No Hermes effort set: the flag is omitted entirely so the CLI's own
+        # configured default stays authoritative (same contract as
+        # ``model: default`` omitting --model).
+        ("claude-cli", None, None),
+        ("codex-cli", None, None),
+        ("claude-cli", {}, None),
+        # Levels both CLIs accept pass through untouched.
+        ("claude-cli", {"enabled": True, "effort": "xhigh"}, "xhigh"),
+        ("codex-cli", {"enabled": True, "effort": "xhigh"}, "xhigh"),
+        # "ultra" is outside both vocabularies — clamp to each ceiling rather
+        # than let Codex forward it and take a 400 from the API.
+        ("claude-cli", {"enabled": True, "effort": "ultra"}, "max"),
+        ("codex-cli", {"enabled": True, "effort": "ultra"}, "max"),
+        # claude --effort has no "none"/"minimal"; both floor onto "low".
+        # Codex accepts them as-is.
+        ("claude-cli", {"enabled": False}, "low"),
+        ("codex-cli", {"enabled": False}, "none"),
+        ("claude-cli", {"enabled": True, "effort": "minimal"}, "low"),
+        ("codex-cli", {"enabled": True, "effort": "minimal"}, "minimal"),
+    ],
+)
+def test_resolve_cli_effort_clamps_onto_each_cli_vocabulary(
+    provider, reasoning_config, expected
+) -> None:
+    from agent.cli_emulated_provider import resolve_cli_effort
+
+    assert resolve_cli_effort(provider, reasoning_config) == expected
+
+
+def test_acting_argv_omits_effort_when_unset() -> None:
+    from agent.local_agent_provider import _acting_argv
+
+    for provider in ("claude-cli", "codex-cli"):
+        argv = _acting_argv("/bin/x", provider, "default", None)
+        assert "--effort" not in argv
+        assert not any(a.startswith("model_reasoning_effort") for a in argv)
+
+
+def test_acting_argv_passes_effort_to_each_cli() -> None:
+    from agent.local_agent_provider import _acting_argv
+
+    claude = _acting_argv("/bin/claude", "claude-cli", "default", "xhigh")
+    assert claude[claude.index("--effort") + 1] == "xhigh"
+
+    # Codex has no dedicated flag; it takes a config override, and everything
+    # must land before the trailing "-" stdin marker.
+    codex = _acting_argv("/bin/codex", "codex-cli", "default", "xhigh")
+    assert codex[codex.index("-c") + 1] == "model_reasoning_effort=xhigh"
+    assert codex[-1] == "-"
+
+
+def test_acting_argv_carries_effort_and_model_together() -> None:
+    from agent.local_agent_provider import _acting_argv
+
+    codex = _acting_argv("/bin/codex", "codex-cli", "gpt-5.5", "high")
+    assert codex[codex.index("--model") + 1] == "gpt-5.5"
+    assert codex[codex.index("-c") + 1] == "model_reasoning_effort=high"
+    assert codex[-1] == "-"
+
+    claude = _acting_argv("/bin/claude", "claude-cli", "opus", "high")
+    assert claude[claude.index("--model") + 1] == "opus"
+    assert claude[claude.index("--effort") + 1] == "high"
+
+
+@pytest.mark.parametrize(
+    ("provider", "command", "expected"),
+    [
+        ("claude-cli", "claude", ["--effort", "xhigh"]),
+        ("codex-cli", "codex", ["-c", "model_reasoning_effort=xhigh"]),
+    ],
+)
+def test_primary_cli_turn_forwards_reasoning_effort_to_the_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    command: str,
+    expected: list[str],
+) -> None:
+    """End-to-end: a Hermes effort must reach the spawned CLI's argv.
+
+    Guards the original defect — effort is a wire parameter for every HTTP
+    provider, and this path spawns a subprocess instead, so it silently
+    dropped the setting.
+    """
+    from agent.local_agent_provider import run_cli_acting
+
+    executable, record = _write_acting_cli(tmp_path, command, "done")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(
+        "agent.cli_emulated_provider.shutil.which",
+        lambda name: str(executable) if name == command else None,
+    )
+
+    run_cli_acting(
+        provider=provider,
+        model="default",
+        messages=[{"role": "user", "content": "Work."}],
+        cwd=str(project),
+        timeout=5,
+        reasoning_config={"enabled": True, "effort": "xhigh"},
+    )
+
+    argv = json.loads(record.read_text())["argv"]
+    assert argv[argv.index(expected[0]) + 1] == expected[1]

@@ -7235,6 +7235,7 @@ def call_llm(
             stream=stream,
             timeout=cli_timeout,
             cancel_check=is_cancelled,
+            reasoning_config=reasoning_config,
         )
 
     effective_timeout = _effective_aux_timeout(task, timeout)
