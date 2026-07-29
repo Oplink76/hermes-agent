@@ -11205,6 +11205,76 @@ def promote_task(
     return True, None
 
 
+def _product_unblock_assignee(
+    meta: Optional[dict], task_scope: Optional[sqlite3.Row]
+) -> tuple[bool, Optional[str]]:
+    """Return whether unblock owns the assignee field and its governed value."""
+    if (
+        task_scope is None
+        or task_scope["workflow_template_id"] != "product"
+        or not isinstance(meta, dict)
+    ):
+        return False, None
+
+    step_key = str(task_scope["current_step_key"] or "").strip()
+    if not step_key:
+        return False, None
+
+    qualification = meta.get("qualification")
+    if isinstance(qualification, dict) and qualification.get("required") is True:
+        phase_assignees = qualification.get("phase_assignees")
+        if not isinstance(phase_assignees, dict) or step_key not in phase_assignees:
+            return False, None
+        mapped = phase_assignees[step_key]
+    else:
+        phase_roles = PRODUCT_QUALIFICATION_DEFAULTS.get("phase_assignees", {})
+        if step_key not in phase_roles:
+            return False, None
+        role = phase_roles[step_key]
+        if role is None:
+            return True, None
+        workflow_assignees = _product_workflow_dict(meta).get("assignees")
+        if not isinstance(workflow_assignees, dict) or role not in workflow_assignees:
+            return False, None
+        mapped = workflow_assignees[role]
+
+    if mapped is None:
+        return (True, None) if step_key == "release_measure" else (False, None)
+    assignee = str(mapped).strip()
+    return (True, assignee) if assignee else (False, None)
+
+
+def _apply_unblock_state(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    new_status: str,
+    task_scope: Optional[sqlite3.Row],
+    meta: Optional[dict],
+    allow_scheduled: bool,
+) -> int:
+    """Apply canonical unblock state, including the board-owned phase route."""
+    restore_assignee, assignee = _product_unblock_assignee(meta, task_scope)
+    assignee_sql = ", assignee = ?" if restore_assignee else ""
+    status_sql = (
+        "status IN ('blocked', 'scheduled')" if allow_scheduled else "status = 'blocked'"
+    )
+    params: list[object] = [new_status]
+    if restore_assignee:
+        params.append(assignee)
+    params.append(task_id)
+    sql = (
+        f"UPDATE tasks SET status = ?{assignee_sql}, current_run_id = NULL, "
+        "consecutive_failures = 0, last_failure_error = NULL "
+        f"WHERE id = ? AND {status_sql}"
+    )
+    if restore_assignee:
+        # Strict-board routing triggers allow only canonical governance writes.
+        with authorized_governance_write():
+            return conn.execute(sql, params).rowcount
+    return conn.execute(sql, params).rowcount
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
@@ -11255,7 +11325,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             for parent in parents
         )
         task_scope = conn.execute(
-            "SELECT t.current_step_key, "
+            "SELECT t.workflow_template_id, t.current_step_key, "
             "json_extract(w.canonical_json, '$.po_evidence.surface') "
             "AS qualification_surface "
             "FROM tasks t LEFT JOIN work_contracts w ON w.id = t.work_contract_id "
@@ -11282,13 +11352,15 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # (the *dispatcher* spawn/crash/timeout counter — a different signal) is
         # still reset here, which is correct: a deliberate unblock is a fresh
         # start for the dispatcher's retry budget.
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
-            (new_status, task_id),
+        rowcount = _apply_unblock_state(
+            conn,
+            task_id=task_id,
+            new_status=new_status,
+            task_scope=task_scope,
+            meta=meta,
+            allow_scheduled=True,
         )
-        if cur.rowcount != 1:
+        if rowcount != 1:
             return False
         # v2 flag maintenance: a just-unblocked card is idle -- (0, 0) --
         # regardless of whether it lands in 'todo' or 'ready'. Direct
@@ -11364,13 +11436,15 @@ def approve_unblock_task(
             (task_id,),
         ).fetchone()
         new_status = "todo" if undone_parents else "ready"
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status = 'blocked'",
-            (new_status, task_id),
+        rowcount = _apply_unblock_state(
+            conn,
+            task_id=task_id,
+            new_status=new_status,
+            task_scope=row,
+            meta=meta,
+            allow_scheduled=False,
         )
-        if cur.rowcount != 1:
+        if rowcount != 1:
             raise RuntimeError("card changed; refresh before approving unblock")
         if _handoff_v2_enabled(meta):
             conn.execute(

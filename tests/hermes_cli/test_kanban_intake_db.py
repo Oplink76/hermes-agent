@@ -118,6 +118,61 @@ def _materialized_card(connection, board: str) -> str:
     return task_id
 
 
+def _escalate_materialized_card(connection, board: str, task_id: str) -> None:
+    ordinary_run = kb.claim_task(connection, task_id)
+    assert ordinary_run is not None and ordinary_run.current_run_id is not None
+    assert kb.block_task(
+        connection,
+        task_id,
+        reason="Need a resolver decision",
+        kind="needs_input",
+        attempted_resolutions=["checked the governed route"],
+        expected_run_id=ordinary_run.current_run_id,
+        board=board,
+        human_escalation_assignee="resolver",
+    )
+    resolver_run = kb.claim_task(connection, task_id)
+    assert resolver_run is not None and resolver_run.current_run_id is not None
+    task = kb.get_task(connection, task_id)
+    preflight = [
+        event
+        for event in kb.list_events(connection, task_id)
+        if event.kind == kb.PRODUCT_WORKFLOW_PRECHECK_EVENT
+    ][-1]
+    expected = {
+        "run_id": resolver_run.current_run_id,
+        "preflight_event_id": preflight.id,
+        "status": task.status,
+        "phase": task.current_step_key,
+        "assignee": task.assignee,
+        "project_id": task.project_id,
+        "workflow_template_id": task.workflow_template_id,
+        "workspace_kind": task.workspace_kind,
+        "workspace_path": task.workspace_path,
+        "branch_name": task.branch_name,
+        "running": task.running,
+        "blocked": task.blocked,
+    }
+    assert kb.resolve_product_preflight(
+        connection,
+        task_id,
+        board=board,
+        request={
+            "decision": "escalate",
+            "fault_domain": "task_state",
+            "diagnosis": "The task requires human intervention",
+            "reason": "Escalate through the canonical resolver path",
+            "expected": expected,
+        },
+        resolver_profile="resolver",
+        resolver_model="test-model",
+    )
+    escalated = kb.get_task(connection, task_id)
+    assert escalated is not None
+    assert escalated.status == "blocked"
+    assert escalated.assignee == "default"
+
+
 def _materialized_scheduled_card(connection, board: str) -> str:
     task_id = _materialized_card(connection, board)
     assert kb.schedule_task(connection, task_id, reason="no wake action")
@@ -150,6 +205,50 @@ def _materialized_epic(connection, board: str) -> str:
         signed_contract=signed,
         secret=b"test-only-secret",
     )
+
+
+def test_unblock_restores_assignee_on_strict_materialized_card(
+    tmp_path, monkeypatch
+):
+    board = "strict-unblock-restores-assignee"
+    _strict_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_card(connection, board)
+        _escalate_materialized_card(connection, board, task_id)
+
+        assert kb.unblock_task(connection, task_id)
+        task = kb.get_task(connection, task_id)
+
+    assert task is not None
+    assert task.status == "ready"
+    assert task.current_step_key == "development"
+    assert task.assignee == "developer"
+
+
+def test_approve_unblock_restores_assignee_on_strict_materialized_card(
+    tmp_path, monkeypatch
+):
+    board = "strict-approve-unblock-restores-assignee"
+    _strict_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_card(connection, board)
+        task = kb.get_task(connection, task_id)
+        _escalate_materialized_card(connection, board, task_id)
+
+        approved = kb.approve_unblock_task(
+            connection,
+            task_id,
+            expected_status="blocked",
+            expected_title=task.title,
+            comment_author="operator",
+        )
+
+    assert approved is not None
+    assert approved.status == "ready"
+    assert approved.current_step_key == "development"
+    assert approved.assignee == "developer"
 
 
 def test_intake_submission_is_durable_and_inert(conn):
@@ -738,6 +837,8 @@ def test_strict_board_rejects_direct_task_insert_and_materializes_atomically(
                 "WHERE id = ?",
                 (task_id,),
             )
+        with pytest.raises(sqlite3.IntegrityError, match="Work Contract-owned"):
+            kb.assign_task(connection, task_id, "reviewer")
         assert kb.set_phase(connection, task_id, "test", board="strict")
         assert kb.get_task(connection, task_id).current_step_key == "test"
         with pytest.raises(sqlite3.IntegrityError, match="Work Contract-owned"):

@@ -3127,6 +3127,154 @@ def test_block_then_unblock(kanban_home):
         assert kb.get_task(conn, t).status == "ready"
 
 
+@pytest.mark.parametrize(
+    ("step", "expected_assignee"),
+    [
+        ("architecture", "architect"),
+        ("development", "developer"),
+        ("test", "tester"),
+    ],
+)
+def test_unblock_restores_product_step_assignee(
+    kanban_home, step, expected_assignee
+):
+    board = f"unblock-restores-{step}"
+    kb.ensure_product_board_defaults(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Escalated card",
+            assignee="default",
+            initial_status="blocked",
+            workflow_template_id="product",
+            current_step_key=step,
+            board=board,
+        )
+
+        assert kb.unblock_task(conn, tid)
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert task.status == "ready"
+    assert task.assignee == expected_assignee
+
+
+def test_unblock_keeps_release_measure_unassigned(kanban_home):
+    board = "unblock-keeps-release-unassigned"
+    kb.ensure_product_board_defaults(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Release gate",
+            assignee="default",
+            initial_status="blocked",
+            workflow_template_id="product",
+            current_step_key="release_measure",
+            board=board,
+        )
+
+        assert kb.unblock_task(conn, tid)
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert task.status == "ready"
+    assert task.assignee is None
+
+
+def test_unblock_does_not_clear_unmapped_executable_phase(kanban_home):
+    board = "unblock-keeps-unmapped-executable-phase"
+    kb.ensure_product_board_defaults(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Temporarily unmapped phase",
+            assignee="default",
+            initial_status="blocked",
+            workflow_template_id="product",
+            current_step_key="development",
+            board=board,
+        )
+        meta_path = kb.board_metadata_path(board)
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["qualification"]["required"] = True
+        meta["qualification"]["phase_assignees"]["development"] = None
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+        assert kb.unblock_task(conn, tid)
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert task.status == "ready"
+    assert task.assignee == "default"
+
+
+def test_unblock_keeps_custom_workflow_assignee_on_product_board(kanban_home):
+    board = "unblock-keeps-custom-workflow-route"
+    kb.ensure_product_board_defaults(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Custom workflow task",
+            assignee="custom-worker",
+            initial_status="blocked",
+            workflow_template_id="custom",
+            current_step_key="development",
+            board=board,
+        )
+
+        assert kb.unblock_task(conn, tid)
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert task.status == "ready"
+    assert task.assignee == "custom-worker"
+
+
+def test_unblock_uses_custom_non_strict_product_assignee(kanban_home):
+    board = "unblock-custom-product-route"
+    kb.ensure_product_board_defaults(board)
+    meta_path = kb.board_metadata_path(board)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["product_workflow"]["assignees"]["developer"] = "custom-developer"
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Custom-routed product task",
+            assignee="default",
+            initial_status="blocked",
+            workflow_template_id="product",
+            current_step_key="development",
+            board=board,
+        )
+
+        assert kb.unblock_task(conn, tid)
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert task.status == "ready"
+    assert task.assignee == "custom-developer"
+
+
+def test_unblock_keeps_non_product_assignee_unchanged(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Generic blocked task",
+            assignee="default",
+            initial_status="blocked",
+            current_step_key="development",
+        )
+
+        assert kb.unblock_task(conn, tid)
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert task.status == "ready"
+    assert task.assignee == "default"
+
+
 def test_unblock_resets_failure_counters(kanban_home):
     """unblock_task must reset consecutive_failures and last_failure_error."""
     with kb.connect() as conn:
