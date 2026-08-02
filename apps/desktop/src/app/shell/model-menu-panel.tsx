@@ -196,6 +196,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     // switch never hits the primary (busy) session by accident.
     select: (model, provider) => {
       const providerState = modelOptions.data?.providers?.find(candidate => candidate.slug === provider)
+
       if (providerState && !isProviderReady(providerState)) {
         return
       }
