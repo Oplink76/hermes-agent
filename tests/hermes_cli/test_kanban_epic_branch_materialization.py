@@ -382,3 +382,58 @@ def test_refused_resolver_routing_runs_before_any_other_claim_mutation(
     assert after == before + ["claim_rejected"]
     assert runs == 0
     assert task is not None and task.status == "blocked"
+
+
+def test_repeated_integration_of_the_same_tip_writes_one_pin(
+    epic_home, tmp_path
+):
+    """A re-entrant integration pass must not multiply pin events.
+
+    Live boards re-record `already_integrated` for done stories on every
+    dispatcher tick — 17,884 such events on one board in 101 hours. A pin per
+    tick would double that churn and record nothing new.
+    """
+    repo = _repo(tmp_path)
+    board = "epic-pin-dedupe"
+    _v2_board(board, repo)
+    with kb.connect(board=board) as conn:
+        epic_id, story_id = _epic_with_story(conn, board, repo, "Story one")
+        story = kb.get_task(conn, story_id)
+        assert story is not None
+        kb._resolve_worktree_workspace(story, board=board, conn=conn)
+        epic_branch = kb.epic_branch_for(epic_id)
+        tip = _git(repo, "rev-parse", epic_branch)
+
+        def pins():
+            return conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+                (epic_id, kb.EPIC_BASE_PINNED_EVENT),
+            ).fetchone()[0]
+
+        baseline = pins()
+        for _ in range(5):
+            kb._record_story_integration(
+                conn, story_id, epic_id, epic_branch,
+                {"target_branch": epic_branch, "candidate_sha": tip,
+                 "already_integrated": True},
+            )
+        # The story's own integration events are still recorded every time.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (story_id, "story_integrated_to_epic"),
+        ).fetchone()[0] == 5
+        assert pins() == baseline, "an unchanged tip must not write a new pin"
+
+        # A real advance still pins exactly once.
+        _git(repo, "checkout", epic_branch)
+        (repo / "advanced.txt").write_text("more\n", encoding="utf-8")
+        _git(repo, "add", "advanced.txt")
+        _git(repo, "commit", "-m", "advance the epic")
+        moved = _git(repo, "rev-parse", epic_branch)
+        _git(repo, "checkout", "main")
+        kb._record_story_integration(
+            conn, story_id, epic_id, epic_branch,
+            {"target_branch": epic_branch, "candidate_sha": moved},
+        )
+        assert pins() == baseline + 1
+        assert kb._epic_base_pinned_sha(conn, epic_id) == moved

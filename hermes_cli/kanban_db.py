@@ -13627,12 +13627,23 @@ def _record_story_integration(
     non-terminal until release, so its own events survive.
     """
     candidate_sha = str(payload.get("candidate_sha") or "").strip()
+    # Only pin when the tip actually moved. A re-entrant integration pass
+    # re-records `already_integrated` for a story whose work is long since in
+    # the epic branch, at whatever rate the dispatcher ticks — on live boards
+    # that is tens of thousands of identical events. Writing a pin for each of
+    # those would double that churn while recording nothing new, and recovery
+    # only ever reads the newest pin.
+    pin_sha = (
+        candidate_sha
+        if candidate_sha and candidate_sha != _epic_base_pinned_sha(conn, epic_id)
+        else None
+    )
     with write_txn(conn):
         _append_event(conn, story_id, "story_integrated_to_epic", payload)
-        if candidate_sha:
+        if pin_sha:
             _append_event(
                 conn, epic_id, EPIC_BASE_PINNED_EVENT,
-                {"branch": epic_branch, "base_sha": candidate_sha},
+                {"branch": epic_branch, "base_sha": pin_sha},
             )
 
 
