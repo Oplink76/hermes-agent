@@ -17,11 +17,22 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_repository import (
+    PreparedRefCASResult,
+    VerificationResult,
+    build_verification_receipt_key,
+    verification_result_payload,
+)
+from hermes_cli.kanban_story_integration import (
+    finish_intent,
+    integration_intent_from_row,
+)
 
 
 @pytest.fixture
@@ -304,14 +315,139 @@ def _refuse_branch_creation(real_run):
     return _run
 
 
+def _integration_board_metadata(repo: Path) -> dict:
+    return {
+        "preset": "product",
+        "default_workdir": str(repo),
+        "product_workflow": {"handoff_v2": True},
+        "repository": {
+            "base_ref": "refs/heads/main",
+            "target_branch": "main",
+            "verification_profiles": {
+                "story_integration": [
+                    {"argv": ["true"], "workdir": ".", "timeout_seconds": 60},
+                ],
+            },
+            "ci_observation": {
+                "provider": "github_actions",
+                "required_workflows": ["CI"],
+            },
+            "boundary_evidence": {
+                "test_globs": ["tests/**"],
+                "fixture_globs": ["tests/fixtures/**"],
+                "generated_paths": [],
+            },
+        },
+    }
+
+
+def _finalize_story_integration(
+    conn,
+    repo: Path,
+    monkeypatch,
+    epic_id: str,
+    story_id: str,
+    *,
+    source_branch: str,
+    source_sha: str,
+    review_base_sha: str,
+    pre_sha: str,
+    candidate_sha: str,
+) -> None:
+    """Drive one prepared story integration through the intent coordinator.
+
+    The intent is seeded in its prepared state with an exact verification
+    receipt, then ``finish_intent`` records the durable fact, the terminal
+    story state, and the epic base pin together. The retained candidate ref
+    is never created on disk; the cleanup CAS treats an absent ref as
+    already removed.
+    """
+    metadata = _integration_board_metadata(repo)
+    with monkeypatch.context() as scope:
+        scope.setattr(kb, "product_board_metadata", lambda _board=None: metadata)
+        contract = kb.repository_contract_for_metadata(metadata)
+        assert contract is not None
+        profile = contract.verification["story_integration"]
+        receipt_key = build_verification_receipt_key(
+            profile,
+            repo,
+            candidate_sha=candidate_sha,
+            contract_digest=contract.digest,
+            generated_policy_digest=contract.generated_policy_digest,
+            gate_kind="story_integration",
+            profile_name="story_integration",
+        )
+        verification = VerificationResult(
+            status="passed",
+            source_sha=source_sha,
+            candidate_sha=candidate_sha,
+            contract_digest=contract.digest,
+            profile="story_integration",
+            steps=(),
+            key=receipt_key,
+        )
+        payload = verification_result_payload(
+            verification, scope="story_integration", subject_id=story_id
+        )
+        now = int(time.time())
+        with kb.authorized_governance_write(), kb.write_txn(conn):
+            seeded = conn.execute(
+                "SELECT 1 FROM story_integration_intents "
+                "WHERE epic_id=? AND story_id=? AND source_sha=?",
+                (epic_id, story_id, source_sha),
+            ).fetchone()
+            if seeded is None:
+                conn.execute(
+                    "UPDATE tasks SET workflow_template_id='product', "
+                    "current_step_key='integration_pending', status='review', "
+                    "assignee=NULL, running=0, blocked=0, current_run_id=NULL, "
+                    "branch_name=? WHERE id=?",
+                    (source_branch, story_id),
+                )
+                event_id = kb._append_event(
+                    conn, story_id, "repository_verification", payload
+                )
+                conn.execute(
+                    "INSERT INTO story_integration_intents "
+                    "(epic_id, story_id, source_sha, source_branch, review_run_id, "
+                    "review_base_sha, status, claim_lock, claim_expires, "
+                    "attempt_count, target_pre_sha, candidate_sha, candidate_ref, "
+                    "verification_event_id, last_failure_code, created_at, "
+                    "updated_at) "
+                    "VALUES (?, ?, ?, ?, 0, ?, 'prepared', NULL, NULL, 1, ?, ?, "
+                    "?, ?, NULL, ?, ?)",
+                    (
+                        epic_id,
+                        story_id,
+                        source_sha,
+                        source_branch,
+                        review_base_sha,
+                        pre_sha,
+                        candidate_sha,
+                        f"refs/hermes/integration-candidates/{story_id}",
+                        event_id,
+                        now,
+                        now,
+                    ),
+                )
+        row = conn.execute(
+            "SELECT * FROM story_integration_intents "
+            "WHERE epic_id=? AND story_id=? AND source_sha=?",
+            (epic_id, story_id, source_sha),
+        ).fetchone()
+        assert row is not None
+        intent = integration_intent_from_row(row)
+        finish_intent(conn, intent, PreparedRefCASResult("advanced", candidate_sha))
+
+
 def test_integration_moves_the_pin_so_recovery_restores_the_epic_tip(
-    epic_home, tmp_path
+    epic_home, tmp_path, monkeypatch
 ):
     """Recovery must restore the integrated tip, not the original base.
 
     Story cards go `done` after integrating, so `gc_events` prunes their
-    `story_integrated_to_epic` rows. If the pin stayed at the first base, a
-    later sibling would branch off a base missing every integrated story.
+    `task_events` rows. If the pin stayed at the first base, a later
+    sibling would branch off a base missing every integrated story.
     """
     repo = _repo(tmp_path)
     board = "epic-pin-follows-tip"
@@ -320,7 +456,9 @@ def test_integration_moves_the_pin_so_recovery_restores_the_epic_tip(
         epic_id, story_id = _epic_with_story(conn, board, repo, "Story one")
         story = kb.get_task(conn, story_id)
         assert story is not None
-        kb._resolve_worktree_workspace(story, board=board, conn=conn)
+        _workspace, story_branch = kb._resolve_worktree_workspace(
+            story, board=board, conn=conn
+        )
         epic_branch = kb.epic_branch_for(epic_id)
         original = _git(repo, "rev-parse", epic_branch)
 
@@ -332,19 +470,24 @@ def test_integration_moves_the_pin_so_recovery_restores_the_epic_tip(
         tip = _git(repo, "rev-parse", epic_branch)
         _git(repo, "checkout", "main")
         assert tip != original
-        kb._record_story_integration(
-            conn, story_id, epic_id, epic_branch,
-            {"target_branch": epic_branch, "candidate_sha": tip},
+        _finalize_story_integration(
+            conn,
+            repo,
+            monkeypatch,
+            epic_id,
+            story_id,
+            source_branch=story_branch,
+            source_sha=_git(repo, "rev-parse", story_branch),
+            review_base_sha=original,
+            pre_sha=original,
+            candidate_sha=tip,
         )
         assert kb._epic_base_pinned_sha(conn, epic_id) == tip
 
         # The story's own events are pruned exactly as gc_events would, so the
         # pin is the only surviving evidence.
         with kb.write_txn(conn):
-            conn.execute(
-                "DELETE FROM task_events WHERE task_id = ? AND kind = ?",
-                (story_id, "story_integrated_to_epic"),
-            )
+            conn.execute("DELETE FROM task_events WHERE task_id = ?", (story_id,))
         _git(repo, "branch", "-D", epic_branch)
         (repo / "moved.txt").write_text("later\n", encoding="utf-8")
         _git(repo, "add", "moved.txt")
@@ -385,7 +528,7 @@ def test_refused_resolver_routing_runs_before_any_other_claim_mutation(
 
 
 def test_repeated_integration_of_the_same_tip_writes_one_pin(
-    epic_home, tmp_path
+    epic_home, tmp_path, monkeypatch
 ):
     """A re-entrant integration pass must not multiply pin events.
 
@@ -400,9 +543,12 @@ def test_repeated_integration_of_the_same_tip_writes_one_pin(
         epic_id, story_id = _epic_with_story(conn, board, repo, "Story one")
         story = kb.get_task(conn, story_id)
         assert story is not None
-        kb._resolve_worktree_workspace(story, board=board, conn=conn)
+        workspace, story_branch = kb._resolve_worktree_workspace(
+            story, board=board, conn=conn
+        )
         epic_branch = kb.epic_branch_for(epic_id)
         tip = _git(repo, "rev-parse", epic_branch)
+        source_sha = _git(repo, "rev-parse", story_branch)
 
         def pins():
             return conn.execute(
@@ -412,16 +558,24 @@ def test_repeated_integration_of_the_same_tip_writes_one_pin(
 
         baseline = pins()
         for _ in range(5):
-            kb._record_story_integration(
-                conn, story_id, epic_id, epic_branch,
-                {"target_branch": epic_branch, "candidate_sha": tip,
-                 "already_integrated": True},
+            _finalize_story_integration(
+                conn,
+                repo,
+                monkeypatch,
+                epic_id,
+                story_id,
+                source_branch=story_branch,
+                source_sha=source_sha,
+                review_base_sha=tip,
+                pre_sha=tip,
+                candidate_sha=tip,
             )
-        # The story's own integration events are still recorded every time.
+        # The durable integration fact is recorded once; the four replays of
+        # the already-integrated intent are exact no-ops.
         assert conn.execute(
             "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
-            (story_id, "story_integrated_to_epic"),
-        ).fetchone()[0] == 5
+            (story_id, "story_integrated"),
+        ).fetchone()[0] == 1
         assert pins() == baseline, "an unchanged tip must not write a new pin"
 
         # A real advance still pins exactly once.
@@ -431,9 +585,22 @@ def test_repeated_integration_of_the_same_tip_writes_one_pin(
         _git(repo, "commit", "-m", "advance the epic")
         moved = _git(repo, "rev-parse", epic_branch)
         _git(repo, "checkout", "main")
-        kb._record_story_integration(
-            conn, story_id, epic_id, epic_branch,
-            {"target_branch": epic_branch, "candidate_sha": moved},
+        # The reworked story integrates again through a fresh intent.
+        (workspace / "rework.txt").write_text("rework\n", encoding="utf-8")
+        _git(workspace, "add", "rework.txt")
+        _git(workspace, "commit", "-m", "rework story")
+        reworked = _git(workspace, "rev-parse", "HEAD")
+        _finalize_story_integration(
+            conn,
+            repo,
+            monkeypatch,
+            epic_id,
+            story_id,
+            source_branch=story_branch,
+            source_sha=reworked,
+            review_base_sha=tip,
+            pre_sha=tip,
+            candidate_sha=moved,
         )
         assert pins() == baseline + 1
         assert kb._epic_base_pinned_sha(conn, epic_id) == moved

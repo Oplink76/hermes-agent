@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -241,3 +243,117 @@ def test_missing_or_ambiguous_configured_base_fails_before_epic_mutation(
         ).fetchone()[0] == 0
 
     assert not kb._git_branch_exists(repo, kb.epic_branch_for(epic_id))
+
+
+def test_public_epic_readiness_uses_current_durable_fact_not_story_events(
+    epic_home, tmp_path
+):
+    repo, base_sha = _repo_with_moved_head(tmp_path)
+    board = "fact-derived-epic-ready"
+    epic_id, story_id = _configured_epic_story(
+        board, repo, base_ref="refs/heads/main"
+    )
+    branch = "story/ready"
+    _git(repo, "switch", "-c", branch)
+    (repo / "story.txt").write_text("ready\n", encoding="utf-8")
+    _git(repo, "add", "story.txt")
+    _git(repo, "commit", "-m", "story")
+    source_sha = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "switch", "main")
+    epic_branch = kb.epic_branch_for(epic_id)
+    _git(repo, "update-ref", f"refs/heads/{epic_branch}", source_sha)
+    now = int(time.time())
+    test_metadata = {
+        "workflow_outcome": {"verdict": "passed"},
+        "ai_provenance": {
+            "writer": {"agent": "developer"},
+            "tester": {"agent": "tester", "result": "passed"},
+        },
+        "test_branch": branch,
+        "test_head_sha": source_sha,
+    }
+    review_metadata = {
+        "workflow_outcome": {"verdict": "approved"},
+        "ai_provenance": {
+            "writer": {"agent": "developer"},
+            "reviewer": {"agent": "reviewer"},
+        },
+        "review_branch": branch,
+        "review_base_sha": base_sha,
+        "review_head_sha": source_sha,
+    }
+
+    with kb.connect(board=board) as connection:
+        connection.execute(
+            "INSERT INTO task_runs "
+            "(task_id, step_key, status, outcome, metadata, started_at, ended_at) "
+            "VALUES (?, 'test', 'completed', 'advanced', ?, ?, ?)",
+            (story_id, json.dumps(test_metadata), now - 4, now - 3),
+        )
+        review_run_id = connection.execute(
+            "INSERT INTO task_runs "
+            "(task_id, step_key, status, outcome, metadata, started_at, ended_at) "
+            "VALUES (?, 'review', 'completed', 'advanced', ?, ?, ?)",
+            (story_id, json.dumps(review_metadata), now - 2, now - 1),
+        ).lastrowid
+        connection.execute(
+            "UPDATE tasks SET status='done', current_step_key='done', running=0, "
+            "blocked=0, current_run_id=NULL, branch_name=? WHERE id=?",
+            (branch, story_id),
+        )
+        connection.execute(
+            "INSERT INTO story_integration_intents ("
+            "epic_id, story_id, source_sha, source_branch, review_run_id, review_base_sha, "
+            "status, candidate_sha, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, 'integrated', ?, ?, ?)",
+            (
+                epic_id,
+                story_id,
+                source_sha,
+                branch,
+                review_run_id,
+                base_sha,
+                source_sha,
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO epic_story_integrations "
+            "(epic_id, story_id, source_sha, candidate_sha, integrated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (epic_id, story_id, source_sha, source_sha, now),
+        )
+        event_id = connection.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'repository_verification', '{}', ?)",
+            (story_id, now),
+        ).lastrowid
+
+        assert kb.epic_ready(
+            connection, epic_id, board=board, verify_fn=lambda _branch: True
+        ) is True
+        connection.execute("DELETE FROM task_events WHERE id=?", (event_id,))
+        assert kb.epic_ready(
+            connection, epic_id, board=board, verify_fn=lambda _branch: True
+        ) is True
+        empty_metadata = dict(review_metadata)
+        empty_metadata["review_base_sha"] = source_sha
+        connection.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(empty_metadata), review_run_id),
+        )
+        assert kb.epic_ready(
+            connection, epic_id, board=board, verify_fn=lambda _branch: True
+        ) is False
+        connection.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(review_metadata), review_run_id),
+        )
+        connection.execute(
+            "DELETE FROM epic_story_integrations WHERE epic_id=? AND story_id=?",
+            (epic_id, story_id),
+        )
+        assert kb.epic_ready(
+            connection, epic_id, board=board, verify_fn=lambda _branch: True
+        ) is False

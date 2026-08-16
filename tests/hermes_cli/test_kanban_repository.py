@@ -11,19 +11,32 @@ import hermes_cli.kanban_repository as repository_module
 from hermes_cli.kanban_repository import (
     EvidenceWorkspaceError,
     EvidenceWorkspaceResult,
+    PreparedRefCASResult,
+    PreparedRefRecoveryResult,
+    RELEASE_CANDIDATE_REF_PREFIX,
     RepositoryConfigurationError,
     RefreshRequest,
+    TargetHeadsObservation,
     VerificationCommand,
     VerificationProfile,
+    advance_prepared_candidate_ref,
     build_verification_receipt,
     build_verification_receipt_key,
+    commit_contains,
+    delete_prepared_candidate_ref,
+    delete_release_candidate_ref,
     inspect_evidence_workspace,
+    inspect_prepared_candidate_ref,
     load_repository_contract,
+    observe_ci_workflow_runs,
+    observe_target_heads,
     refresh_story_branch,
     resolve_commit,
     restore_generated_paths,
     run_verification,
+    verification_receipt_matches,
     verification_receipt_from_payload,
+    verification_result_payload,
 )
 
 
@@ -334,6 +347,30 @@ def test_resolve_commit_rejects_ambiguous_ref(repository: Path):
     assert exc_info.value.code == "missing_ref"
 
 
+def test_commit_contains_accepts_equal_and_ancestor_commits(repository: Path):
+    base_sha = _git(repository, "rev-parse", "HEAD")
+    child_sha = _commit(repository, "child.txt", "child\n", "child")
+
+    assert commit_contains(repository, child_sha, child_sha) is True
+    assert commit_contains(repository, child_sha, base_sha) is True
+    assert commit_contains(repository, base_sha, child_sha) is False
+    with pytest.raises(RepositoryConfigurationError) as missing:
+        commit_contains(repository, "f" * 40, "f" * 40)
+    assert missing.value.code == "ancestry_check_failed"
+
+
+@pytest.mark.parametrize("field", ["descendant_sha", "ancestor_sha"])
+def test_commit_contains_refuses_malformed_fact_sha(repository: Path, field: str):
+    sha = _git(repository, "rev-parse", "HEAD")
+    values = {"descendant_sha": sha, "ancestor_sha": sha}
+    values[field] = "not-a-full-sha"
+
+    with pytest.raises(RepositoryConfigurationError) as exc_info:
+        commit_contains(repository, **values)
+
+    assert exc_info.value.code == f"malformed_{field}"
+
+
 def _git(repo: Path, *args: str) -> str:
     completed = subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -349,6 +386,401 @@ def _commit(repo: Path, name: str, content: str, message: str) -> str:
     _git(repo, "add", name)
     _git(repo, "commit", "-m", message)
     return _git(repo, "rev-parse", "HEAD")
+
+
+def _prepared_ref_fixture(
+    repository: Path, *, checked_out: bool = False
+) -> tuple[str, str, str, str]:
+    target_ref = "refs/heads/main"
+    candidate_ref = "refs/hermes/integration-candidates/exact"
+    pre_sha = _git(repository, "rev-parse", target_ref)
+    _git(repository, "switch", "-c", "candidate-source")
+    candidate_sha = _commit(
+        repository, "candidate.txt", "candidate\n", "candidate"
+    )
+    _git(repository, "update-ref", candidate_ref, candidate_sha)
+    if checked_out:
+        _git(repository, "switch", "main")
+    return target_ref, candidate_ref, pre_sha, candidate_sha
+
+
+def test_prepared_ref_cas_uses_one_exact_update_ref_path(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+):
+    target_ref, candidate_ref, pre_sha, candidate_sha = _prepared_ref_fixture(repository)
+    real_git = repository_module._prepared_ref_git
+    calls: list[tuple[str, ...]] = []
+
+    def capture(path: Path, *args: str):
+        calls.append(args)
+        return real_git(path, *args)
+
+    monkeypatch.setattr(repository_module, "_prepared_ref_git", capture)
+
+    result = advance_prepared_candidate_ref(
+        repository,
+        target_ref=target_ref,
+        candidate_ref=candidate_ref,
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+    )
+
+    assert result == PreparedRefCASResult("advanced", candidate_sha)
+    assert _git(repository, "rev-parse", target_ref) == candidate_sha
+    assert [call for call in calls if call[:1] == ("update-ref",)] == [
+        ("update-ref", target_ref, candidate_sha, pre_sha)
+    ]
+    assert not any(
+        command in call
+        for call in calls
+        for command in ("merge", "read-tree", "reset", "clean", "stash")
+    )
+
+
+def test_prepared_ref_cas_refuses_target_checked_out_in_any_worktree(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+):
+    target_ref, candidate_ref, pre_sha, candidate_sha = _prepared_ref_fixture(
+        repository, checked_out=True
+    )
+    real_git = repository_module._prepared_ref_git
+    calls: list[tuple[str, ...]] = []
+
+    def capture(path: Path, *args: str):
+        calls.append(args)
+        return real_git(path, *args)
+
+    monkeypatch.setattr(repository_module, "_prepared_ref_git", capture)
+
+    result = advance_prepared_candidate_ref(
+        repository,
+        target_ref=target_ref,
+        candidate_ref=candidate_ref,
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+    )
+
+    assert result == PreparedRefCASResult("checked_out", pre_sha)
+    assert _git(repository, "rev-parse", target_ref) == pre_sha
+    assert not any(call[:1] == ("update-ref",) for call in calls)
+
+
+def test_prepared_ref_cas_reports_target_moved_without_ref_movement(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+):
+    target_ref, candidate_ref, pre_sha, candidate_sha = _prepared_ref_fixture(repository)
+    moved_sha = _commit(repository, "operator.txt", "moved\n", "operator move")
+    _git(repository, "update-ref", target_ref, moved_sha, pre_sha)
+    real_git = repository_module._prepared_ref_git
+    calls: list[tuple[str, ...]] = []
+
+    def capture(path: Path, *args: str):
+        calls.append(args)
+        return real_git(path, *args)
+
+    monkeypatch.setattr(repository_module, "_prepared_ref_git", capture)
+
+    result = advance_prepared_candidate_ref(
+        repository,
+        target_ref=target_ref,
+        candidate_ref=candidate_ref,
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+    )
+
+    assert result == PreparedRefCASResult("target_moved", moved_sha)
+    assert _git(repository, "rev-parse", target_ref) == moved_sha
+    assert not any(call[:1] == ("update-ref",) for call in calls)
+
+
+def test_prepared_ref_cas_loss_reports_target_moved_and_preserves_winner(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+):
+    target_ref, candidate_ref, pre_sha, candidate_sha = _prepared_ref_fixture(repository)
+    winner_sha = _commit(repository, "winner.txt", "winner\n", "CAS winner")
+    real_git = repository_module._prepared_ref_git
+    intercepted = False
+
+    def lose_cas(path: Path, *args: str):
+        nonlocal intercepted
+        if args == ("update-ref", target_ref, candidate_sha, pre_sha):
+            intercepted = True
+            won = real_git(path, "update-ref", target_ref, winner_sha, pre_sha)
+            assert won.returncode == 0
+            return subprocess.CompletedProcess(
+                ["git", "update-ref", target_ref], 1, "", "CAS lost"
+            )
+        return real_git(path, *args)
+
+    monkeypatch.setattr(repository_module, "_prepared_ref_git", lose_cas)
+
+    result = advance_prepared_candidate_ref(
+        repository,
+        target_ref=target_ref,
+        candidate_ref=candidate_ref,
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+    )
+
+    assert intercepted is True
+    assert result == PreparedRefCASResult("target_moved", winner_sha)
+    assert _git(repository, "rev-parse", target_ref) == winner_sha
+
+
+def test_prepared_ref_cas_recognizes_reflected_cas_without_second_update(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+):
+    target_ref, candidate_ref, pre_sha, candidate_sha = _prepared_ref_fixture(repository)
+    first = advance_prepared_candidate_ref(
+        repository,
+        target_ref=target_ref,
+        candidate_ref=candidate_ref,
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+    )
+    real_git = repository_module._prepared_ref_git
+    calls: list[tuple[str, ...]] = []
+
+    def capture(path: Path, *args: str):
+        calls.append(args)
+        return real_git(path, *args)
+
+    monkeypatch.setattr(repository_module, "_prepared_ref_git", capture)
+    reflected = advance_prepared_candidate_ref(
+        repository,
+        target_ref=target_ref,
+        candidate_ref=candidate_ref,
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+    )
+
+    assert first == PreparedRefCASResult("advanced", candidate_sha)
+    assert reflected == PreparedRefCASResult("reflected", candidate_sha)
+    assert not any(call[:1] == ("update-ref",) for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_kind"),
+    [
+        ("preimage", "preimage"),
+        ("candidate", "candidate"),
+        ("descendant", "descendant"),
+        ("diverged", "diverged"),
+    ],
+)
+def test_prepared_candidate_ref_inspection_classifies_recovery_boundary(
+    repository: Path, scenario: str, expected_kind: str
+):
+    target_ref, _candidate_ref, pre_sha, candidate_sha = _prepared_ref_fixture(
+        repository
+    )
+    expected_current = pre_sha
+    if scenario == "candidate":
+        _git(repository, "update-ref", target_ref, candidate_sha, pre_sha)
+        expected_current = candidate_sha
+    elif scenario == "descendant":
+        later_sha = _commit(repository, "later.txt", "later\n", "later")
+        _git(repository, "update-ref", target_ref, later_sha, pre_sha)
+        expected_current = later_sha
+    elif scenario == "diverged":
+        _git(repository, "switch", "main")
+        expected_current = _commit(
+            repository, "operator.txt", "operator\n", "operator"
+        )
+
+    result = inspect_prepared_candidate_ref(
+        repository,
+        target_ref=target_ref,
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+    )
+
+    assert result == PreparedRefRecoveryResult(expected_kind, expected_current)
+
+
+def test_delete_prepared_candidate_ref_uses_exact_old_value_and_preserves_mismatch(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _target_ref, candidate_ref, _pre_sha, candidate_sha = _prepared_ref_fixture(
+        repository
+    )
+    real_git = repository_module._prepared_ref_git
+    calls: list[tuple[str, ...]] = []
+
+    def capture(path: Path, *args: str):
+        calls.append(args)
+        return real_git(path, *args)
+
+    monkeypatch.setattr(repository_module, "_prepared_ref_git", capture)
+
+    assert delete_prepared_candidate_ref(
+        repository, candidate_ref=candidate_ref, candidate_sha="f" * 40
+    ) is False
+    assert _git(repository, "rev-parse", candidate_ref) == candidate_sha
+    assert delete_prepared_candidate_ref(
+        repository, candidate_ref=candidate_ref, candidate_sha=candidate_sha
+    ) is True
+    assert subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "--verify", candidate_ref],
+        capture_output=True,
+        text=True,
+    ).returncode != 0
+    assert [call for call in calls if call[:2] == ("update-ref", "-d")] == [
+        ("update-ref", "-d", candidate_ref, candidate_sha)
+    ]
+
+
+def test_release_candidate_ref_uses_release_namespace_and_exact_cleanup(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+):
+    candidate_ref = f"{RELEASE_CANDIDATE_REF_PREFIX}exact"
+    candidate_sha = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "update-ref", candidate_ref, candidate_sha)
+    calls: list[tuple[str, ...]] = []
+    real_git = repository_module._prepared_ref_git
+
+    def capture(path: Path, *args: str):
+        calls.append(args)
+        return real_git(path, *args)
+
+    monkeypatch.setattr(repository_module, "_prepared_ref_git", capture)
+
+    assert delete_release_candidate_ref(
+        repository, candidate_ref=candidate_ref, candidate_sha="f" * 40
+    ) is False
+    assert _git(repository, "rev-parse", candidate_ref) == candidate_sha
+    assert delete_release_candidate_ref(
+        repository, candidate_ref=candidate_ref, candidate_sha=candidate_sha
+    ) is True
+    assert [call for call in calls if call[:2] == ("update-ref", "-d")] == [
+        ("update-ref", "-d", candidate_ref, candidate_sha)
+    ]
+
+    with pytest.raises(RepositoryConfigurationError) as exc_info:
+        delete_release_candidate_ref(
+            repository,
+            candidate_ref="refs/hermes/integration-candidates/not-release",
+            candidate_sha=candidate_sha,
+        )
+    assert exc_info.value.code == "malformed_release_candidate_ref"
+
+
+def test_release_candidate_ref_preserves_repointed_and_mismatched_refs(
+    repository: Path,
+):
+    """Exact ref deletion and preservation on expected-old mismatch at repo level.
+
+    A repointed release-candidate ref must survive when the invalidation
+    expected-old SHA no longer matches, and must be deletable only when the
+    exact current SHA is expected.  An already-absent ref is an idempotent
+    success and never re-creates the ref.
+    """
+
+    candidate_ref = f"{RELEASE_CANDIDATE_REF_PREFIX}exact"
+    first_sha = _git(repository, "rev-parse", "HEAD")
+    later_sha = _commit(repository, "later.txt", "later\n", "later")
+    _git(repository, "update-ref", candidate_ref, first_sha)
+
+    # Repointed — expected old SHA no longer matches → preserved.
+    _git(repository, "update-ref", candidate_ref, later_sha)
+    assert delete_release_candidate_ref(
+        repository, candidate_ref=candidate_ref, candidate_sha=first_sha
+    ) is False
+    assert _git(repository, "rev-parse", candidate_ref) == later_sha
+
+    # Exact current SHA → deleted.
+    assert delete_release_candidate_ref(
+        repository, candidate_ref=candidate_ref, candidate_sha=later_sha
+    ) is True
+    assert subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "--verify", candidate_ref],
+        capture_output=True,
+        text=True,
+    ).returncode != 0
+
+    # Idempotent — absent ref is a success.
+    assert delete_release_candidate_ref(
+        repository, candidate_ref=candidate_ref, candidate_sha=later_sha
+    ) is True
+    assert subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "--verify", candidate_ref],
+        capture_output=True,
+        text=True,
+    ).returncode != 0
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_kind", "expected_current", "expected_updates"),
+    [
+        ("advance", "advanced", "b" * 40, 1),
+        ("reflected", "reflected", "b" * 40, 0),
+        ("checked_out", "checked_out", "a" * 40, 0),
+        ("target_moved", "target_moved", "c" * 40, 0),
+        ("cas_lost", "target_moved", "c" * 40, 1),
+    ],
+)
+def test_prepared_ref_cas_fake_git_proves_single_update_and_refusal_immutability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    expected_kind: str,
+    expected_current: str,
+    expected_updates: int,
+):
+    target_ref = "refs/heads/epic"
+    candidate_ref = "refs/hermes/integration-candidates/exact"
+    pre_sha = "a" * 40
+    candidate_sha = "b" * 40
+    winner_sha = "c" * 40
+    state = {
+        "target": (
+            candidate_sha
+            if scenario == "reflected"
+            else winner_sha if scenario == "target_moved" else pre_sha
+        )
+    }
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git(_path: Path, *args: str):
+        calls.append(args)
+        if args[:2] == ("rev-parse", "--verify"):
+            ref = args[2].removesuffix("^{commit}")
+            value = candidate_sha if ref == candidate_ref else state["target"]
+            return subprocess.CompletedProcess(["git", *args], 0, f"{value}\n", "")
+        if args == ("worktree", "list", "--porcelain"):
+            branch = (
+                f"worktree /tmp/epic\nHEAD {pre_sha}\nbranch {target_ref}\n"
+                if scenario == "checked_out"
+                else f"worktree /tmp/operator\nHEAD {pre_sha}\nbranch refs/heads/operator\n"
+            )
+            return subprocess.CompletedProcess(["git", *args], 0, branch, "")
+        if args == ("update-ref", target_ref, candidate_sha, pre_sha):
+            if scenario == "cas_lost":
+                state["target"] = winner_sha
+                return subprocess.CompletedProcess(["git", *args], 1, "", "CAS lost")
+            state["target"] = candidate_sha
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
+        raise AssertionError(f"unexpected Git call: {args}")
+
+    monkeypatch.setattr(repository_module, "_prepared_ref_git", fake_git)
+
+    result = advance_prepared_candidate_ref(
+        tmp_path,
+        target_ref=target_ref,
+        candidate_ref=candidate_ref,
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+    )
+
+    updates = [call for call in calls if call[:1] == ("update-ref",)]
+    assert result == PreparedRefCASResult(expected_kind, expected_current)
+    assert updates == (
+        [("update-ref", target_ref, candidate_sha, pre_sha)]
+        if expected_updates
+        else []
+    )
+    if scenario in {"checked_out", "target_moved"}:
+        assert state["target"] == expected_current
 
 
 def _refresh_fixture(repository: Path) -> tuple[Path, Path]:
@@ -782,6 +1214,51 @@ def test_verification_receipt_from_payload_rejects_malformed_receipt():
     assert verification_receipt_from_payload({}) is None
 
 
+def test_verification_receipt_match_requires_exact_candidate_contract_and_subject(
+    repository: Path,
+):
+    profile = VerificationProfile(
+        (VerificationCommand(("bash", "scripts/run_tests.sh"), PurePosixPath("."), 60),)
+    )
+    candidate_sha = "a" * 40
+    contract_digest = "b" * 64
+    result = run_verification(
+        profile,
+        repository,
+        source_sha="c" * 40,
+        candidate_sha=candidate_sha,
+        contract_digest=contract_digest,
+        scope="story_integration",
+        subject_id="story-1",
+        profile_name="story_integration",
+        generated_policy_digest="d" * 64,
+    )
+    assert result.status == "passed"
+    payload = verification_result_payload(
+        result, scope="story_integration", subject_id="story-1", created_at=123
+    )
+
+    expected = {
+        "source_sha": "c" * 40,
+        "candidate_sha": candidate_sha,
+        "contract_digest": contract_digest,
+        "gate_kind": "story_integration",
+        "subject_id": "story-1",
+        "profile_name": "story_integration",
+    }
+    assert verification_receipt_matches(payload, **expected)
+    for field, wrong in (
+        ("source_sha", "e" * 40),
+        ("candidate_sha", "e" * 40),
+        ("contract_digest", "e" * 64),
+        ("gate_kind", "epic_release"),
+        ("subject_id", "story-2"),
+        ("profile_name", "epic_release"),
+    ):
+        mismatch = {**expected, field: wrong}
+        assert not verification_receipt_matches(payload, **mismatch)
+
+
 def test_run_verification_missing_executable_is_configuration_error(tmp_path: Path):
     candidate = tmp_path / "candidate"
     candidate.mkdir()
@@ -997,3 +1474,399 @@ def test_repository_boundary_refreshes_verifies_and_preserves_remote_refs(
         "refs/heads",
     ) == remote_refs_before
     assert _git(repository, "rev-parse", "refs/remotes/origin/main") == local_remote_base_before
+
+
+# ---------------------------------------------------------------------------
+# E06 — Read-only target-head observation for the human release handoff
+# ---------------------------------------------------------------------------
+
+
+def test_observe_target_heads_reads_diverged_local_and_remote_heads_without_syncing(
+    tmp_path: Path,
+):
+    remote, repository, base_sha = _remote_fixture(tmp_path)
+    local_main = _commit(repository, "extra.txt", "extra\n", "local-only move")
+
+    observation = observe_target_heads(
+        repository, target_branch="main", base_ref="refs/remotes/origin/main"
+    )
+
+    assert observation.local_head == local_main
+    assert observation.remote_head == base_sha
+    assert observation.remote_name == "origin"
+    assert observation.remote_available is True
+    assert observation.local_head != observation.remote_head
+    # Strictly read-only: the bare remote and the local remote-tracking ref
+    # are exactly as they were — no fetch, no sync, no remote write.
+    assert _git_dir(remote, "rev-parse", "refs/heads/main") == base_sha
+    assert _git(repository, "rev-parse", "refs/remotes/origin/main") == base_sha
+
+
+def test_observe_target_heads_fake_transport_refuses_remote_write_verbs_before_subprocess(
+    repository: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """The observation seam refuses every write verb before any subprocess.
+
+    A fake transport stands in for the subprocess boundary: any merge,
+    push, fetch, update-ref, reset, clean, checkout, branch, tag, or
+    worktree verb raises immediately, proving the production path never
+    even attempts one.  The observation completes with read verbs only.
+    """
+
+    local_sha = _git(repository, "rev-parse", "HEAD")
+    remote_sha = _git(repository, "rev-parse", "refs/remotes/origin/main")
+    calls: list[tuple[str, ...]] = []
+    forbidden = (
+        "push",
+        "fetch",
+        "pull",
+        "update-ref",
+        "merge",
+        "reset",
+        "clean",
+        "checkout",
+        "switch",
+        "branch",
+        "tag",
+        "worktree",
+        "stash",
+        "gc",
+        "prune",
+        "clone",
+    )
+
+    def fake_observe(path: Path, *args: str):
+        calls.append(args)
+        assert not any(verb in args for verb in forbidden), (
+            f"remote-write verb attempted before subprocess: {args}"
+        )
+        if args[:2] == ("rev-parse", "--verify"):
+            return subprocess.CompletedProcess(
+                ["git", *args], 0, f"{local_sha}\n", ""
+            )
+        if args[:2] == ("ls-remote", "--heads"):
+            return subprocess.CompletedProcess(
+                ["git", *args], 0, f"{remote_sha}\trefs/heads/main\n", ""
+            )
+        raise AssertionError(f"unexpected Git observation: {args}")
+
+    monkeypatch.setattr(repository_module, "_remote_observe_git", fake_observe)
+
+    observation = observe_target_heads(
+        repository, target_branch="main", base_ref="refs/remotes/origin/main"
+    )
+
+    assert observation == TargetHeadsObservation(
+        local_head=local_sha,
+        remote_head=remote_sha,
+        remote_name="origin",
+        remote_available=True,
+    )
+    assert calls
+    assert {call[0] for call in calls} == {"rev-parse", "ls-remote"}
+
+
+def test_observe_target_heads_reports_remote_unavailability_without_remote_write(
+    repository: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    local_sha = _git(repository, "rev-parse", "HEAD")
+    calls: list[tuple[str, ...]] = []
+
+    def fake_observe(path: Path, *args: str):
+        calls.append(args)
+        if args[:2] == ("rev-parse", "--verify"):
+            return subprocess.CompletedProcess(
+                ["git", *args], 0, f"{local_sha}\n", ""
+            )
+        if args[:2] == ("ls-remote", "--heads"):
+            return subprocess.CompletedProcess(
+                ["git", *args], 128, "", "fatal: could not read from remote"
+            )
+        raise AssertionError(f"unexpected Git observation: {args}")
+
+    monkeypatch.setattr(repository_module, "_remote_observe_git", fake_observe)
+
+    observation = observe_target_heads(
+        repository, target_branch="main", base_ref="refs/remotes/origin/main"
+    )
+
+    assert observation.local_head == local_sha
+    assert observation.remote_head is None
+    assert observation.remote_available is False
+    assert {call[0] for call in calls} == {"rev-parse", "ls-remote"}
+
+
+def test_observe_target_heads_transport_failure_is_reported_not_raised(
+    repository: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    def fail_transport(path: Path, *args: str):
+        return None  # _remote_observe_git returns None on OSError / SubprocessError
+
+    monkeypatch.setattr(repository_module, "_remote_observe_git", fail_transport)
+
+    observation = observe_target_heads(
+        repository, target_branch="main", base_ref="refs/remotes/origin/main"
+    )
+
+    assert observation.local_head is None
+    assert observation.remote_head is None
+    assert observation.remote_available is False
+
+
+def test_observe_target_heads_missing_remote_branch_is_available_but_headless(
+    repository: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    local_sha = _git(repository, "rev-parse", "HEAD")
+
+    def fake_observe(path: Path, *args: str):
+        if args[:2] == ("rev-parse", "--verify"):
+            return subprocess.CompletedProcess(
+                ["git", *args], 0, f"{local_sha}\n", ""
+            )
+        if args[:2] == ("ls-remote", "--heads"):
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
+        raise AssertionError(f"unexpected Git observation: {args}")
+
+    monkeypatch.setattr(repository_module, "_remote_observe_git", fake_observe)
+
+    observation = observe_target_heads(
+        repository, target_branch="main", base_ref="refs/remotes/origin/main"
+    )
+
+    assert observation.local_head == local_sha
+    assert observation.remote_head is None
+    assert observation.remote_available is True
+
+
+@pytest.mark.parametrize(
+    ("target_branch", "base_ref", "code"),
+    [
+        ("", "refs/remotes/origin/main", "malformed_target_branch"),
+        (" main", "refs/remotes/origin/main", "malformed_target_branch"),
+        ("main", "refs/heads/main", "malformed_base_ref"),
+        ("main", "", "malformed_base_ref"),
+        ("main", "refs/remotes/origin", "malformed_base_ref"),
+        ("main", "refs/remotes/", "malformed_base_ref"),
+        ("main", "refs/remotes//main", "malformed_base_ref"),
+    ],
+)
+def test_observe_target_heads_rejects_malformed_target_branch_and_base_ref(
+    repository: Path, target_branch: str, base_ref: str, code: str
+):
+    with pytest.raises(RepositoryConfigurationError) as exc_info:
+        observe_target_heads(
+            repository, target_branch=target_branch, base_ref=base_ref
+        )
+
+    assert exc_info.value.code == code
+
+
+# ---------------------------------------------------------------------------
+# E06B — Read-only exact-SHA CI observation (workflow runs)
+# ---------------------------------------------------------------------------
+
+
+def test_observe_ci_workflow_runs_read_only_get_maps_latest_run_conclusions(
+    repository: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    local_sha = _git(repository, "rev-parse", "HEAD")
+    git_calls: list[tuple[str, ...]] = []
+    get_urls: list[str] = []
+
+    def fake_observe(path: Path, *args: str):
+        git_calls.append(args)
+        assert args == ("remote", "get-url", "origin")
+        return subprocess.CompletedProcess(
+            ["git", *args], 0, "git@github.com:acme/widgets.git\n", ""
+        )
+
+    def fake_get(url: str, *, timeout: int = 30):
+        get_urls.append(url)
+        return {
+            "workflow_runs": [
+                # Newest-first ordering: the first name match is the latest.
+                {"name": "CI", "conclusion": "success"},
+                {"name": "Deploy Test", "conclusion": "failure"},
+                {"name": "CI", "conclusion": "failure"},
+            ]
+        }
+
+    monkeypatch.setattr(repository_module, "_remote_observe_git", fake_observe)
+    monkeypatch.setattr(repository_module, "_http_observe_get", fake_get)
+
+    conclusions = observe_ci_workflow_runs(
+        repository,
+        base_ref="refs/remotes/origin/main",
+        workflows=("CI", "Deploy Test"),
+        head_sha=local_sha,
+    )
+
+    assert conclusions == {"CI": "success", "Deploy Test": "failure"}
+    assert git_calls == [("remote", "get-url", "origin")]
+    assert get_urls == [
+        "https://api.github.com/repos/acme/widgets/actions/runs"
+        f"?head_sha={local_sha}&per_page=100"
+    ]
+
+
+def test_observe_ci_workflow_runs_read_only_fake_transport_refuses_every_write_primitive(
+    repository: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """The CI observation path never issues a write verb before subprocess.
+
+    A fake transport stands in for both boundaries (Git and HTTP): any
+    push/fetch/merge/update-ref/checkout/tag/worktree Git verb or any
+    rerun/cancel/dispatch URL primitive raises immediately, proving the
+    production path never even attempts one.  The observation completes
+    with one read-only ``remote get-url`` and one GET.
+    """
+
+    local_sha = _git(repository, "rev-parse", "HEAD")
+    forbidden_git = (
+        "push",
+        "fetch",
+        "pull",
+        "update-ref",
+        "merge",
+        "reset",
+        "clean",
+        "checkout",
+        "switch",
+        "branch",
+        "tag",
+        "worktree",
+        "stash",
+        "gc",
+        "prune",
+        "clone",
+    )
+    forbidden_url = ("rerun", "cancel", "dispatches", "/merge", "/push")
+
+    def fake_observe(path: Path, *args: str):
+        assert not any(verb in args for verb in forbidden_git), (
+            f"git write verb attempted before subprocess: {args}"
+        )
+        if args[:2] == ("remote", "get-url"):
+            return subprocess.CompletedProcess(
+                ["git", *args], 0, "https://github.com/acme/widgets.git\n", ""
+            )
+        raise AssertionError(f"unexpected Git observation: {args}")
+
+    def fake_get(url: str, *, timeout: int = 30):
+        assert not any(verb in url for verb in forbidden_url), (
+            f"CI write primitive attempted before subprocess: {url}"
+        )
+        assert "actions/runs" in url
+        assert f"head_sha={local_sha}" in url
+        return {"workflow_runs": []}
+
+    monkeypatch.setattr(repository_module, "_remote_observe_git", fake_observe)
+    monkeypatch.setattr(repository_module, "_http_observe_get", fake_get)
+
+    conclusions = observe_ci_workflow_runs(
+        repository,
+        base_ref="refs/remotes/origin/main",
+        workflows=("CI",),
+        head_sha=local_sha,
+    )
+
+    assert conclusions == {"CI": None}
+
+
+def test_observe_ci_workflow_runs_returns_none_when_remote_unobservable(
+    repository: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    local_sha = _git(repository, "rev-parse", "HEAD")
+
+    def fail_transport(path: Path, *args: str):
+        return None  # remote get-url fails -> unavailable
+
+    monkeypatch.setattr(repository_module, "_remote_observe_git", fail_transport)
+
+    conclusions = observe_ci_workflow_runs(
+        repository,
+        base_ref="refs/remotes/origin/main",
+        workflows=("CI",),
+        head_sha=local_sha,
+    )
+
+    assert conclusions is None
+
+
+def test_observe_ci_workflow_runs_returns_none_when_provider_unreachable(
+    repository: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    local_sha = _git(repository, "rev-parse", "HEAD")
+
+    def fake_observe(path: Path, *args: str):
+        if args[:2] == ("remote", "get-url"):
+            return subprocess.CompletedProcess(
+                ["git", *args], 0, "git@github.com:acme/widgets.git\n", ""
+            )
+        raise AssertionError(f"unexpected Git observation: {args}")
+
+    def fail_get(url: str, *, timeout: int = 30):
+        return None  # HTTP GET fails -> unavailable
+
+    monkeypatch.setattr(repository_module, "_remote_observe_git", fake_observe)
+    monkeypatch.setattr(repository_module, "_http_observe_get", fail_get)
+
+    conclusions = observe_ci_workflow_runs(
+        repository,
+        base_ref="refs/remotes/origin/main",
+        workflows=("CI",),
+        head_sha=local_sha,
+    )
+
+    assert conclusions is None
+
+
+def test_observe_ci_workflow_runs_rejects_malformed_head_sha(
+    repository: Path,
+):
+    with pytest.raises(RepositoryConfigurationError) as exc_info:
+        observe_ci_workflow_runs(
+            repository,
+            base_ref="refs/remotes/origin/main",
+            workflows=("CI",),
+            head_sha="not-a-full-sha",
+        )
+
+    assert exc_info.value.code == "malformed_head_sha"
+
+
+def test_http_observe_get_seam_is_strictly_get_only(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The real HTTP seam builds a GET request — never any write method."""
+
+    requests: list = []
+
+    class FakeResponse:
+        status = 200
+
+        def read(self) -> bytes:
+            return b'{"workflow_runs": []}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info) -> bool:
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        requests.append(req)
+        assert req.method == "GET"
+        assert req.full_url.startswith("https://api.github.com/")
+        return FakeResponse()
+
+    monkeypatch.setattr(repository_module.urllib.request, "urlopen", fake_urlopen)
+
+    data = repository_module._http_observe_get(
+        "https://api.github.com/repos/acme/widgets/actions/runs?head_sha=x"
+    )
+
+    assert data == {"workflow_runs": []}
+    assert len(requests) == 1
+    assert requests[0].method == "GET"
+    assert requests[0].headers["Accept"] == "application/vnd.github+json"

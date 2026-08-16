@@ -1624,3 +1624,95 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+/* ---- Epic release / member integration state panel -------------------- *
+ *
+ * Read-only by construction: the panel renders the server's named release
+ * state and immutable snapshot evidence. There is deliberately no
+ * button/route styling for merge or push — the final merge/push is an
+ * external operator action, surfaced as plain prose + a copyable ref.
+ */
+
+.hermes-kanban-release-state {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+  padding: 0.55rem 0.65rem;
+  background: color-mix(in srgb, var(--color-foreground) 3%, transparent);
+}
+
+.hermes-kanban-release-state--epic {
+  border-color: color-mix(in srgb, var(--color-ring) 45%, var(--color-border));
+}
+
+.hermes-kanban-release-state--member {
+  border-color: color-mix(in srgb, var(--color-border) 80%, transparent);
+}
+
+.hermes-kanban-release-state-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.4rem;
+}
+
+.hermes-kanban-release-actionable {
+  font-size: 0.62rem;
+  font-weight: 600;
+  color: color-mix(in srgb, #3fb97d 80%, var(--color-foreground));
+}
+
+.hermes-kanban-release-readonly {
+  font-size: 0.62rem;
+  color: var(--color-muted-foreground);
+}
+
+.hermes-kanban-release-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.18rem;
+}
+
+.hermes-kanban-release-row {
+  display: grid;
+  grid-template-columns: minmax(8rem, max-content) 1fr;
+  gap: 0.25rem 0.75rem;
+  font-size: 0.74rem;
+  min-width: 0;
+}
+
+.hermes-kanban-release-label {
+  color: var(--color-muted-foreground);
+  font-weight: 500;
+}
+
+.hermes-kanban-release-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+
+.hermes-kanban-release-ref {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  margin-top: 0.45rem;
+}
+
+.hermes-kanban-release-ref-code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.72rem;
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  padding: 0.2rem 0.4rem;
+  border-radius: var(--radius-sm, 0.25rem);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.hermes-kanban-release-action {
+  margin-top: 0.45rem;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  color: color-mix(in srgb, var(--color-foreground) 85%, var(--color-muted-foreground));
+  border-top: 1px dashed color-mix(in srgb, var(--color-border) 70%, transparent);
+  padding-top: 0.4rem;
+}

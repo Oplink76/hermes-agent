@@ -1,16 +1,15 @@
-"""`hermes kanban release` — the operator surface for the Release/Measure gate.
+"""`hermes kanban release-state` — read-only Epic release / member integration state.
 
-`release_measure` is deliberately unassigned: no ordinary worker may hold it
-(see test_kanban_qualifier). Until this command existed the only code path
-that ran `release_product_task` was the worker-side `kanban_complete` tool, so
-the human whose gate it is had no way through it — `hermes kanban complete`
-calls plain `complete_task`, which correctly refuses for lack of release
-orchestration. These tests exercise the real mechanism with a controlled test-created `scripts/run_tests.sh`; they do not run the repository's production verification suite.
+Epics show named lifecycle states (collecting_members, aggregate_verification,
+awaiting_final_release, ci_pending, ci_failed, done) with snapshot evidence.
+Members show integration state (integrating, integration_failed, integrated).
+No route invokes merge or push.
 """
 
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -18,6 +17,10 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_epic_release import (
+    EpicReadiness,
+    EpicReadinessMember,
+)
 
 
 @pytest.fixture
@@ -34,496 +37,321 @@ def release_home(tmp_path, monkeypatch):
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), *args],
-        check=True,
-        capture_output=True,
-        text=True,
+        check=True, capture_output=True, text=True,
     ).stdout.strip()
 
 
-def _repo_with_story_branch(tmp_path: Path) -> tuple[Path, str, str]:
+def _json_state(task_id: str, board: str | None = None) -> dict:
+    extra = f"--board {board} " if board else ""
+    out = kc.run_slash(f"{extra}release-state {task_id} --json")
+    return json.loads(out)
+
+
+def _direct_task_seed(conn, task_id: str, title: str,
+                       work_item_kind: str = "card",
+                       status: str = "done") -> None:
+    """Insert a minimal task row (bypassing create_task)."""
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, work_item_kind, created_at) "
+        "VALUES (?, ?, ?, ?, 99)",
+        (task_id, title, status, work_item_kind),
+    )
+
+
+# ── Epic lifecycle tests ─────────────────────────────────────────────────
+
+
+def test_collecting_members(release_home):
+    """Fresh epic with no members → collecting_members."""
+    with kb.connect() as conn:
+        epic_id = kb.create_task(conn, title="Epic: new", work_item_kind="epic")
+    state = _json_state(epic_id)
+    assert state["kind"] == "epic"
+    assert state["state"] == "collecting_members"
+    assert state["actionable"] is False
+
+
+def test_awaiting_final_release(release_home, tmp_path, monkeypatch):
+    """Snapshot awaiting_push + successful handoff → awaiting_final_release."""
+    board = "e07-afr"
+    repo, _, _ = _repo(tmp_path)
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        epic_id = kb.create_task(conn, title="Epic: AFR", board=board,
+                                  work_item_kind="epic")
+        _seed_snapshot(conn, epic_id, status="awaiting_push")
+
+    class _H:
+        def __init__(self, local_target_head="", remote_target_head="",
+                     remote_name="", checked_at=0, action=""):
+            self.local_target_head = local_target_head
+            self.remote_target_head = remote_target_head
+            self.remote_name = remote_name
+            self.checked_at = checked_at
+            self.action = action
+
+    monkeypatch.setattr(
+        kb, "build_epic_release_handoff",
+        lambda conn_, eid, **kw: _H(
+            local_target_head="2" * 40, remote_target_head="2" * 40,
+            remote_name="origin", checked_at=100,
+            action="Merge and push the pinned candidate externally.",
+        ),
+    )
+
+    state = _json_state(epic_id, board)
+    assert state["state"] == "awaiting_final_release"
+    assert state["actionable"] is True
+    assert "Merge and push" in (state.get("action") or "")
+
+
+def test_ci_pending(release_home, tmp_path, monkeypatch):
+    """Snapshot ci_pending → ci_pending non-actionable."""
+    board = "e07-cip"
+    repo, _, _ = _repo(tmp_path)
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        epic_id = kb.create_task(conn, title="Epic: CIP", board=board,
+                                  work_item_kind="epic")
+        _seed_snapshot(conn, epic_id, status="ci_pending", pushed_sha="6" * 40)
+
+    monkeypatch.setattr(
+        kb, "epic_readiness",
+        lambda conn_, epic_id_, **kw: _fake_readiness(),
+    )
+    state = _json_state(epic_id, board)
+    assert state["state"] == "ci_pending"
+    assert state["actionable"] is False
+
+
+def test_ci_failed(release_home, tmp_path, monkeypatch):
+    """Snapshot ci_failed + CI failure event → ci_failed + CI evidence."""
+    board = "e07-cif"
+    repo, _, _ = _repo(tmp_path)
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        epic_id = kb.create_task(conn, title="Epic: CIF", board=board,
+                                  work_item_kind="epic")
+        _seed_snapshot(conn, epic_id, status="ci_failed", pushed_sha="6" * 40)
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'epic_release_ci_failed', ?, 1)",
+            (epic_id, json.dumps({"conclusions": {"CI": "failure", "Deploy": "cancelled"}})),
+        )
+
+    monkeypatch.setattr(
+        kb, "epic_readiness",
+        lambda conn_, epic_id_, **kw: _fake_readiness(),
+    )
+    state = _json_state(epic_id, board)
+    assert state["state"] == "ci_failed"
+    assert state["actionable"] is False
+    assert (state.get("evidence") or {}).get("ci_evidence") == {
+        "CI": "failure", "Deploy": "cancelled",
+    }
+
+
+def test_aggregate_verification(release_home, tmp_path, monkeypatch):
+    """Readiness ready + no snapshot → aggregate_verification."""
+    board = "e07-av"
+    repo, _, _ = _repo(tmp_path)
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        epic_id = kb.create_task(conn, title="Epic: AV", board=board,
+                                  work_item_kind="epic")
+
+    monkeypatch.setattr(
+        kb, "epic_readiness",
+        lambda conn_, epic_id_, **kw: _fake_readiness(ready=True),
+    )
+    state = _json_state(epic_id, board)
+    assert state["state"] == "aggregate_verification"
+    assert state["actionable"] is False
+
+
+def test_done(release_home, tmp_path, monkeypatch):
+    """Snapshot released → done."""
+    board = "e07-done"
+    repo, _, _ = _repo(tmp_path)
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        epic_id = kb.create_task(conn, title="Epic: DONE", board=board,
+                                  work_item_kind="epic")
+        _seed_snapshot(conn, epic_id, status="released")
+
+    monkeypatch.setattr(
+        kb, "epic_readiness",
+        lambda conn_, epic_id_, **kw: _fake_readiness(),
+    )
+    state = _json_state(epic_id, board)
+    assert state["state"] == "done"
+    assert state["actionable"] is False
+
+
+# ── Member integration tests ─────────────────────────────────────────────
+
+
+def test_member_integrating(release_home):
+    """Member with active intent → integrating."""
+    epic_id = "epic-int-1"
+    story_id = "story-int-1"
+    with kb.connect() as conn:
+        _direct_task_seed(conn, epic_id, "Epic", "epic")
+        _direct_task_seed(conn, story_id, "Story")
+        conn.execute(
+            "INSERT INTO epic_memberships (epic_id, task_id, created_at) "
+            "VALUES (?, ?, 1)", (epic_id, story_id),
+        )
+        conn.execute(
+            "INSERT INTO story_integration_intents "
+            "(epic_id, story_id, source_sha, source_branch, review_run_id, "
+            "review_base_sha, status, attempt_count, last_failure_code, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, 'b', 1, ?, 'pending', 2, NULL, 1, 1)",
+            (epic_id, story_id, "9" * 40, "0" * 40),
+        )
+
+    state = _json_state(story_id)
+    assert state["kind"] == "member"
+    assert state["state"] == "integrating"
+    assert state["actionable"] is False
+    intent = (state.get("evidence") or {}).get("intent") or {}
+    assert intent.get("status") == "pending"
+    assert intent.get("attempt_count") == 2
+
+
+def test_member_integration_failed(release_home):
+    """Member whose latest intent carries a safe failure code → integration_failed."""
+    epic_id = "epic-fail-1"
+    story_id = "story-fail-1"
+    with kb.connect() as conn:
+        _direct_task_seed(conn, epic_id, "Epic", "epic")
+        _direct_task_seed(conn, story_id, "Story")
+        conn.execute(
+            "INSERT INTO epic_memberships (epic_id, task_id, created_at) "
+            "VALUES (?, ?, 1)", (epic_id, story_id),
+        )
+        conn.execute(
+            "INSERT INTO story_integration_intents "
+            "(epic_id, story_id, source_sha, source_branch, review_run_id, "
+            "review_base_sha, status, attempt_count, last_failure_code, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, 'b', 1, ?, 'attention_required', 3, 'merge_conflict', 1, 1)",
+            (epic_id, story_id, "9" * 40, "0" * 40),
+        )
+
+    state = _json_state(story_id)
+    assert state["kind"] == "member"
+    assert state["state"] == "integration_failed"
+    intent = (state.get("evidence") or {}).get("intent") or {}
+    assert intent.get("safe_code") == "merge_conflict"
+
+
+def test_member_integrated(release_home):
+    """Member with durable integration fact → integrated."""
+    epic_id = "epic-fact-1"
+    story_id = "story-fact-1"
+    with kb.connect() as conn:
+        _direct_task_seed(conn, epic_id, "Epic", "epic")
+        _direct_task_seed(conn, story_id, "Story")
+        conn.execute(
+            "INSERT INTO epic_memberships (epic_id, task_id, created_at) "
+            "VALUES (?, ?, 1)", (epic_id, story_id),
+        )
+        conn.execute(
+            "INSERT INTO epic_story_integrations "
+            "(epic_id, story_id, source_sha, candidate_sha, integrated_at) "
+            "VALUES (?, ?, ?, ?, 100)",
+            (epic_id, story_id, "9" * 40, "a" * 40),
+        )
+
+    state = _json_state(story_id)
+    assert state["kind"] == "member"
+    assert state["state"] == "integrated"
+    assert (state.get("evidence") or {}).get("fact") is not None
+
+
+def test_member_not_integrated(release_home):
+    """Member with no intent or fact → not_integrated."""
+    epic_id = "epic-no-1"
+    story_id = "story-no-1"
+    with kb.connect() as conn:
+        _direct_task_seed(conn, epic_id, "Epic", "epic")
+        _direct_task_seed(conn, story_id, "Story")
+        conn.execute(
+            "INSERT INTO epic_memberships (epic_id, task_id, created_at) "
+            "VALUES (?, ?, 1)", (epic_id, story_id),
+        )
+
+    state = _json_state(story_id)
+    assert state["kind"] == "member"
+    assert state["state"] == "not_integrated"
+
+
+# ── Regression: old `release` subcommand removed ─────────────────────────
+
+
+def test_old_release_subcommand_removed(release_home):
+    """The old `release` command is gone."""
+    out = kc.run_slash("release t_nonexistent --note x")
+    assert "invalid choice" in out.lower() or "unknown" in out.lower()
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────
+
+
+def _repo(tmp_path: Path) -> tuple[Path, str, str]:
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-b", "main")
-    _git(repo, "config", "user.email", "release@example.com")
-    _git(repo, "config", "user.name", "Release Test")
+    _git(repo, "config", "user.email", "test@e")
+    _git(repo, "config", "user.name", "T")
     (repo / "README.md").write_text("base\n", encoding="utf-8")
-    scripts = repo / "scripts"
-    scripts.mkdir()
-    (scripts / "run_tests.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "run_tests.sh").write_text(
+        "#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     _git(repo, "add", "README.md", "scripts/run_tests.sh")
     _git(repo, "commit", "-m", "base")
-    branch = "story/release-cli"
+    branch = "story/t"
     _git(repo, "switch", "-c", branch)
-    (repo / "story.txt").write_text("released\n", encoding="utf-8")
-    _git(repo, "add", "story.txt")
+    (repo / "file.txt").write_text("c\n", encoding="utf-8")
+    _git(repo, "add", "file.txt")
     _git(repo, "commit", "-m", "story")
-    source_sha = _git(repo, "rev-parse", "HEAD")
+    sha = _git(repo, "rev-parse", "HEAD")
     _git(repo, "switch", "main")
-    return repo, branch, source_sha
+    return repo, branch, sha
 
 
-def _release_board(board: str, repo: Path, *, policy: str = "manual", pull_request_required: bool = False) -> None:
+def _release_board(board: str, repo: Path, *, policy: str = "manual") -> None:
     kb.ensure_product_board_defaults(board, default_workdir=str(repo))
     path = kb.board_metadata_path(board)
     meta = json.loads(path.read_text(encoding="utf-8"))
-    workflow = meta.setdefault("product_workflow", {})
-    workflow["deployment_policy"] = policy
-    if pull_request_required:
-        workflow["pull_request_required"] = True
+    meta.setdefault("product_workflow", {})["deployment_policy"] = policy
     path.write_text(json.dumps(meta), encoding="utf-8")
-    if _git(repo, "status", "--porcelain"):
-        _git(repo, "add", ".gitignore")
-        _git(repo, "commit", "-m", "ignore integration worktrees")
 
 
-def _seed_reviewed_card(
-    conn,
-    board: str,
-    repo: Path,
-    branch: str,
-    source_sha: str,
-    *,
-    step: str = "release_measure",
-) -> str:
-    task_id = kb.create_task(
-        conn,
-        title="Story: operator release",
-        board=board,
-        workspace_kind="worktree",
-        workspace_path=str(repo),
-        branch_name=branch,
-        workflow_template_id="product",
-        current_step_key=step,
-    )
-    with kb.write_txn(conn):
-        kb._synthesize_ended_run(
-            conn,
-            task_id,
-            outcome="advanced",
-            step_key="development",
-            metadata={
-                "ai_provenance": {
-                    "writer": {
-                        "agent": "claude-code",
-                        "branch": branch,
-                        "commit": source_sha,
-                    }
-                }
-            },
-        )
-        kb._synthesize_ended_run(
-            conn,
-            task_id,
-            outcome="advanced",
-            step_key="test",
-            metadata={
-                "test_branch": branch,
-                "test_head_sha": source_sha,
-                "workflow_outcome": {"verdict": "passed"},
-                "ai_provenance": {
-                    "writer": {"agent": "claude-code"},
-                    "tester": {"agent": "hermes", "result": "passed"},
-                },
-            },
-        )
-        kb._synthesize_ended_run(
-            conn,
-            task_id,
-            outcome="advanced",
-            step_key="review",
-            metadata={
-                "review_branch": branch,
-                "review_base_sha": _git(repo, "merge-base", branch, "main"),
-                "review_head_sha": source_sha,
-                "workflow_outcome": {"verdict": "approved"},
-                "ai_provenance": {
-                    "writer": {"agent": "claude-code"},
-                    "reviewer": {
-                        "agent": "openai-codex",
-                        "verdict": "approved",
-                        "reviewed_branch": branch,
-                        "reviewed_commit": source_sha,
-                    },
-                },
-            },
-        )
-    return task_id
-
-
-def _release(task_id: str, board: str, *extra: str) -> str:
-    args = " ".join(extra) or '--note "measured manually"'
-    return kc.run_slash(f"--board {board} release {task_id} {args}")
-
-
-def _release_snapshot(conn, repo: Path, task_id: str):
-    task = kb.get_task(conn, task_id)
-    assert task is not None
-    return (
-        _git(repo, "rev-parse", "main"),
-        task.status,
-        task.current_step_key,
-        task.current_run_id,
-        tuple((event.kind, event.payload) for event in kb.list_events(conn, task_id)),
+def _seed_snapshot(conn, epic_id: str, *, status: str,
+                    pushed_sha: str | None = None) -> None:
+    conn.execute(
+        "INSERT INTO epic_release_snapshots (epic_id, epic_tip_sha, target_branch, "
+        "target_pre_sha, release_candidate_sha, candidate_ref, "
+        "aggregate_verification_event_id, repository_contract_digest, "
+        "status, pushed_sha, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (epic_id, "1" * 40, "main", "2" * 40, "3" * 40,
+         "refs/hermes/releases/epic-1", 71, "7" * 64,
+         status, pushed_sha, 100, 110),
     )
 
 
-def _assert_release_refused(task_id: str, board: str, repo: Path, expected: str):
-    with kb.connect(board=board) as conn:
-        before = _release_snapshot(conn, repo, task_id)
-    out = _release(task_id, board)
-    with kb.connect(board=board) as conn:
-        after = _release_snapshot(conn, repo, task_id)
-    assert expected in out and "no changes were made" in out.lower()
-    assert after == before
-
-
-def test_release_cli_completes_an_evidenced_release_measure_card(
-    release_home, tmp_path
-):
-    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
-    board = "release-cli-green"
-    _release_board(board, repo)
-    with kb.connect(board=board) as conn:
-        task_id = _seed_reviewed_card(conn, board, repo, branch, source_sha)
-
-    out = _release(task_id, board, '--note "Released and measured by operator" --operator-label Ole')
-
-    assert "Released" in out
-    with kb.connect(board=board) as conn:
-        task = kb.get_task(conn, task_id)
-        run = kb.latest_run(conn, task_id)
-        events = [event.kind for event in kb.list_events(conn, task_id)]
-    assert task is not None
-    assert task.status == "done"
-    assert task.current_step_key == "done"
-    # Integration really happened — release is orchestration, not a status flip.
-    assert (repo / "story.txt").read_text(encoding="utf-8") == "released\n"
-    assert "deployment_policy_evaluated" in events
-    assert run is not None and isinstance(run.metadata, dict)
-    assert run.metadata.get("release_operator_label") == "Ole"
-    assert run.metadata.get("release_surface") == "cli"
-    assert "released_by" not in run.metadata
-
-
-def test_release_cli_refuses_invalid_deployment_policy_before_mutation(
-    release_home, tmp_path
-):
-    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
-    board = "release-cli-invalid-policy"
-    _release_board(board, repo, policy="unsupported")
-    with kb.connect(board=board) as conn:
-        task_id = _seed_reviewed_card(conn, board, repo, branch, source_sha)
-
-    _assert_release_refused(task_id, board, repo, "unsupported deployment policy 'unsupported'")
-
-
-def test_release_cli_refuses_required_policy_without_adapter_before_mutation(
-    release_home, tmp_path
-):
-    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
-    board = "release-cli-required-policy"
-    _release_board(board, repo, policy="required")
-    with kb.connect(board=board) as conn:
-        task_id = _seed_reviewed_card(conn, board, repo, branch, source_sha)
-
-    _assert_release_refused(task_id, board, repo, "adapter-backed controller is required")
-
-
-def test_release_cli_refuses_missing_required_pull_request_before_mutation(
-    release_home, tmp_path
-):
-    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
-    board = "release-cli-required-pr"
-    _release_board(board, repo, pull_request_required=True)
-    with kb.connect(board=board) as conn:
-        task_id = _seed_reviewed_card(conn, board, repo, branch, source_sha)
-
-    _assert_release_refused(task_id, board, repo, "missing required pull_request metadata")
-
-
-def test_release_cli_refuses_a_card_outside_release_measure(release_home, tmp_path):
-    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
-    board = "release-cli-wrong-step"
-    _release_board(board, repo)
-    with kb.connect(board=board) as conn:
-        task_id = _seed_reviewed_card(
-            conn, board, repo, branch, source_sha, step="development"
-        )
-        before = kb.get_task(conn, task_id)
-
-    out = _release(task_id, board)
-
-    assert "release_measure" in out
-    with kb.connect(board=board) as conn:
-        after = kb.get_task(conn, task_id)
-    assert after is not None and before is not None
-    assert after.status == before.status
-    assert after.current_step_key == "development"
-
-
-def test_release_cli_refuses_an_unresolved_preflight(release_home, tmp_path):
-    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
-    board = "release-cli-preflight"
-    _release_board(board, repo)
-    with kb.connect(board=board) as conn:
-        task_id = _seed_reviewed_card(conn, board, repo, branch, source_sha)
-        claimed = kb.claim_task(conn, task_id)
-        assert claimed is not None and claimed.current_run_id is not None
-        assert kb.block_task(
-            conn,
-            task_id,
-            reason="Need a human decision",
-            kind="needs_input",
-            attempted_resolutions=["read docs"],
-            expected_run_id=claimed.current_run_id,
-            board=board,
-            human_escalation_assignee="resolver",
-        )
-        assert kb.has_unresolved_product_preflight(conn, task_id)
-
-    out = _release(task_id, board)
-
-    assert "preflight" in out
-    with kb.connect(board=board) as conn:
-        task = kb.get_task(conn, task_id)
-    assert task is not None and task.status != "done"
-
-
-def test_release_cli_refuses_inside_a_kanban_worker(
-    release_home, tmp_path, monkeypatch
-):
-    """Release/Measure is a human gate; the env check is defense in depth, not authorization: a caller controlling its environment can bypass it."""
-    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
-    board = "release-cli-worker"
-    _release_board(board, repo)
-    with kb.connect(board=board) as conn:
-        task_id = _seed_reviewed_card(conn, board, repo, branch, source_sha)
-    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
-
-    out = _release(task_id, board)
-
-    assert "human" in out.lower() or "operator" in out.lower()
-    with kb.connect(board=board) as conn:
-        task = kb.get_task(conn, task_id)
-    assert task is not None and task.status != "done"
-
-
-def test_release_cli_requires_a_measurement_note(release_home, tmp_path):
-    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
-    board = "release-cli-note"
-    _release_board(board, repo)
-    with kb.connect(board=board) as conn:
-        task_id = _seed_reviewed_card(conn, board, repo, branch, source_sha)
-
-    out = _release(task_id, board, '--note "   "')
-
-    assert "note" in out.lower()
-    with kb.connect(board=board) as conn:
-        task = kb.get_task(conn, task_id)
-    assert task is not None and task.status != "done"
-
-
-def test_release_cli_reports_missing_release_evidence(release_home, tmp_path):
-    """No reviewer approval → the evidence gate refuses, naming what's missing,
-    and the card stays exactly where it was."""
-    repo, branch, _source_sha = _repo_with_story_branch(tmp_path)
-    board = "release-cli-evidence"
-    _release_board(board, repo)
-    with kb.connect(board=board) as conn:
-        task_id = kb.create_task(
-            conn,
-            title="Story: unevidenced",
-            board=board,
-            workspace_kind="worktree",
-            workspace_path=str(repo),
-            branch_name=branch,
-            workflow_template_id="product",
-            current_step_key="release_measure",
-        )
-
-    out = _release(task_id, board)
-
-    assert "evidence" in out.lower()
-    with kb.connect(board=board) as conn:
-        task = kb.get_task(conn, task_id)
-    assert task is not None
-    assert task.status != "done"
-    assert task.current_step_key == "release_measure"
-
-
-def test_release_cli_refuses_when_another_holder_owns_the_run_lease(
-    release_home, tmp_path
-):
-    """Two operators releasing the same card: one wins, the other refuses and
-    does not disturb the winner's claim."""
-    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
-    board = "release-cli-lease"
-    _release_board(board, repo)
-    with kb.connect(board=board) as conn:
-        task_id = _seed_reviewed_card(conn, board, repo, branch, source_sha)
-        # Operator A takes the lease first.
-        winner = kb.claim_task(conn, task_id)
-        assert winner is not None and winner.current_run_id is not None
-        before = _release_snapshot(conn, repo, task_id)
-
-    out = _release(task_id, board)
-
-    assert "already claimed" in out
-    with kb.connect(board=board) as conn:
-        after = _release_snapshot(conn, repo, task_id)
-        task = kb.get_task(conn, task_id)
-    # B changed nothing, and A still holds a live claim on a card that is
-    # neither blocked nor advanced.
-    assert after == before
-    assert task is not None
-    assert task.status == "running"
-    assert task.current_run_id == winner.current_run_id
-
-
-def test_release_cli_returns_the_lease_after_an_evidence_refusal(
-    release_home, tmp_path
-):
-    """An early refusal must not strand the card in `running`."""
-    repo, branch, _source_sha = _repo_with_story_branch(tmp_path)
-    board = "release-cli-lease-return"
-    _release_board(board, repo)
-    with kb.connect(board=board) as conn:
-        task_id = kb.create_task(
-            conn,
-            title="Story: unevidenced",
-            board=board,
-            workspace_kind="worktree",
-            workspace_path=str(repo),
-            branch_name=branch,
-            workflow_template_id="product",
-            current_step_key="release_measure",
-        )
-
-    out = _release(task_id, board)
-
-    assert "evidence" in out.lower()
-    with kb.connect(board=board) as conn:
-        task = kb.get_task(conn, task_id)
-    assert task is not None
-    assert task.status == "ready"
-    assert task.current_run_id is None
-    assert task.current_step_key == "release_measure"
-
-
-def test_release_kernel_refuses_a_policy_changed_after_cli_preflight(
-    release_home, tmp_path, monkeypatch
-):
-    """The metadata race: policy flips between the CLI preflight and the
-    kernel. The kernel reads its own snapshot and refuses before integration."""
-    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
-    board = "release-cli-policy-race"
-    _release_board(board, repo)
-    with kb.connect(board=board) as conn:
-        task_id = _seed_reviewed_card(conn, board, repo, branch, source_sha)
-        before = _release_snapshot(conn, repo, task_id)
-
-    real_metadata = kb.product_board_metadata
-    calls = {"n": 0}
-
-    def flipping_metadata(*args, **kwargs):
-        meta = real_metadata(*args, **kwargs)
-        calls["n"] += 1
-        # First read is the CLI preflight and sees `manual`; every later read
-        # — including the kernel's — sees the policy an operator just changed.
-        if calls["n"] > 1 and isinstance(meta, dict):
-            meta = json.loads(json.dumps(meta))
-            meta.setdefault("product_workflow", {})["deployment_policy"] = "required"
-        return meta
-
-    monkeypatch.setattr(kb, "product_board_metadata", flipping_metadata)
-    out = _release(task_id, board)
-
-    assert calls["n"] > 1
-    assert "did not complete" in out or "release_adapter_missing" in out
-    with kb.connect(board=board) as conn:
-        after = _release_snapshot(conn, repo, task_id)
-    # The target branch never moved: the kernel refused before integration.
-    assert after[0] == before[0]
-    assert (repo / "story.txt").exists() is False
-
-
-def test_release_uses_one_metadata_snapshot_for_the_whole_operation(
-    release_home, tmp_path, monkeypatch
-):
-    """A board edited mid-release cannot make a later step disagree with the
-    gate that admitted it.
-
-    The policy flips to `required` on every read after the first. If any step
-    re-read metadata, it would refuse for a missing adapter — possibly after
-    the target branch had already moved. The release must complete on the
-    snapshot it was admitted under.
-    """
-    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
-    board = "release-single-snapshot"
-    _release_board(board, repo)
-    with kb.connect(board=board) as conn:
-        task_id = _seed_reviewed_card(conn, board, repo, branch, source_sha)
-
-    real_metadata = kb.product_board_metadata
-    reads = {"n": 0}
-
-    def flipping_metadata(*args, **kwargs):
-        meta = real_metadata(*args, **kwargs)
-        reads["n"] += 1
-        if reads["n"] > 1 and isinstance(meta, dict):
-            meta = json.loads(json.dumps(meta))
-            meta.setdefault("product_workflow", {})["deployment_policy"] = "required"
-        return meta
-
-    monkeypatch.setattr(kb, "product_board_metadata", flipping_metadata)
-    with kb.connect(board=board) as conn:
-        result = kb.release_product_task(
-            conn, task_id, board, None, None,
-            measurement_note="Released and measured by operator",
-        )
-        task = kb.get_task(conn, task_id)
-
-    assert result.released is True, f"release refused on a re-read: {result.status}"
-    assert task is not None and task.status == "done"
-    assert (repo / "story.txt").read_text(encoding="utf-8") == "released\n"
-
-
-def test_release_cli_serializes_concurrent_epic_releases(
-    release_home, tmp_path
-):
-    """Epics cannot take a run lease (`claim_task` refuses work_item_kind=epic),
-    so the operator path serializes them on an advisory lock instead."""
-    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
-    board = "release-epic-lease"
-    _release_board(board, repo)
-    with kb.connect(board=board) as conn:
-        epic_id = kb.create_task(
-            conn,
-            title="Epic: operator release",
-            board=board,
-            work_item_kind="epic",
-            workspace_kind="worktree",
-            workspace_path=str(repo),
-            branch_name=branch,
-        )
-        # Legacy shape on purpose: work_item_kind=epic with null workflow
-        # metadata, exactly like t_4cccacd1.
-        assert kb.claim_task(conn, epic_id) is None  # epics are unclaimable
-        before = _release_snapshot(conn, repo, epic_id)
-
-    # Operator A holds the release lock; B must refuse without mutating.
-    held = kc._acquire_release_lock(epic_id)
-    try:
-        out = _release(epic_id, board)
-    finally:
-        kc._release_release_lock(held)
-
-    assert "already running" in out
-    with kb.connect(board=board) as conn:
-        after = _release_snapshot(conn, repo, epic_id)
-    assert after == before
-
-    # With the lock free again, the same command reaches the real gates rather
-    # than the lock refusal — proving the lock was released, not leaked.
-    out_again = _release(epic_id, board)
-    assert "already running" not in out_again
+def _fake_readiness(ready: bool = False):
+    return EpicReadiness(
+        epic_id="epic-1", epic_tip_sha="1" * 40,
+        members=(
+            EpicReadinessMember(
+                story_id="s-1", source_sha="4" * 40,
+                candidate_sha="5" * 40, integrated_at=90,
+            ),
+        ) if ready else (),
+        blockers=() if ready else ("nonterminal_member",),
+    )

@@ -3801,6 +3801,11 @@
         onSpecify: props.onSpecify,
         onDecompose: props.onDecompose,
       }),
+      h(ReleaseStateSection, { data: props.data }),
+      t.intake_id ? h(IntakeRecoverySection, {
+        intakeId: t.intake_id,
+        boardSlug: props.boardSlug,
+      }) : null,
       h(DiagnosticsSection, {
         task: t,
         boardSlug: props.boardSlug,
@@ -3955,6 +3960,42 @@
       ),
       h(WorkerLogSection, { taskId: t.id, boardSlug: props.boardSlug }),
       h(RunHistorySection, { runs: props.data.runs || [] }),
+    );
+  }
+
+  function IntakeRecoverySection(props) {
+    const { t } = useI18n();
+    const [state, setState] = useState({ loading: true, data: null, err: null });
+    const [busy, setBusy] = useState(false);
+    const load = useCallback(function () {
+      setState({ loading: true, data: null, err: null });
+      SDK.fetchJSON(withBoard(`${API}/work-inbox/status?intake_id=${encodeURIComponent(props.intakeId)}`, props.boardSlug))
+        .then(function (data) { setState({ loading: false, data: data, err: null }); })
+        .catch(function (err) { setState({ loading: false, data: null, err: String(err.message || err) }); });
+    }, [props.intakeId, props.boardSlug]);
+    useEffect(function () { load(); }, [load]);
+    if (state.loading) return null;
+    if (state.err || !state.data) return null;
+    const data = state.data;
+    const action = (data.actions || []).find(function (item) { return item.id === "retry"; });
+    return h("div", { className: "hermes-kanban-section hermes-kanban-intake-recovery" },
+      h("div", { className: "hermes-kanban-section-head" }, tx(t, "intakeRecovery", "Intake recovery")),
+      h("div", { className: "text-xs text-muted-foreground" },
+        `Attempts: ${data.attempts_used}/${data.attempts_limit}`),
+      action ? h(Button, {
+        size: "sm",
+        disabled: busy,
+        onClick: function () {
+          setBusy(true);
+          SDK.fetchJSON(withBoard(`${API}/work-inbox`, props.boardSlug), {
+            method: action.method,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ version: 2, kind: "retry", intake_id: props.intakeId }),
+          }).then(load).catch(function (err) {
+            setState({ loading: false, data: data, err: String(err.message || err) });
+          }).finally(function () { setBusy(false); });
+        },
+      }, busy ? tx(t, "retrying", "Retrying…") : tx(t, "retry", "Retry")) : null,
     );
   }
 
@@ -4484,6 +4525,168 @@
           size: "sm",
         }, "+ child"),
       ),
+    );
+  }
+
+  // -----------------------------------------------------------------------
+  // Release / integration state panel.
+  //
+  // Read-only by construction: it renders the server's named release state
+  // (collecting_members, aggregate_verification, awaiting_final_release,
+  // ci_pending, ci_failed, done) and member integration state. No button
+  // here — and no button anywhere in this bundle — invokes merge or push;
+  // the final merge/push is an external operator action.
+  // -----------------------------------------------------------------------
+  const RELEASE_STATE_LABELS = {
+    collecting_members: "Collecting members",
+    aggregate_verification: "Aggregate verification",
+    awaiting_final_release: "Awaiting final release",
+    awaiting_push: "Awaiting push",
+    ci_pending: "CI pending",
+    ci_failed: "CI failed",
+    released: "Released",
+    done: "Done",
+    invalidated: "Invalidated",
+    unavailable: "Unavailable",
+    integrating: "Integrating",
+    integration_failed: "Integration failed",
+    integrated: "Integrated",
+    not_integrated: "Not integrated",
+  };
+  const RELEASE_STATE_VARIANT = {
+    collecting_members: "outline",
+    aggregate_verification: "outline",
+    awaiting_final_release: "default",
+    awaiting_push: "default",
+    ci_pending: "outline",
+    ci_failed: "destructive",
+    released: "default",
+    done: "default",
+    invalidated: "destructive",
+    unavailable: "outline",
+    integrating: "outline",
+    integration_failed: "destructive",
+    integrated: "default",
+    not_integrated: "outline",
+  };
+
+  // Contract-test hook: the release panel's action surface is EMPTY by
+  // construction — it renders state + evidence + copyable ref + prose, and
+  // never a button that could invoke merge or push.
+  function releaseActionsFor(releaseState) {
+    return [];
+  }
+
+  if (window.__HERMES_KANBAN_TEST_HOOK__) {
+    window.__HERMES_KANBAN_TEST_HOOK__.releaseStateLabels = RELEASE_STATE_LABELS;
+    window.__HERMES_KANBAN_TEST_HOOK__.releaseStateVariants = RELEASE_STATE_VARIANT;
+    window.__HERMES_KANBAN_TEST_HOOK__.releaseActionsFor = releaseActionsFor;
+  }
+
+  function ReleaseStateSection(props) {
+    const data = props.data || {};
+    const epicRelease = data.epic_detail && data.epic_detail.release;
+    const memberRelease = data.member_release_state;
+    const release = epicRelease || memberRelease;
+    if (!release) return null;
+
+    const evidence = release.evidence || {};
+    const rows = [];
+
+    function kv(label, value) {
+      if (value == null || value === "") return null;
+      rows.push({ label: label, value: String(value) });
+      return null;
+    }
+
+    function Row(propsRow) {
+      return h("div", { className: "hermes-kanban-release-row" },
+        h("span", { className: "hermes-kanban-release-label" }, propsRow.label),
+        h("span", { className: "hermes-kanban-release-value" }, propsRow.value),
+      );
+    }
+
+    if (epicRelease) {
+      kv("Epic tip", evidence.epic_tip_sha);
+      kv("Target branch", evidence.target_branch);
+      kv("Target pre-SHA", evidence.target_pre_sha);
+      kv("Candidate SHA", evidence.release_candidate_sha);
+      kv("Pushed SHA", evidence.pushed_sha);
+      kv("Contract digest", evidence.repository_contract_digest);
+      kv("Verification event", evidence.aggregate_verification_event_id);
+      const members = evidence.members;
+      if (Array.isArray(members) && members.length) {
+        kv("Members", members.map(function (m) {
+          return m.story_id + " (" + m.candidate_sha + ")";
+        }).join(", "));
+      }
+      const blockers = evidence.blockers;
+      if (Array.isArray(blockers) && blockers.length) {
+        kv("Blockers", blockers.join(", "));
+      }
+      const ciEvidence = evidence.ci_evidence;
+      if (ciEvidence && typeof ciEvidence === "object") {
+        Object.keys(ciEvidence).forEach(function (workflow) {
+          kv("CI " + workflow, ciEvidence[workflow]);
+        });
+      }
+      if (evidence.local_target_head) {
+        kv("Local target head", evidence.local_target_head);
+      }
+      if (evidence.remote_target_head) {
+        kv("Remote target head", evidence.remote_target_head);
+      }
+    } else {
+      const intent = evidence.intent;
+      if (intent) {
+        kv("Integration status", intent.status);
+        kv("Attempt", intent.attempt_count);
+        kv("Safe failure code", intent.safe_code);
+        kv("Candidate SHA", intent.candidate_sha);
+      }
+      const fact = evidence.fact;
+      if (fact) {
+        kv("Integrated candidate", fact.candidate_sha);
+        kv("Integrated source", fact.source_sha);
+        kv("Integrated at", fact.integrated_at);
+      }
+    }
+
+    const state = release.state;
+    const actionable = !!release.actionable;
+    const label = RELEASE_STATE_LABELS[state] || state;
+    const variant = RELEASE_STATE_VARIANT[state] || "outline";
+
+    return h("div", {
+      className: cn(
+        "hermes-kanban-section",
+        "hermes-kanban-release-state",
+        epicRelease ? "hermes-kanban-release-state--epic" : "hermes-kanban-release-state--member",
+      ),
+    },
+      h("div", { className: "hermes-kanban-section-head" },
+        epicRelease
+          ? "Epic release"
+          : "Integration state"),
+      h("div", { className: "hermes-kanban-release-state-head" },
+        h(Badge, { variant: variant }, label),
+        actionable
+          ? h("span", { className: "hermes-kanban-release-actionable" }, "actionable")
+          : h("span", { className: "hermes-kanban-release-readonly" }, "read-only"),
+      ),
+      h("div", { className: "hermes-kanban-release-fields" },
+        rows.map(function (r) {
+          return h(Row, { key: r.label, label: r.label, value: r.value });
+        }),
+      ),
+      evidence.candidate_ref
+        ? h("div", { className: "hermes-kanban-release-ref" },
+            h("span", { className: "hermes-kanban-release-label" }, "Candidate ref (copy)"),
+            h("code", { className: "hermes-kanban-release-ref-code" }, evidence.candidate_ref))
+        : null,
+      release.action
+        ? h("div", { className: "hermes-kanban-release-action" }, release.action)
+        : null,
     );
   }
 

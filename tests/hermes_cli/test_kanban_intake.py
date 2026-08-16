@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import copy
+import concurrent.futures
 import json
 import stat
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -445,6 +447,94 @@ def test_generic_board_preserves_caller_fields_without_contract():
     )
 
     assert fields == {"title": "Standalone work", "assignee": "default"}
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["pending", "running", "needs_clarification", "attention_required"],
+)
+def test_existing_requalification_intake_treats_all_active_statuses_as_active(
+    tmp_path, status
+):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        intake_id = kb.create_qualification_intake(
+            conn,
+            raw_request=json.dumps(
+                {
+                    "kind": "task_requalification",
+                    "target_task_id": "t_target",
+                    "evidence_digest": "stored-evidence",
+                    "qualifier_revision": 3,
+                }
+            ),
+            source="hermes-reconcile",
+        )
+        conn.execute(
+            "UPDATE qualification_intake SET status = ? WHERE id = ?",
+            (status, intake_id),
+        )
+
+        existing = intake.existing_requalification_intake(
+            conn,
+            "t_target",
+            evidence_digest="new-evidence",
+            qualifier_revision=99,
+        )
+    finally:
+        conn.close()
+
+    assert existing is not None
+    assert existing["id"] == intake_id
+    assert existing["status"] == status
+
+
+def test_submit_requalification_is_atomic_across_sqlite_connections(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    setup = kb.connect(db_path)
+    task_id = kb.create_task(
+        setup,
+        title="Scheduled card",
+        initial_status="running",
+        work_contract_id="wc_existing",
+    )
+    assert kb.schedule_task(setup, task_id, reason="test requalification")
+    setup.close()
+
+    barrier = threading.Barrier(2)
+
+    def submit_once():
+        conn = kb.connect(db_path)
+        try:
+            barrier.wait()
+            return intake.submit_requalification(
+                conn,
+                task_id=task_id,
+                reason="scheduled card has no wake action",
+                _wake=False,
+            )
+        finally:
+            conn.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: submit_once(), range(2)))
+
+    assert results[0]["intake_id"] == results[1]["intake_id"]
+    assert sorted(result["created"] for result in results) == [False, True]
+
+    check = kb.connect(db_path)
+    try:
+        rows = check.execute(
+            "SELECT id, status FROM qualification_intake "
+            "WHERE json_extract(raw_request, '$.target_task_id') = ?",
+            (task_id,),
+        ).fetchall()
+    finally:
+        check.close()
+
+    assert len(rows) == 1
+    assert rows[0]["id"] == results[0]["intake_id"]
+    assert rows[0]["status"] == "pending"
 
 
 def test_product_board_defaults_declare_policy_without_activating_it():

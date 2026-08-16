@@ -198,6 +198,7 @@ def test_apply_preserves_evidence_and_converts_only_explicit_epic_links(
     assert metadata["qualification"] == {
         "required": True,
         "contract_version": 1,
+        "max_total_attempts": 3,
         "policy_version": "product-handoff-v2+qualification-v1",
         "paths": ["po", "hermes"],
         "work_types": ["story", "bug", "maintenance", "ops", "spike"],

@@ -119,6 +119,67 @@ def test_init_creates_expected_tables(kanban_home):
     } <= names
 
 
+def test_epic_record_schema_creates_only_the_three_additive_tables(kanban_home):
+    expected = {
+        "story_integration_intents",
+        "epic_release_snapshots",
+        "epic_release_members",
+    }
+
+    with kb.connect() as conn:
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+
+    assert expected <= tables
+    assert "repository_verification_runs" not in tables
+
+
+def test_epic_record_migration_adds_only_three_tables_and_is_idempotent(tmp_path):
+    db_path = tmp_path / "pre-feature.db"
+    expected = {
+        "story_integration_intents",
+        "epic_release_snapshots",
+        "epic_release_members",
+    }
+
+    with kb.connect(db_path) as conn:
+        modern_tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        conn.execute("DROP TABLE epic_release_members")
+        conn.execute("DROP TABLE epic_release_snapshots")
+        conn.execute("DROP TABLE story_integration_intents")
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path) as conn:
+        migrated_tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+
+    assert migrated_tables - (modern_tables - expected) == expected
+    assert migrated_tables == modern_tables
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path) as conn:
+        rerun_tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert rerun_tables == migrated_tables
+
+
 def test_board_metadata_repository_policy_is_validated(kanban_home, tmp_path):
     repo = tmp_path / "repository-policy"
     _init_git_repo(repo)
@@ -5650,7 +5711,9 @@ def test_complete_task_v2_clean_test_evidence_advances_without_commit(kanban_hom
     assert handoff_events[0].payload["sha"] is None
 
 
-def test_complete_task_v2_clean_review_evidence_advances_without_commit(kanban_home, tmp_path, monkeypatch):
+def test_standalone_release_measure_review_evidence_advances_without_commit(
+    kanban_home, tmp_path, monkeypatch
+):
     """A review-step handoff can be evidence-only: independent review should
     move the card to Release / Measure without requiring a new code commit.
     """
@@ -6445,35 +6508,6 @@ def test_reconcile_spawns_stranded_ready_card_idempotently(kanban_home, tmp_path
     assert spawns == [tid]  # spawn count stays <= 1 across both passes
 
 
-def test_reconcile_integrates_one_done_unintegrated_story_per_pass(
-    kanban_home, tmp_path, monkeypatch,
-):
-    """A v2 done+unintegrated story is merged into its epic branch once; a
-    second pass sees it's already integrated and does not re-merge it."""
-    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-reconcile-integrate"
-    _v2_product_board_with_repo(board, repo)
-    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
-
-    with kb.connect(board=board) as conn:
-        first = kb.reconcile(conn, board=board)
-    assert first.integrated == [story]
-
-    ancestor = subprocess.run(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", story_sha, epic_branch],
-        capture_output=True, text=True,
-    )
-    assert ancestor.returncode == 0, "epic branch must contain the story's commit"
-
-    calls = _record_git_calls(monkeypatch)
-    with kb.connect(board=board) as conn:
-        second = kb.reconcile(conn, board=board)
-    assert second.integrated == []
-    assert not any("merge" in cmd and "--no-ff" in cmd for cmd in calls), (
-        "second pass must not re-merge an already-integrated story"
-    )
 
 
 def test_reconcile_legacy_board_is_noop(kanban_home, monkeypatch):
@@ -6495,14 +6529,13 @@ def test_reconcile_legacy_board_is_noop(kanban_home, monkeypatch):
     assert spawns == []
 
 
-def test_reconcile_spawn_ready_false_recovers_and_integrates_but_skips_spawn(
+def test_reconcile_spawn_ready_false_recovers_but_skips_spawn(
     kanban_home, tmp_path, monkeypatch,
 ):
     """``spawn_ready=False`` skips ONLY step 2 (the stranded-ready spawn
-    loop) -- step 1 (dead-worker recovery) and step 3 (story->epic
-    integration) still run. This is the mode the gateway tick uses
+    loop) while step 1 (dead-worker recovery) still runs. The gateway tick uses
     (Codex re-review P1): dispatch_once is already the tick's sole capped
-    spawn owner, so reconcile in the tick must only recover + integrate,
+    spawn owner, so reconcile in the tick must recover but not duplicate spawn,
     never spawn an arbitrary ready card."""
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     repo = tmp_path / "repo"
@@ -6519,8 +6552,6 @@ def test_reconcile_spawn_ready_false_recovers_and_integrates_but_skips_spawn(
     def fake_spawn(task, workspace, board=None):
         spawns.append(task.id)
         return 4242
-
-    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
 
     with kb.connect(board=board) as conn:
         dead_tid = kb.create_task(conn, title="Dead worker story", assignee="developer")
@@ -6540,16 +6571,10 @@ def test_reconcile_spawn_ready_false_recovers_and_integrates_but_skips_spawn(
     assert result.reclaimed == [dead_tid], "recovery (step 1) still runs"
     assert result.spawned == [], "the ready-spawn step (step 2) is skipped"
     assert spawns == []
-    assert result.integrated == [story], "story integration (step 3) still runs"
+    assert result.integrated == []
 
     assert dead_card.status == "ready", "dead-pid card was still re-idled"
     assert ready_card.status == "ready", "stranded ready card was NOT spawned"
-
-    ancestor = subprocess.run(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", story_sha, epic_branch],
-        capture_output=True, text=True,
-    )
-    assert ancestor.returncode == 0, "epic branch must still contain the story's commit"
 
 
 # ---------------------------------------------------------------------------
@@ -11052,6 +11077,93 @@ def _make_epic_branch(repo: Path, epic_branch: str, *, from_branch: str = "main"
     return sha
 
 
+def _make_fact_ready_epic(board: str, repo: Path) -> tuple[str, list[str]]:
+    """Build one Epic member with current terminal authority and facts."""
+    epic, children = _make_epic_with_children(board, n_children=1)
+    story_id = children[0]
+    story_branch = f"story/{story_id}"
+    review_base_sha = _head_sha(repo)
+    source_sha = _make_epic_branch(repo, story_branch)
+    epic_branch = kb.epic_branch_for(epic)
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", epic_branch, story_branch],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _commit_file(repo, "epic_tip.txt", "epic tip\n", "epic tip")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with kb.connect(board=board) as conn:
+        kb.set_branch_name(conn, story_id, story_branch)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workflow_template_id='product', "
+                "current_step_key='done', status='done', completed_at=1, "
+                "assignee=NULL, running=0, blocked=0, current_run_id=NULL "
+                "WHERE id=?",
+                (story_id,),
+            )
+            kb._synthesize_ended_run(
+                conn,
+                story_id,
+                outcome="advanced",
+                step_key="test",
+                metadata={
+                    "test_branch": story_branch,
+                    "test_head_sha": source_sha,
+                    "workflow_outcome": {"verdict": "passed"},
+                    "ai_provenance": {
+                        "writer": {"agent": "developer"},
+                        "tester": {"agent": "tester"},
+                    },
+                },
+            )
+            review_run_id = kb._synthesize_ended_run(
+                conn,
+                story_id,
+                outcome="advanced",
+                step_key="review",
+                metadata={
+                    "review_branch": story_branch,
+                    "review_base_sha": review_base_sha,
+                    "review_head_sha": source_sha,
+                    "workflow_outcome": {"verdict": "approved"},
+                    "ai_provenance": {
+                        "writer": {"agent": "developer"},
+                        "reviewer": {"agent": "reviewer"},
+                    },
+                },
+            )
+            conn.execute(
+                "INSERT INTO story_integration_intents ("
+                "epic_id, story_id, source_sha, source_branch, review_run_id, "
+                "review_base_sha, status, candidate_sha, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, 'integrated', ?, 90, 90)",
+                (
+                    epic,
+                    story_id,
+                    source_sha,
+                    story_branch,
+                    review_run_id,
+                    review_base_sha,
+                    source_sha,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO epic_story_integrations "
+                "(epic_id, story_id, source_sha, candidate_sha, integrated_at) "
+                "VALUES (?, ?, ?, ?, 90)",
+                (epic, story_id, source_sha, source_sha),
+            )
+    return epic, children
+
+
 def _record_git_calls(monkeypatch) -> list[list[str]]:
     """Monkeypatch ``subprocess.run`` to record every argv while still
     executing real git. Returns the list calls are appended to."""
@@ -11265,10 +11377,7 @@ def test_merge_epic_preserves_explicit_injected_candidate_verification(
     _configure_candidate_verification(
         board, repo, command=("python", "-c", "raise SystemExit(9)")
     )
-    epic, children = _make_epic_with_children(board, n_children=1)
-    with kb.connect(board=board) as conn:
-        _set_task_status(conn, children[0], "done")
-    _make_epic_branch(repo, kb.epic_branch_for(epic))
+    epic, children = _make_fact_ready_epic(board, repo)
     injected = unittest.mock.Mock(return_value=True)
 
     with kb.connect(board=board) as conn:
@@ -11313,7 +11422,7 @@ def _run_reusable_verification(conn, fixture):
     )
 
 
-def test_exact_repository_verification_receipt_skips_command(
+def test_parser_addition_preserves_exact_repository_verification_receipt_reuse(
     kanban_home, tmp_path, monkeypatch
 ):
     fixture = _verification_run_fixture(kanban_home, tmp_path, monkeypatch)
@@ -11369,10 +11478,7 @@ def test_verified_candidate_crash_reuses_persisted_receipt(
             "p.write_text(p.read_text() + 'x' if p.exists() else 'x')",
         ),
     )
-    epic, children = _make_epic_with_children(board, n_children=1)
-    with kb.connect(board=board) as conn:
-        _set_task_status(conn, children[0], "done")
-    _make_epic_branch(repo, kb.epic_branch_for(epic))
+    epic, children = _make_fact_ready_epic(board, repo)
     monkeypatch.setenv("GIT_AUTHOR_DATE", "2001-01-01T00:00:00+00:00")
     monkeypatch.setenv("GIT_COMMITTER_DATE", "2001-01-01T00:00:00+00:00")
     apply = unittest.mock.Mock(side_effect=[False, True])
@@ -11506,11 +11612,7 @@ def test_merge_epic_records_configured_profile_failure_as_attention_required(
     }
     meta_path.write_text(json.dumps(meta), encoding="utf-8")
 
-    epic, children = _make_epic_with_children(board, n_children=1)
-    with kb.connect(board=board) as conn:
-        _set_task_status(conn, children[0], "done")
-    epic_branch = kb.epic_branch_for(epic)
-    _make_epic_branch(repo, epic_branch)
+    epic, children = _make_fact_ready_epic(board, repo)
 
     with kb.connect(board=board) as conn:
         result = kb.merge_epic_to_main(conn, epic, board=board)
@@ -11938,405 +12040,6 @@ def test_merge_epic_to_main_non_v2_board_returns_none(kanban_home, tmp_path, mon
         result = kb.merge_epic_to_main(
             conn, epic, board=board, verify_fn=lambda b: True, notify_fn=notify,
         )
-
-    assert result is None
-    assert calls == []
-    notify.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# integrate_story_to_epic -- Hermes-run LOCAL merge of a Done story's branch
-# into its epic's integration branch (W3).
-#
-# THE HARD BOUNDARY: this function must never `git push` / touch origin.
-# Every test below records the git subcommands actually executed (real
-# subprocess, real temp git repos) and asserts none of them is "push".
-# ---------------------------------------------------------------------------
-
-def _make_story_branch(repo: Path, story_branch: str, *, from_branch: str) -> str:
-    """Branch ``story_branch`` off ``from_branch`` and add a unique commit.
-    Returns the new commit sha. Leaves ``from_branch`` checked out."""
-    subprocess.run(
-        ["git", "-C", str(repo), "switch", "-c", story_branch, from_branch],
-        check=True, capture_output=True, text=True,
-    )
-    sha = _commit_file(repo, "story_work.txt", "story work\n", "story commit")
-    subprocess.run(
-        ["git", "-C", str(repo), "switch", from_branch],
-        check=True, capture_output=True, text=True,
-    )
-    return sha
-
-
-def _make_epic_and_done_story(board: str, repo: Path) -> tuple[str, str, str, str]:
-    """Create an epic + a Done story with a real branch off the epic branch.
-
-    Returns ``(epic, story, epic_branch, story_sha)``.
-    """
-    with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
-    epic_branch = kb.epic_branch_for(epic)
-    _make_epic_branch(repo, epic_branch)
-
-    story_branch = f"story/{epic}-s1"
-    story_sha = _make_story_branch(repo, story_branch, from_branch=epic_branch)
-    subprocess.run(
-        ["git", "-C", str(repo), "switch", "main"], check=True, capture_output=True, text=True,
-    )
-
-    with kb.connect(board=board) as conn:
-        story = kb.create_task(
-            conn, title="Story", board=board,
-            workspace_kind="worktree", workspace_path=str(repo),
-            branch_name=story_branch,
-        )
-        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
-        _set_task_status(conn, story, "done")
-    return epic, story, epic_branch, story_sha
-
-
-def _add_approved_review_candidate(
-    conn: sqlite3.Connection,
-    task_id: str,
-    branch: str,
-    source_sha: str,
-) -> None:
-    task = kb.get_task(conn, task_id)
-    assert task is not None
-    assert task.workspace_path is not None
-    epic_id = kb.epic_id_for_task(conn, task_id)
-    assert epic_id is not None
-    base_sha = _git_output(
-        Path(task.workspace_path),
-        "merge-base",
-        branch,
-        kb.epic_branch_for(epic_id),
-    )
-    now = int(time.time())
-    test_metadata = {
-        "workflow_outcome": {"verdict": "passed"},
-        "ai_provenance": {
-            "writer": {"agent": "developer"},
-            "tester": {"agent": "hermes", "result": "passed"},
-        },
-        "test_branch": branch,
-        "test_head_sha": source_sha,
-    }
-    metadata = {
-        "workflow_outcome": {"verdict": "approved"},
-        "ai_provenance": {
-            "writer": {"agent": "developer"},
-            "reviewer": {
-                "agent": "reviewer",
-                "verdict": "approved",
-                "reviewed_branch": branch,
-                "reviewed_commit": source_sha,
-            },
-        },
-        "review_branch": branch,
-        "review_base_sha": base_sha,
-        "review_head_sha": source_sha,
-    }
-    conn.execute(
-        """
-        INSERT INTO task_runs
-            (task_id, step_key, status, started_at, ended_at, outcome, metadata)
-        VALUES (?, 'test', 'done', ?, ?, 'completed', ?)
-        """,
-        (task_id, now, now, json.dumps(test_metadata)),
-    )
-    conn.execute(
-        """
-        INSERT INTO task_runs
-            (task_id, step_key, status, started_at, ended_at, outcome, metadata)
-        VALUES (?, 'review', 'done', ?, ?, 'completed', ?)
-        """,
-        (task_id, now, now, json.dumps(metadata)),
-    )
-
-
-def test_integrate_story_to_epic_merges_and_never_pushes(kanban_home, tmp_path, monkeypatch):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-integrate-happy"
-    _v2_product_board_with_repo(board, repo)
-    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
-
-    calls = _record_git_calls(monkeypatch)
-    notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
-        result = kb.integrate_story_to_epic(conn, story, board=board, notify_fn=notify)
-
-    assert result == "integrated"
-    notify.assert_not_called()
-    _assert_no_push(calls)
-
-    ancestor = subprocess.run(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", story_sha, epic_branch],
-        capture_output=True, text=True,
-    )
-    assert ancestor.returncode == 0, "epic branch must contain the story's commit"
-
-    current_branch = subprocess.run(
-        ["git", "-C", str(repo), "branch", "--show-current"],
-        capture_output=True, text=True,
-    ).stdout.strip()
-    assert current_branch == "main", "repo_root's checkout must be undisturbed"
-
-
-def test_integrate_story_to_epic_idempotent_second_call_is_noop(kanban_home, tmp_path, monkeypatch):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-integrate-idempotent"
-    _v2_product_board_with_repo(board, repo)
-    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
-
-    with kb.connect(board=board) as conn:
-        conn.execute(
-            "UPDATE tasks SET completed_at=? WHERE id=?",
-            (int(time.time()), story),
-        )
-        first = kb.integrate_story_to_epic(conn, story, board=board)
-    assert first == "integrated"
-
-    calls = _record_git_calls(monkeypatch)
-    with kb.connect(board=board) as conn:
-        second = kb.integrate_story_to_epic(conn, story, board=board)
-
-    assert second == "already_integrated"
-    assert not any("merge" in cmd and "--no-ff" in cmd for cmd in calls), (
-        "must not re-merge an already-integrated story"
-    )
-    assert calls == []
-
-
-def test_integrate_story_to_epic_rejects_empty_contribution_before_fact(
-    kanban_home, tmp_path,
-):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-integrate-empty-contribution"
-    _v2_product_board_with_repo(board, repo)
-    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
-    story_branch = f"story/{epic}-s1"
-    _git_output(repo, "branch", "-f", story_branch, epic_branch)
-    empty_sha = _git_output(repo, "rev-parse", story_branch)
-    assert empty_sha != story_sha
-
-    with kb.connect(board=board) as conn:
-        _add_approved_review_candidate(conn, story, story_branch, empty_sha)
-        before = conn.execute(
-            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?",
-            (story,),
-        ).fetchone()[0]
-        result = kb.integrate_story_to_epic(conn, story, board=board)
-        after = conn.execute(
-            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?",
-            (story,),
-        ).fetchone()[0]
-        events = conn.execute(
-            "SELECT COUNT(*) FROM task_events "
-            "WHERE task_id=? AND kind='story_integrated_to_epic'",
-            (story,),
-        ).fetchone()[0]
-
-    assert result == "verify_failed"
-    assert after == before == 0
-    assert events == 0
-    assert _git_output(repo, "rev-parse", epic_branch) == _git_output(
-        repo, "rev-parse", story_branch
-    )
-
-
-def test_integrate_story_to_epic_rejects_ancestor_without_existing_fact(
-    kanban_home, tmp_path,
-):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-integrate-ancestor-without-fact"
-    _v2_product_board_with_repo(board, repo)
-    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
-    story_branch = f"story/{epic}-s1"
-
-    with kb.connect(board=board) as conn:
-        _add_approved_review_candidate(conn, story, story_branch, story_sha)
-
-    # The reviewed contribution is now already in the target branch, but no
-    # durable composite fact records that handoff.  An ancestor check alone is
-    # not enough to manufacture that fact during a later reconcile pass.
-    _git_output(repo, "branch", "-f", epic_branch, story_sha)
-
-    with kb.connect(board=board) as conn:
-        result = kb.integrate_story_to_epic(conn, story, board=board)
-        fact_count = conn.execute(
-            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?",
-            (story,),
-        ).fetchone()[0]
-        event_count = conn.execute(
-            "SELECT COUNT(*) FROM task_events "
-            "WHERE task_id=? AND kind='story_integrated_to_epic'",
-            (story,),
-        ).fetchone()[0]
-
-    assert result == "verify_failed"
-    assert fact_count == 0
-    assert event_count == 0
-
-
-def test_integrate_story_to_epic_replays_existing_composite_fact(
-    kanban_home, tmp_path, monkeypatch,
-):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-integrate-replay"
-    _v2_product_board_with_repo(board, repo)
-    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
-    story_branch = f"story/{epic}-s1"
-
-    with kb.connect(board=board) as conn:
-        _add_approved_review_candidate(conn, story, story_branch, story_sha)
-        kb._record_story_integration(
-            conn,
-            story,
-            epic,
-            epic_branch,
-            {
-                "source_branch": story_branch,
-                "source_sha": story_sha,
-                "target_branch": epic_branch,
-                "candidate_sha": story_sha,
-            },
-        )
-        before = conn.execute(
-            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?",
-            (story,),
-        ).fetchone()[0]
-
-    calls = _record_git_calls(monkeypatch)
-    with kb.connect(board=board) as conn:
-        result = kb.integrate_story_to_epic(conn, story, board=board)
-        after = conn.execute(
-            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?",
-            (story,),
-        ).fetchone()[0]
-
-    assert result == "already_integrated"
-    assert after == before == 1
-    assert calls == []
-
-
-def test_integrate_story_to_epic_conflict_aborts_blocks_story_and_never_pushes(
-    kanban_home, tmp_path, monkeypatch,
-):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-integrate-conflict"
-    _v2_product_board_with_repo(board, repo)
-
-    with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
-    epic_branch = kb.epic_branch_for(epic)
-    _make_epic_branch(repo, epic_branch)
-
-    # Epic branch and story branch both modify the same file differently so
-    # the merge conflicts.
-    subprocess.run(
-        ["git", "-C", str(repo), "switch", epic_branch], check=True,
-        capture_output=True, text=True,
-    )
-    _commit_file(repo, "shared.txt", "epic version\n", "epic edits shared")
-    story_branch = f"story/{epic}-s1"
-    subprocess.run(
-        ["git", "-C", str(repo), "switch", "-c", story_branch, epic_branch],
-        check=True, capture_output=True, text=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "reset", "--hard", "HEAD~1"], check=True,
-        capture_output=True, text=True,
-    )
-    _commit_file(repo, "shared.txt", "story version\n", "story edits shared")
-    subprocess.run(
-        ["git", "-C", str(repo), "switch", "main"], check=True, capture_output=True, text=True,
-    )
-
-    with kb.connect(board=board) as conn:
-        story = kb.create_task(
-            conn, title="Story", board=board,
-            workspace_kind="worktree", workspace_path=str(repo),
-            branch_name=story_branch,
-        )
-        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
-        _set_task_status(conn, story, "done")
-
-    calls = _record_git_calls(monkeypatch)
-    notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
-        result = kb.integrate_story_to_epic(conn, story, board=board, notify_fn=notify)
-
-    assert result == "conflict"
-    _assert_no_push(calls)
-    notify.assert_called_once()
-
-    epic_worktree = repo / ".worktrees" / f"epic-{epic}"
-    status = subprocess.run(
-        ["git", "-C", str(epic_worktree), "status", "--porcelain"],
-        capture_output=True, text=True,
-    )
-    assert status.stdout.strip() == "", "merge --abort must leave the epic worktree clean"
-
-    with kb.connect(board=board) as conn:
-        row = conn.execute("SELECT blocked FROM tasks WHERE id = ?", (story,)).fetchone()
-    assert row["blocked"] == 1
-
-    current_branch = subprocess.run(
-        ["git", "-C", str(repo), "branch", "--show-current"],
-        capture_output=True, text=True,
-    ).stdout.strip()
-    assert current_branch == "main", "repo_root's checkout must be undisturbed"
-
-
-def test_integrate_story_to_epic_non_v2_board_returns_none(kanban_home, tmp_path, monkeypatch):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "legacy-integrate-board"
-    kb.create_board(board, name="Legacy Board", default_workdir=str(repo))
-    with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
-        story = kb.create_task(
-            conn, title="Story", board=board,
-            workspace_kind="worktree", workspace_path=str(repo),
-            branch_name="story/s1",
-        )
-        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
-        _set_task_status(conn, story, "done")
-
-    calls = _record_git_calls(monkeypatch)
-    notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
-        result = kb.integrate_story_to_epic(conn, story, board=board, notify_fn=notify)
-
-    assert result is None
-    assert calls == []
-    notify.assert_not_called()
-
-
-def test_integrate_story_to_epic_no_epic_parent_returns_none(kanban_home, tmp_path, monkeypatch):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-integrate-no-parent"
-    _v2_product_board_with_repo(board, repo)
-    with kb.connect(board=board) as conn:
-        story = kb.create_task(
-            conn, title="Lonely Story", board=board,
-            workspace_kind="worktree", workspace_path=str(repo),
-            branch_name="story/lonely",
-        )
-        _set_task_status(conn, story, "done")
-
-    calls = _record_git_calls(monkeypatch)
-    notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
-        result = kb.integrate_story_to_epic(conn, story, board=board, notify_fn=notify)
 
     assert result is None
     assert calls == []
@@ -14107,414 +13810,83 @@ def test_d4_non_audit_events_invalidate_escalation_without_mutation(kanban_home,
         assert kb.list_events(conn, tid) == before_events
 
 
-def test_reconcile_ten_times_does_not_reprocess_integrated_story(
-    kanban_home, tmp_path, monkeypatch
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def test_qualification_attempt_budget_counts_all_historical_runs_and_preserves_history(
+    kanban_home,
 ):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-reconcile-stable"
-    _v2_product_board_with_repo(board, repo)
-    epic, story, _epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
-
+    board = "qualification-attempt-budget"
+    kb.ensure_product_board_defaults(board)
+    metadata_path = kb.board_metadata_path(board)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["max_total_attempts"] = 3
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
     with kb.connect(board=board) as conn:
-        conn.execute(
-            "UPDATE tasks SET completed_at=? WHERE id=?",
-            (int(time.time()), story),
+        intake_id = kb.create_qualification_intake(
+            conn, raw_request="budget me", source="chat", created_at=10
         )
-        assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
-        before = conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
-            (story, "story_integrated_to_epic"),
-        ).fetchone()[0]
-
-    calls = _record_git_calls(monkeypatch)
-    with kb.connect(board=board) as conn:
-        for _ in range(10):
-            kb.reconcile(conn, board=board, spawn_ready=False)
-        after = conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
-            (story, "story_integrated_to_epic"),
-        ).fetchone()[0]
-
-    assert after == before
-    assert calls == []
-
-
-def test_reconcile_reintegrates_story_after_later_completion(
-    kanban_home, tmp_path, monkeypatch
-):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-reconcile-reworked-story"
-    _v2_product_board_with_repo(board, repo)
-    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
-
-    with kb.connect(board=board) as conn:
-        story_branch = f"story/{epic}-s1"
-        _add_approved_review_candidate(conn, story, story_branch, story_sha)
-        assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
-        first_events = conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
-            (story, "story_integrated_to_epic"),
-        ).fetchone()[0]
-
-        story_branch = f"story/{epic}-s1"
-        subprocess.run(
-            ["git", "-C", str(repo), "switch", story_branch],
-            check=True, capture_output=True, text=True,
-        )
-        _commit_file(repo, "rework.txt", "reworked\n", "rework commit")
-        subprocess.run(
-            ["git", "-C", str(repo), "switch", "main"],
-            check=True, capture_output=True, text=True,
-        )
-        reworked_sha = _git_output(repo, "rev-parse", story_branch)
-        _add_approved_review_candidate(conn, story, story_branch, reworked_sha)
-        conn.commit()
-
-    calls = _record_git_calls(monkeypatch)
-    with kb.connect(board=board) as conn:
-        result = kb.reconcile(conn, board=board, spawn_ready=False)
-        reworked_events = conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
-            (story, "story_integrated_to_epic"),
-        ).fetchone()[0]
-        rework_content = _git_output(repo, "show", f"{epic_branch}:rework.txt")
-        calls.clear()
-        unchanged = kb.reconcile(conn, board=board, spawn_ready=False)
-        unchanged_events = conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
-            (story, "story_integrated_to_epic"),
-        ).fetchone()[0]
-
-    assert result.integrated == [story]
-    assert reworked_events == first_events + 1
-    assert rework_content == "reworked"
-    assert unchanged.integrated == []
-    assert unchanged_events == reworked_events
-    assert calls == []
-
-
-def test_reconcile_reintegrates_unreviewed_story_without_completion_timestamp(
-    kanban_home, tmp_path
-):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-reconcile-unreviewed-rework"
-    _v2_product_board_with_repo(board, repo)
-    epic, story, epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
-    story_branch = f"story/{epic}-s1"
-
-    with kb.connect(board=board) as conn:
-        assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
-        subprocess.run(
-            ["git", "-C", str(repo), "switch", story_branch],
-            check=True, capture_output=True, text=True,
-        )
-        _commit_file(repo, "rework.txt", "reworked\n", "rework commit")
-        subprocess.run(
-            ["git", "-C", str(repo), "switch", "main"],
-            check=True, capture_output=True, text=True,
-        )
-        conn.commit()
-
-        result = kb.reconcile(conn, board=board, spawn_ready=False)
-
-    assert result.integrated == [story]
-    assert _git_output(repo, "show", f"{epic_branch}:rework.txt") == "reworked"
-
-
-def test_reconcile_cache_miss_integrates_approved_sha_not_advanced_story_tip(
-    kanban_home, tmp_path
-):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-reconcile-reviewed-cache-miss"
-    _v2_product_board_with_repo(board, repo)
-    epic, story, epic_branch, approved_sha = _make_epic_and_done_story(board, repo)
-    story_branch = f"story/{epic}-s1"
-
-    with kb.connect(board=board) as conn:
-        _add_approved_review_candidate(conn, story, story_branch, approved_sha)
-        subprocess.run(
-            ["git", "-C", str(repo), "switch", story_branch],
-            check=True, capture_output=True, text=True,
-        )
-        _commit_file(repo, "unreviewed.txt", "unreviewed\n", "unreviewed tip")
-        subprocess.run(
-            ["git", "-C", str(repo), "switch", "main"],
-            check=True, capture_output=True, text=True,
-        )
-        advanced_sha = _git_output(repo, "rev-parse", story_branch)
-        conn.commit()
-
-        result = kb.reconcile(conn, board=board, spawn_ready=False)
-
-    assert result.integrated == [story]
-    assert subprocess.run(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", approved_sha, epic_branch],
-        capture_output=True, text=True,
-    ).returncode == 0
-    assert subprocess.run(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", advanced_sha, epic_branch],
-        capture_output=True, text=True,
-    ).returncode != 0
-    assert _git_output(repo, "show", f"{epic_branch}:story_work.txt") == "story work"
-    assert subprocess.run(
-        ["git", "-C", str(repo), "show", f"{epic_branch}:unreviewed.txt"],
-        capture_output=True, text=True,
-    ).returncode != 0
-    assert _git_output(repo, "for-each-ref", "--format=%(refname)", "refs/heads/hermes/reviewed-") == ""
-
-
-def test_integrate_story_to_epic_reports_reviewed_ref_creation_failure(
-    kanban_home, tmp_path, monkeypatch
-):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-reviewed-ref-create-failure"
-    _v2_product_board_with_repo(board, repo)
-    _epic, story, _epic_branch, approved_sha = _make_epic_and_done_story(board, repo)
-
-    with kb.connect(board=board) as conn:
-        _add_approved_review_candidate(conn, story, f"story/{_epic}-s1", approved_sha)
-
-    real_integration_git = kb._integration_git
-
-    def fail_reviewed_ref_creation(cwd, args, *, timeout=120):
-        if (
-            args[:1] == ["update-ref"]
-            and len(args) > 1
-            and args[1].startswith("refs/heads/hermes/reviewed-")
-        ):
-            return subprocess.CompletedProcess(["git"], 1, "", "forced failure")
-        return real_integration_git(cwd, args, timeout=timeout)
-
-    monkeypatch.setattr(kb, "_integration_git", fail_reviewed_ref_creation)
-    with kb.connect(board=board) as conn:
-        assert kb.integrate_story_to_epic(conn, story, board=board) == "verify_failed"
-
-
-def test_integrate_story_to_epic_reports_reviewed_ref_deletion_failure(
-    kanban_home, tmp_path, monkeypatch
-):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-reviewed-ref-delete-failure"
-    _v2_product_board_with_repo(board, repo)
-    _epic, story, _epic_branch, approved_sha = _make_epic_and_done_story(board, repo)
-
-    with kb.connect(board=board) as conn:
-        _add_approved_review_candidate(conn, story, f"story/{_epic}-s1", approved_sha)
-
-    real_integration_git = kb._integration_git
-
-    def fail_reviewed_ref_deletion(cwd, args, *, timeout=120):
-        if (
-            args[:2] == ["update-ref", "-d"]
-            and len(args) > 2
-            and args[2].startswith("refs/heads/hermes/reviewed-")
-        ):
-            return subprocess.CompletedProcess(["git"], 1, "", "forced failure")
-        return real_integration_git(cwd, args, timeout=timeout)
-
-    monkeypatch.setattr(kb, "_integration_git", fail_reviewed_ref_deletion)
-    with kb.connect(board=board) as conn:
-        assert kb.integrate_story_to_epic(conn, story, board=board) == "verify_failed"
-
-
-def test_reconcile_keeps_prior_member_state_when_sibling_advances_tip(
-    kanban_home, tmp_path, monkeypatch
-):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-reconcile-sibling"
-    _v2_product_board_with_repo(board, repo)
-    epic, first, epic_branch, _first_sha = _make_epic_and_done_story(board, repo)
-
-    with kb.connect(board=board) as conn:
-        completed_at = int(time.time())
-        conn.execute(
-            "UPDATE tasks SET completed_at=? WHERE id=?",
-            (completed_at, first),
-        )
-        assert kb.integrate_story_to_epic(conn, first, board=board) == "integrated"
-        sibling_branch = f"story/{epic}-s2"
-        subprocess.run(
-            ["git", "-C", str(repo), "switch", "-c", sibling_branch, epic_branch],
-            check=True, capture_output=True, text=True,
-        )
-        sibling_sha = _commit_file(
-            repo, "sibling_work.txt", "sibling work\n", "sibling commit"
-        )
-        subprocess.run(
-            ["git", "-C", str(repo), "switch", "main"],
-            check=True, capture_output=True, text=True,
-        )
-        sibling = kb.create_task(
-            conn, title="Sibling", board=board, workspace_kind="worktree",
-            workspace_path=str(repo), branch_name=sibling_branch,
-        )
-        kb.add_epic_membership(conn, epic_id=epic, task_id=sibling)
-        _set_task_status(conn, sibling, "done")
-        conn.execute(
-            "UPDATE tasks SET completed_at=? WHERE id=?",
-            (completed_at, sibling),
-        )
-
-    calls = _record_git_calls(monkeypatch)
-    with kb.connect(board=board) as conn:
-        result = kb.reconcile(conn, board=board, spawn_ready=False)
-        first_events = conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
-            (first, "story_integrated_to_epic"),
-        ).fetchone()[0]
-        sibling_events = conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
-            (sibling, "story_integrated_to_epic"),
-        ).fetchone()[0]
-        had_merge = any("merge" in cmd and "--no-ff" in cmd for cmd in calls)
-        calls.clear()
-        second = kb.reconcile(conn, board=board, spawn_ready=False)
-        first_events_after = conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
-            (first, "story_integrated_to_epic"),
-        ).fetchone()[0]
-        sibling_events_after = conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
-            (sibling, "story_integrated_to_epic"),
-        ).fetchone()[0]
-
-    assert result.integrated == [sibling]
-    assert first_events == 1
-    assert sibling_events == 1
-    assert had_merge
-    assert second.integrated == []
-    assert first_events_after == first_events
-    assert sibling_events_after == sibling_events
-    assert calls == []
-
-
-def test_explicit_integration_verification_is_not_skipped_by_durable_state(
-    kanban_home, tmp_path
-):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-explicit-integration-verification"
-    _v2_product_board_with_repo(board, repo)
-    epic, story, _epic_branch, story_sha = _make_epic_and_done_story(board, repo)
-
-    with kb.connect(board=board) as conn:
-        assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
-        verify_calls = []
-        ownership_calls = []
-
-        def verify(candidate):
-            verify_calls.append(candidate)
-            return True
-
-        def before_apply():
-            ownership_calls.append(True)
-            return True
-
-        assert (
-            kb.integrate_story_to_epic(
+        runtime = {"provider": "test", "model": "test", "effort": "low"}
+        runs = []
+        for now in (20, 30, 40):
+            run = kb.claim_qualification_intake(
                 conn,
-                story,
-                board=board,
-                expected_source_sha="different-source-sha",
+                intake_id,
+                profile="productowner",
+                runtime_identity=runtime,
+                now=now,
             )
-            == "verify_failed"
-        )
-        assert (
-            kb.integrate_story_to_epic(
+            assert run is not None
+            runs.append(run)
+            assert kb.finish_qualification_intake_run(
                 conn,
-                story,
-                board=board,
-                candidate_verify_fn=verify,
-                expected_source_sha=story_sha,
-                before_apply_fn=before_apply,
+                intake_id=intake_id,
+                run_id=run["id"],
+                claim_lock=run["claim_lock"],
+                intake_status="attention_required",
+                outcome="attention_required",
+                now=now + 1,
             )
-            == "already_integrated"
-        )
-
-    assert len(verify_calls) == 1
-    assert ownership_calls == [True]
-
-
-def test_integration_state_survives_member_event_gc_and_restart(
-    kanban_home, tmp_path, monkeypatch
-):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-reconcile-recovery"
-    _v2_product_board_with_repo(board, repo)
-    _epic, story, _epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
-
-    with kb.connect(board=board) as conn:
-        conn.execute(
-            "UPDATE tasks SET completed_at=? WHERE id=?",
-            (int(time.time()), story),
-        )
-        assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
-        with kb.write_txn(conn):
-            conn.execute(
-                "DELETE FROM task_events WHERE task_id=? AND kind=?",
-                (story, "story_integrated_to_epic"),
-            )
-
-    calls = _record_git_calls(monkeypatch)
-    with kb.connect(board=board) as conn:
-        result = kb.reconcile(conn, board=board, spawn_ready=False)
-        count = conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
-            (story, "story_integrated_to_epic"),
-        ).fetchone()[0]
-
-    assert result.integrated == []
-    assert count == 0
-    assert calls == []
-
-
-@pytest.mark.parametrize("terminal_status", ["done", "archived"])
-def test_terminal_epic_members_are_never_reconciled(
-    kanban_home, tmp_path, monkeypatch, terminal_status
-):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = f"v2-terminal-epic-{terminal_status}"
-    _v2_product_board_with_repo(board, repo)
-    epic, _story, _epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
-    with kb.connect(board=board) as conn:
-        _set_task_status(conn, epic, terminal_status)
-
-    calls = _record_git_calls(monkeypatch)
-    with kb.connect(board=board) as conn:
-        result = kb.reconcile(conn, board=board, spawn_ready=False)
-
-    assert result.integrated == []
-    assert calls == []
-
-
-def test_new_active_epic_member_integrates_once_via_reconcile(
-    kanban_home, tmp_path
-):
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    board = "v2-reconcile-new-member"
-    _v2_product_board_with_repo(board, repo)
-    _epic, story, _epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
-    with kb.connect(board=board) as conn:
-        first = kb.reconcile(conn, board=board, spawn_ready=False)
-        second = kb.reconcile(conn, board=board, spawn_ready=False)
-        count = conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
-            (story, "story_integrated_to_epic"),
-        ).fetchone()[0]
-
-    assert first.integrated == [story]
-    assert second.integrated == []
-    assert count == 1
+            if now != 40:
+                assert kb.retry_qualification_intake(conn, intake_id, now=now + 2)
+        state = kb.qualification_retry_state(conn, intake_id, 3)
+        assert state.attempts_used == 3
+        assert state.attempts_limit == 3
+        assert state.allowed is False
+        assert state.reason == "attempt_budget_exhausted"
+        before_runs = conn.execute(
+            "SELECT id, status, outcome FROM qualification_intake_runs "
+            "WHERE intake_id = ? ORDER BY id",
+            (intake_id,),
+        ).fetchall()
+        with pytest.raises(ValueError, match="attempt_budget_exhausted"):
+            kb.retry_qualification_intake(conn, intake_id, now=50)
+        after_runs = conn.execute(
+            "SELECT id, status, outcome FROM qualification_intake_runs "
+            "WHERE intake_id = ? ORDER BY id",
+            (intake_id,),
+        ).fetchall()
+    assert [tuple(row) for row in after_runs] == [tuple(row) for row in before_runs]
 
 
 def _configure_task_expected(task):
@@ -14794,3 +14166,173 @@ def test_configure_task_refuses_active_current_run_without_mutation(kanban_home)
             )
 
         assert _configure_task_row_and_events(conn, task_id) == before
+
+
+def test_engine_owned_integration_pending_refuses_public_lifecycle_paths(
+    kanban_home, monkeypatch
+):
+    board = "engine-owned-guards"
+    _v2_product_board(board)
+    monkeypatch.setattr(
+        kb, "_integration_git",
+        lambda *_args, **_kwargs: pytest.fail("guarded path must not call Git"),
+    )
+    monkeypatch.setattr(
+        kb.subprocess, "run",
+        lambda *_args, **_kwargs: pytest.fail("guarded path must not spawn Git"),
+    )
+    with kb.connect(board=board) as conn:
+        story_id = kb.create_task(
+            conn, title="Story", board=board,
+            workflow_template_id="product", current_step_key="review",
+        )
+        conn.execute(
+            "UPDATE tasks SET current_step_key='integration_pending', status='ready', "
+            "assignee=NULL WHERE id=?", (story_id,),
+        )
+        assert kb.claim_task(conn, story_id, board=board) is None
+        assert kb.complete_task(conn, story_id, board=board) is False
+        assert kb.set_phase(conn, story_id, "development", board=board) is False
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (story_id,))
+        promoted, reason = kb.promote_task(conn, story_id, actor="operator", force=True)
+        assert promoted is False
+        assert reason == "engine-owned integration state cannot be promoted"
+        assert kb.recompute_ready(conn) == 0
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (story_id,))
+        assert kb.unblock_task(conn, story_id) is False
+        with pytest.raises(kb.ReleaseEvidenceError) as exc:
+            kb.release_product_task(
+                conn, story_id, board,
+                candidate_verify_fn=None, release_adapter=None,
+            )
+        assert exc.value.missing == ["engine_owned_state"]
+        with pytest.raises(ValueError, match="engine-owned"):
+            kb.create_task(
+                conn, title="Fabricated inbox delivery", board=board,
+                workflow_template_id="product", current_step_key="integration_pending",
+            )
+
+
+def test_product_epic_and_legacy_reconcile_are_structurally_refused_without_git(
+    kanban_home, monkeypatch
+):
+    board = "product-epic-guards"
+    _v2_product_board(board)
+    monkeypatch.setattr(
+        kb, "_integration_git",
+        lambda *_args, **_kwargs: pytest.fail("guarded path must not call Git"),
+    )
+    monkeypatch.setattr(
+        kb.subprocess, "run",
+        lambda *_args, **_kwargs: pytest.fail("guarded path must not spawn Git"),
+    )
+    with kb.connect(board=board) as conn:
+        epic_id = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
+        story_id = kb.create_task(conn, title="Story", board=board)
+        kb.add_epic_membership(conn, epic_id=epic_id, task_id=story_id)
+        conn.execute(
+            "UPDATE tasks SET workflow_template_id='product_epic', "
+            "current_step_key='collecting_members', status='todo' WHERE id=?", (epic_id,),
+        )
+        conn.execute(
+            "UPDATE tasks SET workflow_template_id='product', current_step_key='done', "
+            "status='done', completed_at=1 WHERE id=?", (story_id,),
+        )
+        assert kb.merge_epic_to_main(conn, epic_id, board=board) == "not_ready"
+        assert kb.complete_task(conn, epic_id, board=board) is False
+        assert kb.promote_task(conn, epic_id, actor="operator", force=True)[0] is False
+        with pytest.raises(kb.ReleaseEvidenceError) as exc:
+            kb.release_product_task(
+                conn, epic_id, board,
+                candidate_verify_fn=lambda _path: True,
+                release_adapter=None,
+                completion_metadata={
+                    "workflow_outcome": {"verdict": "approved"},
+                    "candidate_sha": "f" * 40,
+                },
+            )
+        assert exc.value.missing == ["engine_owned_state"]
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+        facts = conn.execute(
+            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?", (story_id,),
+        ).fetchone()[0]
+    assert result.integrated == []
+    assert facts == 0
+
+
+def test_integration_enqueued_complete_task_routes_approved_member(
+    kanban_home, tmp_path
+):
+    board = "member-review-enqueue"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    base_sha = _git_output(repo, "rev-parse", "HEAD")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", "story/member"],
+        check=True, capture_output=True, text=True,
+    )
+    source_sha = _commit_file(repo, "member.txt", "member\n", "member")
+    _v2_product_board(board)
+    now = int(time.time())
+    test_metadata = {
+        "workflow_outcome": {"verdict": "passed"},
+        "ai_provenance": {
+            "writer": {"agent": "developer"},
+            "tester": {"agent": "tester", "result": "passed"},
+        },
+        "test_branch": "story/member",
+        "test_head_sha": source_sha,
+    }
+    review_pins = {
+        "review_branch": "story/member",
+        "review_base_sha": base_sha,
+        "review_head_sha": source_sha,
+    }
+    completion_metadata = {
+        "workflow_outcome": {"verdict": "approved"},
+        "ai_provenance": {
+            "writer": {"agent": "developer"},
+            "reviewer": {"agent": "reviewer"},
+        },
+    }
+    with kb.connect(board=board) as conn:
+        epic_id = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
+        story_id = kb.create_task(
+            conn, title="Story", board=board, assignee="reviewer",
+            workflow_template_id="product", current_step_key="review",
+            workspace_kind="worktree", workspace_path=str(repo),
+            branch_name="story/member",
+        )
+        kb.add_epic_membership(conn, epic_id=epic_id, task_id=story_id)
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, step_key, status, outcome, metadata, started_at, ended_at) "
+            "VALUES (?, 'test', 'completed', 'advanced', ?, ?, ?)",
+            (story_id, json.dumps(test_metadata), now - 2, now - 1),
+        )
+        review_run_id = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, profile, step_key, status, metadata, started_at) "
+            "VALUES (?, 'reviewer', 'review', 'running', ?, ?)",
+            (story_id, json.dumps(review_pins), now),
+        ).lastrowid
+        conn.execute(
+            "UPDATE tasks SET status='running', running=1, current_run_id=? WHERE id=?",
+            (review_run_id, story_id),
+        )
+
+        assert kb.complete_task(
+            conn, story_id, board=board, expected_run_id=review_run_id,
+            summary="approved", metadata=completion_metadata,
+        ) is True
+        task = kb.get_task(conn, story_id)
+        intents = conn.execute(
+            "SELECT * FROM story_integration_intents WHERE story_id=?", (story_id,),
+        ).fetchall()
+
+    assert task is not None
+    assert task.current_step_key == "integration_pending"
+    assert task.status == "review"
+    assert task.assignee is None
+    assert len(intents) == 1
+    assert intents[0]["source_sha"] == source_sha

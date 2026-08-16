@@ -85,12 +85,16 @@ import threading
 import logging
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Tuple
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
-from hermes_cli.kanban_intake import DEFAULT_POLICY_VERSION
+from hermes_cli.kanban_intake import (
+    ACTIVE_REQUALIFICATION_STATUSES,
+    DEFAULT_POLICY_VERSION,
+    qualification_max_total_attempts,
+)
 from hermes_cli.kanban_repository import (
     EvidenceWorkspaceError,
     EvidenceWorkspaceResult,
@@ -98,21 +102,47 @@ from hermes_cli.kanban_repository import (
     RepositoryContract,
     RefreshRequest,
     RefreshResult,
+    RELEASE_CANDIDATE_REF_PREFIX,
+    TargetHeadsObservation,
     VerificationProfile,
     VerificationResult,
     VerificationStepResult,
+    advance_prepared_candidate_ref,
     build_verification_receipt_key,
-    build_verification_receipt,
+    commit_contains,
+    delete_release_candidate_ref,
     inspect_evidence_workspace,
     load_repository_contract,
+    observe_ci_workflow_runs,
+    observe_target_heads,
     refresh_story_branch,
     resolve_commit,
     restore_generated_paths,
     run_verification,
+    validate_release_candidate_ref,
     verification_receipt_from_payload,
+    verification_receipt_matches,
+    verification_result_payload,
+)
+from hermes_cli.kanban_epic_release import (
+    EpicReadiness,
+    EpicReleaseCIObservation,
+    EpicReleaseCIObservationError,
+    EpicReleaseHandoff,
+    EpicReleaseHandoffError,
+    EpicReleaseInvalidation,
+    EpicReleaseInvalidationError,
+    EpicReleaseMember,
+    EpicReleasePreparationError,
+    EpicReleaseSnapshot,
+    EpicTerminalSource,
+    derive_epic_readiness,
+    epic_release_member_from_row,
+    epic_release_snapshot_from_row,
 )
 from hermes_cli.kanban_product_outcomes import (
     ApprovedCandidate,
+    CandidateEligibility,
     CandidateEligibilityError,
     OutcomeValidationError,
     PassedTest,
@@ -220,6 +250,7 @@ PRODUCT_QUALIFICATION_DEFAULTS: dict[str, Any] = {
     "required": False,
     "contract_version": 1,
     "policy_version": DEFAULT_POLICY_VERSION,
+    "max_total_attempts": 3,
     # Break-glass override is introduced separately and is never a normal path.
     "paths": ["po", "hermes"],
     "work_types": ["story", "bug", "maintenance", "ops", "spike"],
@@ -232,6 +263,16 @@ PRODUCT_QUALIFICATION_DEFAULTS: dict[str, Any] = {
         "release_measure": None,
     },
 }
+
+
+@dataclass(frozen=True)
+class RetryState:
+    attempts_used: int
+    attempts_limit: int
+    allowed: bool
+    reason: Optional[str]
+
+
 DEFAULT_PRODUCT_WORKFLOW: dict[str, Any] = {
     "handoff_v2": True,
     "assignees": PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES,
@@ -277,6 +318,17 @@ PRODUCT_WORKFLOW_ROLE_TO_STEP = {
     "tester": "test",
     "reviewer": "review",
 }
+
+
+def _is_engine_owned_integration_state(row: Any) -> bool:
+    """Identify the two lifecycle states owned only by Epic coordinators."""
+
+    if row is None:
+        return False
+    return (
+        row["workflow_template_id"] == "product_epic"
+        or row["current_step_key"] == "integration_pending"
+    )
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -1724,6 +1776,12 @@ def set_phase(
     """
     meta = product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
+        return False
+    scope = conn.execute(
+        "SELECT workflow_template_id, current_step_key FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if _is_engine_owned_integration_state(scope):
         return False
     _validate_product_workflow_state(PRODUCT_WORKFLOW_TEMPLATE_ID, phase)
     _validate_resolver_cas_fields({"phase": phase})
@@ -4442,6 +4500,59 @@ CREATE TABLE IF NOT EXISTS epic_story_integrations (
     PRIMARY KEY (epic_id, story_id, source_sha)
 );
 
+CREATE TABLE IF NOT EXISTS story_integration_intents (
+    epic_id               TEXT NOT NULL,
+    story_id              TEXT NOT NULL,
+    source_sha            TEXT NOT NULL,
+    source_branch         TEXT NOT NULL,
+    review_run_id         INTEGER NOT NULL,
+    review_base_sha       TEXT NOT NULL,
+    status                TEXT NOT NULL CHECK (status IN (
+                              'pending', 'running', 'prepared', 'rework_required',
+                              'attention_required', 'integrated', 'superseded'
+                          )),
+    claim_lock            TEXT,
+    claim_expires         INTEGER,
+    attempt_count         INTEGER NOT NULL DEFAULT 0,
+    target_pre_sha        TEXT,
+    candidate_sha         TEXT,
+    candidate_ref         TEXT,
+    verification_event_id INTEGER,
+    last_failure_code     TEXT,
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL,
+    PRIMARY KEY (epic_id, story_id, source_sha)
+);
+
+CREATE TABLE IF NOT EXISTS epic_release_snapshots (
+    id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+    epic_id                         TEXT NOT NULL,
+    epic_tip_sha                    TEXT NOT NULL,
+    target_branch                   TEXT NOT NULL,
+    target_pre_sha                  TEXT NOT NULL,
+    release_candidate_sha           TEXT NOT NULL,
+    candidate_ref                   TEXT NOT NULL,
+    aggregate_verification_event_id INTEGER NOT NULL,
+    repository_contract_digest      TEXT NOT NULL,
+    status                          TEXT NOT NULL CHECK (status IN (
+                                        'awaiting_push', 'ci_pending', 'ci_failed',
+                                        'released', 'invalidated'
+                                    )),
+    pushed_sha                      TEXT,
+    created_at                      INTEGER NOT NULL,
+    updated_at                      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS epic_release_members (
+    snapshot_id  INTEGER NOT NULL,
+    epic_id      TEXT NOT NULL,
+    story_id     TEXT NOT NULL,
+    source_sha   TEXT NOT NULL,
+    candidate_sha TEXT NOT NULL,
+    integrated_at INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_id, story_id)
+);
+
 CREATE TABLE IF NOT EXISTS board_governance (
     id                     INTEGER PRIMARY KEY CHECK (id = 1),
     qualification_required INTEGER NOT NULL DEFAULT 0
@@ -4574,6 +4685,11 @@ CREATE INDEX IF NOT EXISTS idx_work_contracts_digest ON work_contracts(digest);
 CREATE INDEX IF NOT EXISTS idx_qualification_decisions_intake
     ON qualification_intake_decisions(intake_id, id);
 CREATE INDEX IF NOT EXISTS idx_epic_memberships_epic ON epic_memberships(epic_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_story_integration_intents_claim
+    ON story_integration_intents(status, claim_expires, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_epic_release_one_active
+    ON epic_release_snapshots(epic_id)
+    WHERE status IN ('awaiting_push', 'ci_pending', 'ci_failed');
 
 CREATE TRIGGER IF NOT EXISTS work_contracts_no_update
 BEFORE UPDATE ON work_contracts BEGIN
@@ -6109,6 +6225,7 @@ def _migrate_qualification_intake_lifecycle(conn: sqlite3.Connection) -> None:
                 conn.rollback()
             raise
 
+    _reconcile_legacy_requalification_duplicates(conn)
     try:
         conn.executescript(
             """
@@ -6118,6 +6235,13 @@ def _migrate_qualification_intake_lifecycle(conn: sqlite3.Connection) -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS idx_qualification_intake_idempotency
             ON qualification_intake(idempotency_digest)
             WHERE idempotency_digest IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_requalification_one_active_target
+            ON qualification_intake(json_extract(raw_request, '$.target_task_id'))
+            WHERE json_valid(raw_request)
+              AND json_extract(raw_request, '$.kind') = 'task_requalification'
+              AND status IN (
+                  'pending', 'running', 'needs_clarification', 'attention_required'
+              );
         CREATE INDEX IF NOT EXISTS idx_qualification_intake_runs
             ON qualification_intake_runs(intake_id, id);
         CREATE INDEX IF NOT EXISTS idx_qualification_intake_events
@@ -6169,6 +6293,67 @@ def _migrate_qualification_intake_lifecycle(conn: sqlite3.Connection) -> None:
         if conn.in_transaction:
             conn.rollback()
         raise
+
+
+def _reconcile_legacy_requalification_duplicates(
+    conn: sqlite3.Connection,
+) -> None:
+    """Reject older active requalification duplicates before indexing targets."""
+
+    placeholders = ",".join("?" for _ in ACTIVE_REQUALIFICATION_STATUSES)
+    duplicate_targets = conn.execute(
+        f"""
+        SELECT json_extract(raw_request, '$.target_task_id') AS target_task_id
+          FROM qualification_intake
+         WHERE json_valid(raw_request)
+           AND json_extract(raw_request, '$.kind') = 'task_requalification'
+           AND json_type(raw_request, '$.target_task_id') = 'text'
+           AND status IN ({placeholders})
+         GROUP BY json_extract(raw_request, '$.target_task_id')
+        HAVING COUNT(*) > 1
+        """,
+        ACTIVE_REQUALIFICATION_STATUSES,
+    ).fetchall()
+    if not duplicate_targets:
+        return
+
+    now = int(time.time())
+    with write_txn(conn):
+        for target in duplicate_targets:
+            rows = conn.execute(
+                f"""
+                SELECT id
+                  FROM qualification_intake
+                 WHERE json_valid(raw_request)
+                   AND json_extract(raw_request, '$.kind') = 'task_requalification'
+                   AND json_extract(raw_request, '$.target_task_id') = ?
+                   AND status IN ({placeholders})
+                 ORDER BY created_at DESC, id DESC
+                """,
+                (target["target_task_id"], *ACTIVE_REQUALIFICATION_STATUSES),
+            ).fetchall()
+            if len(rows) < 2:
+                continue
+            newest_id = str(rows[0]["id"])
+            reason = f"superseded by active requalification intake {newest_id}"
+            for row in rows[1:]:
+                intake_id = str(row["id"])
+                conn.execute(
+                    """
+                    INSERT INTO qualification_intake_decisions (
+                        intake_id, decision, actor_profile, reason, contract_id, created_at
+                    ) VALUES (?, 'rejected', 'hermes-migration', ?, NULL, ?)
+                    """,
+                    (intake_id, reason, now),
+                )
+                conn.execute(
+                    f"""
+                    UPDATE qualification_intake
+                       SET status = 'rejected', updated_at = ?
+                     WHERE id = ? AND status IN ({placeholders})
+                    """,
+                    (now, intake_id, *ACTIVE_REQUALIFICATION_STATUSES),
+                )
 
 
 def _ensure_qualification_boundary_objects(conn: sqlite3.Connection) -> None:
@@ -6961,6 +7146,18 @@ def claim_qualification_intake(
             raise ValueError(f"unknown qualification intake: {intake_id}")
         if current["status"] != "pending":
             return None
+        retry_state = qualification_retry_state(
+            conn,
+            intake_id,
+            qualification_max_total_attempts(read_board_metadata(_board_slug_for_connection(conn))),
+        )
+        if not retry_state.allowed:
+            conn.execute(
+                "UPDATE qualification_intake SET status = 'attention_required', updated_at = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (started, intake_id),
+            )
+            return None
         cursor = conn.execute(
             """
             INSERT INTO qualification_intake_runs (
@@ -7013,6 +7210,31 @@ def claim_qualification_intake(
             created_at=started,
         )
     return get_qualification_intake_run(conn, run_id)
+
+
+def qualification_retry_state(
+    conn: sqlite3.Connection, intake_id: str, max_total_attempts: int
+) -> RetryState:
+    limit = int(max_total_attempts)
+    if limit < 1:
+        raise ValueError("max_total_attempts must be positive")
+    exists = conn.execute(
+        "SELECT 1 FROM qualification_intake WHERE id = ?", (intake_id,)
+    ).fetchone()
+    if exists is None:
+        raise ValueError(f"unknown qualification intake: {intake_id}")
+    used = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM qualification_intake_runs WHERE intake_id = ?",
+            (intake_id,),
+        ).fetchone()[0]
+    )
+    return RetryState(
+        attempts_used=used,
+        attempts_limit=limit,
+        allowed=used < limit,
+        reason=None if used < limit else "attempt_budget_exhausted",
+    )
 
 
 def get_qualification_intake_run(
@@ -7441,6 +7663,13 @@ def retry_qualification_intake(
             raise ValueError("intake must be attention_required before retry")
         if row["current_run_id"] is not None:
             raise ValueError("cannot retry an intake with an active run")
+        retry_state = qualification_retry_state(
+            conn,
+            intake_id,
+            qualification_max_total_attempts(read_board_metadata(_board_slug_for_connection(conn))),
+        )
+        if not retry_state.allowed:
+            raise ValueError("attempt_budget_exhausted")
         updated = conn.execute(
             "UPDATE qualification_intake SET status = 'pending', updated_at = ? "
             "WHERE id = ? AND status = 'attention_required'",
@@ -8112,6 +8341,11 @@ def create_task(
             workflow_template_id = PRODUCT_WORKFLOW_TEMPLATE_ID
             current_step_key = _inferred_step
 
+    if (
+        workflow_template_id == "product_epic"
+        or current_step_key == "integration_pending"
+    ):
+        raise ValueError("engine-owned integration state cannot be materialized directly")
     _validate_product_workflow_state(workflow_template_id, current_step_key)
 
     parents = tuple(p for p in parents if p)
@@ -9823,11 +10057,12 @@ def _promote_ready_task(
 ) -> bool:
     """Promote one eligible task; caller must hold the write transaction."""
     row = conn.execute(
-        "SELECT id, status, consecutive_failures, max_retries "
+        "SELECT id, status, consecutive_failures, max_retries, "
+        "workflow_template_id, current_step_key "
         "FROM tasks WHERE id = ? AND status IN ('todo', 'blocked')",
         (task_id,),
     ).fetchone()
-    if row is None:
+    if row is None or _is_engine_owned_integration_state(row):
         return False
     cur_status = row["status"]
     if cur_status == "blocked" and _has_sticky_block(conn, task_id):
@@ -9979,7 +10214,13 @@ def claim_task(
             "FROM tasks t LEFT JOIN work_contracts w ON w.id = t.work_contract_id "
             "WHERE t.id = ?", (task_id,)
         ).fetchone()
-        if candidate is not None and candidate["work_item_kind"] == "epic":
+        if (
+            candidate is not None
+            and (
+                candidate["work_item_kind"] == "epic"
+                or _is_engine_owned_integration_state(candidate)
+            )
+        ):
             return None
         # Enforcement preflight: repair a plain/legacy role card missing its
         # product workflow metadata before it claims, so it dispatches on the
@@ -11041,6 +11282,12 @@ def complete_task(
     """
     board = board or _board_slug_for_connection(conn)
     now = int(time.time())
+    lifecycle_scope = conn.execute(
+        "SELECT workflow_template_id, current_step_key FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if _is_engine_owned_integration_state(lifecycle_scope):
+        return False
     validated_terminal_outcome: Optional[TerminalOutcome] = None
     validated_outcome_phase: Optional[str] = None
     validated_outcome_run_id: Optional[int] = None
@@ -12473,10 +12720,13 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, workflow_template_id, current_step_key FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
+    if _is_engine_owned_integration_state(row):
+        return False, "engine-owned integration state cannot be promoted"
 
     cur_status = row["status"]
     if cur_status not in ("todo", "blocked"):
@@ -12619,6 +12869,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     meta = product_board_metadata(_board_slug_for_connection(conn))
     now = int(time.time())
     with write_txn(conn):
+        lifecycle_scope = conn.execute(
+            "SELECT workflow_template_id, current_step_key FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if _is_engine_owned_integration_state(lifecycle_scope):
+            return False
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -14042,10 +14298,12 @@ class IntegrationCandidateError(RuntimeError):
         self,
         message: str,
         *,
+        code: str = "integration_error",
         scratch_worktree: Optional[Path] = None,
         verification_result: Optional[VerificationResult] = None,
     ):
         super().__init__(message)
+        self.code = str(code or "integration_error")
         self.scratch_worktree = scratch_worktree
         self.verification_result = verification_result
 
@@ -14054,53 +14312,12 @@ def _verification_result_payload(
     result: VerificationResult, *, scope: str, subject_id: str
 ) -> dict[str, Any]:
     """Serialize bounded repository verification evidence for a task event."""
-    payload: dict[str, Any] = {
-        "scope": scope,
-        "subject_id": subject_id,
-        "status": result.status,
-        "source_sha": result.source_sha,
-        "candidate_sha": result.candidate_sha,
-        "contract_digest": result.contract_digest,
-        "profile": result.profile,
-        "error": result.error,
-        "rework_eligible": result.status == "failed",
-        "steps": [
-            {
-                "argv": list(step.argv),
-                "workdir": str(step.workdir),
-                "status": step.status,
-                "returncode": step.returncode,
-                "duration_seconds": step.duration_seconds,
-                "stdout_tail": step.stdout_tail,
-                "stderr_tail": step.stderr_tail,
-                "error": step.error,
-            }
-            for step in result.steps
-        ],
-    }
-    if result.status == "passed":
-        try:
-            receipt = build_verification_receipt(
-                result, subject_id=subject_id, created_at=int(time.time())
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError("passed verification result cannot produce receipt") from exc
-        else:
-            payload["receipt"] = {
-                "key": {
-                    "candidate_sha": receipt.key.candidate_sha,
-                    "contract_digest": receipt.key.contract_digest,
-                    "command_set_digest": receipt.key.command_set_digest,
-                    "runtime_toolchain_digest": receipt.key.runtime_toolchain_digest,
-                    "generated_policy_digest": receipt.key.generated_policy_digest,
-                    "gate_kind": receipt.key.gate_kind,
-                    "executor_policy": receipt.key.executor_policy,
-                    "digest": receipt.key.digest,
-                },
-                "result_digest": receipt.result_digest,
-                "created_at": receipt.created_at,
-            }
-    return payload
+    try:
+        return verification_result_payload(
+            result, scope=scope, subject_id=subject_id
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("passed verification result cannot produce receipt") from exc
 
 
 def _verification_needs_attention(result: Optional[VerificationResult]) -> bool:
@@ -14181,14 +14398,26 @@ def _integration_git(
             timeout=timeout,
             check=False,
         )
-    except Exception as exc:
-        raise IntegrationCandidateError(f"git command failed: {args[0]}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise IntegrationCandidateError(
+            f"git command timed out: {args[0]}", code="timeout"
+        ) from exc
+    except OSError as exc:
+        raise IntegrationCandidateError(
+            f"git command failed: {args[0]}", code="io_error"
+        ) from exc
+    except subprocess.SubprocessError as exc:
+        raise IntegrationCandidateError(
+            f"git command failed: {args[0]}", code="command_failed"
+        ) from exc
 
 
 def _checked_out_branch_worktree(repo_root: Path, branch: str) -> Optional[Path]:
     listed = _integration_git(repo_root, ["worktree", "list", "--porcelain"])
     if listed.returncode != 0:
-        raise IntegrationCandidateError("could not list repository worktrees")
+        raise IntegrationCandidateError(
+            "could not list repository worktrees", code="command_failed"
+        )
     wanted = f"refs/heads/{branch}"
     for block in (listed.stdout or "").strip().split("\n\n"):
         fields: dict[str, str] = {}
@@ -14209,12 +14438,14 @@ def _remove_clean_integration_worktree(repo_root: Path, scratch: Path) -> None:
     if not _worktree_is_clean(scratch):
         raise IntegrationCandidateError(
             f"scratch worktree is dirty; preserved at {scratch}",
+            code="ownership_changed",
             scratch_worktree=scratch,
         )
     removed = _integration_git(repo_root, ["worktree", "remove", str(scratch)])
     if removed.returncode != 0:
         raise IntegrationCandidateError(
             f"could not remove scratch worktree; preserved at {scratch}",
+            code="command_failed",
             scratch_worktree=scratch,
         )
 
@@ -14235,28 +14466,37 @@ def _build_verified_merge_candidate(
     verification_profile_name: Optional[str] = None,
     verification_generated_policy_digest: str = "",
     configured_verification_fn: Optional[Callable[[Path, str, str], VerificationResult]] = None,
+    candidate_ref_prefix: str = "refs/hermes/integration-candidates/",
 ) -> IntegrationCandidate:
     repo_root = repo_root.resolve()
     target_worktree = _checked_out_branch_worktree(repo_root, target_branch)
     if target_worktree is not None and not _worktree_is_clean(target_worktree):
-        raise IntegrationCandidateError(f"target worktree is dirty: {target_worktree}")
+        raise IntegrationCandidateError(
+            f"target worktree is dirty: {target_worktree}",
+            code="ownership_changed",
+        )
 
     source_result = _integration_git(
         repo_root, ["rev-parse", f"refs/heads/{source_branch}"]
     )
     source_sha = (source_result.stdout or "").strip()
     if source_result.returncode != 0 or not source_sha:
-        raise IntegrationCandidateError(f"could not resolve {source_branch}")
+        raise IntegrationCandidateError(
+            f"could not resolve {source_branch}", code="ref_missing"
+        )
     if expected_source_sha is not None and source_sha != expected_source_sha:
         raise IntegrationCandidateError(
-            f"source branch moved: {source_branch} no longer matches reviewed SHA"
+            f"source branch moved: {source_branch} no longer matches reviewed SHA",
+            code="source_moved",
         )
     approved_source_sha = expected_source_sha or source_sha
 
     pre_result = _integration_git(repo_root, ["rev-parse", f"refs/heads/{target_branch}"])
     pre_sha = (pre_result.stdout or "").strip()
     if pre_result.returncode != 0 or not pre_sha:
-        raise IntegrationCandidateError(f"could not resolve {target_branch}")
+        raise IntegrationCandidateError(
+            f"could not resolve {target_branch}", code="ref_missing"
+        )
 
     source_ancestor = _integration_git(
         repo_root,
@@ -14264,9 +14504,11 @@ def _build_verified_merge_candidate(
     )
     empty_contribution = source_ancestor.returncode == 0
     if empty_contribution and not allow_empty_contribution:
-        raise IntegrationCandidateError("empty contribution")
+        raise IntegrationCandidateError("empty contribution", code="source_moved")
     if source_ancestor.returncode not in {0, 1}:
-        raise IntegrationCandidateError("could not verify candidate contribution")
+        raise IntegrationCandidateError(
+            "could not verify candidate contribution", code="command_failed"
+        )
 
     nonce = secrets.token_hex(6)
     scratch = repo_root / ".worktrees" / f"integration-{nonce}"
@@ -14275,7 +14517,9 @@ def _build_verified_merge_candidate(
         repo_root, ["worktree", "add", "--detach", str(scratch), pre_sha]
     )
     if added.returncode != 0:
-        raise IntegrationCandidateError("could not create integration worktree")
+        raise IntegrationCandidateError(
+            "could not create integration worktree", code="provisioning_failed"
+        )
 
     if not empty_contribution:
         merged = _integration_git(
@@ -14286,7 +14530,7 @@ def _build_verified_merge_candidate(
         if merged.returncode != 0:
             _integration_git(scratch, ["merge", "--abort"])
             _remove_clean_integration_worktree(repo_root, scratch)
-            raise IntegrationCandidateError("merge conflict")
+            raise IntegrationCandidateError("merge conflict", code="merge_conflict")
 
     try:
         _provision_node_dependencies(_primary_checkout_root(repo_root), scratch)
@@ -14294,7 +14538,8 @@ def _build_verified_merge_candidate(
         _cleanup_provisioned_node_dependencies(scratch)
         _remove_clean_integration_worktree(repo_root, scratch)
         raise IntegrationCandidateError(
-            f"candidate dependency provisioning failed: {exc}"
+            f"candidate dependency provisioning failed: {exc}",
+            code="provisioning_failed",
         ) from exc
 
     candidate_result = _integration_git(scratch, ["rev-parse", "HEAD"])
@@ -14302,7 +14547,9 @@ def _build_verified_merge_candidate(
     if candidate_result.returncode != 0 or not candidate_sha:
         _cleanup_provisioned_node_dependencies(scratch)
         raise IntegrationCandidateError(
-            "could not resolve integration candidate", scratch_worktree=scratch
+            "could not resolve integration candidate",
+            code="ref_missing",
+            scratch_worktree=scratch,
         )
 
     verification_result: Optional[VerificationResult] = None
@@ -14349,10 +14596,30 @@ def _build_verified_merge_candidate(
     if not verified:
         _cleanup_provisioned_node_dependencies(scratch)
         _remove_clean_integration_worktree(repo_root, scratch)
+        failure_code = "verification_failed"
+        if verification_result is not None:
+            if verification_result.status == "configuration_error":
+                if verification_result.error in {"missing_profile", "empty_profile"}:
+                    failure_code = "profile_missing"
+                elif verification_result.error in {
+                    "invalid_command",
+                } or str(verification_result.error or "").startswith(
+                    "missing_executable:"
+                ):
+                    failure_code = "command_missing"
+                else:
+                    failure_code = "profile_invalid"
+            elif verification_result.status == "infrastructure_error":
+                failure_code = (
+                    "timeout"
+                    if verification_result.error == "timeout"
+                    else "io_error"
+                )
         raise IntegrationCandidateError(
             "candidate verification failed"
             if verification_result is None
             else f"candidate verification {verification_result.status}",
+            code=failure_code,
             verification_result=verification_result,
         )
 
@@ -14368,20 +14635,31 @@ def _build_verified_merge_candidate(
         ):
             _remove_clean_integration_worktree(repo_root, scratch)
             raise IntegrationCandidateError(
-                f"source branch moved: {source_branch} no longer matches reviewed SHA"
+                f"source branch moved: {source_branch} no longer matches reviewed SHA",
+                code="source_moved",
             )
 
     if not _worktree_is_clean(scratch):
         raise IntegrationCandidateError(
             f"scratch worktree is dirty; preserved at {scratch}",
+            code="ownership_changed",
             scratch_worktree=scratch,
         )
 
-    candidate_ref = f"refs/hermes/integration-candidates/{nonce}"
+    if candidate_ref_prefix not in {
+        "refs/hermes/integration-candidates/",
+        RELEASE_CANDIDATE_REF_PREFIX,
+    }:
+        raise IntegrationCandidateError(
+            "unsupported candidate ref namespace", code="malformed_candidate_ref"
+        )
+    candidate_ref = f"{candidate_ref_prefix}{nonce}"
     retained = _integration_git(repo_root, ["update-ref", candidate_ref, candidate_sha])
     if retained.returncode != 0:
         raise IntegrationCandidateError(
-            "could not retain integration candidate", scratch_worktree=scratch
+            "could not retain integration candidate",
+            code="command_failed",
+            scratch_worktree=scratch,
         )
     _remove_clean_integration_worktree(repo_root, scratch)
     return IntegrationCandidate(
@@ -14520,6 +14798,63 @@ def _default_epic_verify(
         return False
 
 
+def epic_readiness(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    *,
+    board: Optional[str] = None,
+    board_meta: Optional[dict] = None,
+) -> EpicReadiness:
+    """Return the strict, read-only fact derivation for one governed Epic."""
+
+    meta = board_meta if board_meta is not None else product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta) or not _is_epic_task(conn, epic_id):
+        return EpicReadiness(epic_id, None, (), ("not_governed_epic",))
+    try:
+        contract = repository_contract_for_metadata(meta)
+        if contract is None:
+            return EpicReadiness(epic_id, None, (), ("missing_repository_contract",))
+        epic_branch = epic_branch_for(epic_id)
+        epic_tip_sha = resolve_commit(
+            contract.repo_root, f"refs/heads/{epic_branch}"
+        )
+
+        def current_terminal_source(story_id: str) -> Optional[EpicTerminalSource]:
+            terminal_runs = _terminal_run_records(conn, story_id)
+            approved = latest_review_authority(terminal_runs)
+            if approved is None:
+                return None
+            passed = latest_test_authority(terminal_runs, approved.source_sha)
+            if passed is None:
+                return None
+            try:
+                eligibility = candidate_eligibility(
+                    contract.repo_root,
+                    approved,
+                    passed,
+                )
+            except CandidateEligibilityError:
+                return EpicTerminalSource(approved.source_sha, False)
+            return EpicTerminalSource(
+                eligibility.source_sha,
+                eligibility.non_empty,
+            )
+
+        return derive_epic_readiness(
+            conn,
+            epic_id,
+            epic_tip_sha=epic_tip_sha,
+            current_terminal_source=current_terminal_source,
+            commit_contains=lambda descendant, ancestor: commit_contains(
+                contract.repo_root,
+                descendant_sha=descendant,
+                ancestor_sha=ancestor,
+            ),
+        )
+    except (RepositoryConfigurationError, OSError, ValueError):
+        return EpicReadiness(epic_id, None, (), ("repository_unavailable",))
+
+
 def epic_ready(
     conn: sqlite3.Connection,
     epic_id: str,
@@ -14527,20 +14862,14 @@ def epic_ready(
     board: Optional[str] = None,
     verify_fn: Optional[Callable[[str], bool]] = None,
 ) -> bool:
-    """Whether ``epic_id`` is ready to merge its branch to main.
+    """Whether ``epic_id`` has exact current facts and a green local suite.
 
-    ``True`` only when: the board has opted into ``handoff_v2``; the epic
-    has at least one child; every child is strictly ``status == 'done'``
-    (the softer release_measure-unblocks relaxation used elsewhere for
-    dependency satisfaction does NOT apply here -- a story sitting in the
-    human release gate is not done); AND the suite is green on the epic's
-    integration branch.
-
-    Cheap checks short-circuit before the expensive suite verification --
-    ``verify_fn`` is not called unless every child is done. ``verify_fn(
-    epic_branch) -> bool`` is the injectable suite-green probe, defaulting to
-    :func:`_default_epic_verify` (the real, slow suite run).
+    Repository-governed boards derive the cheap gate from current membership,
+    terminal Review authority, integration intents/facts, and commit ancestry.
+    Older handoff-v2 boards without repository policy retain their legacy
+    all-members-done gate.
     """
+
     meta = product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return False
@@ -14549,14 +14878,1397 @@ def epic_ready(
     children = list_epic_members(conn, epic_id)
     if not children:
         return False
-    for child_id in children:
-        child = get_task(conn, child_id)
-        if child is None or child.status != "done":
+    if "repository" in meta:
+        if not epic_readiness(conn, epic_id, board=board, board_meta=meta).ready:
             return False
+    else:
+        for child_id in children:
+            child = get_task(conn, child_id)
+            if child is None or child.status != "done":
+                return False
     verify = verify_fn or (
         lambda branch: _default_epic_verify(branch, board=board)
     )
     return bool(verify(epic_branch_for(epic_id)))
+
+
+_EPIC_RELEASE_ACTIVE_STATUSES = ("awaiting_push", "ci_pending", "ci_failed")
+_EPIC_RELEASE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+@dataclass(frozen=True)
+class _EpicReleaseInputs:
+    epic_tip_sha: str
+    target_branch: str
+    target_pre_sha: str
+    contract_digest: str
+    members: tuple[tuple[str, str, str, int], ...]
+
+
+def _epic_release_input_evidence(inputs: _EpicReleaseInputs) -> dict[str, Any]:
+    return {
+        "epic_tip_sha": inputs.epic_tip_sha,
+        "target_branch": inputs.target_branch,
+        "target_pre_sha": inputs.target_pre_sha,
+        "contract_digest": inputs.contract_digest,
+        "members": [
+            {
+                "story_id": story_id,
+                "source_sha": source_sha,
+                "candidate_sha": candidate_sha,
+                "integrated_at": integrated_at,
+            }
+            for story_id, source_sha, candidate_sha, integrated_at in inputs.members
+        ],
+    }
+
+
+def _epic_release_inputs(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    *,
+    board: Optional[str],
+    board_meta: Optional[dict],
+) -> tuple[_EpicReleaseInputs, RepositoryContract, str]:
+    meta = board_meta if board_meta is not None else product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta) or not _is_epic_task(conn, epic_id):
+        raise EpicReleasePreparationError(
+            "not_governed_epic", {"epic_id": epic_id}
+        )
+    try:
+        contract = repository_contract_for_metadata(meta)
+    except (RepositoryConfigurationError, OSError, ValueError) as exc:
+        raise EpicReleasePreparationError(
+            "repository_unavailable", {"epic_id": epic_id, "error": str(exc)}
+        ) from exc
+    if contract is None:
+        raise EpicReleasePreparationError(
+            "missing_repository_contract", {"epic_id": epic_id}
+        )
+    if "epic_release" not in contract.verification:
+        raise EpicReleasePreparationError(
+            "missing_epic_release_profile", {"epic_id": epic_id}
+        )
+
+    readiness = epic_readiness(
+        conn,
+        epic_id,
+        board=board,
+        board_meta=meta,
+    )
+    if not readiness.ready or readiness.epic_tip_sha is None:
+        raise EpicReleasePreparationError(
+            "not_ready",
+            {"epic_id": epic_id, "blockers": list(readiness.blockers)},
+        )
+
+    epic_branch = epic_branch_for(epic_id)
+    try:
+        epic_tip_sha = resolve_commit(
+            contract.repo_root, f"refs/heads/{epic_branch}"
+        )
+        target_pre_sha = resolve_commit(
+            contract.repo_root, f"refs/heads/{contract.target_branch}"
+        )
+    except (RepositoryConfigurationError, OSError, ValueError) as exc:
+        raise EpicReleasePreparationError(
+            "repository_unavailable", {"epic_id": epic_id, "error": str(exc)}
+        ) from exc
+    if readiness.epic_tip_sha != epic_tip_sha:
+        raise EpicReleasePreparationError(
+            "readiness_tip_mismatch",
+            {
+                "epic_id": epic_id,
+                "readiness_epic_tip_sha": readiness.epic_tip_sha,
+                "epic_tip_sha": epic_tip_sha,
+            },
+        )
+
+    members = tuple(
+        sorted(
+            (
+                member.story_id,
+                member.source_sha,
+                member.candidate_sha,
+                int(member.integrated_at),
+            )
+            for member in readiness.members
+        )
+    )
+    if not members:
+        raise EpicReleasePreparationError(
+            "not_ready", {"epic_id": epic_id, "blockers": ["no_members"]}
+        )
+    return (
+        _EpicReleaseInputs(
+            epic_tip_sha=epic_tip_sha,
+            target_branch=contract.target_branch,
+            target_pre_sha=target_pre_sha,
+            contract_digest=contract.digest,
+            members=members,
+        ),
+        contract,
+        epic_branch,
+    )
+
+
+def _epic_release_active_row(
+    conn: sqlite3.Connection, epic_id: str
+) -> Optional[sqlite3.Row]:
+    placeholders = ",".join("?" for _ in _EPIC_RELEASE_ACTIVE_STATUSES)
+    return conn.execute(
+        f"SELECT * FROM epic_release_snapshots WHERE epic_id=? "
+        f"AND status IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+        (epic_id, *_EPIC_RELEASE_ACTIVE_STATUSES),
+    ).fetchone()
+
+
+def _epic_release_snapshot_members(
+    conn: sqlite3.Connection, snapshot_id: int
+) -> tuple[EpicReleaseMember, ...]:
+    rows = conn.execute(
+        "SELECT * FROM epic_release_members WHERE snapshot_id=? ORDER BY story_id",
+        (snapshot_id,),
+    ).fetchall()
+    return tuple(epic_release_member_from_row(row) for row in rows)
+
+
+def _epic_release_snapshot_mismatch_evidence(
+    conn: sqlite3.Connection,
+    snapshot: EpicReleaseSnapshot,
+    *,
+    epic_id: str,
+    inputs: _EpicReleaseInputs,
+) -> dict[str, Any]:
+    """Accumulate typed drift evidence for one active snapshot.
+
+    An empty result means the snapshot still matches every current input
+    exactly.  Each key records the per-field snapshot value alongside the
+    current authority it no longer matches.
+    """
+
+    evidence: dict[str, Any] = {}
+    if snapshot.epic_id != epic_id:
+        evidence["epic_id"] = {
+            "snapshot": snapshot.epic_id,
+            "current": epic_id,
+        }
+    if snapshot.epic_tip_sha != inputs.epic_tip_sha:
+        evidence["epic_tip_sha"] = {
+            "snapshot": snapshot.epic_tip_sha,
+            "current": inputs.epic_tip_sha,
+        }
+    if snapshot.target_branch != inputs.target_branch:
+        evidence["target_branch"] = {
+            "snapshot": snapshot.target_branch,
+            "current": inputs.target_branch,
+        }
+    if snapshot.target_pre_sha != inputs.target_pre_sha:
+        evidence["target_pre_sha"] = {
+            "snapshot": snapshot.target_pre_sha,
+            "current": inputs.target_pre_sha,
+        }
+    if snapshot.repository_contract_digest != inputs.contract_digest:
+        evidence["repository_contract_digest"] = {
+            "snapshot": snapshot.repository_contract_digest,
+            "current": inputs.contract_digest,
+        }
+    if snapshot.status not in _EPIC_RELEASE_ACTIVE_STATUSES:
+        evidence["status"] = {"snapshot": snapshot.status}
+    try:
+        validate_release_candidate_ref(snapshot.candidate_ref)
+    except RepositoryConfigurationError:
+        evidence["candidate_ref"] = {"snapshot": snapshot.candidate_ref}
+    expected_members = tuple(
+        EpicReleaseMember(
+            snapshot_id=snapshot.id,
+            epic_id=epic_id,
+            story_id=story_id,
+            source_sha=source_sha,
+            candidate_sha=candidate_sha,
+            integrated_at=integrated_at,
+        )
+        for story_id, source_sha, candidate_sha, integrated_at in inputs.members
+    )
+    try:
+        current_members = _epic_release_snapshot_members(conn, snapshot.id)
+    except ValueError as exc:
+        evidence["members"] = {"error": str(exc)}
+    else:
+        if current_members != expected_members:
+            evidence["members"] = {
+                "snapshot": [
+                    {
+                        "story_id": member.story_id,
+                        "source_sha": member.source_sha,
+                        "candidate_sha": member.candidate_sha,
+                        "integrated_at": member.integrated_at,
+                    }
+                    for member in current_members
+                ],
+                "current": [
+                    {
+                        "story_id": member.story_id,
+                        "source_sha": member.source_sha,
+                        "candidate_sha": member.candidate_sha,
+                        "integrated_at": member.integrated_at,
+                    }
+                    for member in expected_members
+                ],
+            }
+    event = conn.execute(
+        "SELECT task_id, kind, payload FROM task_events WHERE id=?",
+        (snapshot.aggregate_verification_event_id,),
+    ).fetchone()
+    receipt_evidence: dict[str, Any] = {}
+    if (
+        event is None
+        or event["task_id"] != epic_id
+        or event["kind"] != "repository_verification"
+    ):
+        receipt_evidence["event"] = {
+            "task_id": event["task_id"] if event is not None else None,
+            "kind": event["kind"] if event is not None else None,
+        }
+    else:
+        try:
+            payload = json.loads(event["payload"]) if event["payload"] else None
+        except (TypeError, ValueError):
+            payload = None
+        if not isinstance(payload, Mapping) or not verification_receipt_matches(
+            payload,
+            source_sha=inputs.epic_tip_sha,
+            candidate_sha=snapshot.release_candidate_sha,
+            contract_digest=inputs.contract_digest,
+            gate_kind="epic_release",
+            subject_id=epic_id,
+            profile_name="epic_release",
+        ):
+            receipt_evidence["receipt"] = {"matches": False}
+    if receipt_evidence:
+        evidence["aggregate_verification_event"] = receipt_evidence
+    return evidence
+
+
+def _epic_release_snapshot_matches(
+    conn: sqlite3.Connection,
+    snapshot: EpicReleaseSnapshot,
+    *,
+    epic_id: str,
+    inputs: _EpicReleaseInputs,
+) -> bool:
+    return not _epic_release_snapshot_mismatch_evidence(
+        conn, snapshot, epic_id=epic_id, inputs=inputs
+    )
+
+
+def _epic_release_active_or_refuse(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    *,
+    inputs: _EpicReleaseInputs,
+) -> Optional[EpicReleaseSnapshot]:
+    row = _epic_release_active_row(conn, epic_id)
+    if row is None:
+        return None
+    try:
+        snapshot = epic_release_snapshot_from_row(row)
+    except ValueError as exc:
+        raise EpicReleasePreparationError(
+            "active_snapshot_mismatch",
+            {"epic_id": epic_id, "snapshot_id": row["id"], "error": str(exc)},
+        ) from exc
+    if not _epic_release_snapshot_matches(
+        conn, snapshot, epic_id=epic_id, inputs=inputs
+    ):
+        raise EpicReleasePreparationError(
+            "active_snapshot_mismatch",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "expected": _epic_release_input_evidence(inputs),
+                "actual": {
+                    "epic_tip_sha": snapshot.epic_tip_sha,
+                    "target_branch": snapshot.target_branch,
+                    "target_pre_sha": snapshot.target_pre_sha,
+                    "release_candidate_sha": snapshot.release_candidate_sha,
+                    "candidate_ref": snapshot.candidate_ref,
+                    "repository_contract_digest": snapshot.repository_contract_digest,
+                    "status": snapshot.status,
+                },
+            },
+        )
+    return snapshot
+
+
+def _validate_epic_release_candidate(
+    candidate: object,
+    *,
+    contract: RepositoryContract,
+    inputs: _EpicReleaseInputs,
+    epic_branch: str,
+    epic_id: str,
+) -> tuple[IntegrationCandidate, dict[str, Any]]:
+    if not isinstance(candidate, IntegrationCandidate):
+        raise EpicReleasePreparationError(
+            "candidate_mismatch", {"epic_id": epic_id, "reason": "invalid_candidate"}
+        )
+    try:
+        validate_release_candidate_ref(candidate.candidate_ref)
+    except RepositoryConfigurationError as exc:
+        raise EpicReleasePreparationError(
+            "candidate_ref_mismatch",
+            {"epic_id": epic_id, "candidate_ref": candidate.candidate_ref},
+        ) from exc
+    verification = candidate.verification_result
+    if not isinstance(verification, VerificationResult):
+        raise EpicReleasePreparationError(
+            "candidate_mismatch",
+            {"epic_id": epic_id, "reason": "missing_verification"},
+        )
+    if (
+        candidate.repo_root.resolve() != contract.repo_root
+        or candidate.target_branch != inputs.target_branch
+        or candidate.source_branch != epic_branch
+        or candidate.source_sha != inputs.epic_tip_sha
+        or candidate.pre_sha != inputs.target_pre_sha
+        or _EPIC_RELEASE_SHA_RE.fullmatch(candidate.candidate_sha) is None
+        or verification.status != "passed"
+        or verification.source_sha != inputs.epic_tip_sha
+        or verification.candidate_sha != candidate.candidate_sha
+        or verification.contract_digest != contract.digest
+        or verification.profile != "epic_release"
+    ):
+        raise EpicReleasePreparationError(
+            "candidate_mismatch",
+            {
+                "epic_id": epic_id,
+                "candidate_sha": candidate.candidate_sha,
+                "candidate_ref": candidate.candidate_ref,
+            },
+        )
+    try:
+        payload = verification_result_payload(
+            verification, scope="epic_release", subject_id=epic_id
+        )
+    except (TypeError, ValueError) as exc:
+        raise EpicReleasePreparationError(
+            "verification_mismatch", {"epic_id": epic_id, "error": str(exc)}
+        ) from exc
+    if not verification_receipt_matches(
+        payload,
+        source_sha=inputs.epic_tip_sha,
+        candidate_sha=candidate.candidate_sha,
+        contract_digest=contract.digest,
+        gate_kind="epic_release",
+        subject_id=epic_id,
+        profile_name="epic_release",
+    ):
+        raise EpicReleasePreparationError(
+            "verification_mismatch", {"epic_id": epic_id}
+        )
+    return candidate, payload
+
+
+def _cleanup_epic_release_candidate(candidate: IntegrationCandidate) -> bool:
+    try:
+        return delete_release_candidate_ref(
+            candidate.repo_root,
+            candidate_ref=candidate.candidate_ref,
+            candidate_sha=candidate.candidate_sha,
+        )
+    except (RepositoryConfigurationError, OSError, subprocess.SubprocessError):
+        return False
+
+
+def _epic_release_invalidate_durably(
+    conn: sqlite3.Connection,
+    *,
+    epic_id: str,
+    snapshot: EpicReleaseSnapshot,
+    evidence: dict[str, Any],
+) -> None:
+    """Atomically mark only the exact active snapshot invalidated.
+
+    Re-checks that the active row is still the same snapshot inside the
+    IMMEDIATE transaction (a concurrent preparation may have won), then
+    records the status flip together with the typed drift evidence.
+    """
+
+    now = int(time.time())
+    with authorized_governance_write(), write_txn(conn):
+        locked_row = _epic_release_active_row(conn, epic_id)
+        if locked_row is None or int(locked_row["id"]) != snapshot.id:
+            raise EpicReleaseInvalidationError(
+                "active_snapshot_changed",
+                {"epic_id": epic_id, "snapshot_id": snapshot.id},
+            )
+        conn.execute(
+            "UPDATE epic_release_snapshots SET status='invalidated', updated_at=? "
+            "WHERE id=? AND status IN ('awaiting_push', 'ci_pending', 'ci_failed')",
+            (now, snapshot.id),
+        )
+        _append_event(
+            conn,
+            epic_id,
+            "epic_release_invalidated",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "drift": evidence,
+                "candidate_ref": snapshot.candidate_ref,
+                "release_candidate_sha": snapshot.release_candidate_sha,
+                "invalidated_at": now,
+            },
+        )
+
+
+def invalidate_epic_release_snapshot(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    *,
+    board: Optional[str] = None,
+    board_meta: Optional[dict] = None,
+) -> EpicReleaseInvalidation:
+    """Invalidate the exact active Epic release snapshot when authority drifted.
+
+    Proven drift — a changed Epic tip, target pre-SHA, repository contract,
+    member set/pins, readiness blockers, or aggregate verification
+    event/receipt, or an invalid candidate ref — atomically marks only that
+    epic's active snapshot ``invalidated`` with typed audit evidence.  After
+    the durable invalidation the snapshot's ``candidate_ref`` is deleted only
+    when it still pins the recorded ``release_candidate_sha``; an absent,
+    mismatched, or repointed ref is preserved and reported.  An exact
+    snapshot is returned untouched so E05B1 preparation replay can keep it,
+    and unverifiable states never invalidate.
+    """
+
+    if conn.in_transaction:
+        raise EpicReleaseInvalidationError(
+            "active_transaction", {"epic_id": epic_id}
+        )
+
+    row = _epic_release_active_row(conn, epic_id)
+    if row is None:
+        return EpicReleaseInvalidation("missing", None, {}, False)
+    try:
+        snapshot = epic_release_snapshot_from_row(row)
+    except ValueError as exc:
+        raise EpicReleaseInvalidationError(
+            "invalid_active_snapshot",
+            {"epic_id": epic_id, "snapshot_id": row["id"], "error": str(exc)},
+        ) from exc
+
+    meta = board_meta if board_meta is not None else product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta) or not _is_epic_task(conn, epic_id):
+        return EpicReleaseInvalidation(
+            "unverifiable", snapshot, {"code": "not_governed_epic"}, False
+        )
+    try:
+        contract = repository_contract_for_metadata(meta)
+    except (RepositoryConfigurationError, OSError, ValueError) as exc:
+        return EpicReleaseInvalidation(
+            "unverifiable",
+            snapshot,
+            {"code": "repository_unavailable", "error": str(exc)},
+            False,
+        )
+    if contract is None:
+        return EpicReleaseInvalidation(
+            "unverifiable", snapshot, {"code": "missing_repository_contract"}, False
+        )
+    if "epic_release" not in contract.verification:
+        return EpicReleaseInvalidation(
+            "unverifiable",
+            snapshot,
+            {"code": "missing_epic_release_profile"},
+            False,
+        )
+
+    evidence: dict[str, Any]
+    try:
+        inputs, _contract, _branch = _epic_release_inputs(
+            conn, epic_id, board=board, board_meta=meta
+        )
+    except EpicReleasePreparationError as exc:
+        if exc.code in ("not_ready", "readiness_tip_mismatch"):
+            evidence = {"inputs_error": exc.code, **exc.evidence}
+        else:
+            return EpicReleaseInvalidation(
+                "unverifiable", snapshot, {"code": exc.code, **exc.evidence}, False
+            )
+    else:
+        evidence = _epic_release_snapshot_mismatch_evidence(
+            conn, snapshot, epic_id=epic_id, inputs=inputs
+        )
+        if not evidence:
+            return EpicReleaseInvalidation("exact", snapshot, {}, False)
+
+    _epic_release_invalidate_durably(
+        conn, epic_id=epic_id, snapshot=snapshot, evidence=evidence
+    )
+
+    deleted = _epic_release_delete_candidate_and_record(
+        conn, epic_id=epic_id, snapshot=snapshot, contract=contract
+    )
+
+    invalidated = replace(
+        snapshot,
+        status="invalidated",
+        updated_at=int(time.time()),
+    )
+    return EpicReleaseInvalidation(
+        "invalidated", invalidated, evidence, bool(deleted)
+    )
+
+
+def _epic_release_delete_candidate_and_record(
+    conn: sqlite3.Connection,
+    *,
+    epic_id: str,
+    snapshot: EpicReleaseSnapshot,
+    contract: RepositoryContract,
+) -> bool:
+    """Exact-SHA candidate-ref cleanup plus the typed ref-outcome audit event.
+
+    Shared by invalidation and by the release handoff's proven-drift
+    refusal: the retained release-candidate ref is deleted only when it
+    still pins the recorded SHA, and the outcome is recorded either way.
+    An absent or repointed ref is preserved and reported, never recreated.
+    """
+
+    deleted = False
+    try:
+        deleted = delete_release_candidate_ref(
+            contract.repo_root,
+            candidate_ref=snapshot.candidate_ref,
+            candidate_sha=snapshot.release_candidate_sha,
+        )
+    except (RepositoryConfigurationError, OSError, subprocess.SubprocessError):
+        deleted = False
+    with authorized_governance_write(), write_txn(conn):
+        _append_event(
+            conn,
+            epic_id,
+            "epic_release_invalidated",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "candidate_ref": snapshot.candidate_ref,
+                "release_candidate_sha": snapshot.release_candidate_sha,
+                "candidate_ref_deleted": bool(deleted),
+            },
+        )
+    return deleted
+
+
+def invalidate_stale_epic_release_snapshots(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    board_meta: Optional[dict] = None,
+) -> tuple[EpicReleaseInvalidation, ...]:
+    """Invalidate every stale active Epic release snapshot on the board.
+
+    Bounded sweep over the currently active snapshots: only proven drift
+    invalidates and only the drifted epic's exact release ref is touched.
+    Exact and unverifiable snapshots are returned untouched, so no unrelated
+    snapshot or ref changes.
+    """
+
+    if conn.in_transaction:
+        raise EpicReleaseInvalidationError("active_transaction", {})
+    meta = board_meta if board_meta is not None else product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta):
+        return ()
+    placeholders = ",".join("?" for _ in _EPIC_RELEASE_ACTIVE_STATUSES)
+    rows = conn.execute(
+        f"SELECT DISTINCT epic_id FROM epic_release_snapshots "  # noqa: S608 -- placeholders only
+        f"WHERE status IN ({placeholders}) ORDER BY epic_id",
+        _EPIC_RELEASE_ACTIVE_STATUSES,
+    ).fetchall()
+    results: list[EpicReleaseInvalidation] = []
+    for (epic_id,) in rows:
+        results.append(
+            invalidate_epic_release_snapshot(
+                conn, str(epic_id), board=board, board_meta=meta
+            )
+        )
+    return tuple(results)
+
+
+def prepare_epic_release_snapshot(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    *,
+    board: Optional[str] = None,
+    board_meta: Optional[dict] = None,
+    candidate_builder: Optional[Callable[..., object]] = None,
+) -> EpicReleaseSnapshot:
+    """Prepare and persist one immutable, verified aggregate Epic snapshot.
+
+    Repository work happens outside the database transaction.  The final
+    transaction rechecks every input and the one-active-snapshot boundary,
+    then records the aggregate verification event, snapshot, and member pins
+    together.  Preparation never moves the target branch and never invalidates
+    an existing snapshot.
+    """
+    if conn.in_transaction:
+        raise EpicReleasePreparationError(
+            "active_transaction", {"epic_id": epic_id}
+        )
+
+    inputs, contract, epic_branch = _epic_release_inputs(
+        conn, epic_id, board=board, board_meta=board_meta
+    )
+    replay = _epic_release_active_or_refuse(conn, epic_id, inputs=inputs)
+    if replay is not None:
+        return replay
+
+    builder = candidate_builder or _build_verified_merge_candidate
+    candidate: Optional[IntegrationCandidate] = None
+    persisted = False
+    winner: Optional[EpicReleaseSnapshot] = None
+    try:
+        candidate_value = builder(
+            contract.repo_root,
+            inputs.target_branch,
+            epic_branch,
+            f"merge epic {epic_id}",
+            expected_source_sha=inputs.epic_tip_sha,
+            verification_profile=contract.verification["epic_release"],
+            verification_contract_digest=contract.digest,
+            verification_scope="epic_release",
+            verification_subject_id=epic_id,
+            verification_profile_name="epic_release",
+            verification_generated_policy_digest=contract.generated_policy_digest,
+            configured_verification_fn=(
+                lambda path, source, candidate_sha: _run_or_reuse_configured_verification(
+                    conn,
+                    task_id=epic_id,
+                    candidate_path=path,
+                    source_sha=source,
+                    candidate_sha=candidate_sha,
+                    contract=contract,
+                    profile_name="epic_release",
+                    gate_kind="epic_release",
+                )
+            )
+            if candidate_builder is None
+            else None,
+            candidate_ref_prefix=RELEASE_CANDIDATE_REF_PREFIX,
+        )
+        if conn.in_transaction:
+            raise EpicReleasePreparationError(
+                "active_transaction", {"epic_id": epic_id}
+            )
+        candidate, verification_payload = _validate_epic_release_candidate(
+            candidate_value,
+            contract=contract,
+            inputs=inputs,
+            epic_branch=epic_branch,
+            epic_id=epic_id,
+        )
+        try:
+            latest_inputs, latest_contract, latest_branch = _epic_release_inputs(
+                conn, epic_id, board=board, board_meta=board_meta
+            )
+        except EpicReleasePreparationError as exc:
+            raise EpicReleasePreparationError(
+                "inputs_changed",
+                {
+                    "epic_id": epic_id,
+                    "before": _epic_release_input_evidence(inputs),
+                    "after_error": exc.code,
+                },
+            ) from exc
+        if (
+            latest_inputs != inputs
+            or latest_contract.digest != contract.digest
+            or latest_branch != epic_branch
+        ):
+            raise EpicReleasePreparationError(
+                "inputs_changed",
+                {
+                    "epic_id": epic_id,
+                    "before": _epic_release_input_evidence(inputs),
+                    "after": _epic_release_input_evidence(latest_inputs),
+                },
+            )
+
+        with authorized_governance_write(), write_txn(conn):
+            locked_inputs, locked_contract, locked_branch = _epic_release_inputs(
+                conn, epic_id, board=board, board_meta=board_meta
+            )
+            if (
+                locked_inputs != inputs
+                or locked_contract.digest != contract.digest
+                or locked_branch != epic_branch
+            ):
+                raise EpicReleasePreparationError(
+                    "inputs_changed",
+                    {
+                        "epic_id": epic_id,
+                        "before": _epic_release_input_evidence(inputs),
+                        "after": _epic_release_input_evidence(locked_inputs),
+                    },
+                )
+            active_row = _epic_release_active_row(conn, epic_id)
+            if active_row is not None:
+                active = epic_release_snapshot_from_row(active_row)
+                if not _epic_release_snapshot_matches(
+                    conn, active, epic_id=epic_id, inputs=locked_inputs
+                ):
+                    raise EpicReleasePreparationError(
+                        "active_snapshot_mismatch",
+                        {
+                            "epic_id": epic_id,
+                            "snapshot_id": active.id,
+                            "expected": _epic_release_input_evidence(locked_inputs),
+                        },
+                    )
+                winner = active
+            else:
+                now = int(time.time())
+                event_id = _append_event(
+                    conn, epic_id, "repository_verification", verification_payload
+                )
+                snapshot_cursor = conn.execute(
+                    "INSERT INTO epic_release_snapshots ("
+                    "epic_id, epic_tip_sha, target_branch, target_pre_sha, "
+                    "release_candidate_sha, candidate_ref, "
+                    "aggregate_verification_event_id, repository_contract_digest, "
+                    "status, pushed_sha, created_at, updated_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'awaiting_push', NULL, ?, ?)",
+                    (
+                        epic_id,
+                        inputs.epic_tip_sha,
+                        inputs.target_branch,
+                        inputs.target_pre_sha,
+                        candidate.candidate_sha,
+                        candidate.candidate_ref,
+                        event_id,
+                        contract.digest,
+                        now,
+                        now,
+                    ),
+                )
+                snapshot_id = snapshot_cursor.lastrowid
+                if snapshot_id is None:
+                    raise RuntimeError("Epic release snapshot insert did not return an id")
+                for story_id, source_sha, candidate_sha, integrated_at in inputs.members:
+                    conn.execute(
+                        "INSERT INTO epic_release_members ("
+                        "snapshot_id, epic_id, story_id, source_sha, candidate_sha, integrated_at"
+                        ") VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            int(snapshot_id),
+                            epic_id,
+                            story_id,
+                            source_sha,
+                            candidate_sha,
+                            integrated_at,
+                        ),
+                    )
+                row = conn.execute(
+                    "SELECT * FROM epic_release_snapshots WHERE id=?",
+                    (int(snapshot_id),),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("Epic release snapshot was not durable")
+                winner = epic_release_snapshot_from_row(row)
+                if not _epic_release_snapshot_matches(
+                    conn, winner, epic_id=epic_id, inputs=locked_inputs
+                ):
+                    raise RuntimeError("Epic release snapshot was not exact")
+                persisted = True
+    except Exception:
+        if candidate is not None and not persisted:
+            _cleanup_epic_release_candidate(candidate)
+        raise
+
+    if winner is None:
+        raise RuntimeError("Epic release preparation produced no snapshot")
+    if candidate is not None and not persisted:
+        _cleanup_epic_release_candidate(candidate)
+    return winner
+
+
+def build_epic_release_handoff(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    *,
+    board: Optional[str] = None,
+    board_meta: Optional[dict] = None,
+) -> EpicReleaseHandoff:
+    """Build truthful immutable release evidence for a human operator.
+
+    The handoff is assembled only after two immediate rechecks, and it is
+    refused — never partially returned — when either recheck fails:
+
+    1. The active snapshot is re-derived against current durable authority
+       (Epic tip, target pre-SHA, contract, member pins, aggregate
+       verification event/receipt).  Any proven drift invalidates the
+       snapshot durably (exact-SHA candidate-ref cleanup included) and
+       refuses the handoff.
+    2. The local and read-only remote target heads are observed right now
+       via :func:`observe_target_heads` and compared to the snapshot's
+       ``target_pre_sha``.  A mismatch invalidates and refuses; an
+       unavailable local or remote target refuses without invalidating
+       (drift cannot be proven, so the snapshot is preserved).
+
+    The returned :class:`EpicReleaseHandoff` carries only plain data —
+    IDs, full SHAs, member keys, contract digest, aggregate verification
+    event, required CI workflows, candidate ref, observed heads, and one
+    plain-language external action.  It deliberately contains no merge or
+    push command and exposes no capability to perform either.
+    """
+
+    if conn.in_transaction:
+        raise EpicReleaseHandoffError("active_transaction", {"epic_id": epic_id})
+
+    meta = board_meta if board_meta is not None else product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta) or not _is_epic_task(conn, epic_id):
+        raise EpicReleaseHandoffError("not_governed_epic", {"epic_id": epic_id})
+    try:
+        contract = repository_contract_for_metadata(meta)
+    except (RepositoryConfigurationError, OSError, ValueError) as exc:
+        raise EpicReleaseHandoffError(
+            "repository_unavailable", {"epic_id": epic_id, "error": str(exc)}
+        ) from exc
+    if contract is None:
+        raise EpicReleaseHandoffError(
+            "missing_repository_contract", {"epic_id": epic_id}
+        )
+    if "epic_release" not in contract.verification:
+        raise EpicReleaseHandoffError(
+            "missing_epic_release_profile", {"epic_id": epic_id}
+        )
+
+    row = _epic_release_active_row(conn, epic_id)
+    if row is None:
+        raise EpicReleaseHandoffError("no_active_snapshot", {"epic_id": epic_id})
+    try:
+        snapshot = epic_release_snapshot_from_row(row)
+    except ValueError as exc:
+        raise EpicReleaseHandoffError(
+            "invalid_active_snapshot",
+            {"epic_id": epic_id, "snapshot_id": row["id"], "error": str(exc)},
+        ) from exc
+
+    # --- Recheck 1: current durable authority. ------------------------------
+    drift: dict[str, Any] = {}
+    try:
+        inputs, _contract, _branch = _epic_release_inputs(
+            conn, epic_id, board=board, board_meta=meta
+        )
+    except EpicReleasePreparationError as exc:
+        if exc.code in ("not_ready", "readiness_tip_mismatch"):
+            drift = {"inputs_error": exc.code, **exc.evidence}
+        else:
+            raise EpicReleaseHandoffError(
+                exc.code, {"epic_id": epic_id, **exc.evidence}
+            ) from exc
+    else:
+        drift = _epic_release_snapshot_mismatch_evidence(
+            conn, snapshot, epic_id=epic_id, inputs=inputs
+        )
+    if drift:
+        _epic_release_invalidate_durably(
+            conn, epic_id=epic_id, snapshot=snapshot, evidence=drift
+        )
+        deleted = _epic_release_delete_candidate_and_record(
+            conn, epic_id=epic_id, snapshot=snapshot, contract=contract
+        )
+        raise EpicReleaseHandoffError(
+            "snapshot_drifted",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "drift": drift,
+                "candidate_ref_deleted": bool(deleted),
+            },
+        )
+
+    # --- Recheck 2: immediate local and read-only remote target heads. ------
+    try:
+        observation = observe_target_heads(
+            contract.repo_root,
+            target_branch=contract.target_branch,
+            base_ref=contract.base_ref,
+        )
+    except RepositoryConfigurationError as exc:
+        raise EpicReleaseHandoffError(
+            "repository_unavailable", {"epic_id": epic_id, "error": exc.code}
+        ) from exc
+    if observation.local_head is None:
+        raise EpicReleaseHandoffError(
+            "local_target_unavailable",
+            {"epic_id": epic_id, "target_branch": contract.target_branch},
+        )
+    if observation.local_head != snapshot.target_pre_sha:
+        _epic_release_invalidate_durably(
+            conn,
+            epic_id=epic_id,
+            snapshot=snapshot,
+            evidence={
+                "target_pre_sha": {
+                    "snapshot": snapshot.target_pre_sha,
+                    "local_head": observation.local_head,
+                },
+                "handoff": "local_target_moved",
+            },
+        )
+        deleted = _epic_release_delete_candidate_and_record(
+            conn, epic_id=epic_id, snapshot=snapshot, contract=contract
+        )
+        raise EpicReleaseHandoffError(
+            "local_target_moved",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "snapshot_pre_sha": snapshot.target_pre_sha,
+                "local_head": observation.local_head,
+                "candidate_ref_deleted": bool(deleted),
+            },
+        )
+    if not observation.remote_available or observation.remote_head is None:
+        raise EpicReleaseHandoffError(
+            "remote_unavailable",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "remote_name": observation.remote_name,
+                "target_branch": contract.target_branch,
+            },
+        )
+    if observation.remote_head != snapshot.target_pre_sha:
+        _epic_release_invalidate_durably(
+            conn,
+            epic_id=epic_id,
+            snapshot=snapshot,
+            evidence={
+                "target_pre_sha": {
+                    "snapshot": snapshot.target_pre_sha,
+                    "remote_head": observation.remote_head,
+                    "remote_name": observation.remote_name,
+                },
+                "handoff": "remote_target_moved",
+            },
+        )
+        deleted = _epic_release_delete_candidate_and_record(
+            conn, epic_id=epic_id, snapshot=snapshot, contract=contract
+        )
+        raise EpicReleaseHandoffError(
+            "remote_target_moved",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "snapshot_pre_sha": snapshot.target_pre_sha,
+                "remote_head": observation.remote_head,
+                "remote_name": observation.remote_name,
+                "candidate_ref_deleted": bool(deleted),
+            },
+        )
+
+    # --- Assemble the immutable, human-facing evidence payload. -------------
+    event = conn.execute(
+        "SELECT task_id, kind, payload FROM task_events WHERE id=?",
+        (snapshot.aggregate_verification_event_id,),
+    ).fetchone()
+    if (
+        event is None
+        or event["task_id"] != epic_id
+        or event["kind"] != "repository_verification"
+    ):
+        raise EpicReleaseHandoffError(
+            "aggregate_event_unavailable",
+            {"epic_id": epic_id, "snapshot_id": snapshot.id},
+        )
+    try:
+        receipt = json.loads(event["payload"]) if event["payload"] else None
+    except (TypeError, ValueError) as exc:
+        raise EpicReleaseHandoffError(
+            "aggregate_event_unavailable",
+            {"epic_id": epic_id, "snapshot_id": snapshot.id, "error": str(exc)},
+        ) from exc
+    if not isinstance(receipt, Mapping):
+        raise EpicReleaseHandoffError(
+            "aggregate_event_unavailable",
+            {"epic_id": epic_id, "snapshot_id": snapshot.id},
+        )
+
+    members = _epic_release_snapshot_members(conn, snapshot.id)
+    action = (
+        f"Epic release snapshot {snapshot.id} for epic {epic_id} is pinned at "
+        f"{snapshot.candidate_ref} ({snapshot.release_candidate_sha}) against "
+        f"target pre-image {snapshot.target_pre_sha} on branch "
+        f"{snapshot.target_branch} of remote {observation.remote_name}. "
+        "A human release operator must review this pinned evidence and perform "
+        "the release out-of-band."
+    )
+    return EpicReleaseHandoff(
+        epic_id=epic_id,
+        snapshot=snapshot,
+        members=members,
+        workflows=tuple(contract.ci_workflows),
+        aggregate_event_kind=str(event["kind"]),
+        aggregate_event_receipt=dict(receipt),
+        local_target_head=observation.local_head,
+        remote_target_head=observation.remote_head,
+        remote_name=observation.remote_name,
+        action=action,
+        checked_at=int(time.time()),
+    )
+
+
+def _epic_release_record_pushed(
+    conn: sqlite3.Connection,
+    *,
+    epic_id: str,
+    snapshot: EpicReleaseSnapshot,
+    pushed_sha: str,
+) -> None:
+    """Atomically pin ``pushed_sha`` for the exact active snapshot.
+
+    Re-checks that the active row is still the same snapshot inside the
+    IMMEDIATE transaction (a concurrent observation may have won), then
+    records the push with a typed event.  A status transition from
+    ``awaiting_push`` to ``ci_pending`` happens here as well.
+    """
+
+    now = int(time.time())
+    with authorized_governance_write(), write_txn(conn):
+        locked_row = _epic_release_active_row(conn, epic_id)
+        if locked_row is None or int(locked_row["id"]) != snapshot.id:
+            raise EpicReleaseCIObservationError(
+                "active_snapshot_changed",
+                {"epic_id": epic_id, "snapshot_id": snapshot.id},
+            )
+        conn.execute(
+            "UPDATE epic_release_snapshots SET pushed_sha=?, status='ci_pending', "
+            "updated_at=? WHERE id=? AND status IN ('awaiting_push', 'ci_pending')",
+            (pushed_sha, now, snapshot.id),
+        )
+        _append_event(
+            conn,
+            epic_id,
+            "epic_release_ci_pending",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "pushed_sha": pushed_sha,
+                "release_candidate_sha": snapshot.release_candidate_sha,
+                "observed_at": now,
+            },
+        )
+
+
+def _epic_release_record_ci_failed(
+    conn: sqlite3.Connection,
+    *,
+    epic_id: str,
+    snapshot: EpicReleaseSnapshot,
+    conclusions: Mapping[str, str | None],
+) -> None:
+    """Atomically mark the exact active snapshot ``ci_failed``.
+
+    Manual recovery is retained: the snapshot stays active, and a later
+    same-SHA observation where every workflow passes still releases it.
+    """
+
+    now = int(time.time())
+    with authorized_governance_write(), write_txn(conn):
+        locked_row = _epic_release_active_row(conn, epic_id)
+        if locked_row is None or int(locked_row["id"]) != snapshot.id:
+            raise EpicReleaseCIObservationError(
+                "active_snapshot_changed",
+                {"epic_id": epic_id, "snapshot_id": snapshot.id},
+            )
+        conn.execute(
+            "UPDATE epic_release_snapshots SET status='ci_failed', updated_at=? "
+            "WHERE id=? AND status IN ('awaiting_push', 'ci_pending', 'ci_failed')",
+            (now, snapshot.id),
+        )
+        _append_event(
+            conn,
+            epic_id,
+            "epic_release_ci_failed",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "pushed_sha": snapshot.release_candidate_sha,
+                "release_candidate_sha": snapshot.release_candidate_sha,
+                "conclusions": dict(conclusions),
+                "observed_at": now,
+            },
+        )
+
+
+def _epic_release_record_released(
+    conn: sqlite3.Connection,
+    *,
+    epic_id: str,
+    snapshot: EpicReleaseSnapshot,
+    conclusions: Mapping[str, str | None],
+) -> None:
+    """Atomically flip the exact active snapshot to ``released``."""
+
+    now = int(time.time())
+    with authorized_governance_write(), write_txn(conn):
+        locked_row = _epic_release_active_row(conn, epic_id)
+        if locked_row is None or int(locked_row["id"]) != snapshot.id:
+            raise EpicReleaseCIObservationError(
+                "active_snapshot_changed",
+                {"epic_id": epic_id, "snapshot_id": snapshot.id},
+            )
+        conn.execute(
+            "UPDATE epic_release_snapshots SET status='released', updated_at=? "
+            "WHERE id=? AND status IN ('awaiting_push', 'ci_pending', 'ci_failed')",
+            (now, snapshot.id),
+        )
+        _append_event(
+            conn,
+            epic_id,
+            "epic_release_released",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "pushed_sha": snapshot.release_candidate_sha,
+                "release_candidate_sha": snapshot.release_candidate_sha,
+                "candidate_ref": snapshot.candidate_ref,
+                "conclusions": dict(conclusions),
+                "released_at": now,
+            },
+        )
+
+
+def observe_epic_release_ci(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    *,
+    board: Optional[str] = None,
+    board_meta: Optional[dict] = None,
+) -> EpicReleaseCIObservation:
+    """Observe the exact active Epic release snapshot's CI state, read-only.
+
+    The observation is strictly read-only against the CI provider (HTTP
+    GET only) and against Git (``rev-parse``/``ls-remote`` only): no
+    rerun, cancel, merge, push, or update-remote primitive is ever issued.
+    Outcomes:
+
+    * Proven durable-authority drift, or a remote target head that moved
+      away from the recorded candidate after it was pinned pushed, marks
+      only the exact snapshot ``invalidated`` and exact-deletes the
+      candidate ref (when it still pins the recorded SHA).
+    * A remote head equal to ``target_pre_sha`` (not yet pushed) leaves
+      the snapshot ``ci_pending``.
+    * Only ``pushed_sha == release_candidate_sha`` plus every required
+      workflow ``success`` releases; a failure/cancel/timeout preserves
+      the snapshot as ``ci_failed`` (manual recovery retained), running or
+      queued stays ``ci_pending``, and a later same-SHA all-pass releases.
+    * An unobservable remote or CI provider preserves the snapshot
+      ``unavailable`` — drift cannot be proven, so nothing changes.
+    """
+
+    if conn.in_transaction:
+        raise EpicReleaseCIObservationError("active_transaction", {"epic_id": epic_id})
+
+    meta = board_meta if board_meta is not None else product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta) or not _is_epic_task(conn, epic_id):
+        raise EpicReleaseCIObservationError("not_governed_epic", {"epic_id": epic_id})
+    try:
+        contract = repository_contract_for_metadata(meta)
+    except (RepositoryConfigurationError, OSError, ValueError) as exc:
+        raise EpicReleaseCIObservationError(
+            "repository_unavailable", {"epic_id": epic_id, "error": str(exc)}
+        ) from exc
+    if contract is None:
+        raise EpicReleaseCIObservationError(
+            "missing_repository_contract", {"epic_id": epic_id}
+        )
+    if "epic_release" not in contract.verification:
+        raise EpicReleaseCIObservationError(
+            "missing_epic_release_profile", {"epic_id": epic_id}
+        )
+
+    row = _epic_release_active_row(conn, epic_id)
+    if row is None:
+        return EpicReleaseCIObservation("missing", None, {}, False, None)
+    try:
+        snapshot = epic_release_snapshot_from_row(row)
+    except ValueError as exc:
+        raise EpicReleaseCIObservationError(
+            "invalid_active_snapshot",
+            {"epic_id": epic_id, "snapshot_id": row["id"], "error": str(exc)},
+        ) from exc
+
+    # --- Recheck current durable authority. ---------------------------------
+    try:
+        inputs, _contract, _branch = _epic_release_inputs(
+            conn, epic_id, board=board, board_meta=meta
+        )
+    except EpicReleasePreparationError as exc:
+        if exc.code in ("not_ready", "readiness_tip_mismatch"):
+            drift = {"inputs_error": exc.code, **exc.evidence}
+        else:
+            raise EpicReleaseCIObservationError(
+                exc.code, {"epic_id": epic_id, **exc.evidence}
+            ) from exc
+    else:
+        drift = _epic_release_snapshot_mismatch_evidence(
+            conn, snapshot, epic_id=epic_id, inputs=inputs
+        )
+    if drift:
+        _epic_release_invalidate_durably(
+            conn, epic_id=epic_id, snapshot=snapshot, evidence=drift
+        )
+        deleted = _epic_release_delete_candidate_and_record(
+            conn, epic_id=epic_id, snapshot=snapshot, contract=contract
+        )
+        invalidated = replace(
+            snapshot, status="invalidated", updated_at=int(time.time())
+        )
+        return EpicReleaseCIObservation(
+            "invalidated", invalidated, drift, bool(deleted), snapshot.pushed_sha
+        )
+
+    # --- Observe the remote target head (read-only). ------------------------
+    try:
+        observation = observe_target_heads(
+            contract.repo_root,
+            target_branch=contract.target_branch,
+            base_ref=contract.base_ref,
+        )
+    except RepositoryConfigurationError as exc:
+        raise EpicReleaseCIObservationError(
+            "repository_unavailable", {"epic_id": epic_id, "error": exc.code}
+        ) from exc
+    if not observation.remote_available or observation.remote_head is None:
+        return EpicReleaseCIObservation(
+            "unavailable",
+            snapshot,
+            {"remote_name": observation.remote_name},
+            False,
+            snapshot.pushed_sha,
+        )
+
+    if observation.remote_head != snapshot.release_candidate_sha:
+        if snapshot.pushed_sha == snapshot.release_candidate_sha:
+            # The candidate was pinned pushed but the remote moved on to a
+            # different SHA: durable invalidation with exact-SHA cleanup.
+            evidence = {
+                "target_pre_sha": {
+                    "snapshot": snapshot.target_pre_sha,
+                    "remote_head": observation.remote_head,
+                },
+                "remote_head": observation.remote_head,
+                "release_candidate_sha": snapshot.release_candidate_sha,
+            }
+            _epic_release_invalidate_durably(
+                conn, epic_id=epic_id, snapshot=snapshot, evidence=evidence
+            )
+            deleted = _epic_release_delete_candidate_and_record(
+                conn, epic_id=epic_id, snapshot=snapshot, contract=contract
+            )
+            invalidated = replace(
+                snapshot, status="invalidated", updated_at=int(time.time())
+            )
+            return EpicReleaseCIObservation(
+                "invalidated", invalidated, evidence, bool(deleted), snapshot.pushed_sha
+            )
+        # Not yet pushed: the remote is still at (or not at) the target
+        # pre-image and we have never pinned a push.  Preserve as pending.
+        return EpicReleaseCIObservation(
+            "ci_pending",
+            snapshot,
+            {
+                "remote_head": observation.remote_head,
+                "release_candidate_sha": snapshot.release_candidate_sha,
+                "not_yet_pushed": True,
+            },
+            False,
+            snapshot.pushed_sha,
+        )
+
+    # The exact candidate is confirmed on the remote target head.
+    if snapshot.pushed_sha != snapshot.release_candidate_sha:
+        _epic_release_record_pushed(
+            conn,
+            epic_id=epic_id,
+            snapshot=snapshot,
+            pushed_sha=snapshot.release_candidate_sha,
+        )
+
+    # --- Observe CI (HTTP GET only) for the exact candidate SHA. -----------
+    try:
+        conclusions = observe_ci_workflow_runs(
+            contract.repo_root,
+            base_ref=contract.base_ref,
+            workflows=tuple(contract.ci_workflows),
+            head_sha=snapshot.release_candidate_sha,
+        )
+    except RepositoryConfigurationError as exc:
+        raise EpicReleaseCIObservationError(
+            "repository_unavailable", {"epic_id": epic_id, "error": exc.code}
+        ) from exc
+    if conclusions is None:
+        return EpicReleaseCIObservation(
+            "unavailable",
+            snapshot,
+            {"ci_provider": "unavailable"},
+            False,
+            snapshot.release_candidate_sha,
+        )
+
+    statuses = [conclusions.get(wf) for wf in contract.ci_workflows]
+    if all(status == "success" for status in statuses):
+        _epic_release_record_released(
+            conn,
+            epic_id=epic_id,
+            snapshot=snapshot,
+            conclusions=conclusions,
+        )
+        deleted = delete_release_candidate_ref(
+            contract.repo_root,
+            candidate_ref=snapshot.candidate_ref,
+            candidate_sha=snapshot.release_candidate_sha,
+        )
+        released = replace(
+            snapshot, status="released", updated_at=int(time.time())
+        )
+        return EpicReleaseCIObservation(
+            "released",
+            released,
+            {"conclusions": dict(conclusions)},
+            bool(deleted),
+            snapshot.release_candidate_sha,
+        )
+    if any(status in ("failure", "cancelled", "timed_out") for status in statuses):
+        _epic_release_record_ci_failed(
+            conn,
+            epic_id=epic_id,
+            snapshot=snapshot,
+            conclusions=conclusions,
+        )
+        failed = replace(
+            snapshot, status="ci_failed", updated_at=int(time.time())
+        )
+        return EpicReleaseCIObservation(
+            "ci_failed",
+            failed,
+            {"conclusions": dict(conclusions)},
+            False,
+            snapshot.release_candidate_sha,
+        )
+    # Running / queued / no run yet.
+    return EpicReleaseCIObservation(
+        "ci_pending",
+        snapshot,
+        {"conclusions": dict(conclusions)},
+        False,
+        snapshot.release_candidate_sha,
+    )
 
 
 def _merge_epic_fail_safe(
@@ -14635,6 +16347,12 @@ def merge_epic_to_main(
     meta = board_meta if board_meta is not None else product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return None
+    lifecycle_scope = conn.execute(
+        "SELECT workflow_template_id, current_step_key FROM tasks WHERE id=?",
+        (epic_id,),
+    ).fetchone()
+    if _is_engine_owned_integration_state(lifecycle_scope):
+        return "not_ready"
     _validate_stored_product_workflow_state(conn, epic_id)
 
     # A repository contract owns verification for governed boards.  Do not
@@ -14761,502 +16479,6 @@ def merge_epic_to_main(
         return "verify_failed"
 
 
-def _integrate_story_fail_safe(
-    conn: sqlite3.Connection,
-    story_id: str,
-    reason: str,
-    *,
-    board: Optional[str],
-    notify_fn: Optional[Callable[[str, str, Optional[str]], None]],
-) -> None:
-    """Block the STORY + emit an event + notify. Never raises.
-
-    Mirrors :func:`_merge_epic_fail_safe`, but a failed story->epic
-    integration merge blocks the STORY (the thing whose merge failed), not
-    the epic -- the epic branch itself is left untouched on a conflict.
-    """
-    try:
-        set_running(conn, story_id, False, board=board)
-        set_blocked(conn, story_id, True, board=board, reason=reason)
-        with write_txn(conn):
-            _append_event(
-                conn, story_id, "blocked",
-                {"reason": reason, "kind": "story_integration_failed"},
-            )
-    except Exception:
-        pass
-    if notify_fn is not None:
-        try:
-            notify_fn(story_id, reason, board)
-        except Exception:
-            pass
-
-
-def integrate_story_to_epic(
-    conn: sqlite3.Connection,
-    story_id: str,
-    *,
-    board: Optional[str] = None,
-    board_meta: Optional[dict] = None,
-    notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
-    candidate_verify_fn: Any = _RECONCILE_INTEGRATION_VERIFY_UNSET,
-    expected_source_sha: Optional[str] = None,
-    before_apply_fn: Optional[Callable[[], bool]] = None,
-) -> Optional[str]:
-    """Merge a Done story's branch into its epic's integration branch, LOCALLY.
-
-    Phase 4 branches each v2 story off its epic's integration branch
-    (:func:`_story_base_branch`) onto its own branch, but nothing merges a
-    completed story's commits BACK into the epic branch -- so a downstream
-    sibling story never sees an upstream story's work, and
-    :func:`merge_epic_to_main` has nothing real to carry to main. This
-    closes that gap. Today the only caller is the bounded :func:`reconcile`
-    safety net (W3); wiring a fast path in on story completion is a natural
-    future call site but out of scope here.
-
-    Returns ``None`` on a non-``handoff_v2`` board, a story with no epic
-    parent, or when the repo / epic branch / story branch can't be resolved
-    (no git mutation in any of these cases -- mirrors
-    :func:`merge_epic_to_main`'s ``"not_ready"`` short-circuits, collapsed to
-    ``None`` here since there's no separate not-ready state to report);
-    ``"already_integrated"`` when the story branch is already an ancestor of
-    the epic branch (idempotent -- no re-merge); ``"conflict"`` when the
-    merge fails (aborted; the STORY -- not the epic -- is blocked and
-    ``notify_fn`` invoked, mirroring :func:`_merge_epic_fail_safe`'s
-    fail-safe pattern via :func:`_integrate_story_fail_safe`); ``"integrated"``
-    on success.
-
-    The merge happens in a DEDICATED epic worktree
-    (``<repo_root>/.worktrees/epic-<epic_id>``) -- never in ``repo_root``'s
-    own checkout -- so this never disturbs whatever branch ``repo_root`` (or
-    any other card's worktree) happens to have checked out.
-    
-    ``board_meta`` is an already-read board metadata snapshot. Release
-    orchestration passes the one snapshot it validated policy against, so a
-    board edit mid-operation cannot make a later step disagree with the gate
-    that admitted it. ``None`` reads fresh, exactly as before.
-    """
-    # =========================================================================
-    # LOCAL only -- never `git push` / touch origin. Production deploys and
-    # `git push origin` are HUMAN-ONLY. This function must NEVER call
-    # `git push`, and must NEVER import or call web_git.py's push helpers
-    # (`_review_push` / `review_push` / `review_create_pr`). Only local git
-    # verbs below: merge-base, worktree add, merge, merge --abort.
-    # =========================================================================
-    meta = board_meta if board_meta is not None else product_board_metadata(board)
-    if meta is None or not _handoff_v2_enabled(meta):
-        return None
-    _validate_stored_product_workflow_state(conn, story_id)
-
-    if _is_epic_task(conn, story_id):
-        return None
-    epic_id = epic_id_for_task(conn, story_id)
-    if epic_id is None:
-        return None
-
-    epic = get_task(conn, epic_id)
-    if epic is None or epic.status in {"done", "archived"}:
-        return None
-
-    # Durable integration state is checked before resolving the repository or
-    # any Git ref only for the ordinary reconcile fast path. Explicit source,
-    # candidate, or ownership controls must retain their verification semantics
-    # and must never be hidden by an older integration row.
-    authority_records = _terminal_run_records(conn, story_id)
-    authority_phase_present = any(
-        record.phase in {"test", "review"} for record in authority_records
-    )
-    reviewed_candidate = latest_review_authority(authority_records)
-    passed_test = (
-        latest_test_authority(authority_records, reviewed_candidate.source_sha)
-        if reviewed_candidate is not None
-        else None
-    )
-    ordinary_reconcile = (
-        candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
-        and expected_source_sha is None
-        and before_apply_fn is None
-    )
-    if ordinary_reconcile:
-        if reviewed_candidate is not None:
-            already_integrated = conn.execute(
-                """
-                SELECT 1
-                  FROM epic_story_integrations
-                 WHERE epic_id=?
-                   AND story_id=?
-                   AND source_sha=?
-                 LIMIT 1
-                """,
-                (epic_id, story_id, reviewed_candidate[1]),
-            ).fetchone()
-        else:
-            already_integrated = conn.execute(
-                """
-                SELECT 1
-                  FROM epic_story_integrations AS integration
-                  JOIN tasks AS story ON story.id = integration.story_id
-                 WHERE integration.epic_id=?
-                   AND integration.story_id=?
-                   AND story.status='done'
-                   AND story.completed_at IS NOT NULL
-                   AND integration.integrated_at >= story.completed_at
-                 LIMIT 1
-                """,
-                (epic_id, story_id),
-            ).fetchone()
-        if already_integrated is not None:
-            return "already_integrated"
-    if authority_phase_present and (
-        reviewed_candidate is None or passed_test is None
-    ):
-        # A product Test/Review attempt exists, so legacy ancestor replay is
-        # not allowed to create a new integration fact without current,
-        # dispatcher-pinned authority from both phases.
-        return None
-
-    try:
-        board_default = str(meta.get("default_workdir") or "").strip()
-        repo_root = _git_toplevel(Path(board_default).expanduser()) if board_default else None
-        if repo_root is None:
-            return None
-        epic_branch = epic_branch_for(epic_id)
-        story = get_task(conn, story_id)
-        story_branch = (story.branch_name or "").strip() if story is not None else ""
-        if (
-            not story_branch
-            or not _git_branch_exists(repo_root, epic_branch)
-            or not _git_branch_exists(repo_root, story_branch)
-        ):
-            return None
-        contract = repository_contract_for_metadata(meta, repo_root=repo_root)
-        if reviewed_candidate is not None:
-            if reviewed_candidate.branch != story_branch:
-                return None
-            if (
-                expected_source_sha is not None
-                and expected_source_sha != reviewed_candidate.source_sha
-            ):
-                return None
-            assert passed_test is not None
-            try:
-                candidate_eligibility(
-                    repo_root, reviewed_candidate, passed_test
-                )
-            except CandidateEligibilityError:
-                # No candidate intent/fact has been written yet.  Leave the
-                # existing integration state untouched for a later replay.
-                return "verify_failed"
-        if ordinary_reconcile and reviewed_candidate is None:
-            current_source_sha = _git_ref_sha(repo_root, story_branch)
-            if current_source_sha and conn.execute(
-                """
-                SELECT 1 FROM epic_story_integrations
-                 WHERE epic_id=? AND story_id=? AND source_sha=?
-                 LIMIT 1
-                """,
-                (epic_id, story_id, current_source_sha),
-            ).fetchone() is not None:
-                return "already_integrated"
-    except Exception:
-        return None
-
-    def _run(args: list[str], *, cwd: Path, timeout: int = 60):
-        try:
-            return subprocess.run(
-                ["git", "-C", str(cwd), *args],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-        except Exception:
-            return None
-
-    try:
-        ancestor_result = _run(
-            ["merge-base", "--is-ancestor", story_branch, epic_branch], cwd=repo_root,
-        )
-        already_integrated = ancestor_result is not None and ancestor_result.returncode == 0
-        if (
-            already_integrated
-            and candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
-            and expected_source_sha is None
-        ):
-            if reviewed_candidate is not None:
-                # A reviewed source that is already an ancestor may have been
-                # applied by an earlier crash, but without the exact durable
-                # composite fact the ancestor relation alone is not replay
-                # authority.
-                return "verify_failed"
-            _record_story_integration(
-                conn, story_id, epic_id, epic_branch,
-                {
-                    "source_branch": story_branch,
-                    "source_sha": _git_ref_sha(repo_root, story_branch),
-                    "target_branch": epic_branch,
-                    "candidate_sha": _git_ref_sha(repo_root, epic_branch),
-                    "already_integrated": True,
-                },
-            )
-            return "already_integrated"
-
-        if (
-            candidate_verify_fn is not _RECONCILE_INTEGRATION_VERIFY_UNSET
-            or expected_source_sha is not None
-            or reviewed_candidate is not None
-        ):
-            reviewed_source_sha = (
-                reviewed_candidate.source_sha
-                if reviewed_candidate is not None
-                else expected_source_sha
-            )
-            existing_integration = (
-                reviewed_source_sha is not None
-                and conn.execute(
-                    """
-                    SELECT 1
-                      FROM epic_story_integrations
-                     WHERE epic_id=? AND story_id=? AND source_sha=?
-                     LIMIT 1
-                    """,
-                    (epic_id, story_id, reviewed_source_sha),
-                ).fetchone()
-                is not None
-            )
-            candidate_source_branch = story_branch
-            candidate_expected_source_sha = expected_source_sha
-            reviewed_source_ref: Optional[str] = None
-            try:
-                if reviewed_candidate is not None:
-                    reviewed_source_ref = f"hermes/reviewed-{secrets.token_hex(6)}"
-                    retained = _integration_git(
-                        repo_root,
-                        [
-                            "update-ref",
-                            f"refs/heads/{reviewed_source_ref}",
-                            reviewed_candidate[1],
-                        ],
-                    )
-                    if retained.returncode != 0:
-                        raise IntegrationCandidateError(
-                            "could not retain reviewed source candidate"
-                        )
-                    candidate_source_branch = reviewed_source_ref
-                    candidate_expected_source_sha = reviewed_candidate[1]
-                effective_verify_fn = (
-                    (lambda _path: True)
-                    if reviewed_candidate is not None
-                    and candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
-                    else (
-                        None
-                        if candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
-                        else candidate_verify_fn
-                    )
-                )
-                try:
-                    candidate = _build_verified_merge_candidate(
-                        repo_root,
-                        epic_branch,
-                        candidate_source_branch,
-                        f"integrate story {story_id}",
-                        effective_verify_fn,
-                        expected_source_sha=candidate_expected_source_sha,
-                        allow_empty_contribution=existing_integration,
-                        verification_profile=(
-                            contract.verification.get("story_integration")
-                            if contract is not None
-                            else None
-                        ),
-                        verification_contract_digest=(
-                            contract.digest if contract is not None else None
-                        ),
-                        verification_scope="story_integration",
-                        verification_subject_id=story_id,
-                        verification_profile_name="story_integration",
-                        verification_generated_policy_digest=(
-                            contract.generated_policy_digest if contract is not None else ""
-                        ),
-                        configured_verification_fn=(
-                            lambda path, source, candidate: _run_or_reuse_configured_verification(
-                                conn, task_id=story_id, candidate_path=path, source_sha=source,
-                                candidate_sha=candidate, contract=contract,
-                                profile_name="story_integration", gate_kind="story_integration"
-                            )
-                        ) if (
-                            contract is not None
-                            and candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
-                        ) else None,
-                    )
-                finally:
-                    if reviewed_source_ref is not None:
-                        released = _integration_git(
-                            repo_root,
-                            [
-                                "update-ref",
-                                "-d",
-                                f"refs/heads/{reviewed_source_ref}",
-                            ],
-                        )
-                        if released.returncode != 0:
-                            raise IntegrationCandidateError(
-                                "could not remove reviewed source candidate"
-                            )
-                if before_apply_fn is not None and not before_apply_fn():
-                    return "ownership_conflict"
-                if not _fast_forward_target(candidate):
-                    reason = (
-                        "epic target moved or became dirty; candidate retained at "
-                        f"{candidate.candidate_ref}"
-                    )
-                    with write_txn(conn):
-                        _append_event(
-                            conn,
-                            story_id,
-                            "story_integration_failed",
-                            {"reason": reason, "release_candidate": True},
-                        )
-                    return "verify_failed"
-            except IntegrationCandidateError as exc:
-                with write_txn(conn):
-                    if exc.verification_result is not None:
-                        _append_event(
-                            conn,
-                            story_id,
-                            "repository_verification",
-                            _verification_result_payload(
-                                exc.verification_result,
-                                scope="story_integration",
-                                subject_id=story_id,
-                            ),
-                        )
-                    _append_event(
-                        conn,
-                        story_id,
-                        "story_integration_failed",
-                        {"reason": str(exc), "release_candidate": True},
-                    )
-                if _verification_needs_attention(exc.verification_result):
-                    return "attention_required"
-                return "conflict" if "merge conflict" in str(exc) else "verify_failed"
-
-            if candidate.verification_result is not None and not candidate.verification_result.reused:
-                with write_txn(conn):
-                    _append_event(
-                        conn,
-                        story_id,
-                        "repository_verification",
-                        _verification_result_payload(
-                            candidate.verification_result,
-                            scope="story_integration",
-                            subject_id=story_id,
-                        ),
-                    )
-            _record_story_integration(
-                conn, story_id, epic_id, epic_branch,
-                {
-                    "source_branch": story_branch,
-                    "source_sha": candidate.source_sha,
-                    "target_branch": epic_branch,
-                    "pre_sha": candidate.pre_sha,
-                    "candidate_sha": candidate.candidate_sha,
-                    "target": str(candidate.target_worktree or epic_branch),
-                    "test_command": "bash scripts/run_tests.sh",
-                    "already_integrated": already_integrated,
-                },
-            )
-            return "already_integrated" if already_integrated else "integrated"
-
-        epic_worktree = repo_root / ".worktrees" / f"epic-{epic_id}"
-        _ensure_git_worktree(repo_root, epic_worktree, epic_branch)
-        if not _worktree_is_clean(epic_worktree):
-            reason = f"epic integration worktree is dirty; preserved at {epic_worktree}"
-            _integrate_story_fail_safe(
-                conn, story_id, reason, board=board, notify_fn=notify_fn
-            )
-            return "verify_failed"
-
-        merge_result = _run(
-            ["merge", "--no-ff", story_branch, "-m", f"integrate story {story_id}"],
-            cwd=epic_worktree, timeout=120,
-        )
-        if merge_result is None or merge_result.returncode != 0:
-            _run(["merge", "--abort"], cwd=epic_worktree)
-            reason = (
-                "story→epic merge conflict"
-                if _worktree_is_clean(epic_worktree)
-                else f"story→epic merge conflict; preserved dirty worktree at {epic_worktree}"
-            )
-            _integrate_story_fail_safe(conn, story_id, reason, board=board, notify_fn=notify_fn)
-            return "conflict"
-
-        _record_story_integration(
-            conn, story_id, epic_id, epic_branch,
-            {
-                "source_branch": story_branch,
-                "source_sha": _git_ref_sha(repo_root, story_branch),
-                "target_branch": epic_branch,
-                "candidate_sha": _git_ref_sha(repo_root, epic_branch),
-            },
-        )
-        return "integrated"
-    except Exception:
-        return None
-
-
-def _record_story_integration(
-    conn: sqlite3.Connection,
-    story_id: str,
-    epic_id: str,
-    epic_branch: str,
-    payload: dict,
-) -> None:
-    """Record a story→epic integration and refresh the epic's base pin.
-
-    The pin must follow the epic tip, not stay at the original base. Story
-    cards go ``done`` after integration, so ``gc_events`` prunes their
-    ``story_integrated_to_epic`` rows after its retention window — recovery
-    would then fall back to the first pin and branch a later sibling off a
-    base missing every already-integrated story. The epic itself stays
-    non-terminal until release, so its own events survive.
-    """
-    candidate_sha = str(payload.get("candidate_sha") or "").strip()
-    # Only pin when the tip actually moved. A re-entrant integration pass
-    # re-records `already_integrated` for a story whose work is long since in
-    # the epic branch, at whatever rate the dispatcher ticks — on live boards
-    # that is tens of thousands of identical events. Writing a pin for each of
-    # those would double that churn while recording nothing new, and recovery
-    # only ever reads the newest pin.
-    pin_sha = (
-        candidate_sha
-        if candidate_sha and candidate_sha != _epic_base_pinned_sha(conn, epic_id)
-        else None
-    )
-    with write_txn(conn):
-        _append_event(conn, story_id, "story_integrated_to_epic", payload)
-        source_sha = str(payload.get("source_sha") or "").strip()
-        if source_sha:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO epic_story_integrations
-                    (epic_id, story_id, source_sha, candidate_sha, integrated_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    epic_id,
-                    story_id,
-                    source_sha,
-                    candidate_sha or None,
-                    int(time.time()),
-                ),
-            )
-        if pin_sha:
-            _append_event(
-                conn, epic_id, EPIC_BASE_PINNED_EVENT,
-                {"branch": epic_branch, "base_sha": pin_sha},
-            )
-
-
 def _merge_standalone_story_to_main(
     conn: sqlite3.Connection,
     story_id: str,
@@ -15275,10 +16497,8 @@ def _merge_standalone_story_to_main(
 
     The common case for imported / single-story product boards: a finished
     story with no epic parent, whose work would otherwise strand on its
-    per-card branch (:func:`integrate_story_to_epic` returns ``None`` -- "no
-    epic parent" -- so nothing carries it anywhere, and
-    :func:`merge_epic_to_main` never runs). This closes that gap for the
-    standalone case, mirroring :func:`merge_epic_to_main` exactly.
+    per-card branch because the epic release path does not apply. This closes
+    that gap for the standalone case, mirroring :func:`merge_epic_to_main`.
 
     Returns ``None`` on a non-``handoff_v2`` board or a story that actually HAS
     an epic parent (that path is the epic integration + merge); ``"not_ready"``
@@ -15289,7 +16509,7 @@ def _merge_standalone_story_to_main(
     isolated candidate is dirty or the suite isn't green (the target remains
     unchanged); ``"merged"`` on success. On both failure outcomes the
     STORY (not an epic) is cleared of ``running``, blocked, and ``notify_fn``
-    invoked -- see :func:`_integrate_story_fail_safe`.
+    invoked.
     """
     # =========================================================================
     # LOCAL main only -- never `git push` / touch origin. Same hard autonomy
@@ -15300,7 +16520,7 @@ def _merge_standalone_story_to_main(
     if meta is None or not _handoff_v2_enabled(meta):
         return None
     _validate_stored_product_workflow_state(conn, story_id)
-    # A story WITH an epic goes through integrate_story_to_epic + merge_epic_to_main.
+    # Epic members are owned by the durable story-integration coordinator.
     if _is_epic_task(conn, story_id) or epic_id_for_task(conn, story_id) is not None:
         return None
     story = get_task(conn, story_id)
@@ -15350,7 +16570,23 @@ def _merge_standalone_story_to_main(
         return "not_ready"
 
     def _fail(reason: str) -> None:
-        _integrate_story_fail_safe(conn, story_id, reason, board=board, notify_fn=notify_fn)
+        try:
+            set_running(conn, story_id, False, board=board)
+            set_blocked(conn, story_id, True, board=board, reason=reason)
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    story_id,
+                    "blocked",
+                    {"reason": reason, "kind": "standalone_merge_failed"},
+                )
+        except Exception:
+            pass
+        if notify_fn is not None:
+            try:
+                notify_fn(story_id, reason, board)
+            except Exception:
+                pass
 
     try:
         ancestor_result = _integration_git(
@@ -15821,6 +17057,12 @@ def release_product_task(
     task = get_task(conn, task_id)
     meta = product_board_metadata(board)
     is_epic_task = bool(task is not None and task.work_item_kind == "epic")
+    lifecycle_scope = conn.execute(
+        "SELECT workflow_template_id, current_step_key FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if _is_engine_owned_integration_state(lifecycle_scope):
+        raise ReleaseEvidenceError(task_id, ["engine_owned_state"])
     if (
         task is None
         or meta is None
@@ -15902,17 +17144,16 @@ def release_product_task(
     is_epic = _is_epic_task(conn, task_id)
     epic_id = epic_id_for_task(conn, task_id)
     if is_epic:
-        target_branch = epic_branch_for(task_id)
         integrated_children = all(
             (child := get_task(conn, child_id)) is not None
             and child.status == "done"
-            and any(
-                event.kind == "story_integrated_to_epic"
-                and isinstance(event.payload, dict)
-                and event.payload.get("target_branch") == target_branch
-                and bool(event.payload.get("candidate_sha"))
-                for event in list_events(conn, child_id)
-            )
+            and conn.execute(
+                "SELECT 1 FROM epic_story_integrations "
+                "WHERE epic_id=? AND story_id=? AND candidate_sha IS NOT NULL "
+                "LIMIT 1",
+                (task_id, child_id),
+            ).fetchone()
+            is not None
             for child_id in children
         )
         if not integrated_children:
@@ -15928,16 +17169,10 @@ def release_product_task(
         )
         integration_kinds = {"epic_merged"}
     elif epic_id is not None:
-        integration_status = integrate_story_to_epic(
-            conn,
-            task_id,
-            board=board,
-            board_meta=meta,
-            candidate_verify_fn=candidate_verify_fn,
-            expected_source_sha=source_sha,
-            before_apply_fn=before_apply_fn,
-        )
-        integration_kinds = {"story_integrated_to_epic"}
+        # Epic-member release is engine-owned and is completed only by the
+        # durable integration intent finalizer, never by this legacy release
+        # surface.
+        raise ReleaseEvidenceError(task_id, ["durable_story_integration"])
     else:
         integration_status = _merge_standalone_story_to_main(
             conn,
@@ -16879,6 +18114,60 @@ def handoff(
     if sha is None and str(step or "") in _PRODUCT_COMMIT_REQUIRED_STEPS:
         return False
 
+    if str(step or "") == "review":
+        epic_id = epic_id_for_task(conn, task_id)
+        if epic_id is not None:
+            if expected_run_id is None:
+                return False
+            active_run = get_run(conn, expected_run_id)
+            if (
+                active_run is None
+                or active_run.ended_at is not None
+                or not isinstance(active_run.metadata, dict)
+            ):
+                return False
+            final_metadata = dict(metadata or {})
+            for key in ("review_branch", "review_base_sha", "review_head_sha"):
+                pinned = active_run.metadata.get(key)
+                if pinned is not None:
+                    final_metadata[key] = pinned
+            approved = ApprovedCandidate(
+                run_id=expected_run_id,
+                branch=str(final_metadata.get("review_branch") or "").strip(),
+                base_sha=str(final_metadata.get("review_base_sha") or "").strip(),
+                source_sha=str(final_metadata.get("review_head_sha") or "").strip(),
+                reviewer_provider=str(
+                    _reviewer_agent_from_metadata(final_metadata) or ""
+                ).strip(),
+                writer_provider=str(
+                    _writer_agent_from_metadata(final_metadata) or ""
+                ).strip(),
+            )
+            authority_records = _terminal_run_records(conn, task_id)
+            passed = latest_test_authority(authority_records, approved.source_sha)
+            if passed is None or workspace is None:
+                return False
+            try:
+                eligibility: CandidateEligibility = candidate_eligibility(
+                    workspace, approved, passed
+                )
+            except CandidateEligibilityError:
+                return False
+            from hermes_cli.kanban_story_integration import enqueue_approved_story
+
+            enqueue_approved_story(
+                conn,
+                epic_id=epic_id,
+                story_id=task_id,
+                approved=approved,
+                passed=passed,
+                eligibility=eligibility,
+                expected_run_id=expected_run_id,
+                summary=summary,
+                metadata=metadata,
+            )
+            return True
+
     next_step = transition["next_step"]
     next_role = transition.get("assignee_role")
     next_assignee = _product_role_assignee(meta, next_role)
@@ -17804,9 +19093,8 @@ class ReconcileResult:
     """Task ids spawned this pass via :func:`_spawn_one_v2` (claim-CAS makes
     this fire-once)."""
     integrated: list[str] = field(default_factory=list)
-    """Story task ids merged into their epic's integration branch this pass
-    via :func:`integrate_story_to_epic` (at most one per pass -- see the
-    added step at the end of :func:`reconcile`'s docstring)."""
+    """Story task ids durably finalized into their epic integration branch
+    by the claimed intent coordinator this pass."""
     merged_to_main: list[str] = field(default_factory=list)
     """Story ids (standalone) or epic ids whose branch was merged into LOCAL
     main this pass via :func:`_merge_standalone_story_to_main` /
@@ -17873,14 +19161,10 @@ def reconcile(
        inert requalification intake. A pending intake makes the step
        idempotent. All other waits and terminal states are left untouched.
 
-    4. **Story->epic integration (W3).** At most ONE ``done`` story whose
-       branch is not yet an ancestor of its epic's integration branch is
-       merged in via :func:`integrate_story_to_epic` this pass -- the safety
-       net for the same reason steps 1-2 exist: nothing else guarantees a
-       completed story's commits land in the epic branch. Bounded to one per
-       pass (mirroring the one-action discipline above); already-integrated
-       stories are skipped without counting against the bound, so this step
-       still fires on the first genuinely unintegrated candidate.
+    4. **Story->epic integration.** Recover every prepared crash boundary,
+       then claim, prepare, advance, and atomically finalize at most one new
+       durable integration intent. The immutable integration fact, terminal
+       story state, event, and release-snapshot invalidation commit together.
 
     Non-v2 boards return an empty ``ReconcileResult`` (a no-op); legacy
     boards keep using ``dispatch_once`` unchanged.
@@ -18000,14 +19284,76 @@ def reconcile(
             result.requalification_requested.append(task_id)
             break
 
-    # Step 4: integrate at most one un-integrated Done story into its epic
-    # branch this pass (W3). Scans done cards in completion order;
-    # "already_integrated" / no-epic-parent / unresolvable cards are skipped
-    # (not counted as this pass's action) so a real integration can still
-    # happen this pass even if earlier done cards are already merged.
+    # Step 4: converge prepared crash boundaries, then advance at most one new
+    # pending intent through the claimed coordinator. Facts observed before
+    # recovery let the result report only stories finalized by this pass.
+    from hermes_cli.kanban_story_integration import (
+        advance_prepared_intent,
+        claim_next_intent,
+        finish_intent,
+        prepare_claimed_intent,
+        recover_expired_intents,
+        route_intent_failure,
+    )
+
+    facts_before = {
+        (row["epic_id"], row["story_id"], row["source_sha"])
+        for row in conn.execute(
+            "SELECT epic_id, story_id, source_sha FROM epic_story_integrations"
+        ).fetchall()
+    }
+    recovery = recover_expired_intents(conn, board=board)
+    facts_after_recovery = {
+        (row["epic_id"], row["story_id"], row["source_sha"])
+        for row in conn.execute(
+            "SELECT epic_id, story_id, source_sha FROM epic_story_integrations"
+        ).fetchall()
+    }
+    result.integrated.extend(
+        sorted({story_id for _epic_id, story_id, _source in facts_after_recovery - facts_before})
+    )
+    if recovery.finalized == 0:
+        claimed_intent = claim_next_intent(
+            conn,
+            _claimer_id(),
+            _resolve_claim_ttl_seconds(ttl_seconds),
+            board=board,
+        )
+        if claimed_intent is not None:
+            active_intent = claimed_intent
+            try:
+                prepared_intent = prepare_claimed_intent(
+                    conn, claimed_intent, board=board
+                )
+                active_intent = prepared_intent
+                cas_result = advance_prepared_intent(
+                    conn, prepared_intent, board=board
+                )
+                if (
+                    cas_result.kind in {"advanced", "reflected"}
+                    and cas_result.current_sha == prepared_intent.candidate_sha
+                ):
+                    fact = finish_intent(
+                        conn, prepared_intent, cas_result, board=board
+                    )
+                    result.integrated.append(fact.story_id)
+                else:
+                    route_intent_failure(
+                        conn, prepared_intent, cas_result, board=board
+                    )
+            except Exception as exc:
+                try:
+                    route_intent_failure(conn, active_intent, exc, board=board)
+                except Exception:
+                    # Lost ownership or an interrupted routing transaction keeps
+                    # the durable intent available to same-lineage recovery.
+                    pass
+
+    # Step 5 (merge-back): carry finished work to LOCAL main. OFF unless the
+    # board opts into product_workflow.merge_after_green.
     done_rows = conn.execute(
         """
-        SELECT t.id
+        SELECT t.id, em.epic_id
           FROM tasks t
           LEFT JOIN epic_memberships em ON em.task_id = t.id
           LEFT JOIN tasks e ON e.id = em.epic_id
@@ -18016,32 +19362,28 @@ def reconcile(
          ORDER BY t.completed_at ASC
         """
     ).fetchall()
-    # Step 5 (merge-back): carry finished work to LOCAL main. OFF unless the
-    # board opts into product_workflow.merge_after_green -- when off, behavior
-    # is byte-for-byte the pre-existing integrate-one-per-pass loop.
     merge_after_green = _product_merge_after_green(product_board_metadata(board))
-    for row in done_rows:
-        story_id = row["id"]
-        outcome = integrate_story_to_epic(conn, story_id, board=board)
-        if outcome == "integrated":
-            result.integrated.append(story_id)
-            if merge_after_green:
-                epic_id = epic_id_for_task(conn, story_id)
-                if epic_id and epic_ready(conn, epic_id, board=board):
-                    if merge_epic_to_main(conn, epic_id, board=board) == "merged":
-                        result.merged_to_main.append(epic_id)
-            break
-        if merge_after_green:
-            if outcome == "already_integrated":
-                epic_id = epic_id_for_task(conn, story_id)
-                if epic_id and epic_ready(conn, epic_id, board=board):
+    if merge_after_green:
+        attempted_epics: set[str] = set()
+        for row in done_rows:
+            story_id = row["id"]
+            epic_id = row["epic_id"]
+            if epic_id is not None:
+                if epic_id in attempted_epics:
+                    continue
+                attempted_epics.add(epic_id)
+                integrated = conn.execute(
+                    "SELECT 1 FROM epic_story_integrations "
+                    "WHERE epic_id=? AND story_id=? LIMIT 1",
+                    (epic_id, story_id),
+                ).fetchone()
+                if integrated is not None and epic_ready(conn, epic_id, board=board):
                     if merge_epic_to_main(conn, epic_id, board=board) == "merged":
                         result.merged_to_main.append(epic_id)
                         break
-            elif outcome is None:
-                if _merge_standalone_story_to_main(conn, story_id, board=board) == "merged":
-                    result.merged_to_main.append(story_id)
-                    break
+            elif _merge_standalone_story_to_main(conn, story_id, board=board) == "merged":
+                result.merged_to_main.append(story_id)
+                break
 
     return result
 

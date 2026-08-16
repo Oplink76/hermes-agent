@@ -25,8 +25,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_epic_release as ker
 from hermes_cli import kanban_intake
 from hermes_cli import kanban_swarm as ks
+from hermes_cli import kanban_v2_migration
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +280,46 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_qualification_migrate.add_argument(
         "--json", action="store_true", help="Emit the full machine-readable result"
     )
+
+    # --- v2-migrate ---
+    p_v2_migrate = sub.add_parser(
+        "v2-migrate",
+        help="Audit or migrate a scratch kanban DB copy to product v2",
+    )
+    p_v2_migrate.add_argument(
+        "db_path",
+        metavar="<db-path>",
+        help="Absolute path to the scratch SQLite DB copy to audit or migrate",
+    )
+    p_v2_migrate.add_argument(
+        "--apply",
+        action="store_true",
+        help="Snapshot, backfill product workflow metadata, and produce receipt",
+    )
+    p_v2_migrate.add_argument(
+        "--recovery-root",
+        metavar="<dir>",
+        help="Directory for immutable migration snapshots (default: next to the DB)",
+    )
+    p_v2_migrate.add_argument(
+        "--json", action="store_true", help="Emit the full machine-readable result"
+    )
+
+    # --- intake inspect/retry ---
+    p_intake = sub.add_parser(
+        "intake",
+        help="Inspect or retry a durable qualification intake",
+    )
+    intake_sub = p_intake.add_subparsers(dest="intake_action")
+    p_intake_show = intake_sub.add_parser(
+        "show", help="Show safe status, failure path, and retry budget"
+    )
+    p_intake_show.add_argument("intake_id")
+    p_intake_show.add_argument("--json", action="store_true")
+    p_intake_retry = intake_sub.add_parser(
+        "retry", help="Retry an attention-required intake within its budget"
+    )
+    p_intake_retry.add_argument("intake_id")
 
     # --- legacy-reconcile ---
     p_legacy_reconcile = sub.add_parser(
@@ -698,37 +740,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_clear_terminal_state.add_argument("--reason", required=True)
     p_clear_terminal_state.add_argument("--json", action="store_true")
 
-    p_release = sub.add_parser(
-        "release",
-        help="Operator gate: release a product card from Release / Measure",
+    p_release_state = sub.add_parser(
+        "release-state",
+        help="Show the truthful Epic release / member integration state (read-only)",
         description=(
-            "Run release orchestration (integrate the reviewed candidate, "
-            "evaluate deployment policy, then finish the card) for a product "
-            "card sitting at release_measure. This is the human merge gate: "
-            "no worker profile owns it, and generic `complete` cannot perform "
-            "the orchestration it requires."
+            "Read-only view of the Epic release lifecycle (collecting_members, "
+            "aggregate_verification, awaiting_final_release, ci_pending, "
+            "ci_failed, done) or a member's integration state. Displays the "
+            "immutable snapshot evidence. Never merges or pushes: the final "
+            "merge/push is an external operator action."
         ),
     )
-    p_release.add_argument("task_id")
-    p_release.add_argument(
-        "--note",
-        required=True,
-        help="Measurement note — release evidence, stored as the card's "
-             "terminal summary. Required and must be non-empty.",
-    )
-    p_release.add_argument(
-        "--metadata",
-        default=None,
-        help='JSON dict of completion metadata (e.g. \'{"pull_request": '
-             '"https://..."}\' on boards that require a PR). Stored on the '
-             "closing run alongside the caller-supplied operator label.",
-    )
-    p_release.add_argument(
-        "--operator-label",
-        default=None,
-        help="Caller-supplied operator label recorded on the closing run "
-             "(default: $HERMES_PROFILE or 'user')",
-    )
+    p_release_state.add_argument("task_id")
+    p_release_state.add_argument("--json", action="store_true",
+                                 help="Emit machine-readable JSON")
 
     p_edit = sub.add_parser(
         "edit",
@@ -1175,6 +1200,9 @@ def kanban_command(args: argparse.Namespace) -> int:
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
     with board_scope:
+        if action == "intake":
+            return _dispatch_intake(args)
+
         # `repair` must dispatch BEFORE the auto-init below: on a corrupt DB
         # init_db() itself raises KanbanDbCorruptError, which would turn
         # every `hermes kanban repair` into "could not initialize database"
@@ -1184,7 +1212,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         # These migrations own their full safety boundaries: dry-run must be
         # byte-for-byte read-only, while apply must snapshot before any schema
         # migration. Their implementations open the boards themselves.
-        if action not in {"qualification-migrate", "legacy-reconcile"}:
+        if action not in {"qualification-migrate", "legacy-reconcile", "v2-migrate"}:
             try:
                 kb.init_db()
             except Exception as exc:
@@ -1194,6 +1222,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "qualification-migrate": _cmd_qualification_migrate,
+            "v2-migrate": _cmd_v2_migrate,
             "legacy-reconcile": _cmd_legacy_reconcile,
             "create":   _cmd_create,
             "swarm":    _cmd_swarm,
@@ -1215,7 +1244,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
             "clear-terminal-state": _cmd_clear_terminal_state,
-            "release":  _cmd_release,
+            "release-state": _cmd_release_state,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
@@ -1268,6 +1297,78 @@ def _profile_author() -> str:
         return "user"
 
 
+def _dispatch_intake(args: argparse.Namespace) -> int:
+    action = getattr(args, "intake_action", None)
+    if action == "show":
+        return _cmd_intake_show(args)
+    if action == "retry":
+        return _cmd_intake_retry(args)
+    print("kanban intake: choose show or retry", file=sys.stderr)
+    return 2
+
+
+def _intake_retry_view(conn, intake_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
+    record = kb.get_qualification_intake(conn, intake_id)
+    if record is None:
+        raise ValueError(f"unknown qualification intake: {intake_id}")
+    events = kb.list_qualification_intake_events(conn, intake_id)
+    failure_path = next(
+        (
+            event.get("payload", {}).get("failure_path")
+            for event in reversed(events)
+            if event.get("kind") == "work_contract_verification_failed"
+            and event.get("payload", {}).get("failure_path") in {
+                "shape", "canonical_mismatch", "digest_mismatch",
+                "signature_mismatch", "key_unreadable", "io_error",
+            }
+        ),
+        None,
+    )
+    state = kb.qualification_retry_state(
+        conn, intake_id, kanban_intake.qualification_max_total_attempts(metadata)
+    )
+    return {
+        "intake_id": intake_id,
+        "status": record["status"],
+        "failure_path": failure_path,
+        "attempts_used": state.attempts_used,
+        "attempts_limit": state.attempts_limit,
+        "retry_allowed": state.allowed and record["status"] == "attention_required",
+    }
+
+
+def _cmd_intake_show(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        metadata = kb.read_board_metadata(kb.get_current_board())
+        view = _intake_retry_view(conn, args.intake_id, metadata)
+    if getattr(args, "json", False):
+        print(json.dumps(view, indent=2, ensure_ascii=False))
+    else:
+        print(f"Intake {view['intake_id']}: {view['status']}")
+        if view["failure_path"]:
+            print(f"Failure path: {view['failure_path']}")
+        print(
+            f"Attempts: {view['attempts_used']}/{view['attempts_limit']} "
+            f"(retry {'allowed' if view['retry_allowed'] else 'not allowed'})"
+        )
+    return 0
+
+
+def _cmd_intake_retry(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        try:
+            ok = kb.retry_qualification_intake(conn, args.intake_id)
+        except ValueError as exc:
+            print(f"kanban intake retry: {exc}", file=sys.stderr)
+            return 1
+    if not ok:
+        print(f"kanban intake retry: {args.intake_id} was not scheduled", file=sys.stderr)
+        return 1
+    kanban_intake._wake_intake_qualifier()
+    print(f"{args.intake_id}: pending")
+    return 0
+
+
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init",
     "create",
@@ -1283,7 +1384,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "attach-rm",
     "complete",
     "clear-terminal-state",
-    "release",
+    "release-state",
     "edit",
     "block",
     "schedule",
@@ -1640,6 +1741,42 @@ def _cmd_qualification_migrate(args: argparse.Namespace) -> int:
             f"{counts['running']} running, {counts['ambiguous']} ambiguous."
         )
         print("Ready to apply." if result["strict_ready"] else "Not safe to apply.")
+    return 0
+
+
+def _cmd_v2_migrate(args: argparse.Namespace) -> int:
+    db_path = getattr(args, "db_path", "")
+    if not db_path:
+        print("kanban v2-migrate: <db-path> is required", file=sys.stderr)
+        return 2
+
+    try:
+        if args.apply:
+            result = kanban_v2_migration.apply_db(
+                db_path,
+                recovery_root=args.recovery_root,
+            )
+        else:
+            result = kanban_v2_migration.audit_db(db_path)
+    except kanban_v2_migration.MigrationBlocked as exc:
+        print(f"kanban v2-migrate: blocked: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    elif args.apply:
+        print(
+            f"V2 migration applied: {result['changed']} task(s) backfilled to product workflow. "
+            f"Receipt: {result['receipt_path']}"
+        )
+    else:
+        counts = result["counts"]
+        print(
+            f"V2 dry-run: {counts['total']} task(s), "
+            f"{counts['already_product']} already product, "
+            f"{counts['needs_migration']} need migration."
+        )
+        print("Ready to apply." if not counts.get("active", 0) else "Not safe to apply.")
     return 0
 
 
@@ -2471,221 +2608,377 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _acquire_release_lock(task_id: str):
-    """Exclusive host-wide advisory lock for one card's release.
-
-    Reuses the kernel's existing flock helper — no second locking scheme.
-    Raises RuntimeError when another release of the same card holds it.
-    """
-    from hermes_cli.worktree_dependencies import _acquire_project_lock
-    from pathlib import Path as _Path
-
-    hermes_home = _Path(os.environ.get("HERMES_HOME", _Path.home() / ".hermes"))
-    return _acquire_project_lock(hermes_home / "release-lease" / task_id)
-
-
-def _release_release_lock(lock) -> None:
-    if lock is None:
-        return
-    try:
-        lock.release()
-    except Exception:
-        pass
-
-
-def _cmd_release(args: argparse.Namespace) -> int:
-    """Run release orchestration for a product card at Release / Measure.
-
-    ``release_measure`` is deliberately unassigned — no ordinary worker may
-    hold it (see ``kanban_qualifier``), and generic ``complete`` runs plain
-    ``complete_task``, which correctly refuses the step for lack of release
-    orchestration. That left the human whose gate it is with no supported way
-    through it. This is that way: the same ``release_product_task`` the
-    worker-side tool calls, driven by an operator, with every gate intact
-    (board/task scoping, lifecycle state, release evidence, deployment policy,
-    smoke/rollback evidence). The worker-environment check below is defense in
-    depth, not authorization: a caller that controls its own environment can
-    bypass it.
-    """
+def _cmd_release_state(args: argparse.Namespace) -> int:
+    """Read-only surface: show the truthful release state for a task."""
     task_id = args.task_id
-    # Defense in depth only; the process can alter its own environment.
-    if os.environ.get("HERMES_KANBAN_TASK"):
-        print(
-            "kanban: release is the human operator gate — a kanban worker "
-            "cannot release a card. Complete your own step and let the "
-            "operator run `hermes kanban release`.",
-            file=sys.stderr,
-        )
-        return 2
-    note = (getattr(args, "note", None) or "").strip()
-    if not note:
-        print(
-            "kanban: --note is required and must be non-empty: the measurement "
-            "note is release evidence, recorded as the card's terminal summary.",
-            file=sys.stderr,
-        )
-        return 2
-    metadata: Optional[dict] = None
-    raw_meta = getattr(args, "metadata", None)
-    if raw_meta:
-        try:
-            metadata = json.loads(raw_meta)
-            if not isinstance(metadata, dict):
-                raise ValueError("must be a JSON object")
-        except (ValueError, json.JSONDecodeError) as exc:
-            print(f"kanban: --metadata: {exc}", file=sys.stderr)
-            return 2
-    operator_label = getattr(args, "operator_label", None) or _profile_author()
-    board = kb.get_current_board()
+    board = getattr(args, "board", None)
+    json_out = getattr(args, "json", False)
+
     with kb.connect_closing(board=board) as conn:
         task = kb.get_task(conn, task_id)
         if task is None:
             print(f"kanban: unknown task {task_id}", file=sys.stderr)
             return 1
-        is_epic = task.work_item_kind == "epic"
-        # Legacy epics predate product-workflow metadata: work_item_kind is
-        # 'epic' while workflow_template_id and current_step_key are null. The
-        # kernel accepts those for release, so the CLI must not refuse them
-        # ahead of it — only ordinary cards carry the step requirement.
-        if not is_epic and (
-            task.workflow_template_id != "product"
-            or task.current_step_key != "release_measure"
-        ):
-            print(
-                f"kanban: cannot release {task_id}: release orchestration "
-                f"applies only to a product card at release_measure "
-                f"(this card is workflow={task.workflow_template_id or 'none'} "
-                f"step={task.current_step_key or 'none'}).",
-                file=sys.stderr,
-            )
-            return 1
-        if kb.has_unresolved_product_preflight(conn, task_id):
-            print(
-                f"kanban: cannot release {task_id}: it has an unresolved "
-                "product preflight. Resolve it first (Resolver, or "
-                "`hermes kanban answer-escalation`), then release.",
-                file=sys.stderr,
-            )
-            return 1
-        board_meta = kb.product_board_metadata(board)
-        workflow = kb._product_workflow_dict(board_meta)
-        policy_name = str(workflow.get("deployment_policy") or "manual").strip()
-        # Keep this name in sync with release_product_task.
-        if policy_name not in {"manual", "not_required", "required"}:
-            print(
-                f"kanban: cannot release {task_id}: unsupported deployment policy "
-                f"{policy_name!r}; no changes were made.",
-                file=sys.stderr,
-            )
-            return 1
-        if policy_name == "required":
-            print(
-                f"kanban: cannot release {task_id}: deployment policy 'required': "
-                "an adapter-backed controller is required; the CLI supplies no adapter "
-                "and no changes were made.",
-                file=sys.stderr,
-            )
-            return 1
-        if workflow.get("pull_request_required") is True and not (
-            isinstance(metadata, dict) and metadata.get("pull_request")
-        ):
-            print(
-                f"kanban: cannot release {task_id}: missing required pull_request "
-                "metadata; no changes were made.",
-                file=sys.stderr,
-            )
-            return 1
-        completion_metadata = dict(metadata or {})
-        completion_metadata.update(
-            release_operator_label=operator_label, release_surface="cli"
-        )
-        # Take the card's run lease before mutating anything. Two operators
-        # (or an operator and a dispatcher) releasing the same card would
-        # otherwise both pass their preflight and both integrate. Epics are
-        # deliberately unclaimable (`claim_task` refuses work_item_kind=epic),
-        # so they release without a lease exactly as before.
-        expected_run_id = None
-        epic_lock = None
-        if is_epic:
-            # Epics are deliberately unclaimable (`claim_task` refuses
-            # work_item_kind=epic), so the run-lease CAS is unavailable to
-            # them. Serialize on the same advisory file lock the kernel
-            # already uses for verification worktrees rather than inventing a
-            # second locking scheme. Host-scoped, which matches the threat:
-            # two operator terminals on this machine.
-            try:
-                epic_lock = _acquire_release_lock(task_id)
-            except RuntimeError:
-                print(
-                    f"kanban: cannot release {task_id}: another release of this "
-                    "epic is already running on this host. Nothing was changed.",
-                    file=sys.stderr,
-                )
-                return 1
+        state = _task_release_state(conn, task_id, board=board)
+        if json_out:
+            print(json.dumps(state, indent=2, default=str))
+            return 0
+
+        if state["kind"] == "epic":
+            _print_epic_release_state(state)
+        elif state["kind"] == "member":
+            _print_member_release_state(state)
         else:
-            claimed = kb.claim_task(conn, task_id)
-            if claimed is None:
-                print(
-                    f"kanban: cannot release {task_id}: it is already claimed — "
-                    "another operator or a worker holds the run lease. Nothing "
-                    "was changed.",
-                    file=sys.stderr,
-                )
-                return 1
-            expected_run_id = claimed.current_run_id
-
-        def _release_lease() -> None:
-            """Return an unmutated card to ready after an early refusal."""
-            if expected_run_id is not None:
-                kb.reclaim_task(conn, task_id, reason="release refused")
-
-        try:
-            result = kb.release_product_task(
-                conn,
-                task_id,
-                board,
-                None,
-                None,
-                measurement_note=note,
-                completion_metadata=completion_metadata,
-                expected_run_id=expected_run_id,
-            )
-        except kb.ReleaseEvidenceError as exc:
-            _release_lease()
-            _release_release_lock(epic_lock)
-            print(
-                f"kanban: release of {task_id} blocked by release evidence "
-                f"policy. Missing: {', '.join(exc.missing)}. The card remains "
-                "at release_measure.",
-                file=sys.stderr,
-            )
-            return 1
-        except ValueError as exc:
-            _release_lease()
-            _release_release_lock(epic_lock)
-            print(f"kanban: cannot release {task_id}: {exc}", file=sys.stderr)
-            return 1
-        except Exception:
-            _release_lease()
-            _release_release_lock(epic_lock)
-            raise
-        if not result.released:
-            _release_lease()
-    if epic_lock is not None:
-        _release_release_lock(epic_lock)
-    if not result.released:
-        print(
-            f"kanban: release of {task_id} did not complete: {result.status}. "
-            "The card remains at release_measure.",
-            file=sys.stderr,
-        )
-        return 1
-    sha = (result.integration_sha or "")[:12]
-    print(
-        f"Released {task_id} (operator label: {operator_label})"
-        + (f" (integrated {sha})" if sha else "")
-    )
+            _print_standalone_release_state(state, task)
     return 0
+
+
+def _print_epic_release_state(state: dict[str, Any]) -> None:
+    evidence = state.get("evidence") or {}
+    label = "actionable" if state.get("actionable") else "read-only"
+    print(f"Release state: {state['state']} ({label})")
+    print(f"  epic:           {state['epic_id']}")
+    if evidence.get("epic_tip_sha"):
+        print(f"  epic tip:       {evidence['epic_tip_sha']}")
+    if evidence.get("target_branch"):
+        print(f"  target branch:  {evidence['target_branch']}")
+    if evidence.get("target_pre_sha"):
+        print(f"  target pre-SHA: {evidence['target_pre_sha']}")
+    if evidence.get("release_candidate_sha"):
+        print(f"  candidate SHA:  {evidence['release_candidate_sha']}")
+    if evidence.get("candidate_ref"):
+        print(f"  candidate ref:  {evidence['candidate_ref']}")
+    if evidence.get("pushed_sha"):
+        print(f"  pushed SHA:     {evidence['pushed_sha']}")
+    members = evidence.get("members")
+    if isinstance(members, list) and members:
+        print(f"  members:        {', '.join(str(m) for m in members)}")
+    blockers = evidence.get("blockers")
+    if isinstance(blockers, list) and blockers:
+        print(f"  blockers:       {', '.join(str(b) for b in blockers)}")
+    ci = evidence.get("ci_evidence")
+    if isinstance(ci, dict):
+        for wf, url in sorted(ci.items()):
+            print(f"  CI {wf}:         {url}")
+    action_text = state.get("action")
+    if action_text:
+        print(f"  action:         {action_text}")
+
+
+def _print_member_release_state(state: dict[str, Any]) -> None:
+    evidence = state.get("evidence") or {}
+    print(f"Member release state: {state['state']}")
+    if evidence.get("epic_id"):
+        print(f"  epic:           {evidence['epic_id']}")
+    intent_info = evidence.get("intent")
+    if intent_info:
+        print(f"  integration:    status={intent_info.get('status')}"
+              f", attempt={intent_info.get('attempt_count')}")
+        safe_code = intent_info.get("safe_code")
+        if safe_code:
+            print(f"  safe code:      {safe_code}")
+    fact = evidence.get("fact")
+    if fact:
+        print(f"  integrated:     candidate={str(fact.get('candidate_sha', ''))[:12]}..."
+              f" at {fact.get('integrated_at')}")
+
+
+def _print_standalone_release_state(state: dict[str, Any], task) -> None:
+    step = task.current_step_key or "(none)"
+    print(f"Release state: {state['state']} (step: {step})")
+
+
+# ---------------------------------------------------------------------------
+# Epic release state read model — also imported by the dashboard plugin API.
+# ---------------------------------------------------------------------------
+
+
+def _task_release_state(
+    conn,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
+    """Truthful read-only release state for any task (Epic, member, standalone).
+
+    Returns a plain dict with ``kind``, ``state``, ``actionable``,
+    ``evidence``, and optional ``action``.  For Epics, ``actionable`` is
+    ``True`` only when the pinned handoff target is verified actionable
+    right now via ``build_epic_release_handoff`` (the E06 target check).
+    """
+    task = kb.get_task(conn, task_id)
+    if task is None:
+        raise ValueError(f"unknown task {task_id}")
+
+    if task.work_item_kind == "epic":
+        return _epic_release_state(conn, task_id, board=board)
+
+    epic_id = kb.epic_id_for_task(conn, task_id)
+    if epic_id is not None:
+        return _member_release_state(conn, task_id, epic_id)
+
+    return _standalone_release_state(task)
+
+
+def _epic_release_state(
+    conn,
+    epic_id: str,
+    *,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
+    """Derive the truthful Epic release lifecycle state from durable rows.
+
+    Named states follow the canonical lifecycle:
+
+      collecting_members → aggregate_verification → awaiting_final_release
+        → ci_pending → ci_failed | done
+    """
+    if kb.get_task(conn, epic_id) is None:
+        raise ValueError(f"unknown epic {epic_id}")
+
+    evidence: dict[str, Any] = {"epic_id": epic_id}
+
+    # Snapshot rows are the durable truth for post-verification phases.
+    row = conn.execute(
+        "SELECT * FROM epic_release_snapshots WHERE epic_id=? "
+        "AND status IN ('awaiting_push','ci_pending','ci_failed','released') "
+        "ORDER BY id DESC LIMIT 1",
+        (epic_id,),
+    ).fetchone()
+
+    snapshot_status: Optional[str] = None
+    if row is not None:
+        snapshot_status = str(row["status"])
+        evidence.update({
+            "epic_tip_sha": str(row["epic_tip_sha"] or ""),
+            "target_branch": str(row["target_branch"] or ""),
+            "target_pre_sha": str(row["target_pre_sha"] or ""),
+            "release_candidate_sha": str(row["release_candidate_sha"] or ""),
+            "candidate_ref": str(row["candidate_ref"] or ""),
+            "aggregate_verification_event_id": int(row["aggregate_verification_event_id"]),
+            "repository_contract_digest": str(row["repository_contract_digest"] or ""),
+            "pushed_sha": str(row["pushed_sha"]) if row["pushed_sha"] else None,
+            "created_at": int(row["created_at"]),
+            "updated_at": int(row["updated_at"]),
+        })
+
+    if snapshot_status == "released":
+        return {
+            "kind": "epic",
+            "epic_id": epic_id,
+            "state": "done",
+            "actionable": False,
+            "evidence": evidence,
+            "action": None,
+        }
+
+    # Readiness derivation — degrades cleanly when the repository is down.
+    try:
+        readiness = kb.epic_readiness(conn, epic_id, board=board)
+    except Exception:
+        readiness = ker.EpicReadiness(epic_id, None, (), ("repository_unavailable",))
+
+    if readiness.epic_tip_sha:
+        evidence["epic_tip_sha"] = readiness.epic_tip_sha
+    if readiness.blockers:
+        evidence["blockers"] = list(readiness.blockers)
+    evidence["members"] = [
+        {
+            "story_id": m.story_id,
+            "source_sha": m.source_sha,
+            "candidate_sha": m.candidate_sha,
+            "integrated_at": m.integrated_at,
+        }
+        for m in readiness.members
+    ]
+
+    if snapshot_status == "awaiting_push":
+        # Actionable only after the immediate E06 target check succeeds.
+        handoff = _try_build_epic_release_handoff(conn, epic_id, board=board)
+        if handoff:
+            evidence.update(handoff.get("evidence") or {})
+            return {
+                "kind": "epic",
+                "epic_id": epic_id,
+                "state": "awaiting_final_release",
+                "actionable": True,
+                "evidence": evidence,
+                "action": handoff.get("action"),
+            }
+        return {
+            "kind": "epic",
+            "epic_id": epic_id,
+            "state": "awaiting_push",
+            "actionable": False,
+            "evidence": evidence,
+            "action": None,
+        }
+
+    if snapshot_status == "ci_pending":
+        return {
+            "kind": "epic",
+            "epic_id": epic_id,
+            "state": "ci_pending",
+            "actionable": False,
+            "evidence": evidence,
+            "action": None,
+        }
+
+    if snapshot_status == "ci_failed":
+        ci_ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind IN ('epic_release_ci_failed', 'epic_release_released') "
+            "ORDER BY id DESC LIMIT 1",
+            (epic_id,),
+        ).fetchone()
+        if ci_ev is not None and ci_ev["payload"]:
+            try:
+                ci_payload = json.loads(ci_ev["payload"])
+                conclusions = ci_payload.get("conclusions")
+                if isinstance(conclusions, dict):
+                    evidence["ci_evidence"] = conclusions
+            except (TypeError, json.JSONDecodeError):
+                pass
+        return {
+            "kind": "epic",
+            "epic_id": epic_id,
+            "state": "ci_failed",
+            "actionable": False,
+            "evidence": evidence,
+            "action": None,
+        }
+
+    if readiness.ready:
+        return {
+            "kind": "epic",
+            "epic_id": epic_id,
+            "state": "aggregate_verification",
+            "actionable": False,
+            "evidence": evidence,
+            "action": None,
+        }
+
+    if readiness.blockers == ("not_governed_epic",):
+        progress = kb.epic_progress(conn, epic_id)
+        evidence["progress"] = dict(progress)
+        named = "collecting_members"
+        if progress["total"] > 0 and progress["done"] == progress["total"]:
+            named = "aggregate_verification"
+        return {
+            "kind": "epic",
+            "epic_id": epic_id,
+            "state": named,
+            "actionable": False,
+            "evidence": evidence,
+            "action": None,
+        }
+
+    return {
+        "kind": "epic",
+        "epic_id": epic_id,
+        "state": "collecting_members",
+        "actionable": False,
+        "evidence": evidence,
+        "action": None,
+    }
+
+
+def _try_build_epic_release_handoff(
+    conn,
+    epic_id: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Run the E06 target check and return evidence + action, or None."""
+    try:
+        handoff = kb.build_epic_release_handoff(conn, epic_id, board=board)
+    except Exception:
+        return None
+    return {
+        "evidence": {
+            "local_target_head": handoff.local_target_head,
+            "remote_target_head": handoff.remote_target_head,
+            "remote_name": handoff.remote_name,
+            "checked_at": handoff.checked_at,
+        },
+        "action": handoff.action,
+    }
+
+
+def _member_release_state(
+    conn,
+    task_id: str,
+    epic_id: str,
+) -> dict[str, Any]:
+    """Derive member integration state from intents and durable facts."""
+    evidence: dict[str, Any] = {"epic_id": epic_id}
+
+    intent_row = conn.execute(
+        "SELECT * FROM story_integration_intents WHERE story_id=? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+
+    fact_row = conn.execute(
+        "SELECT * FROM epic_story_integrations WHERE story_id=? AND epic_id=? "
+        "ORDER BY integrated_at DESC LIMIT 1",
+        (task_id, epic_id),
+    ).fetchone()
+
+    if fact_row is not None:
+        evidence["fact"] = {
+            "source_sha": str(fact_row["source_sha"]),
+            "candidate_sha": str(fact_row["candidate_sha"]),
+            "integrated_at": int(fact_row["integrated_at"]),
+        }
+        return {
+            "kind": "member",
+            "task_id": task_id,
+            "state": "integrated",
+            "actionable": False,
+            "evidence": evidence,
+        }
+
+    if intent_row is not None:
+        intent = {
+            "status": str(intent_row["status"]),
+            "attempt_count": int(intent_row["attempt_count"]),
+            "source_sha": str(intent_row["source_sha"] or ""),
+            "candidate_sha": str(intent_row["candidate_sha"] or ""),
+        }
+        safe_code = intent_row["last_failure_code"]
+        if safe_code:
+            intent["safe_code"] = str(safe_code)
+        evidence["intent"] = intent
+        state_name = "integrating"
+        if intent_row["status"] == "attention_required" or safe_code:
+            state_name = "integration_failed"
+        return {
+            "kind": "member",
+            "task_id": task_id,
+            "state": state_name,
+            "actionable": False,
+            "evidence": evidence,
+        }
+
+    return {
+        "kind": "member",
+        "task_id": task_id,
+        "state": "not_integrated",
+        "actionable": False,
+        "evidence": evidence,
+    }
+
+
+def _standalone_release_state(task) -> dict[str, Any]:
+    step = task.current_step_key
+    return {
+        "kind": "standalone",
+        "task_id": task.id,
+        "state": step or task.status,
+        "actionable": False,
+        "evidence": {"current_step_key": step},
+    }
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:

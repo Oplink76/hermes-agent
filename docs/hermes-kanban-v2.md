@@ -161,20 +161,38 @@ repository service and must be recorded as a distinct observation.
 Run the proof against a temporary bare remote, local clone, board database, and
 worktrees. Capture the exact command, result count, duration, authority SHAs,
 retained diagnostic paths, and clean/dirty status. The repository proof should
-show that a configured non-checked-out `base_ref` resolves correctly, a newer
+show that a configured non-checked-out ``base_ref`` resolves correctly, a newer
 Epic tip refreshes the story, the configured command passes, generated output
 is restored, and the remote refs are byte-for-byte unchanged.
 
 ```bash
 scripts/run_tests.sh \
   tests/hermes_cli/test_kanban_repository.py \
-  tests/e2e/test_kanban_product_recovery_flow.py -q
+  tests/e2e/test_kanban_product_recovery_flow.py \
+  tests/e2e/test_kanban_epic_integration_release.py -q
+```
 
+The E2E epic-integration file (``test_kanban_epic_integration_release.py``)
+provides the structural no-remote-write proof: a push-refusing fake ``git``
+executable on PATH logs every engine invocation and exercises the full public
+path — dispatcher (``reconcile``), integrator (story→Epic-merge lifecycle),
+snapshot (prepare + invalidation), dashboard API (release-state), CLI
+(``release-state`` and ``v2-migrate``), CI observer (``observe_epic_release_ci``),
+and migration (audit/apply/grandfathering) — asserting zero ``push``
+invocations and a byte-identical bare remote after every operation. Only the
+harness-side ``FakeGit.real()`` runner may write to the remote.
+
+The recovery-flow file (``test_kanban_product_recovery_flow.py``) carries an
+additional cross-surface no-push test exercising the same public paths through
+the fake ``git`` and asserting the remote is untouched.
+
+```bash
 rg -n "git push|push --force|update-ref.*refs/remotes" \
   hermes_cli/kanban_repository.py \
   hermes_cli/kanban_db.py \
   tests/hermes_cli/test_kanban_repository.py \
-  tests/e2e/test_kanban_product_recovery_flow.py
+  tests/e2e/test_kanban_product_recovery_flow.py \
+  tests/e2e/test_kanban_epic_integration_release.py
 ```
 
 The scan may match explicit refusal text or fixture assertions, but it must not
@@ -192,3 +210,97 @@ Before handoff, verify:
 - generated mutations were recorded and restored;
 - no remote ref changed;
 - the target worktree contains only the intended test/documentation changes.
+
+
+## V2 product migration (``hermes kanban v2-migrate``)
+
+The ``v2-migrate`` subcommand provides a guarded, manifest-hashed migration
+from a generic kanban board to a product v2 board. It operates exclusively on
+**explicit scratch copies** of the kanban database — it refuses any path that
+resolves to a live board. This ensures the migration can be proven safe before
+the operator copies the migrated DB into place.
+
+### Safety properties
+
+- **Scratch-only.** The migration reads and writes only explicit absolute file
+  paths. Board-slug resolution, the ``default`` board symlink, and live DB
+  paths are rejected with a ``MigrationBlocked`` error.
+- **Manifest-hashed.** Every dry-run and apply produces a SHA-256 content
+  manifest. The manifest is stable for the same input DB — re-running produces
+  the identical digest.
+- **All-or-nothing.** Apply runs in one SQLite transaction. If any step fails,
+  the entire migration is rolled back and the scratch DB is left unchanged.
+- **Idempotent.** Running apply on an already-migrated scratch DB changes zero
+  rows and produces an identical receipt.
+- **Snapshot-first.** Apply creates an immutable pre-migration snapshot before
+  modifying anything. The snapshot is integrity-checked at creation time.
+- **Zero active runs.** Apply refuses to proceed if the scratch DB contains
+  any task with ``running=1``.
+- **Preserves history.** All task comments, events, links, and membership rows
+  survive the migration intact. Only ``workflow_template_id`` and
+  ``current_step_key`` columns are backfilled.
+- **Approvals never grandfather.** The migration only sets workflow metadata
+  from durable task evidence (assignee, status). No approval, review outcome,
+  or release measurement is carried forward.
+- **Facts grandfather from exact evidence.** The inferred v2 step comes from
+  the task's current ``assignee`` (mapped through ``PRODUCT_WORKFLOW_ROLE_TO_STEP``),
+  ``status``, and ``current_step_key`` — never from sibling boards or
+  external sources.
+
+### Usage
+
+```bash
+# 1. Create a scratch copy of the board database
+cp ~/.hermes/kanban.db /tmp/scratch-kanban.db
+
+# 2. Audit (dry-run) — read-only, no changes
+hermes kanban v2-migrate /tmp/scratch-kanban.db
+# Output: V2 dry-run: 8 task(s), 1 already product, 7 need migration. Ready to apply.
+
+# 3. Apply the migration
+hermes kanban v2-migrate /tmp/scratch-kanban.db --apply
+# Output: V2 migration applied: 7 task(s) backfilled to product workflow. Receipt: ...
+
+# 4. Verify the migrated DB
+hermes kanban v2-migrate /tmp/scratch-kanban.db
+# Output: V2 dry-run: 8 task(s), 8 already product, 0 need migration. Ready to apply.
+
+# 5. After verification, replace the live DB (while the dispatcher is stopped)
+mv /tmp/scratch-kanban.db ~/.hermes/kanban.db
+
+# Machine-readable output is available with --json
+hermes kanban v2-migrate /tmp/scratch-kanban.db --json
+```
+
+### What the migration does
+
+For each non-archived task that does not already have ``workflow_template_id =
+'product'`` with a valid step, the migration:
+
+1. Infers the product workflow step from the task's assignee, status, and
+   current_step_key using the same role-to-step mapping as the rest of the
+   kanban system.
+2. Sets ``workflow_template_id = 'product'`` and ``current_step_key = <inferred>``.
+3. Records a ``v2_migrated`` event on the task with the manifest digest.
+4. Does **not** change task status, assignee, work_contract_id, or any other
+   column beyond the two workflow metadata fields.
+
+Epics (``work_item_kind = 'epic'``) are recognized and skipped — they do not
+receive a workflow step.
+
+### Recovery
+
+Each apply creates an immutable snapshot directory under the recovery root
+(default: ``<db-parent>/v2-migration-snapshots/``). The snapshot contains a
+byte-for-byte copy of the pre-migration database and an ``inventory.json``
+manifest with integrity checks. To restore, copy the snapshot DB back over the
+migrated file.
+
+### Non-goals
+
+- Does not run against live boards — use a scratch copy.
+- Does not change task status, assignee, or any operational state.
+- Does not create, destroy, or modify work contracts.
+- Does not grandfather approvals from other boards.
+- Does not create a production coordinator or generalize to non-kanban DBs.
+- Does not push, merge, deploy, or touch remotes.

@@ -964,42 +964,6 @@ def test_required_deployment_rejects_explicitly_failed_evidence(
         assert task.current_step_key == "release_measure"
 
 
-def test_epic_child_integrates_before_child_done(release_home, tmp_path, monkeypatch):
-    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
-    board = "release-epic-child"
-    _release_board(board, repo)
-    with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
-        story = _release_task(conn, board, repo, branch)
-        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
-        _seed_structured_evidence(conn, story, branch, source_sha)
-
-        def integrate_before_done(inner_conn, story_id, **_kwargs):
-            assert kb.get_task(inner_conn, story_id).status != "done"
-            with kb.write_txn(inner_conn):
-                kb._append_event(
-                    inner_conn,
-                    story_id,
-                    "story_integrated_to_epic",
-                    {
-                        "source_branch": branch,
-                        "source_sha": source_sha,
-                        "target_branch": kb.epic_branch_for(epic),
-                        "candidate_sha": source_sha,
-                    },
-                )
-            return "integrated"
-
-        monkeypatch.setattr(kb, "integrate_story_to_epic", integrate_before_done)
-        result = kb.release_product_task(
-            conn, story, board, lambda _path: True, None,
-            measurement_note="child integrated",
-        )
-
-        assert result.released is True
-        assert kb.get_task(conn, story).status == "done"
-
-
 def test_dependency_edges_do_not_turn_a_reviewed_story_into_an_epic(
     release_home, tmp_path,
 ):
@@ -1060,90 +1024,15 @@ def test_dependency_parent_does_not_change_story_worktree_base(release_home):
         assert kb._story_base_branch(conn, story, board=board) is None
 
 
-def test_epic_child_failed_candidate_verification_preserves_epic_and_release_state(
-    release_home, tmp_path,
-):
-    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
-    board = "release-epic-child-verify-fails"
-    _release_board(board, repo)
-    with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
-        epic_branch = kb.epic_branch_for(epic)
-        _git(repo, "branch", epic_branch, "main")
-        story = _release_task(conn, board, repo, branch)
-        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
-        _seed_structured_evidence(conn, story, branch, source_sha)
-        epic_before = _git(repo, "rev-parse", epic_branch)
-        status_before = kb.get_task(conn, story).status
-        observed_combined_tree: list[bool] = []
-
-        def reject_combined(candidate: Path) -> bool:
-            observed_combined_tree.append((candidate / "story.txt").is_file())
-            return False
-
-        with pytest.raises(kb.ReleaseEvidenceError) as exc_info:
-            kb.release_product_task(
-                conn,
-                story,
-                board,
-                reject_combined,
-                None,
-                measurement_note="child integration rejected",
-            )
-
-        assert "integrated_branch" in exc_info.value.missing
-        assert observed_combined_tree == [True]
-        assert _git(repo, "rev-parse", epic_branch) == epic_before
-        task = kb.get_task(conn, story)
-        assert task is not None
-        assert task.status == status_before
-        assert task.current_step_key == "release_measure"
-        assert not any(
-            event.kind == "story_integrated_to_epic"
-            for event in kb.list_events(conn, story)
-        )
-
-
-def test_epic_child_verified_candidate_fast_forwards_before_done(
-    release_home, tmp_path,
-):
-    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
-    board = "release-epic-child-verified"
-    _release_board(board, repo)
-    with kb.connect(board=board) as conn:
-        epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
-        epic_branch = kb.epic_branch_for(epic)
-        _git(repo, "branch", epic_branch, "main")
-        story = _release_task(conn, board, repo, branch)
-        kb.add_epic_membership(conn, epic_id=epic, task_id=story)
-        _seed_structured_evidence(conn, story, branch, source_sha)
-        observed: list[str] = []
-
-        def accept_combined(candidate: Path) -> bool:
-            observed.append((candidate / "story.txt").read_text(encoding="utf-8"))
-            return True
-
-        result = kb.release_product_task(
-            conn,
-            story,
-            board,
-            accept_combined,
-            None,
-            measurement_note="child integration verified",
-        )
-
-        assert result.released is True
-        assert observed == ["released\n"]
-        assert _git(repo, "merge-base", "--is-ancestor", source_sha, epic_branch) == ""
-        task = kb.get_task(conn, story)
-        assert task is not None
-        assert task.status == "done"
-        assert task.current_step_key == "done"
-
-
 def test_epic_release_requires_every_child_done_and_integrated(
     release_home, tmp_path, monkeypatch,
 ):
+    """Epic release needs every child done AND a durable integration fact.
+
+    Migrated from the legacy epic-member release model (E01-E03): the gate's
+    authority is the durable ``epic_story_integrations`` fact row, not the
+    prunable ``story_integrated_to_epic`` event.
+    """
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = "release-epic"
     _release_board(board, repo)
@@ -1178,14 +1067,11 @@ def test_epic_release_requires_every_child_done_and_integrated(
         merge.assert_not_called()
 
         with kb.write_txn(conn):
-            kb._append_event(
-                conn,
-                child,
-                "story_integrated_to_epic",
-                {
-                    "target_branch": kb.epic_branch_for(epic),
-                    "candidate_sha": source_sha,
-                },
+            conn.execute(
+                "INSERT INTO epic_story_integrations "
+                "(epic_id, story_id, source_sha, candidate_sha, integrated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (epic, child, source_sha, source_sha, 1),
             )
 
         def merge_before_done(inner_conn, epic_id, **_kwargs):
@@ -1216,6 +1102,12 @@ def test_epic_release_requires_every_child_done_and_integrated(
 def test_epic_release_evidence_binds_to_derived_integration_branch(
     release_home, tmp_path, monkeypatch,
 ):
+    """Epic release evidence binds to the derived epic integration branch.
+
+    Migrated from the legacy epic-member release model (E01-E03): the child
+    integration prerequisite is a durable ``epic_story_integrations`` fact row
+    instead of the prunable ``story_integrated_to_epic`` event.
+    """
     repo, task_branch, _task_sha = _repo_with_story_branch(tmp_path)
     board = "release-epic-reviewed-branch"
     _release_board(board, repo)
@@ -1249,11 +1141,11 @@ def test_epic_release_evidence_binds_to_derived_integration_branch(
         _git(repo, "switch", "main")
 
         with kb.write_txn(conn):
-            kb._append_event(
-                conn,
-                child,
-                "story_integrated_to_epic",
-                {"target_branch": epic_branch, "candidate_sha": epic_sha},
+            conn.execute(
+                "INSERT INTO epic_story_integrations "
+                "(epic_id, story_id, source_sha, candidate_sha, integrated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (epic, child, epic_sha, epic_sha, 1),
             )
         _seed_structured_evidence(conn, epic, epic_branch, epic_sha)
 

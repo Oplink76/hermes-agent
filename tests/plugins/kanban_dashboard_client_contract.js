@@ -137,6 +137,44 @@ async function main() {
   const form = new CapturedFormData();
   testHook.appendExpectedTaskSnapshot(form, task);
   assert.deepEqual(JSON.parse(form.get("expected_snapshot")), expectedSnapshot);
+
+  // ---- Truthful release state contract ----------------------------------
+  // The bundle must expose the named Epic release states and member
+  // integration states, and its release panel must expose NO action that
+  // could invoke merge or push.
+  assert.ok(testHook.releaseStateLabels, "releaseStateLabels exported");
+  const requiredStates = [
+    "collecting_members",
+    "aggregate_verification",
+    "awaiting_final_release",
+    "awaiting_push",
+    "ci_pending",
+    "ci_failed",
+    "done",
+    "integrating",
+    "integration_failed",
+    "integrated",
+  ];
+  for (const state of requiredStates) {
+    assert.ok(
+      testHook.releaseStateLabels[state],
+      `named release state ${state} is labelled`,
+    );
+  }
+  assert.equal(typeof testHook.releaseActionsFor, "function");
+  for (const state of requiredStates) {
+    const actions = testHook.releaseActionsFor({ state: state });
+    // Cross-realm: the bundle returns arrays from its own VM context, so
+    // compare shape rather than deepStrictEqual prototype equality.
+    assert.ok(Array.isArray(actions) && actions.length === 0,
+      `no merge/push action for state ${state}`);
+  }
+
+  // No request in this session may target a merge/push/transport route.
+  for (const captured of requests) {
+    assert.ok(!/merge|push|release-product|integrate/i.test(String(captured.url)),
+      `no transport route may be invoked (saw ${captured.url})`);
+  }
 }
 
 main().catch(function (error) {

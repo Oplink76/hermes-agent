@@ -436,14 +436,15 @@ def test_board_and_detail_keep_epics_separate_from_dependency_relations(client):
         task for column in board["columns"] for task in column["tasks"]
     ]
     assert epic_id not in {task["id"] for task in column_tasks}
-    assert board["epics"] == [
-        {
-            "id": epic_id,
-            "title": "Portfolio outcome",
-            "workItemKind": "epic",
-            "progress": {"done": 0, "total": 1, "release_state": "pending"},
-        }
-    ]
+    epics = board["epics"]
+    assert len(epics) == 1
+    assert epics[0]["id"] == epic_id
+    assert epics[0]["title"] == "Portfolio outcome"
+    assert epics[0]["workItemKind"] == "epic"
+    assert epics[0]["progress"] == {"done": 0, "total": 1, "release_state": "pending"}
+    # Truthful named lifecycle state surfaced per epic (E07).
+    assert epics[0]["release_state"] == "collecting_members"
+    assert epics[0]["release_actionable"] is False
     member = next(task for task in column_tasks if task["id"] == member_id)
     assert member["workItemKind"] == "card"
     assert member["epic"] == {"id": epic_id, "title": "Portfolio outcome"}
@@ -465,6 +466,10 @@ def test_board_and_detail_keep_epics_separate_from_dependency_relations(client):
         "total": 1,
         "release_state": "pending",
     }
+    named = epic_detail["epic_detail"]
+    assert named["release_state"] == "collecting_members"
+    assert named["release"]["state"] == "collecting_members"
+    assert named["release"]["actionable"] is False
 
 
 def test_strict_board_post_tasks_returns_intake_without_task(client):
@@ -689,15 +694,20 @@ def test_task_and_epic_detail_expose_safe_work_contract_views(client):
     epic = client.get(
         f"/api/plugins/kanban/tasks/{epic_id}?board=strict"
     ).json()
-    assert epic["epic_detail"] == {
-        "outcome": "Customers receive the governed outcome",
-        "scope": ["Hermes"],
-        "constraints": ["bypass release evidence"],
-        "definition_of_done": ["outcome measured"],
-        "members": [card_id],
-        "progress": {"done": 0, "total": 1, "release_state": "pending"},
-        "release_state": "pending",
+    assert epic["epic_detail"]["outcome"] == "Customers receive the governed outcome"
+    assert epic["epic_detail"]["scope"] == ["Hermes"]
+    assert epic["epic_detail"]["constraints"] == ["bypass release evidence"]
+    assert epic["epic_detail"]["definition_of_done"] == ["outcome measured"]
+    assert epic["epic_detail"]["members"] == [card_id]
+    assert epic["epic_detail"]["progress"] == {
+        "done": 0, "total": 1, "release_state": "pending",
     }
+    # E07: truthful named lifecycle state (read-only), not the coarse flag.
+    assert epic["epic_detail"]["release_state"] == "collecting_members"
+    release = epic["epic_detail"]["release"]
+    assert release["kind"] == "epic"
+    assert release["state"] == "collecting_members"
+    assert release["actionable"] is False
     serialized = json.dumps(epic).lower()
     assert "signature" not in serialized
     assert "canonical_json" not in serialized
@@ -3046,6 +3056,180 @@ def test_conditional_reassign_holds_write_lock_through_canonical_mutation(
     assert race["blocked"] is True
     assert _operator_snapshot(task_id)["title"] == "Race target"
     assert _task_assignee(task_id) == "developer"
+
+
+# ---------------------------------------------------------------------------
+# Truthful release lifecycle state (E07)
+# ---------------------------------------------------------------------------
+
+
+def _epic_task(conn, epic_id="epic-e07", board=None):
+    return kb.create_task(
+        conn,
+        title=f"Epic: {epic_id}",
+        board=board,
+        work_item_kind="epic",
+    )
+
+
+def _member_task(conn, epic_id, story_id="story-e07"):
+    task_id = kb.create_task(conn, title=f"Story: {story_id}", board=None)
+    conn.execute(
+        "INSERT INTO epic_memberships (epic_id, task_id, created_at) "
+        "VALUES (?, ?, 1)",
+        (epic_id, task_id),
+    )
+    return task_id
+
+
+def test_release_state_endpoint_epic_collecting_members(client):
+    with kb.connect() as conn:
+        epic_id = _epic_task(conn)
+
+    resp = client.get(f"/api/plugins/kanban/tasks/{epic_id}/release-state")
+
+    assert resp.status_code == 200, resp.text
+    state = resp.json()
+    assert state["kind"] == "epic"
+    assert state["state"] == "collecting_members"
+    assert state["actionable"] is False
+
+
+def test_release_state_endpoint_404_for_unknown_task(client):
+    resp = client.get("/api/plugins/kanban/tasks/t_missing/release-state")
+    assert resp.status_code == 404
+
+
+def test_release_state_endpoint_epic_ci_failed(client):
+    with kb.connect() as conn:
+        epic_id = _epic_task(conn)
+        conn.execute(
+            "INSERT INTO epic_release_snapshots (epic_id, epic_tip_sha, target_branch, "
+            "target_pre_sha, release_candidate_sha, candidate_ref, "
+            "aggregate_verification_event_id, repository_contract_digest, "
+            "status, pushed_sha, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ci_failed', ?, ?, ?)",
+            (epic_id, "1" * 40, "main", "2" * 40, "3" * 40,
+             "refs/hermes/releases/epic-1", 71, "7" * 64, "6" * 40, 100, 110),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'epic_release_ci_failed', ?, 1)",
+            (epic_id, json.dumps(
+                {"conclusions": {"CI": "failure", "Deploy Test": "cancelled"}})),
+        )
+
+    resp = client.get(f"/api/plugins/kanban/tasks/{epic_id}/release-state")
+
+    assert resp.status_code == 200, resp.text
+    state = resp.json()
+    assert state["kind"] == "epic"
+    assert state["state"] == "ci_failed"
+    assert state["actionable"] is False
+    assert (state.get("evidence") or {}).get("ci_evidence") == {
+        "CI": "failure",
+        "Deploy Test": "cancelled",
+    }
+
+
+def test_release_state_endpoint_member_integrating(client):
+    with kb.connect() as conn:
+        epic_id = _epic_task(conn)
+        member_id = _member_task(conn, epic_id)
+        conn.execute(
+            "INSERT INTO story_integration_intents "
+            "(epic_id, story_id, source_sha, source_branch, review_run_id, "
+            "review_base_sha, status, attempt_count, last_failure_code, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, 'b', 1, ?, 'pending', 2, NULL, 1, 1)",
+            (epic_id, member_id, "9" * 40, "0" * 40),
+        )
+
+    resp = client.get(f"/api/plugins/kanban/tasks/{member_id}/release-state")
+
+    assert resp.status_code == 200, resp.text
+    state = resp.json()
+    assert state["kind"] == "member"
+    assert state["state"] == "integrating"
+    assert state["actionable"] is False
+    intent = (state.get("evidence") or {}).get("intent") or {}
+    assert intent.get("status") == "pending"
+    assert intent.get("attempt_count") == 2
+
+    # The member detail payload carries the same read-only state and no
+    # Release/Measure surface.
+    detail = client.get(f"/api/plugins/kanban/tasks/{member_id}").json()
+    assert detail.get("member_release_state", {}).get("state") == "integrating"
+    assert "release_measure" not in json.dumps(detail.get("member_release_state"))
+
+
+def test_release_state_endpoint_actionable_requires_e06_target_check(
+    client, monkeypatch
+):
+    """Actionable=True is granted only after the E06 target re-check passes."""
+    with kb.connect() as conn:
+        epic_id = _epic_task(conn)
+        conn.execute(
+            "INSERT INTO epic_release_snapshots (epic_id, epic_tip_sha, target_branch, "
+            "target_pre_sha, release_candidate_sha, candidate_ref, "
+            "aggregate_verification_event_id, repository_contract_digest, "
+            "status, pushed_sha, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'awaiting_push', NULL, ?, ?)",
+            (epic_id, "1" * 40, "main", "2" * 40, "3" * 40,
+             "refs/hermes/releases/epic-1", 71, "7" * 64, 100, 110),
+        )
+
+    class _Handoff:
+        def __init__(self, local_target_head, remote_target_head, remote_name,
+                     checked_at, action):
+            self.local_target_head = local_target_head
+            self.remote_target_head = remote_target_head
+            self.remote_name = remote_name
+            self.checked_at = checked_at
+            self.action = action
+
+    from hermes_cli import kanban_db
+
+    def failing_handoff(conn, eid, **kw):
+        raise kanban_db.EpicReleaseHandoffError("remote_unavailable", {"epic_id": eid})
+
+    monkeypatch.setattr(kanban_db, "build_epic_release_handoff", failing_handoff)
+    resp = client.get(f"/api/plugins/kanban/tasks/{epic_id}/release-state")
+    assert resp.status_code == 200, resp.text
+    state = resp.json()
+    assert state["state"] == "awaiting_push"
+    assert state["actionable"] is False
+
+    def passing_handoff(conn, eid, **kw):
+        return _Handoff(
+            local_target_head="2" * 40,
+            remote_target_head="2" * 40,
+            remote_name="origin",
+            checked_at=123,
+            action="Merge and push the pinned candidate externally.",
+        )
+
+    monkeypatch.setattr(kanban_db, "build_epic_release_handoff", passing_handoff)
+    resp = client.get(f"/api/plugins/kanban/tasks/{epic_id}/release-state")
+    assert resp.status_code == 200, resp.text
+    state = resp.json()
+    assert state["state"] == "awaiting_final_release"
+    assert state["actionable"] is True
+    assert "Merge and push" in (state.get("action") or "")
+
+
+def test_task_detail_surfaces_named_release_state_for_epic(client):
+    with kb.connect() as conn:
+        epic_id = _epic_task(conn)
+        member_id = _member_task(conn, epic_id)
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{epic_id}").json()
+
+    epic_detail = detail.get("epic_detail") or {}
+    assert epic_detail["release_state"] == "collecting_members"
+    assert epic_detail["release"]["kind"] == "epic"
+    assert epic_detail["release"]["state"] == "collecting_members"
+    assert epic_detail["release"]["actionable"] is False
 
 
 # ---------------------------------------------------------------------------

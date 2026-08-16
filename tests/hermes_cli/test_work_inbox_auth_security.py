@@ -237,6 +237,9 @@ def test_work_inbox_credential_can_observe_its_intake_status_only(
         "status": "pending",
         "reason": None,
         "items": [],
+        "actions": [],
+        "attempts_used": 0,
+        "attempts_limit": 3,
     }
 
     with kb.connect(board=strict_board) as conn:
@@ -406,6 +409,115 @@ def test_same_credential_can_answer_clarification_and_retry_attention(
         assert kb.list_qualification_intake_events(conn, intake_id)[-1][
             "kind"
         ] == "retry_scheduled"
+
+
+def test_work_inbox_status_exposes_retry_only_when_server_authorizes_it(
+    app_client, strict_board, strong_secret,
+):
+    headers = {"Authorization": f"Bearer {strong_secret}"}
+    submitted = app_client.post(
+        f"/api/plugins/kanban/work-inbox?board={strict_board}",
+        headers=headers,
+        json={
+            "version": 2,
+            "kind": "new_work",
+            "request": {"functional_intent": {"title": "Retry capability"}},
+        },
+    )
+    intake_id = submitted.json()["intake_id"]
+    with kb.connect(board=strict_board) as conn:
+        run = kb.claim_qualification_intake(
+            conn,
+            intake_id,
+            profile="productowner",
+            runtime_identity={"provider": "test", "model": "test", "effort": "low"},
+        )
+        assert run is not None
+        assert kb.finish_qualification_intake_run(
+            conn,
+            intake_id=intake_id,
+            run_id=run["id"],
+            claim_lock=run["claim_lock"],
+            intake_status="attention_required",
+            outcome="attention_required",
+        )
+
+    status = app_client.get(
+        "/api/plugins/kanban/work-inbox/status",
+        params={"board": strict_board, "intake_id": intake_id},
+        headers=headers,
+    )
+    assert status.status_code == 200, status.text
+    assert status.json()["attempts_used"] == 1
+    assert status.json()["attempts_limit"] == 3
+    assert status.json()["actions"] == [
+        {"id": "retry", "method": "POST", "target": "work-inbox"}
+    ]
+
+    retried = app_client.post(
+        f"/api/plugins/kanban/work-inbox?board={strict_board}",
+        headers=headers,
+        json={"version": 2, "kind": "retry", "intake_id": intake_id},
+    )
+    assert retried.status_code == 202, retried.text
+
+    pending = app_client.get(
+        "/api/plugins/kanban/work-inbox/status",
+        params={"board": strict_board, "intake_id": intake_id},
+        headers=headers,
+    )
+    assert pending.status_code == 200
+    assert pending.json()["status"] == "pending"
+    assert pending.json()["attempts_used"] == 1
+    assert pending.json()["actions"] == []
+
+
+def test_work_inbox_status_hides_retry_when_attempt_budget_is_exhausted(
+    app_client, strict_board, strong_secret,
+):
+    headers = {"Authorization": f"Bearer {strong_secret}"}
+    submitted = app_client.post(
+        f"/api/plugins/kanban/work-inbox?board={strict_board}",
+        headers=headers,
+        json={
+            "version": 2,
+            "kind": "new_work",
+            "request": {"functional_intent": {"title": "Exhaust retry"}},
+        },
+    )
+    intake_id = submitted.json()["intake_id"]
+    with kb.connect(board=strict_board) as conn:
+        for now in (10, 20, 30):
+            run = kb.claim_qualification_intake(
+                conn,
+                intake_id,
+                profile="productowner",
+                runtime_identity={"provider": "test", "model": "test", "effort": "low"},
+                now=now,
+            )
+            assert run is not None
+            assert kb.finish_qualification_intake_run(
+                conn,
+                intake_id=intake_id,
+                run_id=run["id"],
+                claim_lock=run["claim_lock"],
+                intake_status="attention_required",
+                outcome="attention_required",
+                now=now + 1,
+            )
+            if now != 30:
+                assert kb.retry_qualification_intake(conn, intake_id, now=now + 2)
+
+    status = app_client.get(
+        "/api/plugins/kanban/work-inbox/status",
+        params={"board": strict_board, "intake_id": intake_id},
+        headers=headers,
+    )
+    assert status.status_code == 200
+    assert status.json()["status"] == "attention_required"
+    assert status.json()["attempts_used"] == 3
+    assert status.json()["attempts_limit"] == 3
+    assert status.json()["actions"] == []
 
 
 def test_clarification_question_is_redacted_before_external_status_response(

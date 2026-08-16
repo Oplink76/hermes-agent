@@ -16,16 +16,19 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 FULL_DIGEST = re.compile(r"[0-9a-f]{64}")
+RELEASE_CANDIDATE_REF_PREFIX = "refs/hermes/release-candidates/"
 
 _REPOSITORY_KEYS = frozenset(
     {
@@ -129,6 +132,22 @@ class VerificationResult:
     key: VerificationReceiptKey
     error: str | None = None
     reused: bool = False
+
+
+@dataclass(frozen=True)
+class PreparedRefCASResult:
+    """Typed outcome of the sole prepared-candidate target-ref CAS path."""
+
+    kind: Literal["advanced", "reflected", "checked_out", "target_moved"]
+    current_sha: str | None
+
+
+@dataclass(frozen=True)
+class PreparedRefRecoveryResult:
+    """Relationship between a prepared candidate and the current target tip."""
+
+    kind: Literal["preimage", "candidate", "descendant", "diverged"]
+    current_sha: str | None
 
 
 _VERIFICATION_OUTPUT_TAIL_CHARS = 4096
@@ -375,6 +394,64 @@ def build_verification_receipt(
         ),
         created_at=int(created_at),
     )
+
+
+def verification_result_payload(
+    result: VerificationResult,
+    *,
+    scope: str,
+    subject_id: str,
+    created_at: int | None = None,
+) -> dict[str, Any]:
+    """Serialize bounded verification evidence with an exact passed receipt."""
+
+    payload: dict[str, Any] = {
+        "scope": scope,
+        "subject_id": subject_id,
+        "status": result.status,
+        "source_sha": result.source_sha,
+        "candidate_sha": result.candidate_sha,
+        "contract_digest": result.contract_digest,
+        "profile": result.profile,
+        "error": result.error,
+        "rework_eligible": result.status == "failed",
+        "steps": [
+            {
+                "argv": list(step.argv),
+                "workdir": str(step.workdir),
+                "status": step.status,
+                "returncode": step.returncode,
+                "duration_seconds": step.duration_seconds,
+                "stdout_tail": step.stdout_tail,
+                "stderr_tail": step.stderr_tail,
+                "error": step.error,
+            }
+            for step in result.steps
+        ],
+    }
+    if result.status == "passed":
+        receipt = build_verification_receipt(
+            result,
+            subject_id=subject_id,
+            created_at=int(time.time()) if created_at is None else int(created_at),
+        )
+        payload["receipt"] = {
+            "key": {
+                "candidate_sha": receipt.key.candidate_sha,
+                "contract_digest": receipt.key.contract_digest,
+                "command_set_digest": receipt.key.command_set_digest,
+                "runtime_toolchain_digest": receipt.key.runtime_toolchain_digest,
+                "generated_policy_digest": receipt.key.generated_policy_digest,
+                "gate_kind": receipt.key.gate_kind,
+                "executor_policy": receipt.key.executor_policy,
+                "digest": receipt.key.digest,
+            },
+            "result_digest": receipt.result_digest,
+            "created_at": receipt.created_at,
+        }
+    return payload
+
+
 def verification_receipt_from_payload(
     payload: Mapping[str, object],
 ) -> VerificationReceipt | None:
@@ -498,6 +575,35 @@ def verification_receipt_from_payload(
         return VerificationReceipt(result.key, result_digest, created_at)
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def verification_receipt_matches(
+    payload: Mapping[str, object],
+    *,
+    source_sha: str,
+    candidate_sha: str,
+    contract_digest: str,
+    gate_kind: str,
+    subject_id: str,
+    profile_name: str,
+) -> bool:
+    """Whether a persisted passed receipt exactly identifies one verification."""
+
+    receipt = verification_receipt_from_payload(payload)
+    return bool(
+        receipt is not None
+        and payload.get("source_sha") == source_sha
+        and payload.get("candidate_sha") == candidate_sha
+        and payload.get("contract_digest") == contract_digest
+        and payload.get("scope") == gate_kind
+        and payload.get("subject_id") == subject_id
+        and payload.get("profile") == profile_name
+        and receipt.key.candidate_sha == candidate_sha
+        and receipt.key.contract_digest == contract_digest
+        and receipt.key.gate_kind == gate_kind
+        and receipt.key.executor_policy
+        == f"hermes_repository_verifier:v1:{profile_name}"
+    )
 
 
 def run_verification(
@@ -758,6 +864,24 @@ class EvidenceWorkspaceResult:
         return self.declared_generated
 
 
+@dataclass(frozen=True)
+class TargetHeadsObservation:
+    """Read-only local and remote target-head observation for a handoff recheck.
+
+    ``local_head`` is ``None`` when the local branch cannot be resolved.
+    ``remote_head`` is ``None`` when the remote is unreachable or the
+    target branch does not exist on it.  ``remote_available`` is false
+    only when ``git ls-remote`` itself failed; a branch that simply
+    does not exist on the remote sets ``remote_head=None`` and
+    ``remote_available=True``.
+    """
+
+    local_head: str | None
+    remote_head: str | None
+    remote_name: str
+    remote_available: bool
+
+
 def _evidence_git(workspace: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """Run one bounded, read-only or explicit-path Git operation."""
 
@@ -773,6 +897,32 @@ def _evidence_git(workspace: Path, *args: str) -> subprocess.CompletedProcess[st
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise EvidenceWorkspaceError("git_error", str(exc)) from exc
+
+
+def _remote_observe_git(
+    repo_root: Path, *args: str
+) -> subprocess.CompletedProcess[str] | None:
+    """Run one bounded, shell-free, strictly read-only Git observation.
+
+    This seam exists so handoff tests can substitute a fake transport and
+    prove that the observation path never issues a remote-write verb.
+    The only commands routed through it are ``rev-parse`` and
+    ``ls-remote``.  Returns ``None`` instead of raising so a failing
+    observation reads as "unavailable" rather than crashing the handoff.
+    """
+
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def _evidence_paths(value: object) -> tuple[PurePosixPath, ...]:
@@ -1333,6 +1483,454 @@ def resolve_commit(repo_root: Path, ref: str) -> str:
     ):
         raise _error("missing_ref", ref)
     return sha
+
+
+def commit_contains(
+    repo_root: Path,
+    descendant_sha: str,
+    ancestor_sha: str,
+) -> bool:
+    """Return whether one exact commit contains another, including equality."""
+
+    for field, value in (
+        ("descendant_sha", descendant_sha),
+        ("ancestor_sha", ancestor_sha),
+    ):
+        if not isinstance(value, str) or FULL_SHA.fullmatch(value) is None:
+            raise RepositoryConfigurationError(f"malformed_{field}")
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(Path(repo_root).expanduser().resolve(strict=False)),
+                "merge-base",
+                "--is-ancestor",
+                ancestor_sha,
+                descendant_sha,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RepositoryConfigurationError("ancestry_check_failed") from exc
+    if completed.returncode == 0:
+        return True
+    if completed.returncode == 1:
+        return False
+    raise RepositoryConfigurationError("ancestry_check_failed")
+
+
+def _prepared_ref_git(
+    repo_root: Path, *args: str
+) -> subprocess.CompletedProcess[str]:
+    """Run one bounded, shell-free Git command for prepared-ref CAS."""
+
+    return subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+        check=False,
+    )
+
+
+def _prepared_ref_sha(repo_root: Path, ref: str) -> str | None:
+    completed = _prepared_ref_git(
+        repo_root, "rev-parse", "--verify", f"{ref}^{{commit}}"
+    )
+    value = (completed.stdout or "").strip()
+    return value if completed.returncode == 0 and FULL_SHA.fullmatch(value) else None
+
+
+def _prepared_target_is_checked_out(repo_root: Path, target_ref: str) -> bool:
+    listed = _prepared_ref_git(repo_root, "worktree", "list", "--porcelain")
+    if listed.returncode != 0:
+        raise RepositoryConfigurationError("worktree_list_failed")
+    for block in (listed.stdout or "").strip().split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in block.splitlines():
+            key, _, value = line.partition(" ")
+            fields[key] = value
+        if fields.get("branch") == target_ref and fields.get("worktree"):
+            return True
+    return False
+
+
+def advance_prepared_candidate_ref(
+    repo_root: Path,
+    *,
+    target_ref: str,
+    candidate_ref: str,
+    pre_sha: str,
+    candidate_sha: str,
+) -> PreparedRefCASResult:
+    """Advance one exact unchecked target ref by one preimage-protected CAS.
+
+    The retained candidate ref is validated before any target operation.  A
+    target already at the exact candidate is a reflected successful CAS; every
+    other preimage mismatch is typed as target movement.  Checked-out targets
+    are always refused, even when their worktree is clean.  This function has
+    no merge/read-tree/reset/clean/stash path and never deletes the retained
+    candidate ref.
+    """
+
+    root = Path(repo_root).expanduser().resolve(strict=False)
+    if (
+        not isinstance(target_ref, str)
+        or not target_ref.startswith("refs/heads/")
+        or target_ref != target_ref.strip()
+        or "\x00" in target_ref
+    ):
+        raise RepositoryConfigurationError("malformed_target_ref")
+    if (
+        not isinstance(candidate_ref, str)
+        or not candidate_ref.startswith("refs/hermes/integration-candidates/")
+        or candidate_ref != candidate_ref.strip()
+        or "\x00" in candidate_ref
+    ):
+        raise RepositoryConfigurationError("malformed_candidate_ref")
+    if not isinstance(pre_sha, str) or FULL_SHA.fullmatch(pre_sha) is None:
+        raise RepositoryConfigurationError("malformed_pre_sha")
+    if not isinstance(candidate_sha, str) or FULL_SHA.fullmatch(candidate_sha) is None:
+        raise RepositoryConfigurationError("malformed_candidate_sha")
+
+    retained_sha = _prepared_ref_sha(root, candidate_ref)
+    if retained_sha != candidate_sha:
+        raise RepositoryConfigurationError("candidate_ref_mismatch")
+    current_sha = _prepared_ref_sha(root, target_ref)
+    if current_sha == candidate_sha:
+        return PreparedRefCASResult("reflected", current_sha)
+    if current_sha != pre_sha:
+        return PreparedRefCASResult("target_moved", current_sha)
+    if _prepared_target_is_checked_out(root, target_ref):
+        return PreparedRefCASResult("checked_out", current_sha)
+
+    applied = _prepared_ref_git(
+        root, "update-ref", target_ref, candidate_sha, pre_sha
+    )
+    reflected_sha = _prepared_ref_sha(root, target_ref)
+    if applied.returncode == 0 and reflected_sha == candidate_sha:
+        return PreparedRefCASResult("advanced", reflected_sha)
+    if reflected_sha == candidate_sha:
+        return PreparedRefCASResult("reflected", reflected_sha)
+    return PreparedRefCASResult("target_moved", reflected_sha)
+
+
+def inspect_prepared_candidate_ref(
+    repo_root: Path,
+    *,
+    target_ref: str,
+    pre_sha: str,
+    candidate_sha: str,
+) -> PreparedRefRecoveryResult:
+    """Classify the four deterministic recovery states of a prepared CAS."""
+
+    root = Path(repo_root).expanduser().resolve(strict=False)
+    if (
+        not isinstance(target_ref, str)
+        or not target_ref.startswith("refs/heads/")
+        or target_ref != target_ref.strip()
+        or "\x00" in target_ref
+    ):
+        raise RepositoryConfigurationError("malformed_target_ref")
+    if not isinstance(pre_sha, str) or FULL_SHA.fullmatch(pre_sha) is None:
+        raise RepositoryConfigurationError("malformed_pre_sha")
+    if not isinstance(candidate_sha, str) or FULL_SHA.fullmatch(candidate_sha) is None:
+        raise RepositoryConfigurationError("malformed_candidate_sha")
+
+    current_sha = _prepared_ref_sha(root, target_ref)
+    if current_sha == pre_sha:
+        return PreparedRefRecoveryResult("preimage", current_sha)
+    if current_sha == candidate_sha:
+        return PreparedRefRecoveryResult("candidate", current_sha)
+    if current_sha is None:
+        return PreparedRefRecoveryResult("diverged", None)
+    ancestor = _prepared_ref_git(
+        root, "merge-base", "--is-ancestor", candidate_sha, current_sha
+    )
+    if ancestor.returncode == 0:
+        return PreparedRefRecoveryResult("descendant", current_sha)
+    if ancestor.returncode == 1:
+        return PreparedRefRecoveryResult("diverged", current_sha)
+    raise RepositoryConfigurationError("ancestry_check_failed")
+
+
+def delete_prepared_candidate_ref(
+    repo_root: Path,
+    *,
+    candidate_ref: str,
+    candidate_sha: str,
+) -> bool:
+    """Delete only the retained candidate ref that still pins the exact SHA."""
+
+    root = Path(repo_root).expanduser().resolve(strict=False)
+    if (
+        not isinstance(candidate_ref, str)
+        or not candidate_ref.startswith("refs/hermes/integration-candidates/")
+        or candidate_ref != candidate_ref.strip()
+        or "\x00" in candidate_ref
+    ):
+        raise RepositoryConfigurationError("malformed_candidate_ref")
+    if not isinstance(candidate_sha, str) or FULL_SHA.fullmatch(candidate_sha) is None:
+        raise RepositoryConfigurationError("malformed_candidate_sha")
+
+    retained_sha = _prepared_ref_sha(root, candidate_ref)
+    if retained_sha is None:
+        return True
+    if retained_sha != candidate_sha:
+        return False
+    deleted = _prepared_ref_git(
+        root, "update-ref", "-d", candidate_ref, candidate_sha
+    )
+    return deleted.returncode == 0 and _prepared_ref_sha(root, candidate_ref) is None
+
+
+def validate_release_candidate_ref(candidate_ref: str) -> str:
+    """Validate the release-only retained-candidate namespace."""
+
+    if (
+        not isinstance(candidate_ref, str)
+        or not candidate_ref.startswith(RELEASE_CANDIDATE_REF_PREFIX)
+        or candidate_ref != candidate_ref.strip()
+        or "\x00" in candidate_ref
+        or candidate_ref == RELEASE_CANDIDATE_REF_PREFIX
+    ):
+        raise RepositoryConfigurationError("malformed_release_candidate_ref")
+    return candidate_ref
+
+
+def delete_release_candidate_ref(
+    repo_root: Path,
+    *,
+    candidate_ref: str,
+    candidate_sha: str,
+) -> bool:
+    """Delete a release candidate only when the exact old SHA still matches."""
+
+    root = Path(repo_root).expanduser().resolve(strict=False)
+    validate_release_candidate_ref(candidate_ref)
+    if not isinstance(candidate_sha, str) or FULL_SHA.fullmatch(candidate_sha) is None:
+        raise RepositoryConfigurationError("malformed_candidate_sha")
+
+    retained_sha = _prepared_ref_sha(root, candidate_ref)
+    if retained_sha is None:
+        return True
+    if retained_sha != candidate_sha:
+        return False
+    deleted = _prepared_ref_git(
+        root, "update-ref", "-d", candidate_ref, candidate_sha
+    )
+    return deleted.returncode == 0 and _prepared_ref_sha(root, candidate_ref) is None
+
+
+def observe_target_heads(
+    repo_root: Path, *, target_branch: str, base_ref: str
+) -> TargetHeadsObservation:
+    """Observe the exact local and remote heads of the release target branch.
+
+    Local head:  ``git rev-parse --verify refs/heads/<target>^{commit}``.
+    Remote head: ``git ls-remote <remote> refs/heads/<target>`` — strictly
+    read-only; no fetch, no remote-write verb, and no local ref update.
+    The remote name is derived from the configured ``base_ref``
+    (``refs/remotes/<remote>/<branch>``) so no extra configuration key is
+    needed.  Both results are reported even when unavailable so the caller
+    can truthfully refuse rather than guess.
+    """
+
+    root = Path(repo_root).expanduser().resolve(strict=False)
+    if (
+        not isinstance(target_branch, str)
+        or not target_branch
+        or target_branch != target_branch.strip()
+        or "\x00" in target_branch
+    ):
+        raise _error("malformed_target_branch")
+    if (
+        not isinstance(base_ref, str)
+        or not base_ref.startswith("refs/remotes/")
+        or base_ref != base_ref.strip()
+        or "\x00" in base_ref
+    ):
+        raise _error("malformed_base_ref")
+    remote_path = base_ref[len("refs/remotes/") :]
+    if (
+        not remote_path
+        or "/" not in remote_path
+        or remote_path.split("/", 1)[0] in {"", "."}
+    ):
+        raise _error("malformed_base_ref")
+
+    remote_name = remote_path.split("/", 1)[0]
+
+    local_head: str | None = None
+    local = _remote_observe_git(
+        root, "rev-parse", "--verify", f"refs/heads/{target_branch}^{{commit}}"
+    )
+    if local is not None:
+        value = (local.stdout or "").strip()
+        if local.returncode == 0 and FULL_SHA.fullmatch(value):
+            local_head = value
+
+    remote_head: str | None = None
+    remote_available = False
+    remote = _remote_observe_git(
+        root, "ls-remote", "--heads", remote_name, f"refs/heads/{target_branch}"
+    )
+    if remote is None:
+        remote_available = False
+    elif remote.returncode != 0:
+        remote_available = False
+    else:
+        remote_available = True
+        for line in (remote.stdout or "").splitlines():
+            parts = line.split()
+            if parts and FULL_SHA.fullmatch(parts[0]):
+                remote_head = parts[0]
+                break
+
+    return TargetHeadsObservation(
+        local_head=local_head,
+        remote_head=remote_head,
+        remote_name=remote_name,
+        remote_available=remote_available,
+    )
+
+
+def _http_observe_get(url: str, *, timeout: int = 30) -> dict[str, object] | None:
+    """Run one bounded, strictly read-only HTTP GET observation.
+
+    This seam exists so CI-observation tests can substitute a fake
+    transport and prove that the observation path never issues a write
+    verb (GET only, no POST/PATCH/DELETE/PUT).  Returns the parsed JSON
+    dict or ``None`` on any failure (timeout, non-200, malformed JSON,
+    network error) — callers treat ``None`` as "unavailable".
+    """
+
+    try:
+        req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={"Accept": "application/vnd.github+json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            raw = resp.read()
+            data = json.loads(raw.decode("utf-8"))
+    except (OSError, urllib.error.URLError, ValueError, LookupError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return cast(dict[str, object], data)
+
+
+def observe_ci_workflow_runs(
+    repo_root: Path,
+    *,
+    base_ref: str,
+    workflows: tuple[str, ...],
+    head_sha: str,
+) -> dict[str, str | None] | None:
+    """Observe the latest GitHub Actions run conclusion for each required
+    workflow at an exact head SHA.
+
+    The GitHub repository owner and name are derived from the configured
+    remote URL via ``git remote get-url`` — strictly read-only; no remote
+    write verb is ever issued.  Each workflow name is matched against the
+    ``workflow_runs`` returned by the GET to
+    ``/repos/{owner}/{repo}/actions/runs?head_sha=<sha>`` and the latest
+    run's ``conclusion`` is returned (``success``, ``failure``,
+    ``cancelled``, ``timed_out``, ``None`` for queued/in_progress, or
+    the key is absent when no run exists for that workflow).
+
+    Returns ``None`` (not a dict) when the remote URL or CI provider
+    cannot be reached — callers treat this as "unavailable".
+    """
+
+    root = Path(repo_root).expanduser().resolve(strict=False)
+    if not isinstance(head_sha, str) or FULL_SHA.fullmatch(head_sha) is None:
+        raise _error("malformed_head_sha")
+    if (
+        not isinstance(base_ref, str)
+        or not base_ref.startswith("refs/remotes/")
+        or base_ref != base_ref.strip()
+        or "\x00" in base_ref
+    ):
+        raise _error("malformed_base_ref")
+    remote_path = base_ref[len("refs/remotes/") :]
+    if (
+        not remote_path
+        or "/" not in remote_path
+        or remote_path.split("/", 1)[0] in {"", "."}
+    ):
+        raise _error("malformed_base_ref")
+
+    remote_name = remote_path.split("/", 1)[0]
+    remote_url: str | None = None
+    result = _remote_observe_git(root, "remote", "get-url", remote_name)
+    if result is not None and result.returncode == 0:
+        url_text = (result.stdout or "").strip()
+        if url_text:
+            remote_url = url_text
+
+    if remote_url is None:
+        return None
+
+    owner: str | None = None
+    repo: str | None = None
+    # Parse GitHub URLs: git@github.com:owner/repo.git or https://github.com/owner/repo
+    ssh_match = re.match(r"^git@github\.com:([^/]+)/([^/\s]+?)(\.git)?$", remote_url)
+    https_match = re.match(
+        r"^https://github\.com/([^/]+)/([^/\s]+?)(\.git)?$", remote_url
+    )
+    if ssh_match:
+        owner = ssh_match.group(1)
+        repo = ssh_match.group(2)
+    elif https_match:
+        owner = https_match.group(1)
+        repo = https_match.group(2)
+
+    if not owner or not repo:
+        return None
+
+    api_url = (
+        f"https://api.github.com/repos/{owner}/{repo}/actions/runs"
+        f"?head_sha={head_sha}&per_page=100"
+    )
+    data = _http_observe_get(api_url)
+    if data is None:
+        return None
+
+    workflow_runs = data.get("workflow_runs")
+    if not isinstance(workflow_runs, list):
+        return None
+
+    conclusions: dict[str, str | None] = {}
+    for workflow in workflows:
+        if not workflow or not isinstance(workflow, str):
+            continue
+        # The API returns runs newest-first, so the first name match is the
+        # latest run for that workflow.  An absent workflow keeps ``None``
+        # (treated by callers as queued/no-run, i.e. still pending).
+        latest: dict[str, object] | None = None
+        for run in workflow_runs:
+            if isinstance(run, dict) and run.get("name") == workflow:
+                latest = run
+                break
+        if latest is None:
+            conclusions[workflow] = None
+        else:
+            conclusion = latest.get("conclusion")
+            conclusions[workflow] = (
+                str(conclusion) if isinstance(conclusion, str) else None
+            )
+
+    return conclusions
 
 
 def _refresh_git(

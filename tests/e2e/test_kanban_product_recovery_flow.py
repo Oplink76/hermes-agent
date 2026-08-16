@@ -1,9 +1,19 @@
-"""End-to-end acceptance coverage for a governed product recovery story."""
+"""End-to-end acceptance coverage for a governed product recovery story.
+
+Includes the structural no-push boundary proof: a fake ``git`` executable
+on PATH that logs every engine invocation and refuses ``push`` is used to
+prove that the dispatcher, integrator, snapshot, API, CLI, observer, and
+migration public paths never reach a remote-write verb, and that the
+temporary bare remote stays byte-for-byte unchanged.
+"""
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
+import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +23,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_story_integration as integration_module
+from hermes_cli.kanban_product_outcomes import CandidateEligibility
 from hermes_cli import projects_db as pdb
 from hermes_cli.plugins import PluginManager
 
@@ -546,3 +558,331 @@ def test_governed_product_story_recovers_through_release_and_done(
     ]
     assert worktree_paths
     assert all(_git(worktree, "status", "--porcelain") == "" for worktree in worktree_paths)
+
+
+@pytest.mark.parametrize(
+    ("failure_code", "expected_status", "expected_rework"),
+    [
+        ("merge_conflict", "rework_required", 1),
+        ("timeout", "attention_required", 0),
+    ],
+)
+def test_public_reconcile_routes_integration_failure_without_approval_or_graph_growth(
+    governed_profile: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_code: str,
+    expected_status: str,
+    expected_rework: int,
+) -> None:
+    repo = tmp_path / f"integration-{failure_code}"
+    repo.mkdir()
+    board = f"integration-{failure_code}"
+    kb.ensure_product_board_defaults(
+        board,
+        name="Integration ownership fixture",
+        default_workdir=str(repo),
+    )
+    metadata_path = kb.board_metadata_path(board)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["product_workflow"]["handoff_v2"] = True
+    metadata["repository"] = {
+        "base_ref": "refs/heads/main",
+        "target_branch": "main",
+        "verification_profiles": {
+            "story_integration": [
+                {
+                    "argv": ["bash", "scripts/run_tests.sh"],
+                    "workdir": ".",
+                    "timeout_seconds": 30,
+                }
+            ],
+            "epic_release": [
+                {
+                    "argv": ["bash", "scripts/run_tests.sh"],
+                    "workdir": ".",
+                    "timeout_seconds": 30,
+                }
+            ],
+        },
+        "ci_observation": {
+            "provider": "github_actions",
+            "required_workflows": ["CI"],
+        },
+        "boundary_evidence": {
+            "test_globs": ["tests/**"],
+            "fixture_globs": ["tests/fixtures/**"],
+            "generated_paths": [],
+        },
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+    now = 1_700_000_000
+    source_sha = "1" * 40
+    base_sha = "2" * 40
+    branch = "story/owned-failure"
+    with kb.connect(board=board) as conn:
+        epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
+        story_id = kb.create_task(
+            conn,
+            title="Story",
+            workflow_template_id="product",
+            current_step_key="review",
+        )
+        kb.add_epic_membership(conn, epic_id=epic_id, task_id=story_id)
+        test_metadata = {
+            "workflow_outcome": {"verdict": "passed"},
+            "ai_provenance": {
+                "writer": {"agent": "developer"},
+                "tester": {"agent": "tester", "result": "passed"},
+            },
+            "test_branch": branch,
+            "test_head_sha": source_sha,
+        }
+        review_metadata = {
+            "workflow_outcome": {"verdict": "approved"},
+            "ai_provenance": {
+                "writer": {"agent": "developer"},
+                "reviewer": {"agent": "reviewer"},
+            },
+            "review_branch": branch,
+            "review_base_sha": base_sha,
+            "review_head_sha": source_sha,
+        }
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, step_key, status, outcome, metadata, started_at, ended_at) "
+            "VALUES (?, 'test', 'completed', 'advanced', ?, ?, ?)",
+            (story_id, json.dumps(test_metadata), now - 4, now - 3),
+        )
+        review_run_id = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, step_key, status, outcome, metadata, started_at, ended_at) "
+            "VALUES (?, 'review', 'completed', 'advanced', ?, ?, ?)",
+            (story_id, json.dumps(review_metadata), now - 2, now - 1),
+        ).lastrowid
+        with kb.authorized_governance_write(), kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workflow_template_id='product_epic', "
+                "current_step_key='collecting_members', status='todo', assignee=NULL, "
+                "running=0, blocked=0, current_run_id=NULL WHERE id=?",
+                (epic_id,),
+            )
+            conn.execute(
+                "UPDATE tasks SET current_step_key='integration_pending', "
+                "status='review', assignee=NULL, running=0, blocked=0, "
+                "current_run_id=NULL, branch_name=? WHERE id=?",
+                (branch, story_id),
+            )
+            conn.execute(
+                "INSERT INTO story_integration_intents "
+                "(epic_id, story_id, source_sha, source_branch, review_run_id, "
+                "review_base_sha, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    epic_id,
+                    story_id,
+                    source_sha,
+                    branch,
+                    review_run_id,
+                    base_sha,
+                    now,
+                    now,
+                ),
+            )
+        before_tasks = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        before_links = conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0]
+        before_runs = conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0]
+
+        monkeypatch.setattr(
+            integration_module,
+            "candidate_eligibility",
+            lambda *_args: CandidateEligibility(source_sha, True),
+        )
+
+        observed_lineages = []
+
+        def fail_preparation(_conn, intent, **_kwargs):
+            observed_lineages.append(intent.key)
+            if failure_code == "merge_conflict":
+                raise RuntimeError("merge conflict")
+            raise kb.IntegrationCandidateError("safe forced failure", code=failure_code)
+
+        monkeypatch.setattr(
+            integration_module,
+            "prepare_claimed_intent",
+            fail_preparation,
+        )
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+        if not expected_rework:
+            retry_result = kb.reconcile(conn, board=board, spawn_ready=False)
+            assert retry_result.integrated == []
+
+        intent = conn.execute(
+            "SELECT status, last_failure_code, attempt_count "
+            "FROM story_integration_intents WHERE story_id=?",
+            (story_id,),
+        ).fetchone()
+        task = kb.get_task(conn, story_id)
+        directive = kb.active_rework_directive(conn, story_id)
+        after_tasks = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        after_links = conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0]
+        after_runs = conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0]
+        event_kinds = {
+            row["kind"]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=?",
+                (story_id,),
+            ).fetchall()
+        }
+
+    assert result.integrated == []
+    expected_attempts = 1 if expected_rework else 2
+    assert tuple(intent) == (expected_status, failure_code, expected_attempts)
+    assert len(observed_lineages) == expected_attempts
+    assert len(set(observed_lineages)) == 1
+    assert task is not None and task.rework_count == expected_rework
+    assert task.current_step_key == (
+        "development" if expected_rework else "integration_pending"
+    )
+    assert task.current_step_key != "release_measure"
+    assert (directive is not None) is bool(expected_rework)
+    assert (after_tasks, after_links, after_runs) == (
+        before_tasks,
+        before_links,
+        before_runs,
+    )
+    assert not event_kinds.intersection(
+        {"approval_requested", "release_requested", "release_approved"}
+    )
+
+
+# ---------------------------------------------------------------------------
+# No-push boundary proof (fake git across every public engine path)
+# ---------------------------------------------------------------------------
+
+def test_no_push_boundary_across_all_public_paths(
+    governed_profile: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A push-refusing fake git proves no engine public path issues a
+    remote-write verb and the bare remote stays byte-for-byte unchanged.
+
+    Exercises the dispatcher (``reconcile``), the integrator (story
+    integration intent lifecycle), the snapshot path (prepare +
+    invalidate), the dashboard API, the release-state CLI, the CI
+    observer, and the v2-migrate CLI dry-run — all through the fake git.
+    """
+    from tests.e2e.test_kanban_epic_integration_release import (
+        FakeGit,
+        _ProductFixture,
+        _create_epic,
+        _create_epic_member,
+        _default_product_board_metadata,
+        _drive_story_to_review,
+        _load_api_module,
+    )
+
+    fake_git = FakeGit(tmp_path / "fake-git", monkeypatch)
+
+    board = "no-push-boundary"
+    remote = tmp_path / "remote.git"
+    clone = tmp_path / "clone"
+    remote.mkdir()
+    clone.mkdir(parents=True)
+    fake_git.real(tmp_path, "init", "--bare", "-b", "main", str(remote))
+    fake_git.real(tmp_path, "clone", str(remote), str(clone))
+    fake_git.real(clone, "config", "user.email", "no-push@e2e.test")
+    fake_git.real(clone, "config", "user.name", "No Push Boundary")
+    script_dir = clone / "tests" / "e2e_scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "run_tests.sh").write_text(
+        "#!/bin/sh\nset -eu\necho ok\nexit 0\n", encoding="utf-8",
+    )
+    (script_dir / "run_tests.sh").chmod(0o755)
+    (clone / ".gitignore").write_text("*.pyc\n__pycache__/\n")
+    _default_product_board_metadata(board, clone)
+    fake_git.real(clone, "add", ".gitignore", "tests/e2e_scripts/run_tests.sh")
+    fake_git.real(clone, "commit", "-m", "initial")
+    initial_sha = fake_git.real(clone, "rev-parse", "HEAD").stdout.strip()
+    fake_git.real(clone, "push", "origin", "main")
+    fake_git.reset_log()
+
+    remote_refs_before = fake_git.real(remote, "show-ref").stdout
+
+    product = _ProductFixture(
+        board=board, repo=clone, remote=remote,
+        fake_git=fake_git, initial_sha=initial_sha,
+    )
+
+    with kb.connect(board=board) as conn:
+        epic_id = _create_epic(conn, "Epic: no-push proof")
+        story_id, worktree, branch = _create_epic_member(
+            conn, product, board, epic_id,
+        )
+
+        # Dispatcher + integrator: full story lifecycle through reconcile.
+        _drive_story_to_review(conn, story_id, worktree, branch, board)
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+        assert story_id in result.integrated
+
+        # Snapshot path: prepare + drift invalidation.
+        snap = kb.prepare_epic_release_snapshot(conn, epic_id, board=board)
+        assert snap.status == "awaiting_push"
+        fake_git.real(clone, "switch", "main")
+        (clone / "marker.txt").write_text("advance\n", encoding="utf-8")
+        fake_git.real(clone, "add", "marker.txt")
+        fake_git.real(clone, "commit", "-m", "main advance")
+        inv = kb.invalidate_epic_release_snapshot(conn, epic_id, board=board)
+        assert inv.kind == "invalidated"
+
+        # Observer path: read-only CI observation (target pre-image drift
+        # invalidates again; nothing is pushed).
+        obs = kb.observe_epic_release_ci(conn, epic_id, board=board)
+        assert obs.kind in {"invalidated", "missing", "unavailable"}
+
+        # API path: read-only release-state endpoints.
+        dashboard = _load_api_module()
+        app = FastAPI()
+        app.include_router(dashboard.router, prefix="/api/plugins/kanban")
+        api = TestClient(app)
+        resp = api.get(
+            f"/api/plugins/kanban/tasks/{epic_id}/release-state?board={board}",
+        )
+        assert resp.status_code == 200, resp.text
+        resp2 = api.get(
+            f"/api/plugins/kanban/tasks/{story_id}?board={board}",
+        )
+        assert resp2.status_code == 200, resp2.text
+
+        # CLI path: release-state read model + v2-migrate dry-run handler.
+        from hermes_cli import kanban as kanban_cli
+        state = kanban_cli._task_release_state(conn, epic_id, board=board)
+        assert state["kind"] == "epic"
+
+        live_db = kb.kanban_db_path(board=board)
+        with sqlite3.connect(str(live_db)) as raw:
+            raw.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        scratch_db = tmp_path / "scratch-cli.db"
+        shutil.copy2(live_db, scratch_db)
+        migrate_args = argparse.Namespace(
+            db_path=str(scratch_db), apply=False,
+            recovery_root=None, json=True,
+        )
+        assert kanban_cli._cmd_v2_migrate(migrate_args) == 0
+
+    remote_refs_after = fake_git.real(remote, "show-ref").stdout
+
+    # The structural guarantee: zero push invocations across every public
+    # path exercised above, and the remote untouched.
+    assert fake_git.invocations, (
+        "fake git observed no engine invocations — PATH wiring is broken"
+    )
+    assert fake_git.push_invocations == [], (
+        f"ENGINE ISSUED GIT PUSH: {fake_git.push_invocations}"
+    )
+    assert remote_refs_after == remote_refs_before, (
+        "bare remote changed during engine activity:\n"
+        f"before:\n{remote_refs_before}\nafter:\n{remote_refs_after}"
+    )
