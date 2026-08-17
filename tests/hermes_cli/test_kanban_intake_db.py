@@ -1069,6 +1069,10 @@ def test_ambiguous_project_binding_rejects_materialization_and_rolls_back(
             name="Second Qualification Project",
             primary_path=str(repo),
             board_slug=board,
+            # This fixture deliberately builds the ambiguous binding the test
+            # asserts intake rejects. Upstream's duplicate-path guard would
+            # otherwise refuse to construct it, so opt out explicitly here.
+            allow_duplicate_path=True,
         )
 
     with kb.connect(board=board) as connection:
