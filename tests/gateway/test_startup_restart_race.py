@@ -240,7 +240,11 @@ async def test_startup_aborts_after_registered_adapter_restart(tmp_path, monkeyp
     assert result is True
     assert telegram.connected is True
     assert telegram.disconnected is True
-    assert slack.connected is False
+    # Upstream moved adapter startup from strictly sequential to concurrent, so
+    # a later adapter may already be mid-connect when the restart is observed.
+    # The invariant that actually matters is unchanged: an aborted startup
+    # leaves NO adapter live — anything that connected must also be torn down.
+    assert slack.connected is False or slack.disconnected is True
     assert runner._running is False
     assert runner.adapters == {}
     assert runner._update_runtime_status.call_args_list[-1].args[0] == "stopped"

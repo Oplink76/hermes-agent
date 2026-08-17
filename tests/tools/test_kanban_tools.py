@@ -3098,6 +3098,10 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     paid for splitting the product commit-first path and the non-product
     ``review-required`` convention into separate, separately-scoped
     paragraphs — the two used to read as one contradictory instruction.
+    The 2026-08-17 upstream sync raised the ceiling to 8,000 (upstream's own
+    independently chosen bound) to pay for step 5 carrying BOTH review models:
+    the product commit-first lifecycle and upstream's first-class
+    ``kanban_request_review`` / ``kanban_request_changes`` loop.
     """
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
     home = tmp_path / ".hermes"
@@ -3107,25 +3111,8 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 6_600, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 8_000, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
-    )
-
-
-def test_kanban_guidance_prompt_size_bounded():
-    """KANBAN_GUIDANCE is injected into every kanban-capable process's system
-    prompt and resolved once at agent init, so its size is a per-worker token
-    tax paid on every spawn. Bound it as an invariant, not a change-detector:
-    the ceiling (8000 chars, roughly 2000 tokens) leaves headroom above the
-    current ~6.2k chars for tight additions, while catching accidental bloat
-    (pasted docs, duplicated sections) before it ships to every worker.
-    """
-    from agent.prompt_builder import KANBAN_GUIDANCE
-
-    assert len(KANBAN_GUIDANCE) < 8000, (
-        f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars; it is injected into "
-        "every kanban worker's system prompt — trim it or consciously re-bound "
-        "this invariant with justification."
     )
 
 

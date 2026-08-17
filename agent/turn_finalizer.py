@@ -80,7 +80,20 @@ def _record_kanban_budget_exhausted(
         from hermes_cli import kanban_db as _kb
         _conn = _kb.connect()
         try:
-            handled = _kb.handle_development_budget_exhaustion(_conn, kanban_task)
+            # Routing is best-effort on its own: if the product-workflow park
+            # fails for any reason we must still fall through to the generic
+            # terminal failure below, or the task is left with no outcome at
+            # all. Never let this swallow the record path.
+            try:
+                handled = _kb.handle_development_budget_exhaustion(_conn, kanban_task)
+            except Exception:
+                logger.warning(
+                    "Development budget-exhaustion routing failed for task %s; "
+                    "falling back to terminal failure",
+                    kanban_task,
+                    exc_info=True,
+                )
+                handled = False
             if handled:
                 logger.info(
                     "routed Development budget exhaustion for task %s",

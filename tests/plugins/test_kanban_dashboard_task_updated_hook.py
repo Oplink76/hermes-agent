@@ -74,10 +74,31 @@ def _make_task(title="t"):
         conn.close()
 
 
+def _expected_snapshot(task_id: str) -> dict:
+    """Current optimistic-concurrency snapshot for *task_id*.
+
+    Fork contract: mutations of an existing card must carry a complete
+    expected-task snapshot, so a dashboard write cannot clobber a card that
+    moved underneath the operator. Upstream's dashboard has no such
+    requirement, hence this helper is fork-local.
+    """
+    conn = kb.connect()
+    try:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        assert row is not None
+        return kb.task_snapshot_from_row(row)
+    finally:
+        conn.close()
+
+
 def test_patch_priority_fires_task_updated(client, captured_updates):
     tid = _make_task()
     captured_updates.clear()
-    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"priority": 5})
+    body = {"priority": 5}
+    body.update(
+        {f"expected_{k}": v for k, v in _expected_snapshot(tid).items()}
+    )
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json=body)
     assert r.status_code == 200
     assert len(captured_updates) == 1
     kw = captured_updates[0]
@@ -91,7 +112,14 @@ def test_bulk_priority_fires_task_updated_per_task(client, captured_updates):
     captured_updates.clear()
     r = client.post(
         "/api/plugins/kanban/tasks/bulk",
-        json={"ids": [tid1, tid2], "priority": 3},
+        json={
+            "ids": [tid1, tid2],
+            "priority": 3,
+            "expected_snapshots": {
+                tid: {f"expected_{k}": v for k, v in _expected_snapshot(tid).items()}
+                for tid in (tid1, tid2)
+            },
+        },
     )
     assert r.status_code == 200
     assert all(entry["ok"] for entry in r.json()["results"])

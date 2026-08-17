@@ -1088,7 +1088,13 @@ DEFAULT_CONFIG = {
         # (Telegram, Discord, etc.) where the verification narrative would reach
         # a human as chat noise. Doc/markdown/skill-only edits never fire it.
         # Set true to force on everywhere, or false to disable.
-        "verify_on_stop": "auto",
+        # Opt-in default (False), not the "auto" surface-aware sentinel: a
+        # fresh install must not fire the verify-on-stop nudge on any
+        # surface. This used to be supplied by the v30->31 migration, but
+        # upstream's config support floor skips that migration for configs
+        # at/above the floor, which silently re-enabled the nudge. Encoding
+        # the intent in the default keeps it true regardless of migrations.
+        "verify_on_stop": False,
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.

@@ -52,6 +52,19 @@ def _reopen_parent_directly(conn, parent_id: str) -> None:
         )
 
 
+def _with_snapshot(body: dict, task_id: str) -> dict:
+    """Fork contract: existing-card mutations carry a complete expected-task
+    snapshot (optimistic concurrency). Upstream's dashboard has no such
+    requirement, so this helper is fork-local."""
+    import hermes_cli.kanban_db as _kb
+    with _kb.connect() as _c:
+        row = _c.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assert row is not None
+    out = dict(body)
+    out.update({f"expected_{k}": v for k, v in _kb.task_snapshot_from_row(row).items()})
+    return out
+
+
 def test_reopen_demotes_done_descendants_with_events_and_comments(conn):
     parent_id, child_id = _done_parent_with_done_child(conn)
     grandchild_id = kb.create_task(
@@ -190,7 +203,7 @@ def test_dashboard_and_db_paths_produce_identical_outcomes(tmp_path, monkeypatch
 
     # Surface 1: dashboard drag (done -> todo) via _set_status_direct.
     r = client.patch(
-        f"/api/plugins/kanban/tasks/{dash_parent}", json={"status": "todo"},
+        f"/api/plugins/kanban/tasks/{dash_parent}", json=_with_snapshot({"status": "todo"}, dash_parent),
     )
     assert r.status_code == 200, r.text
 

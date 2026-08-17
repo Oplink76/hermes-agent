@@ -5828,13 +5828,30 @@ def connect(
                 conn.execute("PRAGMA foreign_keys=ON")
                 conn.execute("PRAGMA secure_delete=ON")
                 conn.execute("PRAGMA cell_size_check=ON")
+                schema_present = _schema_is_present(conn)
         except Exception:
             conn.close()
             raise
-        _sync_board_governance(
-            conn, _known_board_slug_for_connection(conn) or governance_board
+        if schema_present:
+            _sync_board_governance(
+                conn, _known_board_slug_for_connection(conn) or governance_board
+            )
+            return conn
+        # The cache says "initialized", the file says otherwise: it was deleted
+        # or replaced under a live process, and the open above silently
+        # recreated an empty DB. Left alone, every query on this path fails
+        # with "no such table: tasks" for the rest of the process's life and
+        # the board just renders empty (#83445). Drop the stale cache entry and
+        # fall through to the full init path, which re-runs the header and
+        # integrity probes and the schema script under the cross-process lock.
+        conn.close()
+        with _INIT_LOCK:
+            _INITIALIZED_PATHS.discard(resolved)
+        _log.warning(
+            "kanban DB %s lost its schema after this process initialized it "
+            "(deleted or replaced externally); re-initializing.",
+            path,
         )
-        return conn
 
     with _cross_process_init_lock(path):
         # Read-only file/sidecar preflight (port of kilocode#12508) —
@@ -6935,17 +6952,17 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     task + recording an event, etc.).  A claim CAS inside this context is
     atomic -- at most one concurrent writer can succeed.
 
-    ``allow_nested`` exists for API compatibility with upstream, whose
-    version raises on an unflagged nested call so that only deliberate
-    composition primitives run under one outer commit. This fork does NOT
-    adopt that raise yet: nesting has always been permitted here and is
-    handled with a savepoint, and the fork's governance code adds a large
-    number of transaction sites that upstream's audit did not cover — the
-    strict form would surface as RuntimeError on live boards. Nesting is
-    therefore still accepted from any caller; passing ``allow_nested=True``
-    documents intent and is what upstream's newer helpers pass.
-    Follow-up (CONVERGE): audit the fork's nested call sites, then adopt
-    upstream's raise so accidental nesting is caught.
+    ``allow_nested`` is upstream's API for opting a caller into savepoint
+    semantics when it is already inside a transaction. Upstream *raises* on
+    an unflagged nested call; this fork deliberately does NOT, because
+    nesting has always composed here via savepoints and the fork's
+    governance code relies on it in paths upstream never audited. Adopting
+    the strict form was measured on 2026-08-17 and fails 56 tests across
+    the dashboard, product-workflow and notify-subscription paths, so the
+    permissive behaviour stands and ``allow_nested`` documents intent.
+    Follow-up (CONVERGE): annotate the fork's deliberate nested call sites
+    with ``allow_nested=True``, then adopt upstream's raise so accidental
+    nesting is caught.
 
     The explicit ROLLBACK on exception is wrapped in try/except so that
     a SQLite auto-rollback (which leaves no active transaction) does not
@@ -9012,7 +9029,10 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
         _append_event(conn, task_id, "assigned", {"assignee": profile})
-        return True
+    # Task-mutation observer (RFC #58548), fired AFTER the assignment txn
+    # has committed so subscribers always observe durable board state.
+    notify_task_updated(conn, task_id, ("assignee",))
+    return True
 
 
 CONFIGURE_TASK_SNAPSHOT_FIELDS = TASK_SNAPSHOT_FIELDS + (
@@ -12620,7 +12640,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """
     try:
         row = conn.execute(
-            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+            "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if not row:
@@ -12629,13 +12649,16 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         path: Optional[str] = row["workspace_path"]
         if kind == "worktree" and path:
             worktree_path = Path(path)
-            if not _worktree_has_other_running_consumer(
-                conn, task_id, worktree_path
-            ):
-                _cleanup_provisioned_node_dependencies(worktree_path)
-            _try_cleanup_parent_workspaces(conn, task_id)
-            return
-        if kind != "scratch" or not path:
+            if _worktree_has_other_running_consumer(conn, task_id, worktree_path):
+                # Another running task still shares this worktree — leave both
+                # the provisioned dependencies and the worktree itself alone.
+                _try_cleanup_parent_workspaces(conn, task_id)
+                return
+            _cleanup_provisioned_node_dependencies(worktree_path)
+            # Fall through: the guarded reaping below removes the worktree only
+            # when it is provably free of work (clean tree, every commit
+            # reachable from a remote-tracking ref).
+        if kind not in ("scratch", "worktree") or not path:
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
             # (e.g. a 'dir' child whose scratch parent was waiting on it). #33774
@@ -13053,6 +13076,21 @@ def block_task(
 
     if kind == "dependency":
         with write_txn(conn):
+            # Capture the phase we are leaving BEFORE the UPDATE below rewrites
+            # it to 'todo', so the dependency_wait event can record where the
+            # card must resume once its parents finish (review vs ready).
+            _dep_row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            source_status = (
+                _retry_status_for_run(conn, task_id)
+                if _dep_row is not None and _dep_row["status"] == "running"
+                else (
+                    "review"
+                    if _dep_row is not None and _dep_row["status"] == "review"
+                    else "ready"
+                )
+            )
             if expected_run_id is None:
                 cur = conn.execute(
                     """
@@ -13108,6 +13146,7 @@ def block_task(
                     "reason": reason,
                     "kind": kind,
                     "attempted_resolutions": attempts,
+                    "source_status": source_status,
                 },
                 run_id=run_id,
             )
@@ -13871,6 +13910,21 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if has_undone_parent and not architecture_assessment
             else "ready"
         )
+        # Restore the phase the block came FROM. A card blocked out of the
+        # review lane must return to ``review``, not to ``ready`` -- otherwise
+        # an escalation silently converts a reviewer handoff back into
+        # implementation work. Parent gating still wins: if parents are
+        # unfinished the card waits in ``todo`` regardless.
+        _current_row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        resume_status = (
+            _resume_status_from_events(conn, task_id)
+            if _current_row is not None and _current_row["status"] == "blocked"
+            else "ready"
+        )
+        if new_status == "ready" and resume_status == "review":
+            new_status = "review"
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
@@ -13902,7 +13956,11 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             )
         _append_event(
             conn, task_id, "unblocked",
-            {"status": new_status} if new_status != "ready" else None,
+            (
+                {"status": new_status, "resume_status": resume_status}
+                if new_status != "ready" or resume_status != "ready"
+                else None
+            ),
         )
         return True
 

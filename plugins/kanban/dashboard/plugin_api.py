@@ -1790,6 +1790,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             raise
         if updated is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        changed = _observed_changed_fields(payload)
+        if changed:
+            kanban_db.notify_task_updated(conn, task_id, changed, board=board)
         return {"task": _task_dict(updated)}
     finally:
         conn.close()
@@ -1943,6 +1946,20 @@ def _insert_task_event(
             int(time.time()),
         ),
     )
+
+
+# Task-mutation boundary (RFC #58548): the dashboard writes priority/title/body
+# with direct SQL, bypassing every kanban_db mutator, so the observer must be
+# fired explicitly AFTER the patch transaction commits. Field NAMES only.
+_DIRECT_WRITE_OBSERVED_FIELDS = ("priority", "title", "body", "assignee")
+
+
+def _observed_changed_fields(payload) -> list[str]:
+    return [
+        field
+        for field in _DIRECT_WRITE_OBSERVED_FIELDS
+        if getattr(payload, field, None) is not None
+    ]
 
 
 def _patch_task(
@@ -2720,6 +2737,14 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     snapshot_checked=True,
                 ) is None:
                     entry.update(ok=False, error="not found")
+                else:
+                    # Same mutation-boundary observer as the single-task PATCH,
+                    # fired per task once its patch has committed.
+                    changed = _observed_changed_fields(patch)
+                    if changed:
+                        kanban_db.notify_task_updated(
+                            conn, tid, changed, board=board,
+                        )
             except HTTPException as exc:
                 entry.update(ok=False, error=str(exc.detail))
             except Exception as e:  # defensive — one bad id shouldn't kill the batch

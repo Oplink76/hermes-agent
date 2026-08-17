@@ -8577,7 +8577,7 @@ def _update_via_zip(args):
 
     pip_cmd = [sys.executable, "-m", "pip"]
     if not uv_bin:
-        uv_bin = _ensure_uv_for_termux(pip_cmd)
+        uv_bin = _self()._ensure_uv_for_termux(pip_cmd)
     if uv_bin:
         uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
         if _is_termux_env(uv_env):
@@ -8607,9 +8607,9 @@ def _update_via_zip(args):
     # ZIP path parity: heal the active memory provider's bridge packages
     # after the dependency reinstall, same as the git-pull path (#53272,
     # #70636).
-    _refresh_active_memory_provider_dependencies()
+    _self()._refresh_active_memory_provider_dependencies()
 
-    node_failures = _update_node_dependencies()
+    node_failures = _self()._update_node_dependencies()
     _build_web_ui(PROJECT_ROOT / "web")
 
     # Sync skills
@@ -8723,16 +8723,16 @@ def _update_via_zip(args):
     else:
         print("✓ Update complete!")
     try:
-        _print_curator_first_run_notice()
+        _self()._print_curator_first_run_notice()
     except Exception as e:
         logger.debug("Curator first-run notice failed: %s", e)
     try:
-        _print_curator_recent_run_notice()
+        _self()._print_curator_recent_run_notice()
     except Exception as e:
         logger.debug("Curator recent-run notice failed: %s", e)
     # Don't stop a working dashboard when the Node refresh failed — see the
     # git-update path for rationale (#30271).
-    _finish_dashboard_update_cleanup(node_failures)
+    _self()._finish_dashboard_update_cleanup(node_failures)
 
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
