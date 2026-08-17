@@ -167,6 +167,17 @@ def _worktree_task(conn, repo: Path, title: str = "wt-task") -> tuple[str, Path]
     return tid, wt
 
 
+@pytest.mark.skip(
+    reason=(
+        "Upstream reaps a completed/archived task's worktree when it judges it "
+        "'provably free of work'. This fork deliberately keeps worktrees "
+        "persistent and removes only dispatcher-provisioned Node dependencies "
+        "(see test_worktree_cleanup_removes_provisioned_dependencies, which "
+        "asserts the worktree survives). The guarded reaping helper itself is "
+        "merged and still covered by the other tests in this module. "
+        "(2026-08-17 upstream sync.)"
+    )
+)
 def test_complete_task_reaps_clean_worktree(kanban_home: Path, repo: Path) -> None:
     with kb.connect_closing() as conn:
         tid, wt = _worktree_task(conn, repo)
@@ -190,6 +201,17 @@ def test_complete_task_preserves_dirty_worktree(kanban_home: Path, repo: Path) -
     assert (wt / "wip.txt").exists()
 
 
+@pytest.mark.skip(
+    reason=(
+        "Upstream reaps a completed/archived task's worktree when it judges it "
+        "'provably free of work'. This fork deliberately keeps worktrees "
+        "persistent and removes only dispatcher-provisioned Node dependencies "
+        "(see test_worktree_cleanup_removes_provisioned_dependencies, which "
+        "asserts the worktree survives). The guarded reaping helper itself is "
+        "merged and still covered by the other tests in this module. "
+        "(2026-08-17 upstream sync.)"
+    )
+)
 def test_archive_task_reaps_clean_worktree(kanban_home: Path, repo: Path) -> None:
     with kb.connect_closing() as conn:
         tid, wt = _worktree_task(conn, repo)

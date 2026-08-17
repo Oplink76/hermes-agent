@@ -12649,15 +12649,18 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         path: Optional[str] = row["workspace_path"]
         if kind == "worktree" and path:
             worktree_path = Path(path)
-            if _worktree_has_other_running_consumer(conn, task_id, worktree_path):
-                # Another running task still shares this worktree — leave both
-                # the provisioned dependencies and the worktree itself alone.
-                _try_cleanup_parent_workspaces(conn, task_id)
-                return
-            _cleanup_provisioned_node_dependencies(worktree_path)
-            # Fall through: the guarded reaping below removes the worktree only
-            # when it is provably free of work (clean tree, every commit
-            # reachable from a remote-tracking ref).
+            if not _worktree_has_other_running_consumer(
+                conn, task_id, worktree_path
+            ):
+                _cleanup_provisioned_node_dependencies(worktree_path)
+            # Fork behaviour, deliberately NOT upstream's: worktrees are
+            # persistent here and are never reaped on completion, only their
+            # dispatcher-provisioned Node dependencies are removed. Upstream
+            # reaps a worktree it judges "provably free of work"; this fork
+            # keeps long-lived worktrees (see
+            # test_worktree_cleanup_removes_provisioned_dependencies).
+            _try_cleanup_parent_workspaces(conn, task_id)
+            return
         if kind not in ("scratch", "worktree") or not path:
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
