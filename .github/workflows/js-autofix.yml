@@ -34,17 +34,20 @@ name: auto-fix lint issues & formatting
 #      the PR is auto-closed and the branch deleted — the next run re-applies
 #      on the current state.
 
+# DISABLED ON THIS FORK (2026-08-18). The push trigger is removed; manual
+# dispatch is kept so this becomes live again the moment the credential below
+# exists.
+#
+# This fork has no APP_CLIENT_ID variable and no APP_PRIVATE_KEY secret, so
+# .github/actions/get-app-token takes its documented fallback to GITHUB_TOKEN.
+# GitHub does not trigger workflows on a PR created with GITHUB_TOKEN -- the
+# recursion guard this file's own header relies on being absent for App tokens
+# -- so the bot PR never gets CI, `gh pr merge --auto` never fires, and the PR
+# sits open forever. PR #72 sat that way from 2026-08-02 for one blank line.
+#
+# The workflow is correct; it simply cannot complete without the App
+# credential. Restore the push trigger if that credential is ever configured.
 on:
-  push:
-    branches: [main]
-    paths:
-      - '**/*.js'
-      - '**/*.cjs'
-      - '**/*.mjs'
-      - '**/*.ts'
-      - '**/*.tsx'
-      - 'package.json'
-      - 'package-lock.json'
   workflow_dispatch:
 
 permissions:
