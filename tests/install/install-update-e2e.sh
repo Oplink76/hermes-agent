@@ -99,9 +99,12 @@ collect_sandbox_logs() {
   local tag="$1"
   local src="$SANDBOX_ROOT/root/logs"
   local dest="$LOG_DIR/sandbox-$tag"
-  [ -d "$src" ] || return 0
-  mkdir -p "$dest"
-  cp -a "$src/." "$dest/" 2>/dev/null || true
+  if [ -d "$src" ]; then
+    mkdir -p "$dest"
+    cp -a "$src/." "$dest/" 2>/dev/null || true
+  fi
+  collect_npm_logs "$dest"
+  [ -d "$dest" ] || return 0
   # Print it, not just archive it: a rejected TLS handshake here is the whole
   # explanation for a failure that otherwise reads as a bare `curl: (35)`, and
   # whoever is reading the job log should not have to download an artifact to
@@ -112,6 +115,32 @@ collect_sandbox_logs() {
     cat "$dest/proxy.log" >&2
     echo "--- end proxy.log ---" >&2
   fi
+}
+
+# `install.sh` runs `npm install --silent`, which suppresses npm's error report
+# entirely -- a failed install reaches CI as "npm install failed or timed out"
+# with no cause attached, and the captured stdout holds only warnings. npm does
+# still write the real reason to a debug log under its cache, so lift that out
+# of the sandbox too and print the tail. Without this there is nothing in the
+# job log or the artifact that says why npm exited non-zero.
+collect_npm_logs() {
+  local dest="$1"
+  local src="$SANDBOX_ROOT/home/.npm/_logs"
+  # npm honours npm_config_cache, so do not assume the default location -- if
+  # the usual path is absent, take the first _logs directory anywhere under the
+  # sandbox home rather than silently collecting nothing.
+  if [ ! -d "$src" ]; then
+    src="$(find "$SANDBOX_ROOT/home" -type d -name _logs -print 2>/dev/null | head -1 || true)"
+  fi
+  [ -n "$src" ] && [ -d "$src" ] || return 0
+  mkdir -p "$dest/npm"
+  cp -a "$src/." "$dest/npm/" 2>/dev/null || true
+  local newest
+  newest="$(ls -1t "$dest/npm"/*.log 2>/dev/null | head -1 || true)"
+  [ -n "$newest" ] || return 0
+  echo "--- npm debug log ($(basename "$newest")) ---" >&2
+  tail -n 120 "$newest" >&2
+  echo "--- end npm debug log ---" >&2
 }
 
 # ── preflight ──────────────────────────────────────────────────────────────
