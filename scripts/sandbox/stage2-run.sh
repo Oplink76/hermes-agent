@@ -196,6 +196,17 @@ if [ "$DEV_SANDBOX_INTERACTIVE" = true ]; then
   dev_mounts=(--dev /dev)
 fi
 
+# Everything inside the sandbox reaches the network through the local MITM
+# proxy, which presents certificates minted from the sandbox's own CA
+# (certs/ca.pem). Every client therefore has to trust *that* CA, node
+# included: NODE_EXTRA_CA_CERTS appends to node's built-in roots rather than
+# replacing them, so pointing it at certs/real-ca.pem added nothing node did
+# not already have and left the proxy's certificate unverifiable. npm then
+# aborted the handshake on every fetch -- visible only as `SSLEOFError` in
+# proxy.log -- so node dependencies never installed in this sandbox.
+# certs/real-ca.pem stays where it belongs: on proxy.py, which uses it to
+# verify the *upstream* side of the connection.
+
 exec bwrap \
   --unshare-pid \
   --die-with-parent --proc /proc --tmpfs /tmp \
@@ -216,7 +227,7 @@ exec bwrap \
   --setenv CURL_CA_BUNDLE /work/certs/ca.pem \
   --setenv SSL_CERT_FILE /work/certs/ca.pem \
   --setenv GIT_SSL_CAINFO /work/certs/ca.pem \
-  --setenv NODE_EXTRA_CA_CERTS /work/certs/real-ca.pem \
+  --setenv NODE_EXTRA_CA_CERTS /work/certs/ca.pem \
   --setenv OPENSSL_CONF /work/certs/openssl.cnf \
   --setenv HTTP_PROXY http://127.0.0.1:8080 \
   --setenv HTTPS_PROXY http://127.0.0.1:8080 \
