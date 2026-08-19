@@ -470,6 +470,7 @@ class AIAgent:
         read_preview_callback: callable = None,
         read_window_below_callback: callable = None,
         setup_mcp_callback: callable = None,
+        tour_callback: callable = None,
         step_callback: callable = None,
         stream_delta_callback: callable = None,
         interim_assistant_callback: callable = None,
@@ -558,6 +559,7 @@ class AIAgent:
             read_preview_callback=read_preview_callback,
             read_window_below_callback=read_window_below_callback,
             setup_mcp_callback=setup_mcp_callback,
+            tour_callback=tour_callback,
             step_callback=step_callback,
             stream_delta_callback=stream_delta_callback,
             interim_assistant_callback=interim_assistant_callback,
@@ -3879,8 +3881,12 @@ class AIAgent:
                     + "the turn was stopped because the state database "
                     "reported structural corruption (the transcript would "
                     "have been lost on restart). Freeing disk space will "
-                    "not help — run `hermes doctor` to repair the state "
-                    "database, then send your message again."
+                    "not help. Recovery options:\n"
+                    "1. Run `hermes doctor --fix`\n"
+                    "2. Salvage with: sqlite3 ~/.hermes/state.db \".recover\" "
+                    "(then replace state.db)\n"
+                    "3. Restore from a backup in ~/.hermes/backups/\n"
+                    "Then send your message again."
                 )
             if cause == "disk":
                 return (
