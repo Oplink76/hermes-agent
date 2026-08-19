@@ -950,6 +950,14 @@ class CLICommandsMixin:
                 _cprint(f"  ↻ Handoff complete. The session is now active on {platform_name}.")
                 _cprint(f"  Resume it on this CLI later with: /resume {session_title}")
                 _cprint("")
+                # Mark this session as handed off so _run_cleanup does NOT
+                # finalize it on CLI exit.  The gateway reopened the session
+                # row and now owns its lifecycle; a CLI cleanup finalize would
+                # set end_reason on the row the gateway is actively writing
+                # to, causing the handoff leg to vanish from session history
+                # and session_search (#88234).
+                from cli import _handed_off_session_ids
+                _handed_off_session_ids.add(self.session_id)
                 # End the CLI cleanly — same exit semantics as /quit.
                 self._should_exit = True
                 return False
@@ -2797,10 +2805,24 @@ class CLICommandsMixin:
                 _cprint(f"  {_DIM}No goal to resume.{_RST}")
             else:
                 _cprint(f"  ▶ Goal resumed: {state.goal}")
-                _cprint(
-                    f"  {_DIM}Send any message (or press Enter on an empty prompt "
-                    f"is a no-op; type 'continue' to kick it off).{_RST}"
-                )
+                # Resume must restart work, not just flip persisted state
+                # (#75362): queue the canonical continuation prompt the same
+                # way /goal <text> queues its kickoff, so the loop takes the
+                # next step without the user sending another message.
+                prompt = mgr.next_continuation_prompt()
+                queued = False
+                if prompt:
+                    try:
+                        self._pending_input.put(prompt)
+                        queued = True
+                    except Exception:
+                        pass
+                if queued:
+                    _cprint(f"  {_DIM}Continuing now — taking the next step.{_RST}")
+                else:
+                    _cprint(
+                        f"  {_DIM}Send any message to kick off the next step.{_RST}"
+                    )
             return
 
         if lower in {"clear", "stop", "done"}:
