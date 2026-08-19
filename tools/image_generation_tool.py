@@ -685,7 +685,10 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
             "prompt", "aspect_ratio", "num_images", "output_format",
             "resolution", "quality", "sync_mode",
         },
-        "upscale": True,   # 1k native is sub-2MP
+        "upscale": False,   # 1k native is sub-2MP, but opt-in only: upstream
+        # shipped this entry with upscale True, which violates its own
+        # test_upscale_defaults_are_all_off invariant (no catalog entry may
+        # default upscale on). Set False here to match that stated policy.
         # Edit endpoint takes `image_urls` (max 3) + the same knobs;
         # aspect_ratio defaults to "auto" (follows the first input image),
         # so we don't send it on edits.
