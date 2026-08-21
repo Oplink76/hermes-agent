@@ -194,14 +194,25 @@ def _load_xai_config() -> Dict[str, Any]:
         return {}
 
 
-def _resolve_model() -> Tuple[str, Dict[str, Any]]:
+def _resolve_model(caller_model: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
     """Decide which model to use and return ``(model_id, meta)``.
 
-    Overrides are validated against the merged live+static catalog, so a
-    newly released xAI model can be selected the day it appears in the
+    Priority:
+    1. Caller-supplied ``caller_model`` — the dispatcher forwards top-level
+       ``image_gen.model`` (what ``hermes tools`` writes) as the ``model``
+       kwarg, mirroring the openrouter provider.
+    2. ``XAI_IMAGE_MODEL`` env override.
+    3. Scoped ``image_gen.xai.model`` in config.yaml.
+    4. :data:`DEFAULT_MODEL`.
+
+    Every candidate is validated against the merged live+static catalog,
+    so a newly released xAI model is selectable the day it appears in the
     live catalog — no code change required.
     """
     catalog = _catalog()
+    if caller_model and caller_model in catalog:
+        return caller_model, catalog[caller_model]
+
     env_override = os.environ.get("XAI_IMAGE_MODEL")
     if env_override and env_override in catalog:
         return env_override, catalog[env_override]
@@ -214,15 +225,15 @@ def _resolve_model() -> Tuple[str, Dict[str, Any]]:
     return DEFAULT_MODEL, catalog.get(DEFAULT_MODEL, _MODELS[DEFAULT_MODEL])
 
 
-def _resolve_edit_model() -> str:
+def _resolve_edit_model(caller_model: Optional[str] = None) -> str:
     """Model for ``/v1/images/edits`` requests.
 
-    An explicitly selected model (env or config) that accepts image input
-    is honored for edits; otherwise fall back to the quality model, which
-    xAI documents as the edit-capable baseline.
+    An explicitly selected model (caller kwarg, env, or config) that accepts
+    image input is honored for edits; otherwise fall back to the quality
+    model, which xAI documents as the edit-capable baseline.
     """
     catalog = _catalog()
-    explicit = os.environ.get("XAI_IMAGE_MODEL") or (
+    explicit = caller_model or os.environ.get("XAI_IMAGE_MODEL") or (
         _load_xai_config().get("model") if isinstance(_load_xai_config().get("model"), str) else None
     )
     if explicit and explicit in catalog:
@@ -357,7 +368,7 @@ class XAIImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect_ratio,
             )
 
-        model_id, meta = _resolve_model()
+        model_id, meta = _resolve_model(kwargs.get("model"))
         aspect = resolve_aspect_ratio(aspect_ratio)
         xai_ar = _XAI_ASPECT_RATIOS.get(aspect, "1:1")
         resolution = _resolve_resolution()
@@ -419,7 +430,7 @@ class XAIImageGenProvider(ImageGenProvider):
             # is honored; otherwise the documented quality baseline is used.
             # The source image may be a public URL or a base64 data URI;
             # local file paths are converted to a data URI here.
-            edit_model = _resolve_edit_model()
+            edit_model = _resolve_edit_model(kwargs.get("model"))
             try:
                 image_fields = [_xai_image_field(source) for source in source_images]
             except Exception as exc:
