@@ -990,7 +990,7 @@ DEFAULT_CONFIG = {
     # pressure. Reopening one re-resumes it from disk. 0/null disables.
     "max_live_sessions": 16,
     "agent": {
-        "max_turns": 500,
+        "max_turns": None,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -2372,7 +2372,6 @@ DEFAULT_CONFIG = {
         # the raw transcript is also echoed back to the user as a 🎙️ message.
         # Set false to keep STT for the agent while suppressing that user-facing echo.
         "echo_transcripts": True,
-        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "elevenlabs" (Scribe) | "deepinfra"
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
@@ -3234,7 +3233,7 @@ DEFAULT_CONFIG = {
         # — whether the feature is enabled at all is the Labs toggle, never a
         # config key (decisions.md D2/D11). 0/negative falls back to the default.
         "scale_to_zero": {
-            "idle_timeout_minutes": 5,
+            "idle_timeout_minutes": 2,
         },
 
         # Auto-resume restart-loop breaker (#30719, defense-3). When the
