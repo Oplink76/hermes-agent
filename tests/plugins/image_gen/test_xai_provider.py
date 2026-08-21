@@ -124,6 +124,43 @@ class TestConfig:
         model_id, _ = _resolve_model()
         assert model_id == "grok-imagine-image"
 
+    def test_caller_model_overrides_env(self, monkeypatch):
+        """caller_model (from image_gen.model config key) must take priority
+        over XAI_IMAGE_MODEL env — mirrors the fix applied to the openrouter
+        provider in #55672."""
+        monkeypatch.setenv("XAI_IMAGE_MODEL", "grok-imagine-image")
+        from plugins.image_gen.xai import _resolve_model
+
+        model_id, _ = _resolve_model("grok-imagine-image-quality")
+        assert model_id == "grok-imagine-image-quality"
+
+    def test_unknown_caller_model_falls_back_to_env(self, monkeypatch):
+        """An unrecognised caller_model must not crash — fall through to env."""
+        monkeypatch.setenv("XAI_IMAGE_MODEL", "grok-imagine-image")
+        from plugins.image_gen.xai import _resolve_model
+
+        model_id, _ = _resolve_model("not-a-real-model")
+        assert model_id == "grok-imagine-image"
+
+    def test_model_kwarg_forwarded_to_generate(self):
+        """generate(model=...) must use the supplied model, not the default."""
+        from plugins.image_gen.xai import XAIImageGenProvider
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"data": [{"b64_json": "dGVzdA=="}]}
+
+        with patch("plugins.image_gen.xai.requests.post", return_value=mock_resp) as mock_post:
+            with patch("plugins.image_gen.xai.save_b64_image", return_value="/tmp/out.png"):
+                provider = XAIImageGenProvider()
+                result = provider.generate(prompt="test", model="grok-imagine-image-quality")
+
+        assert result["success"] is True
+        assert result["model"] == "grok-imagine-image-quality"
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json", {})
+        assert payload.get("model") == "grok-imagine-image-quality"
+
 
 # ---------------------------------------------------------------------------
 # Live catalog merge tests
@@ -183,6 +220,23 @@ class TestLiveCatalog:
         monkeypatch.setattr(xai_mod, "_LIVE_CACHE", None)
         monkeypatch.delenv("XAI_IMAGE_MODEL", raising=False)
         assert xai_mod._resolve_edit_model() == "grok-imagine-image-quality"
+
+    def test_edit_model_honors_caller_kwarg(self, monkeypatch):
+        """The dispatched model kwarg reaches the edit path too."""
+        import plugins.image_gen.xai as xai_mod
+
+        live = {
+            "grok-imagine-image-2.0": {"input_modalities": ["text", "image"], "aliases": []},
+            "grok-imagine-image-quality": {"input_modalities": ["text", "image"], "aliases": []},
+        }
+        monkeypatch.setattr(xai_mod, "_fetch_live_models", lambda: live)
+        monkeypatch.setattr(xai_mod, "_LIVE_CACHE", None)
+        monkeypatch.delenv("XAI_IMAGE_MODEL", raising=False)
+        assert xai_mod._resolve_edit_model("grok-imagine-image-2.0") == "grok-imagine-image-2.0"
+        # Text-only caller model must not hijack the edit path.
+        live["grok-imagine-image-2.0"]["input_modalities"] = ["text"]
+        monkeypatch.setattr(xai_mod, "_LIVE_CACHE", None)
+        assert xai_mod._resolve_edit_model("grok-imagine-image-2.0") == "grok-imagine-image-quality"
 
 
 # ---------------------------------------------------------------------------
