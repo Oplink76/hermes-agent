@@ -67,6 +67,30 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
     monkeypatch.setattr(hermes_main, "_upgrade_pip_before_lazy_refresh", lambda *a, **kw: None)
     monkeypatch.setattr(hermes_main, "_refresh_active_lazy_features", lambda *a, **kw: True)
+    # Keep unit update flows isolated from the developer machine's live fleet.
+    # The plan/restart/verify phases otherwise discover real profile homes and
+    # launchd services, while these tests deliberately mock subprocess calls.
+    from hermes_cli.update_inventory import UpdatePlan
+
+    monkeypatch.setattr(
+        "hermes_cli.update_inventory.collect_runtime_inventory", lambda: UpdatePlan()
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions", lambda **kw: []
+    )
+    monkeypatch.setattr(
+        "hermes_cli.gateway.find_gateway_pids", lambda **kw: [], raising=False
+    )
+    monkeypatch.setattr(
+        "hermes_cli.gateway.find_profile_gateway_processes", lambda **kw: []
+    )
+    monkeypatch.setattr(
+        "hermes_cli.gateway._get_service_pids", lambda **kw: set()
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_cmd._restart_macos_launchd_gateways",
+        lambda *args, **kwargs: None,
+    )
 
 
 
