@@ -103,6 +103,15 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
       ipcRenderer.on('hermes:hud:cursor', listener)
 
       return () => ipcRenderer.removeListener('hermes:hud:cursor', listener)
+    },
+    // Main's game-overlay watch: whether a fullscreen app (a game) is under
+    // the HUD, so the renderer can step back to the low-opacity overlay
+    // treatment while one owns the screen.
+    onGameOverlay: callback => {
+      const listener = (_event, state) => callback(state)
+      ipcRenderer.on('hermes:hud:game-overlay', listener)
+
+      return () => ipcRenderer.removeListener('hermes:hud:game-overlay', listener)
     }
   },
   // Quick Entry: the global-hotkey mini composer window. Main owns the OS
@@ -196,6 +205,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     set: maxMb => ipcRenderer.invoke('hermes:data-url-read-max:set', maxMb)
   },
   readFileText: filePath => ipcRenderer.invoke('hermes:readFileText', filePath),
+  readPluginSource: (filePath: string) => ipcRenderer.invoke('hermes:readPluginSource', filePath),
   selectPaths: options => ipcRenderer.invoke('hermes:selectPaths', options),
   selectSavePath: options => ipcRenderer.invoke('hermes:selectSavePath', options),
   writeClipboard: text => ipcRenderer.invoke('hermes:writeClipboard', text),
@@ -269,6 +279,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   revealPath: targetPath => ipcRenderer.invoke('hermes:fs:reveal', targetPath),
   openDir: dirPath => ipcRenderer.invoke('hermes:fs:openDir', dirPath),
   desktopPluginsRoot: () => ipcRenderer.invoke('hermes:fs:desktopPluginsRoot'),
+  logsRoot: () => ipcRenderer.invoke('hermes:fs:logsRoot'),
   agentPluginsRoot: () => ipcRenderer.invoke('hermes:fs:agentPluginsRoot'),
   renamePath: (targetPath, newName) => ipcRenderer.invoke('hermes:fs:rename', targetPath, newName),
   writeTextFile: (filePath, content) => ipcRenderer.invoke('hermes:fs:writeText', filePath, content),

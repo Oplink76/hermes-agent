@@ -258,6 +258,38 @@ def test_every_lane_reaches_the_composite_action():
     assert lanes - action_outputs == set(), "lane(s) missing from the composite action's outputs"
 
 
+def test_detect_change_consumers_only_pass_declared_inputs():
+    """Unknown local-action inputs make GitHub reject a workflow before jobs exist."""
+    action = _yaml(".github/actions/detect-changes/action.yml")
+    declared = set(action.get("inputs", {}))
+    invalid: list[str] = []
+
+    for workflow_path in sorted((_REPO / ".github/workflows").glob("*.y*ml")):
+        workflow = _yaml(str(workflow_path.relative_to(_REPO)))
+        for job_name, job in workflow.get("jobs", {}).items():
+            for step in job.get("steps", []) or []:
+                if step.get("uses") != "./.github/actions/detect-changes":
+                    continue
+                unknown = set(step.get("with", {})) - declared
+                invalid.extend(
+                    f"{workflow_path.name}:{job_name}:{name}"
+                    for name in sorted(unknown)
+                )
+
+    assert invalid == [], f"detect-changes received undeclared input(s): {invalid}"
+
+
+def test_ci_detect_checks_out_its_local_action():
+    """A sparse checkout can omit the local action and fail before classification."""
+    detect = _yaml(".github/workflows/ci.yaml")["jobs"]["detect"]
+    checkout = next(
+        step for step in detect["steps"]
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+
+    assert "sparse-checkout" not in checkout.get("with", {})
+
+
 def test_ci_jobs_only_gate_on_detect_outputs_that_detect_actually_declares():
     """An ``if`` that reads an undeclared output resolves to the empty string.
 

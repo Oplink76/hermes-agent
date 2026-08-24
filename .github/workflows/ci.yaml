@@ -38,6 +38,9 @@ jobs:
   detect:
     name: Detect affected areas
     runs-on: ubuntu-latest
+    # A full checkout keeps the repository-local detect action and its script
+    # available. The upstream one-minute sparse checkout excluded the action
+    # itself, so GitHub rejected the lane before classification could run.
     timeout-minutes: 10
     outputs:
       python: ${{ steps.classify.outputs.python }}
@@ -72,8 +75,6 @@ jobs:
     needs: detect
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/tests.yml
-    with:
-      slice_count: 12
 
   # macOS + Windows lanes. The main `tests` lane above is Linux-only, and
   # the OS-marked tests it collects are skipped there by design (see the
