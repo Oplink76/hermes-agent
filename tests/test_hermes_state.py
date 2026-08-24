@@ -2061,6 +2061,43 @@ class TestFtsRebuildLoopWithoutTrigram:
             )
             assert name not in FTS_TRIGRAM_SQL
 
+    def test_drop_trigram_fts_never_drops_a_late_base_trigger(self, monkeypatch):
+        """Optional trigram cleanup must classify triggers by name, not position."""
+        import hermes_state_schema as schema
+
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY)")
+            late_base = "messages_fts_archive_insert"
+            trigram_triggers = schema._FTS_TRIGRAM_TRIGGERS
+            for name in (*trigram_triggers, late_base):
+                conn.execute(
+                    f"CREATE TRIGGER {name} AFTER INSERT ON messages BEGIN SELECT 1; END"
+                )
+
+            # Patch the live name-based classification to prove cleanup reads
+            # that symbol and drops only its members. A future base trigger
+            # outside the classification must remain regardless of position.
+            classified_trigram = trigram_triggers[:1]
+            monkeypatch.setattr(
+                schema,
+                "_FTS_TRIGRAM_TRIGGERS",
+                classified_trigram,
+            )
+            schema.SessionSchemaMixin._drop_trigram_fts(conn.cursor())
+
+            remaining = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                )
+            }
+            assert late_base in remaining
+            assert not remaining.intersection(classified_trigram)
+            assert set(trigram_triggers[1:]).issubset(remaining)
+        finally:
+            conn.close()
+
     def test_missing_trigram_tokenizer_does_not_rebuild_fts_on_every_open(
         self, tmp_path, monkeypatch
     ):

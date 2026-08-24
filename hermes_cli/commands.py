@@ -1361,12 +1361,6 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     /hermes update on Slack. Demoted to free the native slot /approvals now
 #     claims — without this entry /approvals tips the registry past the 50-cap
 #     and silently clamps /update off, breaking Telegram parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({
-    "topup", "credits", "billing", "moa", "debug", "egress", "init",
-    "version", "diff", "update", "project-create", "project-import",
-    "project_create", "project_import", "heartbeat", "refine", "pause",
-    "review", "whoami", "platform",
-})
 #   - heartbeat: session heartbeat management; reached via /hermes heartbeat
 #     on Slack. Added at the 50-cap — a native slot would clamp /insights.
 #   - refine: on-demand memory/skill review; reached via /hermes refine on
@@ -1384,6 +1378,16 @@ _SLACK_VIA_HERMES_ONLY = frozenset({
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
+#   - review: session review mode; reached via /hermes review on Slack so it
+#     does not displace an existing native slash at the 50-command cap.
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "topup", "credits", "billing", "moa", "debug", "egress", "init",
+    "version", "diff", "update", "project-create", "project-import",
+    "project_create", "project_import", "heartbeat", "refine", "pause",
+    "review", "whoami", "platform",
+})
+
+
 def _sanitize_slack_name(raw: str) -> str:
     """Convert a command name to a valid Slack slash command name.
 

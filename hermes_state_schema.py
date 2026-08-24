@@ -38,8 +38,6 @@ from hermes_state_common import (
 # keep that logger identity so log filtering/capture behavior is unchanged.
 logger = logging.getLogger("hermes_state")
 
-_BASE_FTS_TRIGGERS = _FTS_TRIGGERS[:3]
-_TRIGRAM_FTS_TRIGGERS = _FTS_TRIGGERS[3:]
 DEFAULT_FTS_TRIGRAM_MAX_MESSAGES = 50_000
 _FTS_HOLDER_ESCALATE_ATTEMPTS = 3
 _FTS_HOLDER_ESCALATE_SECONDS = 60.0
@@ -331,7 +329,7 @@ class SessionSchemaMixin:
     @staticmethod
     def _drop_trigram_fts(cursor: sqlite3.Cursor) -> None:
         """Drop optional trigram search data without risking canonical rows."""
-        for trigger in _TRIGRAM_FTS_TRIGGERS:
+        for trigger in _FTS_TRIGRAM_TRIGGERS:
             try:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             except sqlite3.OperationalError:
