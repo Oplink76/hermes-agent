@@ -211,6 +211,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                busy_policy="dispatch"),
     CommandDef("refine", "Review this conversation now and save lessons to memory/skills", "Session",
                args_hint="[focus instructions]"),
+    CommandDef("review", "Spawn an independent subagent to review the work just discussed (PR, code, docs)", "Session",
+               args_hint="[review instructions]"),
     CommandDef("loop", "Re-run a prompt on a recurring interval in this session", "Session",
                aliases=("proactive",),
                args_hint="[interval] <prompt> [--times N] [--until <condition>] | status | pause | resume | stop",
@@ -1363,7 +1365,7 @@ _SLACK_VIA_HERMES_ONLY = frozenset({
     "topup", "credits", "billing", "moa", "debug", "egress", "init",
     "version", "diff", "update", "project-create", "project-import",
     "project_create", "project_import", "heartbeat", "refine", "pause",
-    "whoami", "platform",
+    "review", "whoami", "platform",
 })
 #   - heartbeat: session heartbeat management; reached via /hermes heartbeat
 #     on Slack. Added at the 50-cap — a native slot would clamp /insights.
@@ -1382,8 +1384,6 @@ _SLACK_VIA_HERMES_ONLY = frozenset({
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-
-
 def _sanitize_slack_name(raw: str) -> str:
     """Convert a command name to a valid Slack slash command name.
 
