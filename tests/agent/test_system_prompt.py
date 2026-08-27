@@ -48,7 +48,6 @@ def _captured_context_cwd(agent):
 
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", side_effect=fake_context_files),
     ):
@@ -71,7 +70,6 @@ class TestContextFileCwd:
 def _stable_prompt(agent):
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
@@ -109,7 +107,6 @@ def test_task_scoped_claude_system_prompt_omits_unavailable_generic_tool_guidanc
 def _prompt_parts(agent):
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
@@ -299,7 +296,6 @@ def test_build_system_prompt_records_stable_prefix():
     agent = _make_agent()
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value="context"),
     ):
@@ -319,6 +315,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     )
     monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")
     monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
+    monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS", "HELP")
     monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
     monkeypatch.setattr(system_prompt, "get_hermes_home", lambda: Path("/hermes"))
 
@@ -344,7 +341,6 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
 
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value="CONTEXT_FILES"),
         patch(
@@ -489,7 +485,6 @@ def _build(builder, **overrides):
     agent = _make_agent(valid_tool_names=["skills_list"], **overrides)
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value=_CONTEXT),
         patch("run_agent.get_toolset_for_tool", return_value=None),
@@ -518,3 +513,61 @@ class TestSkillsInVolatileBand:
         full = _build(build_system_prompt)
         assert full.index(_CONTEXT) < full.index(_SKILLS)
         assert full.index(_SKILLS) < full.index("Conversation started:")
+
+
+class TestMemoryProviderSystemPromptGating:
+    """Issue #81014: the provider's ``system_prompt_block()`` must be gated
+    on the same ``memory_provider_tools_enabled`` check as tool injection.
+    Otherwise the agent receives instructions for tools that don't exist in
+    its tool surface.
+    """
+
+    @staticmethod
+    def _make_fake_manager(prompt_block: str):
+        """Build a MemoryManager-like object exposing only what
+        ``build_system_prompt_parts`` touches."""
+        from unittest.mock import MagicMock
+        mgr = MagicMock()
+        mgr.build_system_prompt.return_value = prompt_block
+        return mgr
+
+    def _agent(self, *, enabled_toolsets, disabled_toolsets, prompt_block):
+        return _make_agent(
+            valid_tool_names=["skills_list"],
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            _memory_manager=self._make_fake_manager(prompt_block),
+        )
+
+    def test_block_injected_when_memory_toolset_enabled(self):
+        block = "PROVIDER_BLOCK_SENTINEL"
+        agent = self._agent(
+            enabled_toolsets=["memory"],
+            disabled_toolsets=None,
+            prompt_block=block,
+        )
+        full = _build(build_system_prompt, _memory_manager=agent._memory_manager,
+                      enabled_toolsets=["memory"], disabled_toolsets=None)
+        assert block in full
+
+    def test_block_dropped_when_memory_toolset_disabled(self):
+        block = "PROVIDER_BLOCK_SENTINEL"
+        agent = self._agent(
+            enabled_toolsets=None,
+            disabled_toolsets=["memory"],
+            prompt_block=block,
+        )
+        full = _build(build_system_prompt, _memory_manager=agent._memory_manager,
+                      enabled_toolsets=None, disabled_toolsets=["memory"])
+        assert block not in full
+
+    def test_block_dropped_when_memory_not_in_enabled_toolsets(self):
+        block = "PROVIDER_BLOCK_SENTINEL"
+        agent = self._agent(
+            enabled_toolsets=["web_search"],
+            disabled_toolsets=None,
+            prompt_block=block,
+        )
+        full = _build(build_system_prompt, _memory_manager=agent._memory_manager,
+                      enabled_toolsets=["web_search"], disabled_toolsets=None)
+        assert block not in full
