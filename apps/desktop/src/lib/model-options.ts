@@ -56,7 +56,7 @@ export function selectionInCatalog(providers: ModelOptionProvider[] | undefined,
   return providers.some(provider => (provider.models ?? []).includes(model))
 }
 
-/** First real (non-MoA) catalog row that still has models. */
+/** First ready, real (non-MoA) catalog row that still has models. */
 export function firstSelectableCatalogModel(
   providers: ModelOptionProvider[] | undefined
 ): { model: string; provider: string } | null {
@@ -65,7 +65,7 @@ export function firstSelectableCatalogModel(
   }
 
   for (const provider of providers) {
-    if (provider.slug === MOA_PROVIDER_SLUG) {
+    if (provider.slug === MOA_PROVIDER_SLUG || !isProviderReady(provider)) {
       continue
     }
 
