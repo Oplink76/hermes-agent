@@ -12,7 +12,6 @@ the late-binding seam in :mod:`hermes_cli.web_deps` so tests that
 ``monkeypatch.setattr(web_server, "_helper", ...)`` keep working.
 """
 
-import asyncio  # noqa: F401 — used by handlers
 import inspect
 import json
 import logging
@@ -796,7 +795,7 @@ async def backfill_session_owner_profiles(body: SessionOwnerBackfill):
             db.close()
 
     try:
-        stamped = await asyncio.to_thread(_backfill)
+        stamped = await _run_session_db_io(_backfill)
     except HTTPException:
         raise
     except Exception:

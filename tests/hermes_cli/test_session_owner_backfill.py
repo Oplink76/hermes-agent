@@ -10,6 +10,7 @@ overwriting a non-NULL owner.
 """
 
 import sqlite3
+import threading
 
 import pytest
 
@@ -139,3 +140,27 @@ def test_backfill_treats_empty_string_profile_as_legacy(client):
     assert resp.status_code == 200
     assert resp.json()["stamped"] == 1
     assert _profiles(get_hermes_home() / "state.db")["legacy-empty"] == "default"
+
+
+def test_backfill_runs_sessiondb_write_on_dedicated_executor(client, monkeypatch):
+    from hermes_constants import get_hermes_home
+    from hermes_cli import web_server
+
+    db_path = get_hermes_home() / "state.db"
+    _seed(db_path, [("legacy-thread", None)])
+
+    open_db = web_server._open_session_db_for_profile
+    worker_names: list[str] = []
+
+    def observed_open_db(profile=None, *, read_only):
+        worker_names.append(threading.current_thread().name)
+        return open_db(profile, read_only=read_only)
+
+    monkeypatch.setattr(web_server, "_open_session_db_for_profile", observed_open_db)
+
+    resp = client.post("/api/sessions/owner-backfill", json={})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["stamped"] == 1
+    assert worker_names
+    assert all(name.startswith("hermes-session-db") for name in worker_names)

@@ -4,8 +4,8 @@ import { getGlobalModelOptions } from '@/hermes'
 
 import {
   filterMoaSlotProviders,
-  isProviderReady,
   firstSelectableCatalogModel,
+  isProviderReady,
   manualPickRemoved,
   modelOptionsQueryKey,
   reconcileSelectionAfterCatalogRefresh,
