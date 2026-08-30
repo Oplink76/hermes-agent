@@ -394,7 +394,9 @@ def verify_work_contract(
         return WorkContractVerification(valid=False, failure="io_error")
 
     try:
-        if not hmac.compare_digest(canonical, supplied_canonical):
+        if not hmac.compare_digest(
+            canonical.encode("utf-8"), supplied_canonical.encode("utf-8")
+        ):
             return WorkContractVerification(valid=False, failure="canonical_mismatch")
         digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         if not hmac.compare_digest(digest, supplied_digest):
@@ -402,6 +404,10 @@ def verify_work_contract(
     except OSError:
         return WorkContractVerification(valid=False, failure="io_error")
     except (TypeError, ValueError):
+        logger.warning(
+            "Work Contract comparison failed for an invalid signed field shape",
+            exc_info=True,
+        )
         return WorkContractVerification(valid=False, failure="shape")
 
     try:
@@ -420,6 +426,10 @@ def verify_work_contract(
     except OSError:
         return WorkContractVerification(valid=False, failure="io_error")
     except (TypeError, ValueError):
+        logger.warning(
+            "Work Contract comparison failed for an invalid signed field shape",
+            exc_info=True,
+        )
         return WorkContractVerification(valid=False, failure="shape")
     return WorkContractVerification(valid=True)
 

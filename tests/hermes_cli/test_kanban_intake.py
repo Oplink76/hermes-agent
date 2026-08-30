@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import concurrent.futures
 import json
+import logging
 import stat
 import subprocess
 import sys
@@ -68,6 +69,53 @@ def test_service_signature_verifies_and_caller_signature_is_ignored():
     assert signed["digest"] != "caller-controlled"
     assert "signature" not in signed["contract"]
     assert intake.verify_work_contract(signed, secret=secret).valid
+
+
+@pytest.mark.parametrize("title", ["Review — contract", "Ruteplan for København"])
+def test_service_signature_verifies_non_ascii_contract(title):
+    secret = b"test-only-secret"
+    contract = _contract()
+    contract["work"]["title"] = title
+
+    signed = intake.sign_work_contract(contract, secret=secret)
+
+    assert signed["canonical_json"] == intake.canonical_contract_json(contract)
+    assert intake.verify_work_contract(signed, secret=secret).valid
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("canonical_json", "pre\ud800fix"),
+        ("signature", "signatur-ø-sentinel"),
+    ],
+)
+def test_verify_work_contract_logs_internal_shape_without_signed_values(
+    caplog, field, value
+):
+    signed = intake.sign_work_contract(_contract(), secret=b"test-only-secret")
+    signed[field] = value
+
+    with caplog.at_level(logging.WARNING, logger=intake.__name__):
+        result = intake.verify_work_contract(signed, secret=b"test-only-secret")
+
+    assert result == intake.WorkContractVerification(valid=False, failure="shape")
+    assert (
+        "Work Contract comparison failed for an invalid signed field shape"
+        in caplog.text
+    )
+    assert value not in caplog.text
+
+
+def test_verify_work_contract_does_not_log_ordinary_shape_rejection(caplog):
+    signed = intake.sign_work_contract(_contract(), secret=b"test-only-secret")
+    signed["contract"] = None
+
+    with caplog.at_level(logging.WARNING, logger=intake.__name__):
+        result = intake.verify_work_contract(signed, secret=b"test-only-secret")
+
+    assert result == intake.WorkContractVerification(valid=False, failure="shape")
+    assert caplog.records == []
 
 
 @pytest.mark.parametrize(

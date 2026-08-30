@@ -838,6 +838,7 @@ def test_clarification_stays_inert_and_two_invalid_decisions_need_attention(
 def test_accepted_epic_materializes_all_stories_ready_at_architecture(
     tmp_path, monkeypatch
 ):
+    from hermes_cli import kanban_intake
     from hermes_cli import kanban_po_intake
 
     board = _strict_board(tmp_path, monkeypatch, "po-intake-epic")
@@ -845,7 +846,7 @@ def test_accepted_epic_materializes_all_stories_ready_at_architecture(
     _intake_id, _run = _active_intake(conn, monkeypatch)
     proposal = _proposal()
     proposal["work"]["item_kind"] = "epic"
-    proposal["work"]["title"] = "Export reporting"
+    proposal["work"]["title"] = "Eksport — rapportering"
     proposal["routing"] = {
         "entry_phase": None,
         "assignee": None,
@@ -857,7 +858,7 @@ def test_accepted_epic_materializes_all_stories_ready_at_architecture(
     proposal["handover"]["next_role"] = None
     proposal["stories"] = [
         {
-            "title": "Export data",
+            "title": "Eksportér data",
             "outcome": "CSV can be generated",
             "scope": ["CSV generation"],
             "out_of_scope": ["Download UI"],
@@ -865,7 +866,7 @@ def test_accepted_epic_materializes_all_stories_ready_at_architecture(
             "depends_on": [],
         },
         {
-            "title": "Download export",
+            "title": "Hent CSV — København",
             "outcome": "User can download CSV",
             "scope": ["Download UI"],
             "out_of_scope": ["PDF"],
@@ -895,12 +896,26 @@ def test_accepted_epic_materializes_all_stories_ready_at_architecture(
             reason="A bounded Epic is needed",
             proposal=proposal,
         )
+        parent = kb.get_task(conn, result["task_id"])
+        parent_contract = kb.get_work_contract(conn, parent.work_contract_id)
         stories = [kb.get_task(conn, task_id) for task_id in kb.list_epic_members(
             conn, result["task_id"]
         )]
+        story_contracts = [
+            kb.get_work_contract(conn, story.work_contract_id) for story in stories
+        ]
     finally:
         conn.close()
 
+    assert result["status"] == "qualified"
+    assert sorted(story.title for story in stories) == [
+        "Eksportér data",
+        "Hent CSV — København",
+    ]
+    assert all(
+        kanban_intake.verify_work_contract(envelope).valid
+        for envelope in [parent_contract, *story_contracts]
+    )
     assert [(story.current_step_key, story.assignee, story.status) for story in stories] == [
         ("architecture", "architect", "ready"),
         ("architecture", "architect", "ready"),
