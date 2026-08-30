@@ -302,6 +302,16 @@ def test_spawn_is_detached_intake_scoped_and_disables_provider_fallback(
     assert "HERMES_KANBAN_TASK" not in env
 
 
+def test_product_owner_prompt_allows_one_bounded_invalid_retry():
+    from hermes_cli import kanban_po_intake
+
+    prompt = kanban_po_intake.PRODUCT_OWNER_PROMPT
+    assert "exactly one" not in prompt
+    assert "returns status invalid" in prompt
+    assert "retry once in the same run" in prompt
+    assert "at most two work_inbox_decide calls total" in prompt
+
+
 def test_requalification_keeps_auxiliary_qualifier(monkeypatch):
     from hermes_cli import kanban_po_intake
     from hermes_cli import kanban_qualifier
@@ -766,6 +776,40 @@ def test_budget_exhaustion_routing_rolls_back_as_one_transaction(
     assert card.worker_pid == 981002
     assert budget_events == []
     assert len(intakes) == 1  # only the original admission intake
+
+
+def test_valid_second_decision_after_invalid_qualifies(tmp_path, monkeypatch):
+    from hermes_cli import kanban_po_intake
+
+    board = _strict_board(tmp_path, monkeypatch, "po-intake-corrected")
+    conn = kb.connect(board=board)
+    intake_id, run = _active_intake(conn, monkeypatch)
+    try:
+        first = kanban_po_intake.decide_product_owner_intake(
+            conn,
+            board=board,
+            disposition="accepted",
+            reason="first invalid proposal",
+            proposal={"work": {}},
+        )
+        second = kanban_po_intake.decide_product_owner_intake(
+            conn,
+            board=board,
+            disposition="accepted",
+            reason="corrected proposal",
+            proposal=_proposal(),
+        )
+        persisted = kb.get_qualification_intake(conn, intake_id)
+        persisted_run = kb.get_qualification_intake_run(conn, int(run["id"]))
+    finally:
+        conn.close()
+
+    assert first["status"] == "invalid"
+    assert first["attempt"] == 1
+    assert second["status"] == "qualified"
+    assert second["task_id"]
+    assert persisted["status"] == "qualified"
+    assert persisted_run["validation_attempts"] == 1
 
 
 def test_clarification_stays_inert_and_two_invalid_decisions_need_attention(

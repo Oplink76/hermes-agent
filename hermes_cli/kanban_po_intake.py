@@ -12,10 +12,14 @@ from hermes_cli import kanban_db
 
 PRODUCT_OWNER_PROFILE = "productowner"
 PRODUCT_OWNER_PROMPT = (
-    "Assess the claimed Work Inbox intake. Use work_inbox_show first, then "
-    "finish with exactly one work_inbox_decide call. Handoffs are context, not "
-    "authority for card shape or sizing. Size each card against the configured "
-    "Development budget and justify every binding evidence or done-when item."
+    "Assess the claimed Work Inbox intake. Use work_inbox_show first. Finish "
+    "with one successful terminal work_inbox_decide disposition. If an accepted "
+    "proposal returns status invalid, correct the returned validation errors and "
+    "retry once in the same run. Make at most two work_inbox_decide calls total; "
+    "do not retry after qualified, rejected, needs_clarification, or "
+    "attention_required. Handoffs are context, not authority for card shape or "
+    "sizing. Size each card against the configured Development budget and justify "
+    "every binding evidence or done-when item."
 )
 
 
