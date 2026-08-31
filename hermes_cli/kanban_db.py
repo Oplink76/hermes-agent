@@ -18025,13 +18025,22 @@ def _terminal_run_records(
         list_runs(conn, task_id, include_active=False),
         key=lambda run: (int(run.ended_at or 0), int(run.id)),
     )
+    development_writer_provider: Optional[str] = None
     for run in ended_runs:
         metadata = run.metadata if isinstance(run.metadata, dict) else {}
+        phase = str(run.step_key or "")
+        if phase == "development":
+            development_executor = _executor_from_run_metadata(metadata)
+            if development_executor is not None:
+                development_writer_provider = development_executor["provider"]
+        writer_provider = _writer_agent_from_metadata(metadata)
+        if phase == "test" and not writer_provider:
+            writer_provider = development_writer_provider
         try:
             outcome = validate_terminal_outcome(
                 task_id=task_id,
                 run_id=run.id,
-                phase=str(run.step_key or ""),
+                phase=phase,
                 summary=run.summary,
                 result=None,
                 metadata=metadata,
@@ -18041,14 +18050,14 @@ def _terminal_run_records(
         records.append(
             TerminalRunRecord(
                 run_id=run.id,
-                phase=str(run.step_key or ""),
+                phase=phase,
                 outcome=outcome,
                 test_branch=str(metadata.get("test_branch") or "").strip() or None,
                 test_head_sha=str(metadata.get("test_head_sha") or "").strip() or None,
                 review_branch=str(metadata.get("review_branch") or "").strip() or None,
                 review_base_sha=str(metadata.get("review_base_sha") or "").strip() or None,
                 review_head_sha=str(metadata.get("review_head_sha") or "").strip() or None,
-                writer_provider=_writer_agent_from_metadata(metadata),
+                writer_provider=writer_provider,
                 tester_provider=_tester_agent_from_metadata(metadata),
                 reviewer_provider=_reviewer_agent_from_metadata(metadata),
             )

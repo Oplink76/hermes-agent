@@ -8720,6 +8720,78 @@ def test_pinned_review_target_survives_run_completion(
     }
 
 
+def test_terminal_run_records_fill_test_writer_from_preceding_development_executor(
+    kanban_home,
+):
+    first_writer = {
+        "profile": "developer",
+        "provider": "openrouter",
+        "model": "model-a",
+        "effort": "high",
+        "surface": "hermes-primary",
+    }
+    later_writer = {
+        "profile": "developer",
+        "provider": "claude-cli",
+        "model": "model-b",
+        "effort": "high",
+        "surface": "hermes-primary",
+    }
+    test_metadata = {
+        "workflow_outcome": {"verdict": "passed"},
+        "ai_provenance": {"tester": {"agent": "openrouter"}},
+        "test_branch": "story/example",
+        "test_head_sha": "b" * 40,
+    }
+    explicit_test_metadata = {
+        **test_metadata,
+        "ai_provenance": {
+            "writer": {"agent": "recorded-writer"},
+            "tester": {"agent": "openrouter"},
+        },
+    }
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="Chronological test writer")
+        kb._synthesize_ended_run(
+            conn,
+            task_id,
+            outcome="advanced",
+            step_key="development",
+            metadata={"executor": first_writer},
+        )
+        first_test_run_id = kb._synthesize_ended_run(
+            conn,
+            task_id,
+            outcome="advanced",
+            step_key="test",
+            metadata=test_metadata,
+        )
+        kb._synthesize_ended_run(
+            conn,
+            task_id,
+            outcome="advanced",
+            step_key="development",
+            metadata={"executor": later_writer},
+        )
+        explicit_test_run_id = kb._synthesize_ended_run(
+            conn,
+            task_id,
+            outcome="advanced",
+            step_key="test",
+            metadata=explicit_test_metadata,
+        )
+
+        test_records = {
+            record.run_id: record
+            for record in kb._terminal_run_records(conn, task_id)
+            if record.phase == "test"
+        }
+
+    assert test_records[first_test_run_id].writer_provider == "openrouter"
+    assert test_records[explicit_test_run_id].writer_provider == "recorded-writer"
+
+
 # Production baseline measured before R04: 56 ended Test runs contained six
 # distinct SHAs and 76 ended Review runs contained zero SHAs.  These behavior
 # tests cover the replacement contract instead of freezing those observations.
@@ -14333,7 +14405,7 @@ def test_product_epic_and_legacy_reconcile_are_structurally_refused_without_git(
     assert facts == 0
 
 
-def test_integration_enqueued_complete_task_routes_approved_member(
+def test_integration_enqueued_accepts_test_by_development_provider_without_test_writer(
     kanban_home, tmp_path
 ):
     board = "member-review-enqueue"
@@ -14347,11 +14419,24 @@ def test_integration_enqueued_complete_task_routes_approved_member(
     source_sha = _commit_file(repo, "member.txt", "member\n", "member")
     _v2_product_board(board)
     now = int(time.time())
+    developer_executor = {
+        "profile": "developer",
+        "provider": "openrouter",
+        "model": "developer-model",
+        "effort": "high",
+        "surface": "hermes-primary",
+    }
+    reviewer_executor = {
+        "profile": "reviewer",
+        "provider": "claude-cli",
+        "model": "reviewer-model",
+        "effort": "high",
+        "surface": "hermes-primary",
+    }
     test_metadata = {
         "workflow_outcome": {"verdict": "passed"},
         "ai_provenance": {
-            "writer": {"agent": "developer"},
-            "tester": {"agent": "tester", "result": "passed"},
+            "tester": {"agent": "openrouter", "result": "passed"},
         },
         "test_branch": "story/member",
         "test_head_sha": source_sha,
@@ -14360,6 +14445,7 @@ def test_integration_enqueued_complete_task_routes_approved_member(
         "review_branch": "story/member",
         "review_base_sha": base_sha,
         "review_head_sha": source_sha,
+        "executor": reviewer_executor,
     }
     completion_metadata = {
         "workflow_outcome": {"verdict": "approved"},
@@ -14377,6 +14463,17 @@ def test_integration_enqueued_complete_task_routes_approved_member(
             branch_name="story/member",
         )
         kb.add_epic_membership(conn, epic_id=epic_id, task_id=story_id)
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, step_key, status, outcome, metadata, started_at, ended_at) "
+            "VALUES (?, 'development', 'completed', 'advanced', ?, ?, ?)",
+            (
+                story_id,
+                json.dumps({"executor": developer_executor}),
+                now - 4,
+                now - 3,
+            ),
+        )
         conn.execute(
             "INSERT INTO task_runs "
             "(task_id, step_key, status, outcome, metadata, started_at, ended_at) "

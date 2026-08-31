@@ -543,6 +543,19 @@ def test_test_authority_requires_exact_requested_source_sha():
     assert latest_test_authority([_test_record(1, head_sha=_SHA_C)], _SHA_B) is None
 
 
+def test_test_authority_accepts_writer_and_tester_from_the_same_provider():
+    assert latest_test_authority(
+        [_test_record(1, tester="openrouter", writer="openrouter")],
+        _SHA_B,
+    ) == PassedTest(
+        run_id=1,
+        branch="story/example",
+        source_sha=_SHA_B,
+        tester_provider="openrouter",
+        writer_provider="openrouter",
+    )
+
+
 def test_candidate_eligibility_rejects_test_branch_mismatch(tmp_path):
     approved = ApprovedCandidate(
         run_id=1,

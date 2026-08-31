@@ -625,7 +625,6 @@ def test_claim_next_intent_fails_closed_on_running_lease_without_expiry(
         "test",
         "review",
         "provider",
-        "test_provider",
         "sha",
         "source_branch",
         "directive",
@@ -646,8 +645,8 @@ def test_claim_next_intent_refuses_stale_authority_before_repository_access(
                 "DELETE FROM epic_memberships WHERE epic_id=? AND task_id=?",
                 (key.epic_id, key.story_id),
             )
-        elif stale_case in {"test", "review", "provider", "test_provider", "sha"}:
-            phase = "test" if stale_case in {"test", "test_provider"} else "review"
+        elif stale_case in {"test", "review", "provider", "sha"}:
+            phase = "test" if stale_case == "test" else "review"
             row = conn.execute(
                 "SELECT id, metadata FROM task_runs WHERE task_id=? AND step_key=? "
                 "ORDER BY id DESC LIMIT 1",
@@ -662,8 +661,6 @@ def test_claim_next_intent_refuses_stale_authority_before_repository_access(
                 }
             elif stale_case == "provider":
                 metadata["ai_provenance"]["reviewer"]["agent"] = "developer"
-            elif stale_case == "test_provider":
-                metadata["ai_provenance"]["tester"]["agent"] = "developer"
             else:
                 metadata["review_head_sha"] = "9" * 40
             conn.execute(
