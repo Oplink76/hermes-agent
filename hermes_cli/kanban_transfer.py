@@ -183,7 +183,9 @@ def export_board(
         # The snapshot is a private file with no other writers, so plain
         # commit/close is enough — no need for the board DB's WAL dance.
         with contextlib.closing(sqlite3.connect(str(staged / "kanban.db"))) as snapshot:
-            _scrub_local_state(snapshot)
+            kb._register_governance_write_authorizer(snapshot)
+            with kb.authorized_governance_write():
+                _scrub_local_state(snapshot)
             snapshot.commit()
             counts = _count_rows(snapshot)
 
@@ -316,7 +318,7 @@ def _relocate_imported_rows(
     now = int(time.time())
     attachments_dir = kb.attachments_root(slug)
 
-    with kb.write_txn(conn):
+    with kb.authorized_governance_write(), kb.write_txn(conn):
         _scrub_local_state(conn)
 
         dropped = 0

@@ -4997,6 +4997,16 @@ def _resolve_busy_timeout_ms() -> int:
     return DEFAULT_BUSY_TIMEOUT_MS
 
 
+def _register_governance_write_authorizer(conn: sqlite3.Connection) -> None:
+    """Register the governance trigger function on a Kanban database handle."""
+
+    conn.create_function(
+        "hermes_governance_write_authorized",
+        0,
+        lambda: 1 if _GOVERNANCE_WRITE_AUTHORIZED.get() else 0,
+    )
+
+
 def _sqlite_connect(path: Path) -> sqlite3.Connection:
     """Open a Kanban SQLite connection with consistent lock waiting.
 
@@ -5021,11 +5031,7 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
         # the PRAGMA explicitly so it is observable and survives future wrapper
         # changes. Parameter binding is not supported for PRAGMA assignments.
         conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
-        conn.create_function(
-            "hermes_governance_write_authorized",
-            0,
-            lambda: 1 if _GOVERNANCE_WRITE_AUTHORIZED.get() else 0,
-        )
+        _register_governance_write_authorizer(conn)
     except BaseException:
         # A half-open connection abandoned here would leak its fd AND leave a
         # stale entry in the connect_tracked live-connection registry (which

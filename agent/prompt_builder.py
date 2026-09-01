@@ -218,8 +218,9 @@ def build_memory_guidance(memory_enabled: bool = True, profile_enabled: bool = T
     if memory_enabled:
         frame = (
             "You have persistent memory, carried across sessions and loaded "
-            "into each new session's context; the memory tool's schema "
-            "defines what belongs there. "
+            "into each new session's context; the memory tool's schema defines "
+            "which durable facts belong there. Do NOT save task progress; use "
+            "session_search for that history. "
         )
     else:
         frame = (
