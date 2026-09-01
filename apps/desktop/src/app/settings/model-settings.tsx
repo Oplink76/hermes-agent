@@ -24,12 +24,13 @@ import type {
   StaleAuxAssignment
 } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { isCodeSkewRestartRequired } from '@/lib/code-skew-error'
 import { AlertTriangle, Cpu, Loader2 } from '@/lib/icons'
 import { filterMoaSlotProviders, isProviderReady } from '@/lib/model-options'
 import { DEFAULT_REASONING_EFFORT, REASONING_EFFORT_VALUES } from '@/lib/reasoning-effort'
 import { cn } from '@/lib/utils'
 import { setMainModelAssignment } from '@/store/cron-model-impact'
-import { notifyError } from '@/store/notifications'
+import { notifyError, readableError } from '@/store/notifications'
 import { startManualLocalEndpoint, startManualOnboarding, startManualProviderOAuth } from '@/store/onboarding'
 
 import { hermesConfigCacheWriter, invalidateHermesConfig, useHermesConfigRecord } from '../hooks/use-config-record'
@@ -186,6 +187,8 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
   const m = t.settings.model
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [skewRestart, setSkewRestart] = useState(false)
+  const [restartingBackend, setRestartingBackend] = useState(false)
   const [mainModel, setMainModel] = useState<{ model: string; provider: string } | null>(null)
   const [providers, setProviders] = useState<ModelOptionProvider[]>([])
   const [selectedProvider, setSelectedProvider] = useState('')
@@ -222,11 +225,21 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
   // A's models/providers into profile B (or fire onMainModelChanged for A).
   const profileEpoch = useRef(0)
 
+  const setCaughtError = useCallback(
+    (err: unknown, fallback: string) => {
+      const skew = isCodeSkewRestartRequired(err)
+      setSkewRestart(skew)
+      setError(skew ? m.restartRequired : readableError(err, fallback).message)
+    },
+    [m.restartRequired]
+  )
+
   const refresh = useCallback(
     async ({ replaceSelection = false }: { replaceSelection?: boolean } = {}) => {
       const epoch = profileEpoch.current
       setLoading(true)
       setError('')
+      setSkewRestart(false)
 
       try {
         const [modelInfo, modelOptions, auxiliaryModels, moaModels] = await Promise.all([
@@ -263,7 +276,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
         void invalidateHermesConfig(scopeProfile)
       } catch (err) {
         if (profileEpoch.current === epoch) {
-          setError(err instanceof Error ? err.message : String(err))
+          setCaughtError(err, m.loadFailed)
         }
       } finally {
         if (profileEpoch.current === epoch) {
@@ -271,7 +284,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
         }
       }
     },
-    [scopeProfile]
+    [m.loadFailed, scopeProfile, setCaughtError]
   )
 
   useEffect(() => {
@@ -404,12 +417,12 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
           })
           .catch(err => {
             if (moaSaveGeneration.current === generation) {
-              setError(err instanceof Error ? err.message : String(err))
+              setCaughtError(err, m.loadFailed)
             }
           })
       }, 600)
     },
-    [scopeProfile]
+    [m.loadFailed, scopeProfile, setCaughtError]
   )
 
   const updateMoaPreset = useCallback(
@@ -473,12 +486,12 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
 
         setMoa(saved)
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err))
+        setCaughtError(err, m.loadFailed)
       } finally {
         setApplying(false)
       }
     },
-    [scopeProfile]
+    [m.loadFailed, scopeProfile, setCaughtError]
   )
 
   const auxiliaryTaskLabel = useCallback((key: string) => m.tasks[key]?.label ?? key, [m.tasks])
@@ -588,11 +601,11 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       const fallbackModel = refreshedRow?.models?.[0] ?? ''
       setSelectedModel(nextModel || fallbackModel)
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setCaughtError(err, m.loadFailed)
     } finally {
       setActivating(false)
     }
-  }, [apiKeyDraft, scopeProfile, selectedProviderRow])
+  }, [apiKeyDraft, m.loadFailed, scopeProfile, selectedProviderRow, setCaughtError])
 
   // OAuth / external providers can't be activated with a pasted key — hand off
   // to the shared onboarding flow scoped to this provider's real sign-in. The
@@ -656,11 +669,20 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
 
       await refresh()
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setCaughtError(err, m.loadFailed)
     } finally {
       setApplying(false)
     }
-  }, [onMainModelChanged, refresh, scopeProfile, selectedModel, selectedProvider, selectedProviderRow])
+  }, [
+    m.loadFailed,
+    onMainModelChanged,
+    refresh,
+    scopeProfile,
+    selectedModel,
+    selectedProvider,
+    selectedProviderRow,
+    setCaughtError
+  ])
 
   // Sibling of the applyMainModel endpoint passthrough (#65254): auxiliary
   // assignments targeting a user-defined provider must carry that provider's
@@ -698,12 +720,12 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
         )
         await refresh()
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err))
+        setCaughtError(err, m.loadFailed)
       } finally {
         setApplying(false)
       }
     },
-    [endpointForProvider, mainModel, refresh, scopeProfile]
+    [endpointForProvider, m.loadFailed, mainModel, refresh, scopeProfile, setCaughtError]
   )
 
   const applyAuxiliaryDraft = useCallback(
@@ -729,12 +751,12 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
         setEditingAuxTask(null)
         await refresh()
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err))
+        setCaughtError(err, m.loadFailed)
       } finally {
         setApplying(false)
       }
     },
-    [auxDraft, endpointForProvider, refresh, scopeProfile]
+    [auxDraft, endpointForProvider, m.loadFailed, refresh, scopeProfile, setCaughtError]
   )
 
   const beginAuxiliaryEdit = useCallback(
@@ -772,11 +794,26 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       setSwitchStaleAux([])
       await refresh()
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setCaughtError(err, m.loadFailed)
     } finally {
       setApplying(false)
     }
-  }, [mainModel, refresh, scopeProfile])
+  }, [m.loadFailed, mainModel, refresh, scopeProfile, setCaughtError])
+
+  const recycleStaleBackend = useCallback(async () => {
+    setRestartingBackend(true)
+    setError('')
+    setSkewRestart(false)
+
+    try {
+      await window.hermesDesktop?.recycleBackend?.(scopeProfile)
+      await refresh({ replaceSelection: true })
+    } catch (err) {
+      setCaughtError(err, m.restartFailed)
+    } finally {
+      setRestartingBackend(false)
+    }
+  }, [m.restartFailed, refresh, scopeProfile, setCaughtError])
 
   if (loading && !mainModel) {
     return <ModelSettingsSkeleton />
@@ -900,7 +937,22 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
             )}
           </div>
         )}
-        {error && <div className="mt-2 text-xs text-destructive">{error}</div>}
+        {error && (
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-destructive">
+            <span>{error}</span>
+            {skewRestart && (
+              <Button
+                disabled={restartingBackend}
+                onClick={() => void recycleStaleBackend()}
+                size="sm"
+                variant="textStrong"
+              >
+                {restartingBackend && <Loader2 className="size-3.5 animate-spin" />}
+                {restartingBackend ? m.restartingBackend : m.restartBackend}
+              </Button>
+            )}
+          </div>
+        )}
         {switchStaleAux.length > 0 && (
           <div className="mt-2">
             <StaleAuxWarning

@@ -63,6 +63,7 @@ import {
   verifyHermesCli
 } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
+import { recycleOwnedBackend } from './backend-recycle'
 import { isPidAliveWindows, waitForBackendRelease } from './backend-release-gate'
 import {
   isHostKeyChangedBootFailure,
@@ -87,7 +88,7 @@ import {
   buildBrowserWindowUrl
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
-import { applyConnectionChange, teardownSshState } from './connection-apply'
+import { applyConnectionChange, sshQuitShouldBlock, teardownSshState } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
   authModeFromStatus,
@@ -187,13 +188,16 @@ import { createFirstRunSetupGate } from './first-run-setup-gate'
 import { registerFsIpc } from './fs-ipc'
 import {
   filenameFromContentDisposition,
+  fsPumpDeps,
   gatewayFilePath,
   gatewayFileRequestPaths,
   isNotFoundError,
   parseDataUrlToBuffer,
   pumpStreamToFile,
-  resolveGatewayFileBackend
+  resolveGatewayFileBackend,
+  writeBufferToFile
 } from './gateway-file-download'
+import { startGatewaysAfterUpdateAbort, stopGatewayBeforeUpdate } from './gateway-stop-before-update'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { registerGitIpc } from './git-ipc'
 import { clearStaleGitLocks } from './gitlock'
@@ -244,6 +248,7 @@ import {
   waitForManagedSshBootstrapFence,
   waitForManagedUpdateOperations
 } from './managed-ssh-update'
+import { registerMcpOauthCallbackIpc } from './mcp-oauth-callback-ipc'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
 import {
   oauthGuardMayHardFail,
@@ -277,6 +282,7 @@ import { selectPoolEvictions } from './pool-eviction'
 import { createPoolStopper } from './pool-stop'
 import { poolTouchKeys } from './pool-touch-scope'
 import { createKeepAwake } from './power-save'
+import { capturePreviewContents } from './preview-capture'
 import { PreviewReachRegistry } from './preview-reach'
 import {
   createPrimaryRemoteConnection,
@@ -388,6 +394,7 @@ import {
   scanVenvBlockers,
   stopSafeVenvBlockers
 } from './venv-blocker-scan'
+import { isHermesOwnedVenvDaemon } from './venv-holder-select'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
 import { enumerateWindowsFrontToBack, enumerationFailed, readWindowBelow } from './window-below'
@@ -3219,6 +3226,54 @@ function isShimLocked(shimPath) {
   }
 }
 
+// Kill only Hermes-OWNED venv daemons (the memory plugin's hindsight daemon:
+// exe under venv\Scripts AND cmdline referencing hindsight_api.main). The
+// daemon is spawned DETACHED, so it outlives the backend tree-kill and keeps
+// venv files mapped. External holders (a user terminal running `hermes`,
+// unrelated scripts) are NOT killed — scanVenvBlockers reports them and the
+// hand-off aborts, per existing design. Selection lives in the pure
+// venv-holder-select module (ordinal path-prefix, no PowerShell -like
+// wildcard hazards) so it's testable without Electron.
+function killHermesOwnedVenvDaemons(updateRoot) {
+  if (!IS_WINDOWS) {
+    return
+  }
+
+  const scriptsDir = path.join(updateRoot, 'venv', 'Scripts')
+
+  let holders = []
+
+  try {
+    const out = execFileSync(
+      'powershell',
+      [
+        '-NoProfile',
+        '-Command',
+        'Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.CommandLine } | Select-Object ProcessId, ExecutablePath, CommandLine | ConvertTo-Json -Compress'
+      ],
+      hiddenWindowsChildOptions({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15_000 })
+    )
+
+    const parsed = JSON.parse(String(out || '[]'))
+
+    holders = (Array.isArray(parsed) ? parsed : [parsed]).filter(p =>
+      isHermesOwnedVenvDaemon(p?.ExecutablePath, p?.CommandLine, scriptsDir)
+    )
+  } catch {
+    // Best-effort: the venv-blocker scan downstream is the real backstop.
+    return
+  }
+
+  for (const holder of holders) {
+    const pid = Number(holder?.ProcessId)
+
+    if (Number.isInteger(pid) && pid > 0) {
+      rememberLog(`[updates] stopping Hermes-owned venv daemon (hindsight) PID ${pid} before hand-off`)
+      forceKillProcessTree(pid)
+    }
+  }
+}
+
 // Force-kill the entire process TREE rooted at each PID. Node's child.kill()
 // only signals the direct child, so on Windows a backend `hermes.exe` that
 // spawned its own grandchildren (a `hermes` REPL, a pty terminal session, the
@@ -3569,6 +3624,27 @@ async function releaseBackendLock(updateRoot, tag) {
     stopAllPoolBackends
   })
 
+  // Stop separately-running messaging gateways (all profiles) BEFORE the
+  // release gate. The gateway is launched by the gateway-launcher desktop
+  // plugin via /api/gateway/start and is NOT in backendConnectionState or
+  // backendPool, so the tree-kills above never see it — on Windows its
+  // launcher (venv\Scripts\python.exe) keeps the venv mandatory-locked and
+  // the 15s gate aborts the hand-off before the venv-blocker scan's
+  // pausable-gateway exemption ever gets a chance (#70337). Delegate to
+  // `hermes gateway stop --all`: the CLI discovers every profile's gateway
+  // (launcher + worker — gateway.pid records only the uv WORKER, and
+  // taskkill /T from the worker never reaches its parent), drains in-flight
+  // agents, and force-kills survivors. Best-effort; abort paths restore via
+  // startGatewaysAfterUpdateAbort. No-op off Windows.
+  stopGatewayBeforeUpdate(venvHermesShimPath(updateRoot), HERMES_HOME)
+
+  // Reap Hermes-OWNED venv daemons the tree-kill above cannot reach: the
+  // memory plugin's hindsight daemon is spawned DETACHED (it outlives the
+  // backend) yet runs off venv\Scripts\pythonw.exe, keeping venv files
+  // mapped past the backend teardown (#75477/#75478). Narrowly scoped
+  // (venv-holder-select) — external holders are never killed here.
+  killHermesOwnedVenvDaemons(updateRoot)
+
   const shim = venvHermesShimPath(updateRoot)
 
   const gate = await waitForBackendRelease(
@@ -3753,6 +3829,12 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
       emitUpdateProgress({ stage: 'error', message, percent: null })
       startHermes().catch(() => {})
 
+      if (IS_WINDOWS) {
+        // The pre-gate `gateway stop --all` (#70337) took every profile's
+        // gateway down for an update that never happened — bring them back.
+        startGatewaysAfterUpdateAbort(venvHermesShimPath(updateRoot))
+      }
+
       return { ok: false, error: message }
     }
 
@@ -3802,16 +3884,21 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
         rememberLog(`[updates] venv-blocked: ${scanOutcome.result.processes.length} process(es) hold the install`)
         emitUpdateProgress({ stage: 'error', message, percent: null })
         startHermes().catch(() => {})
+        // Restore the gateways the pre-gate stop took down (#70337 drain
+        // semantics): the update aborted, so nothing else will relaunch them.
+        startGatewaysAfterUpdateAbort(venvHermesShimPath(updateRoot))
 
         return { ok: false, error: 'venv-blocked', message, blockers: scanOutcome.result.processes }
       }
 
       if (scanOutcome.kind === 'probe-failure') {
-        const message = formatProbeFailedMessage()
+        const message = formatProbeFailedMessage(scanOutcome.error)
 
         rememberLog(`[updates] venv-blocker probe failed: ${scanOutcome.error}`)
         emitUpdateProgress({ stage: 'error', message, percent: null })
         startHermes().catch(() => {})
+        // Same drain-semantics restore as the venv-blocked abort above.
+        startGatewaysAfterUpdateAbort(venvHermesShimPath(updateRoot))
 
         return { ok: false, error: 'venv-probe-failed', message }
       }
@@ -3939,6 +4026,11 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
       rememberLog(`[updates] hand-off not viable, aborting quit: ${handoffOutcome.message}`)
       emitUpdateProgress({ stage: 'error', message, percent: null })
       startHermes().catch(() => {})
+
+      if (IS_WINDOWS) {
+        // Same drain-semantics restore as the earlier abort paths (#70337).
+        startGatewaysAfterUpdateAbort(venvHermesShimPath(updateRoot))
+      }
 
       return { ok: false, error: 'updater-spawn-failed', message }
     }
@@ -5850,7 +5942,7 @@ async function saveImageFromUrl(rawUrl) {
   return true
 }
 
-async function writeComposerImage(buffer, ext = '.png') {
+async function writeComposerImage(buffer, ext = '.png', name = '') {
   const rawExt = String(ext || '.png')
     .trim()
     .toLowerCase()
@@ -5861,7 +5953,19 @@ async function writeComposerImage(buffer, ext = '.png') {
   await fs.promises.mkdir(dir, { recursive: true })
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').replace('Z', '')
   const random = crypto.randomBytes(3).toString('hex')
-  const filePath = path.join(dir, `composer_${stamp}_${random}${safeExt}`)
+
+  const baseName = String(name || '')
+    .split(/[\\/]/)
+    .pop()
+    ?.replace(/\.[^.]+$/, '')
+
+  const safeName = (baseName || '')
+    .replace(/[^\p{L}\p{N}._-]+/gu, '_')
+    .replace(/^[._-]+|[._-]+$/g, '')
+    .slice(0, 80)
+
+  const fileName = safeName ? `${safeName}_${random}${safeExt}` : `composer_${stamp}_${random}${safeExt}`
+  const filePath = path.join(dir, fileName)
   await fs.promises.writeFile(filePath, buffer)
 
   return filePath
@@ -7709,10 +7813,9 @@ async function finalizeGatewayDownload(res, statusCode, headers, ctx: any = {}) 
   }
 
   try {
-    await pumpStreamToFile(res, result.filePath, {
-      createWriteStream: (destPath: string) => fs.createWriteStream(destPath),
-      unlink: (destPath: string) => fs.promises.unlink(destPath)
-    })
+    // Failure-atomic: exclusive temp create beside the destination, rename into
+    // place only once the body is complete (#96597).
+    await pumpStreamToFile(res, result.filePath, fsPumpDeps())
   } catch (error) {
     ctx.abort?.()
     throw error
@@ -7864,7 +7967,9 @@ async function saveGatewayFileViaDataUrl(
     return { canceled: true, saved: false }
   }
 
-  await fs.promises.writeFile(result.filePath, buffer)
+  // Same failure-atomic contract as the streaming path: a direct writeFile
+  // truncates an existing destination before the write completes (#96597).
+  await writeBufferToFile(buffer, result.filePath, fsPumpDeps())
 
   return { path: result.filePath, saved: true }
 }
@@ -9847,6 +9952,7 @@ function clearManagedSshRecovery(connectionId, correlationId) {
 const sshBootstrapCoordinator = createBootstrapCoordinator()
 
 let sshQuitTeardownDone = false
+let sshQuitTeardownPromise: Promise<void> | null = null
 let backendQuitTeardownDone = false
 
 function sshScopeKey(profile) {
@@ -11147,7 +11253,8 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
       return {
         ...primaryDescriptor,
         profile: profileKey,
-        connectionId: id
+        connectionId: id,
+        sharedRemote: true
       }
     }
   }
@@ -13533,6 +13640,11 @@ function spawnHudWindow(sessionId, profile) {
     // `hermes:hud:set-bounds`, which flips resizable on for the call — the
     // same pattern the pet overlay uses for its wheel-scale.
     resizable: false,
+    // macOS AppKit's constrainFrameRect clamps setBounds to the current
+    // display unless this is on. The HUD is moved by renderer-driven
+    // setBounds (not a native titlebar drag), so without it the bar cannot
+    // be dragged onto another monitor. No-op on Windows/Linux.
+    enableLargerThanScreen: true,
     movable: true,
     minimizable: false,
     maximizable: false,
@@ -14471,6 +14583,21 @@ const hudIpc = registerHudIpc({
   }
 })
 
+ipcMain.handle('hermes:backend:recycle', async (_event, profile) => {
+  // Models-page recovery after a code-skew 503 (#97046): kill the owned
+  // SSH serve (if any) before the local child so reconnect cannot reuse a
+  // stale lockfile. Soft primary teardown keeps the renderer shell mounted.
+  await recycleOwnedBackend({
+    notifyApplied: sendConnectionApplied,
+    primaryProfile: primaryProfileKey(),
+    profile: typeof profile === 'string' ? profile : '',
+    teardownPool: teardownPoolBackendAndWait,
+    teardownPrimary: () => teardownPrimaryBackendAndWait({ soft: true }),
+    teardownSsh: value => teardownSshConnection(value || null)
+  })
+
+  return { ok: true }
+})
 ipcMain.handle('hermes:bootstrap:reset', async () => {
   // Renderer's "Reload and retry" path. Clear the latched failure and
   // reset connection state so the next startHermes() call restarts the
@@ -16366,6 +16493,12 @@ ipcMain.handle('hermes:context-menu:guest-add-word', (_event, payload) => {
   }
 })
 
+ipcMain.handle('hermes:capturePreview', async (_event, payload) => {
+  const guest = electronWebContents.fromId(Number(payload?.webContentsId))
+
+  return capturePreviewContents(guest, payload?.rect, payload?.viewport)
+})
+
 ipcMain.handle('hermes:saveImageBuffer', async (_event, payload) => {
   const data = payload?.data
 
@@ -16375,7 +16508,7 @@ ipcMain.handle('hermes:saveImageBuffer', async (_event, payload) => {
 
   const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data)
 
-  return writeComposerImage(buffer, payload?.ext || '.png')
+  return writeComposerImage(buffer, payload?.ext || '.png', payload?.name)
 })
 
 ipcMain.handle('hermes:saveClipboardImage', async () => {
@@ -16832,6 +16965,10 @@ registerFsIpc({
 
 // Git-driven features (worktrees, review pane, repo scan) — see git-ipc.ts.
 registerGitIpc({ resolveGitBinary, resolveGhBinary })
+
+// Client-side loopback callback for MCP OAuth against remote backends — see
+// mcp-oauth-callback-ipc.ts.
+registerMcpOauthCallbackIpc()
 
 // Embedded terminal PTY host (hermes:terminal:*) — see terminal-ipc.ts.
 const terminalIpc = registerTerminalIpc({
@@ -17526,20 +17663,39 @@ app.on('before-quit', event => {
     })
   }
 
-  if ((sshConnections.size > 0 || sshBootstrapCoordinator.promises().length > 0) && !sshQuitTeardownDone) {
+  // backendShutdown.finally() re-enters before-quit. teardownSshConnection
+  // already deleted the map entries, so size===0 would skip the kill wait
+  // and let window-X quit finish while SSH exec is still running (#91668).
+  if (
+    sshQuitShouldBlock({
+      teardownDone: sshQuitTeardownDone,
+      connectionCount: sshConnections.size,
+      bootstrapPending: sshBootstrapCoordinator.promises().length,
+      inFlight: sshQuitTeardownPromise
+    })
+  ) {
     event.preventDefault()
-    const scopes = [...sshConnections.keys()]
 
-    const pending = Promise.allSettled([
-      ...scopes.map(scope => teardownSshConnection(scope || null)),
-      ...sshBootstrapCoordinator.promises()
-    ])
+    if (!sshQuitTeardownPromise) {
+      const scopes = [...sshConnections.keys()]
 
-    // cleanupStale waits up to 5s for the owned pid to exit (50 * 100ms).
-    // The previous 4s race could close SSH first and leave serve --isolated
-    // reparented to pid 1.
-    void Promise.race([pending, new Promise(resolve => setTimeout(resolve, 6_000))]).then(async () => {
-      await sshBootstrapCoordinator.forceCleanupAll()
+      const pending = Promise.allSettled([
+        ...scopes.map(scope => teardownSshConnection(scope || null)),
+        ...sshBootstrapCoordinator.promises()
+      ])
+
+      // cleanupStale waits up to 5s for the owned pid to exit (50 * 100ms).
+      // The previous 4s race could close SSH first and leave serve --isolated
+      // reparented to pid 1. Latch this promise BEFORE those deletes land so
+      // a re-entrant quit still waits.
+      sshQuitTeardownPromise = Promise.race([pending, new Promise<void>(resolve => setTimeout(resolve, 6_000))]).then(
+        async () => {
+          await sshBootstrapCoordinator.forceCleanupAll()
+        }
+      )
+    }
+
+    void sshQuitTeardownPromise.then(() => {
       sshQuitTeardownDone = true
       app.quit()
     })

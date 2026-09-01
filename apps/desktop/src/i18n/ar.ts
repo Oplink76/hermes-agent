@@ -165,7 +165,8 @@ export const ar = defineLocale({
       microphonePermission: 'تم رفض إذن الميكروفون.',
       openaiRejectedApiKey: 'رفض OpenAI مفتاح API.',
       openaiRejectedApiKeyWithStatus: status => `رفض OpenAI مفتاح API (${status} invalid_api_key).`,
-      openaiTtsNeedsKey: 'يتطلب OpenAI TTS المفتاح VOICE_TOOLS_OPENAI_KEY أو OPENAI_API_KEY.'
+      openaiTtsNeedsKey: 'يتطلب OpenAI TTS المفتاح VOICE_TOOLS_OPENAI_KEY أو OPENAI_API_KEY.',
+      codeSkewRestartRequired: 'بعد التحديث ما زال هذا الخلفية يشغّل كودا قديما. أعد تشغيله لتحميل الكود الجديد.'
     },
     voice: {
       configureSpeechToText: 'اضبط تحويل الكلام إلى نص لاستخدام وضع الصوت.',
@@ -469,6 +470,12 @@ export const ar = defineLocale({
       introSplashDesc: 'الشعار النصي والعبارة التمهيدية في محادثة فارغة.',
       reactionsTitle: 'تفاعلات الرسائل',
       reactionsDesc: 'تفاعلات إيموجي بأسلوب iMessage — تفاعل مع الرسائل، ويمكن لـ Hermes التفاعل مع رسائلك.',
+      tipsTitle: 'نصائح داخل التطبيق',
+      tipsDesc:
+        'فقاعة صغيرة تشير إلى جزء من التطبيق، تظهر أحيانًا أثناء الخمول ومن Hermes عند الحاجة. إغلاق نصيحة يزيلها نهائيًا.',
+      tipsReset: count => `استعادة ${count} نصيحة مغلقة`,
+      toursTitle: 'جولات إرشادية',
+      toursDesc: 'دع Hermes يرشدك في التطبيق، مع تعتيم الشاشة وإبراز كل خطوة.',
       composerPopoutTitle: 'محرر عائم',
       composerPopoutDesc: 'السماح بسحب محرر الرسائل خارج موضعه. عطّل هذا الخيار لإبقائه مثبتًا في الأسفل.',
       vibeHeartsTitle: 'قلوب المزاج',
@@ -858,6 +865,11 @@ export const ar = defineLocale({
       reasoning: 'الاستدلال',
       reasoningOff: 'إيقاف',
       defaultsFailed: 'فشل حفظ افتراضيات النموذج',
+      loadFailed: 'تعذر تحميل النماذج',
+      restartRequired: 'بعد التحديث ما زال هذا الخلفية يشغّل كودا قديما. أعد تشغيله لتحميل الكود الجديد.',
+      restartBackend: 'إعادة تشغيل الخلفية',
+      restartingBackend: 'جار إعادة تشغيل الخلفية...',
+      restartFailed: 'تعذر إعادة تشغيل الخلفية',
       auxiliaryTitle: 'النماذج المساعدة',
       resetAllToMain: 'إعادة تعيين الكل إلى النموذج الرئيسي',
       auxiliaryDesc: 'تعمل المهام المساعدة على النموذج الرئيسي افتراضيا. عيّن نموذجا مخصصا لأي مهمة لتجاوز ذلك.',
@@ -1389,6 +1401,7 @@ export const ar = defineLocale({
     newProfile: 'ملف شخصي جديد',
     importProfile: 'استيراد ملف شخصي…',
     exportProfile: 'تصدير ملف شخصي…',
+    exportMenu: 'تصدير…',
     imported: 'تم استيراد الملف الشخصي',
     exported: 'تم تصدير الملف الشخصي',
     failedImport: 'فشل استيراد الملف الشخصي',
@@ -1720,7 +1733,7 @@ export const ar = defineLocale({
       removeFolder: 'إزالة',
       create: 'إنشاء',
       menu: 'إجراءات',
-      menuRename: 'إعادة تسمية',
+      menuRename: 'إعادة تسمية…',
       menuAppearance: 'المظهر',
       noColor: 'بلا لون',
       menuAddFolder: 'إضافة مجلد',
@@ -1778,7 +1791,7 @@ export const ar = defineLocale({
       copyId: 'نسخ المعرف',
       export: 'تصدير',
       branchFrom: 'فرع',
-      rename: 'إعادة تسمية',
+      rename: 'إعادة تسمية…',
       archive: 'أرشفة',
       newWindow: 'فتح في نافذة جديدة',
       openInTerminal: 'فتح في الطرفية',
@@ -2835,6 +2848,51 @@ export const ar = defineLocale({
     boundaryDesc: 'يمكنك إعادة تحميل النافذة أو فتح السجلات لمعرفة التفاصيل.',
     reloadWindow: 'إعادة تحميل النافذة',
     openLogs: 'فتح السجلات'
+  },
+  tips: {
+    close: 'لا تعرض هذه النصيحة مرة أخرى',
+    items: {
+      'new-session': {
+        title: 'ابدأ من جديد',
+        text: 'كل محادثة جديدة لها سياقها وطرفيتها ومجلد عملها الخاص.'
+      },
+      skills: {
+        title: 'علّمه مرة واحدة',
+        text: 'المهارات مجلدات من التعليمات يحمّلها Hermes عندما يقتضي العمل ذلك.'
+      },
+      messaging: {
+        title: 'Hermes بعيدًا عن مكتبك',
+        text: 'اربطه بـ Telegram وDiscord وSlack وغيرها — الوكيل نفسه والذاكرة نفسها.'
+      },
+      artifacts: {
+        title: 'كل ما صنعه Hermes',
+        text: 'الصور والملفات والروابط من كل الجلسات، مفهرسة في مكان واحد.'
+      },
+      cron: {
+        title: 'عمل يجري من تلقاء نفسه',
+        text: 'جدوِل موجّهًا كل ساعة أو كل ليلة أو وفق تعبير cron.'
+      },
+      'command-palette': {
+        title: 'صندوق واحد لكل شيء',
+        text: 'الجلسات والإعدادات والمهارات والأوامر كلها تستجيب للوحة الأوامر.'
+      },
+      profiles: {
+        title: 'الملفات الشخصية منفصلة',
+        text: 'كل واحد منها Hermes مستقل — مفاتيحه وذاكرته وجلساته الخاصة.'
+      },
+      'composer-mentions': {
+        title: 'المرفقات والأوامر',
+        text: 'اكتب @ لإحضار ملف إلى المحادثة، و / لتشغيل أمر.'
+      },
+      'model-switch': {
+        title: 'بدّل النموذج أثناء المحادثة',
+        text: 'اسم النموذج زر. غيّره كلما تغيّرت طبيعة العمل.'
+      },
+      'right-pane': {
+        title: 'لوحة العمل',
+        text: 'الملفات والطرفية والمراجعة والمتصفح المدمج تتشارك اللوحة الجانبية.'
+      }
+    }
   },
   ui: {
     search: {

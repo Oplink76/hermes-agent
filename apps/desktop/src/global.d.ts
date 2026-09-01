@@ -101,12 +101,15 @@ declare global {
           clientPlacement: boolean
           controlDrag: boolean
           nativeDrag: boolean
+          solid: boolean
           workspaceTransfer: boolean
         }
         open: (request?: { sessionId?: null | string; profile?: null | string }) => Promise<{ ok: boolean }>
         close: () => Promise<{ ok: boolean }>
         setIgnoreMouse: (ignore: boolean) => void
-        moveBy: (delta: { x: number; y: number; width: number; height: number }) => void
+        beginMove: () => void
+        endMove: () => void
+        moveBy: (delta: { width: number; height: number }) => void
         setWorkspaceTransfer?: (transferring: boolean) => void
         setBounds: (bounds: { x: number; y: number; width: number; height: number }) => void
         resetLayout: () => Promise<{ ok: boolean }>
@@ -275,7 +278,13 @@ declare global {
       onContextMenuSpellcheck?: (
         callback: (payload: { misspelledWord: string; suggestions: string[] }) => void
       ) => () => void
-      saveImageBuffer: (data: ArrayBuffer | Uint8Array, ext: string) => Promise<string>
+      saveImageBuffer: (data: ArrayBuffer | Uint8Array, ext: string, name?: string) => Promise<string>
+      /** Crop the in-app browser guest. `rect` is CSS pixels in the page viewport. */
+      capturePreview?: (payload: {
+        rect?: { height: number; width: number; x: number; y: number }
+        viewport?: { height: number; width: number }
+        webContentsId: number
+      }) => Promise<string>
       saveClipboardImage: () => Promise<string>
       getPathForFile: (file: File) => string
       normalizePreviewTarget: (target: string, baseDir?: string) => Promise<HermesPreviewTarget | null>
@@ -297,6 +306,18 @@ declare global {
       setDisableF12?: (blocked: boolean) => void
       setPreviewShortcutActive?: (active: boolean) => void
       openExternal: (url: string) => Promise<void>
+      /** One-shot loopback callback listener for MCP OAuth against remote
+       *  backends (electron/mcp-oauth-callback-ipc.ts): bind on THIS machine,
+       *  pass redirectUri as client_redirect_uri to mcp.servers.oauth.start,
+       *  await the provider redirect, relay code/state via oauth.callback. */
+      mcpOauth?: {
+        listen: () => Promise<{ id: string; redirectUri: string }>
+        wait: (
+          id: string,
+          timeoutMs?: number
+        ) => Promise<{ code: null | string; error: null | string; state: null | string }>
+        cancel: (id: string) => Promise<boolean>
+      }
       openPreviewInBrowser?: (url: string) => Promise<void>
       fetchLinkTitle: (url: string) => Promise<string>
       /** A site's icon as a data URL, or '' when it has none we can read.
@@ -411,6 +432,7 @@ declare global {
         ) => Promise<{ root: string; label: string }[]>
       }
       terminal: {
+        attach: (id: string) => Promise<boolean>
         /** Best-effort current working directory of the live PTY child (POSIX
          *  only; null on Windows or when unavailable). Used to reopen a tab
          *  where the user last `cd`'d. */
@@ -471,6 +493,7 @@ declare global {
       onBootProgress: (callback: (payload: DesktopBootProgress) => void) => () => void
       getBootstrapState: () => Promise<DesktopBootstrapState>
       continueBootstrapLocal: () => Promise<{ ok: boolean }>
+      recycleBackend?: (profile?: null | string) => Promise<{ ok: boolean }>
       resetBootstrap: () => Promise<{ ok: boolean }>
       repairBootstrap: () => Promise<{ ok: boolean }>
       cancelBootstrap: () => Promise<{ ok: boolean; cancelled: boolean }>
