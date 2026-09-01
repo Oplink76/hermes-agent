@@ -321,6 +321,105 @@ def test_restore_stashed_changes_success_preserves_exact_sha_before_drop(
     assert calls[2] == ["git", "update-ref", "refs/hermes/autostash/abc1234", "abc1234"]
 
 
+def test_real_repository_restore_preserves_exact_sha_before_drop(
+    monkeypatch, tmp_path
+):
+    """The production delegate must durably name the exact stash before dropping it."""
+    import subprocess
+    from hermes_cli import update_cmd
+
+    real_run = subprocess.run
+    calls = []
+
+    def run_git(*args, check=True):
+        return real_run(
+            ["git", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    run_git("init", "-q", "-b", "main")
+    run_git("config", "user.email", "t@example.com")
+    run_git("config", "user.name", "t")
+    local_file = tmp_path / "local.txt"
+    local_file.write_text("original\n", encoding="utf-8")
+    run_git("add", "local.txt")
+    run_git("commit", "-qm", "init")
+    local_file.write_text("restored\n", encoding="utf-8")
+    stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+    assert stash_ref
+
+    def recording_run(cmd, **kwargs):
+        if cmd[1] == "update-ref" or cmd[1:3] == ["stash", "drop"]:
+            calls.append(cmd)
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ())
+    monkeypatch.setattr(update_cmd.subprocess, "run", recording_run)
+
+    assert hermes_main._restore_stashed_changes(
+        ["git"], tmp_path, stash_ref, prompt_user=False
+    )
+
+    recovery_ref = f"refs/hermes/autostash/{stash_ref}"
+    assert run_git("rev-parse", recovery_ref).stdout.strip() == stash_ref
+    assert run_git("stash", "list").stdout.strip() == ""
+    assert calls == [
+        ["git", "update-ref", recovery_ref, stash_ref],
+        ["git", "stash", "drop", "stash@{0}"],
+    ]
+
+
+def test_real_repository_restore_keeps_stash_when_recovery_ref_fails(
+    monkeypatch, tmp_path, capsys
+):
+    """A production recovery-ref failure must leave the exact stash recoverable."""
+    import subprocess
+    from hermes_cli import update_cmd
+
+    real_run = subprocess.run
+
+    def run_git(*args, check=True):
+        return real_run(
+            ["git", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    run_git("init", "-q", "-b", "main")
+    run_git("config", "user.email", "t@example.com")
+    run_git("config", "user.name", "t")
+    local_file = tmp_path / "local.txt"
+    local_file.write_text("original\n", encoding="utf-8")
+    run_git("add", "local.txt")
+    run_git("commit", "-qm", "init")
+    local_file.write_text("restored\n", encoding="utf-8")
+    stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+    assert stash_ref
+
+    def fail_update_ref(cmd, **kwargs):
+        if cmd[1] == "update-ref":
+            return subprocess.CompletedProcess(cmd, 1, "", "ref write failed\n")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ())
+    monkeypatch.setattr(update_cmd.subprocess, "run", fail_update_ref)
+
+    assert hermes_main._restore_stashed_changes(
+        ["git"], tmp_path, stash_ref, prompt_user=False
+    )
+
+    assert run_git("stash", "list", "--format=%H").stdout.strip() == stash_ref
+    output = capsys.readouterr().out
+    recovery_ref = f"refs/hermes/autostash/{stash_ref}"
+    assert "The stash was left in place; it was not dropped." in output
+    assert f"git update-ref {recovery_ref} {stash_ref}" in output
+
+
 
 
 

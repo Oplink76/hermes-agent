@@ -490,7 +490,7 @@ describe('ModelMenuPanel provider collapse', () => {
     const { content, onSelectModel } = renderPanel()
 
     await content.findByText(/Glm 4\.5 Air/i)
-    fireEvent.click(await content.findByText('Refresh Models'))
+    fireEvent.click(await content.findByText('Refresh models'))
 
     await vi.waitFor(() => {
       expect(onSelectModel).toHaveBeenCalledWith({

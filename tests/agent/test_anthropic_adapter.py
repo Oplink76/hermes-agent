@@ -39,7 +39,7 @@ def _isolate_macos_keychain(monkeypatch):
     Keychain entry must not participate.
     """
     monkeypatch.setattr(
-        "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
+        "agent.anthropic_credentials._read_claude_code_credentials_from_keychain",
         lambda: None,
     )
 

@@ -27,6 +27,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -2821,6 +2822,16 @@ def _restore_stashed_changes_impl(
             f"agent import {failing_module or 'unknown'}",
             import_error[1],
         )
+
+    safe_sha = re.sub(r"[^0-9a-f]", "", stash_ref.lower())
+    recovery_ref = f"refs/hermes/autostash/{safe_sha}"
+    if not _m()._preserve_stash_commit(git_cmd, cwd, stash_ref):
+        print(
+            "⚠ Local changes were restored, but Hermes couldn't create a durable recovery ref."
+        )
+        print("  The stash was left in place; it was not dropped.")
+        print(f"  Retry with: git update-ref {recovery_ref} {stash_ref}")
+        return True
 
     stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
     if stash_selector is None:
@@ -10908,9 +10919,10 @@ def _service_restart_sec(
     return total if matched else default
 
 
-# The autostash implementation is canonically owned by ``main.py``.  Keep
-# this module's historical import surface as lazy delegators so direct callers
-# cannot accidentally bind the mechanically extracted, pre-fix copy above.
+# Stash creation, selector lookup, durable-ref creation, and discard remain
+# canonically owned by ``main.py``.  Safe restore validation is canonically
+# owned by this module's ``_restore_stashed_changes_impl``.  Keep the historical
+# import surface below as lazy delegators to those actual owners.
 def _stash_local_changes_if_needed(git_cmd, cwd):
     return _m()._stash_local_changes_if_needed(git_cmd, cwd)
 
