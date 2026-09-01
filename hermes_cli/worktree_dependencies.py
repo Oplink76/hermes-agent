@@ -337,6 +337,19 @@ def _install_command(project_dir: Path) -> list[str]:
     return [executable, "ci", "--include=dev", "--ignore-scripts"]
 
 
+def _scripted_dependency_is_safe_without_lifecycle_scripts(
+    package_path: str, package: dict
+) -> bool:
+    """Return whether one known optional watcher remains safe script-free."""
+    return (
+        package_path == "node_modules/fsevents"
+        and package.get("version") == "2.3.3"
+        and package.get("dev") is True
+        and package.get("optional") is True
+        and package.get("os") == ["darwin"]
+    )
+
+
 def _install_requires_lifecycle_scripts(project_dir: Path) -> bool:
     lockfile = _applicable_lockfile(project_dir)
     if lockfile is None:
@@ -352,6 +365,9 @@ def _install_requires_lifecycle_scripts(project_dir: Path) -> bool:
         package_path
         and isinstance(package, dict)
         and package.get("hasInstallScript") is True
+        and not _scripted_dependency_is_safe_without_lifecycle_scripts(
+            package_path, package
+        )
         for package_path, package in packages.items()
     )
 
