@@ -168,6 +168,15 @@ class TestCapabilitySets:
         )
         assert not any(name.startswith("kanban_") for name in selected)
 
+    def test_product_owner_intake_authority_allows_one_bounded_invalid_retry(self):
+        from agent.transports.hermes_tools_mcp_server import CAPABILITY_INSTRUCTIONS
+
+        prompt = CAPABILITY_INSTRUCTIONS["product-owner-intake"]
+        assert "exactly one" not in prompt
+        assert "returns status invalid" in prompt
+        assert "retry once in the same run" in prompt
+        assert "at most two work_inbox_decide calls total" in prompt
+
     def test_capability_selection_does_not_leak_between_runs(self):
         from agent.transports import hermes_tools_mcp_server as m
 

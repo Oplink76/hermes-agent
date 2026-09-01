@@ -135,9 +135,24 @@ def test_manifest_mismatch_runs_real_install_in_dispatcher_context(
     repo = _repo_with_node_dependencies(tmp_path)
     _git(repo, "switch", "-c", "feature")
     (repo / "package.json").write_bytes(b'{"name":"fixture","version":"2.0.0"}\n')
-    (repo / "package-lock.json").write_bytes(
-        b'{"name":"fixture","version":"2.0.0","lockfileVersion":3,'
-        b'"packages":{"":{"name":"fixture","version":"2.0.0"}}}\n'
+    feature_lock = {
+        "name": "fixture",
+        "version": "2.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {"name": "fixture", "version": "2.0.0"},
+            "node_modules/fsevents": {
+                "version": "2.3.3",
+                "dev": True,
+                "optional": True,
+                "os": ["darwin"],
+                "hasInstallScript": True,
+            },
+        },
+    }
+    (repo / "package-lock.json").write_text(
+        json.dumps(feature_lock, separators=(",", ":")) + "\n",
+        encoding="utf-8",
     )
     _git(repo, "add", "package.json", "package-lock.json")
     _git(repo, "commit", "-m", "feature manifest")
@@ -184,6 +199,61 @@ def test_manifest_mismatch_runs_real_install_in_dispatcher_context(
         workspace / "node_modules" / "fixture-dependency" / "index.js"
     ).exists()
     assert target == workspace
+
+
+@pytest.mark.parametrize(
+    ("package_path", "overrides"),
+    [
+        ("node_modules/other", {}),
+        ("node_modules/fsevents", {"version": "2.3.2"}),
+        ("node_modules/fsevents", {"dev": False}),
+        ("node_modules/fsevents", {"optional": False}),
+        ("node_modules/fsevents", {"os": ["linux"]}),
+    ],
+)
+def test_real_fallback_refuses_other_dependency_install_scripts(
+    tmp_path, package_path, overrides
+):
+    primary = tmp_path / "primary"
+    target = tmp_path / "target"
+    primary.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(target)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    package = {"name": "fixture", "version": "1.0.0"}
+    scripted_dependency = {
+        "version": "2.3.3",
+        "dev": True,
+        "optional": True,
+        "os": ["darwin"],
+        "hasInstallScript": True,
+        **overrides,
+    }
+    lock = {
+        "name": "fixture",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": package,
+            package_path: scripted_dependency,
+        },
+    }
+    for project in (primary, target):
+        (project / "package.json").write_text(
+            json.dumps(package) + "\n", encoding="utf-8"
+        )
+        (project / "package-lock.json").write_text(
+            json.dumps(lock) + "\n", encoding="utf-8"
+        )
+    (target / ".gitignore").write_text("node_modules\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="require lifecycle scripts"):
+        wd.provision_node_dependencies(primary, target)
+
+    assert not (target / "node_modules").exists()
 
 
 def test_worktree_cleanup_removes_provisioned_dependencies(kanban_home, tmp_path):

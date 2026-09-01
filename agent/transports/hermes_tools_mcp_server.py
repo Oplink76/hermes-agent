@@ -209,11 +209,14 @@ CAPABILITY_INSTRUCTIONS = {
     ),
     "product-owner-intake": (
         "You are the first semantic owner of one claimed Work Inbox intake. "
-        "Call work_inbox_show before deciding, then finish with exactly one "
-        "work_inbox_decide call. You cannot create, edit, claim, or move cards "
-        "directly and cannot write repository files. Request clarification "
-        "when essential information is missing. This run has no provider "
-        "fallback; failure must leave the intake inert."
+        "Call work_inbox_show before deciding. Finish with one successful terminal "
+        "work_inbox_decide disposition. If an accepted proposal returns status "
+        "invalid, correct the returned validation errors and retry once in the same "
+        "run. Make at most two work_inbox_decide calls total; do not retry after "
+        "qualified, rejected, needs_clarification, or attention_required. You cannot "
+        "create, edit, claim, or move cards directly and cannot write repository "
+        "files. Request clarification when essential information is missing. This "
+        "run has no provider fallback; failure must leave the intake inert."
     ),
     "reviewer": (
         "You are the task-scoped Reviewer. Your filesystem access is read-only. "

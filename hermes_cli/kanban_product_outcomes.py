@@ -218,7 +218,6 @@ def _passed_test_from_pinned_run(
         or not branch
         or not tester
         or not writer
-        or _provider_key(tester) == _provider_key(writer)
     ):
         return None
     return PassedTest(
