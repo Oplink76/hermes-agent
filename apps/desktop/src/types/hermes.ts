@@ -683,6 +683,12 @@ export interface SessionResumeResponse {
   session_key?: string
   started_at?: number
   status?: string
+  /** Latest full task snapshot. Revisions let the renderer reject a response
+   * that raced with a newer live update. */
+  todo_state?: {
+    revision?: number
+    todos?: unknown
+  }
   /** Epoch seconds the current turn started, or null when idle. */
   turn_started_at?: number | null
 }
@@ -1018,6 +1024,17 @@ export interface SkillInfo {
   usage?: number
   /** 'agent' = learned/local (editable), 'bundled' = ships with Hermes, 'hub' = installed. */
   provenance?: 'agent' | 'bundled' | 'hub'
+}
+
+/** One entry of the built-in optional-skills catalog (optional-skills/ in the
+ *  repo) — official skills that ship with Hermes but install on demand. */
+export interface OfficialSkillInfo {
+  category: string
+  description: string
+  identifier: string
+  installed: boolean
+  name: string
+  tags: string[]
 }
 
 export interface ToolsetInfo {
