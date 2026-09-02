@@ -10739,6 +10739,50 @@ def test_complete_task_v2_terminal_done_sets_phase_and_clears_flags(kanban_home)
     assert row["status"] == kb._legacy_status(row, meta)
 
 
+def test_complete_task_product_card_without_product_board_metadata_fails_closed(
+    kanban_home,
+):
+    """A product-stamped nonterminal card must never use generic completion
+    when its board cannot supply product lifecycle policy.
+    """
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Story: require product board metadata",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+
+        with pytest.raises(
+            kb.ProductWorkflowStateError,
+            match="product board metadata",
+        ):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="Implementation is ready.",
+                board="missing-product-board",
+            )
+
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert task.status == "running"
+    assert task.current_step_key == "development"
+    blocked = [
+        event
+        for event in events
+        if event.kind == "completion_blocked_product_board_resolution"
+    ]
+    assert len(blocked) == 1
+    assert blocked[0].payload["board"] == "missing-product-board"
+    assert blocked[0].payload["connection_board"] == "default"
+    assert blocked[0].payload["database_path"].endswith("kanban.db")
+
+
 def test_complete_task_release_measure_cannot_bypass_release_orchestration(
     kanban_home, monkeypatch,
 ):

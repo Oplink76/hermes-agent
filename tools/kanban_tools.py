@@ -1632,6 +1632,7 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            board = kb._known_board_slug_for_connection(conn) or board
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
@@ -1729,6 +1730,12 @@ def _handle_complete(args: dict, **kw) -> str:
                     "kanban_complete blocked by release evidence policy. "
                     f"Missing: {', '.join(release_err.missing)}. "
                     "The task remains in release_measure."
+                )
+            except kb.ProductWorkflowStateError as workflow_err:
+                return tool_error(
+                    "kanban_complete blocked by product workflow state: "
+                    f"{workflow_err}. The task is still in-flight "
+                    "(no state change)."
                 )
             except kb.ProductProvenanceError as prov_err:
                 missing = getattr(prov_err, "missing", None) or []

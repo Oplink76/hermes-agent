@@ -12049,6 +12049,40 @@ def complete_task(
         )
         if product_transition is not None:
             return product_transition
+        if (
+            lifecycle_scope is not None
+            and lifecycle_scope["workflow_template_id"]
+            == PRODUCT_WORKFLOW_TEMPLATE_ID
+            and meta is None
+        ):
+            connection_board = _known_board_slug_for_connection(conn)
+            database_rows = conn.execute("PRAGMA database_list").fetchall()
+            main_database = next(
+                (row for row in database_rows if row["name"] == "main"),
+                None,
+            )
+            database_path = (
+                str(main_database["file"] or "")
+                if main_database is not None
+                else ""
+            )
+            reason = "product board metadata is unavailable"
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_product_board_resolution",
+                    {
+                        "board": board,
+                        "connection_board": connection_board,
+                        "database_path": database_path,
+                    },
+                )
+            raise ProductWorkflowStateError(
+                task_id,
+                lifecycle_scope["current_step_key"],
+                reason,
+            )
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
