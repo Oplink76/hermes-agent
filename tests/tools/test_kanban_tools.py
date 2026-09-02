@@ -22,6 +22,41 @@ def _init_git_repo(path):
     (path / ".git").mkdir()
 
 
+def _init_real_git_repo(path):
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "-b", "main", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.email", "kanban@example.com"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.name", "Kanban Test"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (path / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(path), "add", "README.md"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(path), "commit", "-m", "init"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------
@@ -2044,6 +2079,132 @@ def test_worker_product_complete_uses_db_connection_board_for_handoff(
     assert task.status == "ready"
     assert task.assignee == "architect"
     assert task.current_step_key == "architecture"
+
+
+def test_worker_product_complete_canonicalizes_current_to_connection_board(
+    monkeypatch, tmp_path,
+):
+    """An env-pinned worker may call the board ``current``; lifecycle policy
+    must still come from the managed product-board DB it actually opened.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    board = "product-tool-current-alias"
+    kb.create_board(board, name="Current Alias", preset="product")
+    board_metadata = kb.read_board_metadata(board)
+    board_metadata.setdefault("product_workflow", {})["handoff_v2"] = True
+    kb.board_metadata_path(board).write_text(json.dumps(board_metadata))
+    repo = tmp_path / "task-worktree"
+    _init_real_git_repo(repo)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: canonicalize current board",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        claimed = kb.claim_task(conn, tid, board=board)
+    (repo / "implementation.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board)))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+
+    out = json.loads(kt._handle_complete({
+        "board": "current",
+        "summary": "Implementation is ready.",
+        "metadata": {"ai_provenance": {"writer": {"agent": "claude-code"}}},
+    }))
+
+    assert out["ok"] is True
+    with kb.connect(board=board) as conn:
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert task.status == "ready"
+    assert task.current_step_key == "test"
+    handoff_events = [event for event in events if event.kind == "handoff"]
+    assert len(handoff_events) == 1
+    candidate_sha = handoff_events[0].payload["sha"]
+    assert len(candidate_sha) == 40
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head == candidate_sha
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert status == ""
+
+
+def test_worker_product_complete_surfaces_unresolved_product_board(
+    monkeypatch, tmp_path,
+):
+    """When an unmanaged DB cannot supply a canonical board, the worker gets
+    the product-workflow refusal instead of a false success or unknown-id error.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "developer")
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    loose_db = tmp_path / "loose.db"
+    with kb.connect(db_path=loose_db) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: fail closed without board metadata",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+        )
+        claimed = kb.claim_task(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(loose_db))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+
+    out = json.loads(kt._handle_complete({
+        "board": "current",
+        "summary": "Implementation is ready.",
+    }))
+
+    assert not out.get("ok")
+    assert "blocked by product workflow state" in out["error"]
+    assert "unknown id" not in out["error"]
+    with kb.connect(db_path=loose_db) as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "running"
+    assert task.current_step_key == "development"
 
 
 
