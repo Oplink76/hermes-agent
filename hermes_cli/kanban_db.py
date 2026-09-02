@@ -3447,6 +3447,21 @@ _RESOLVER_ESCALATION_BENIGN_EVENT_KINDS = frozenset({
 _RESOLVER_ESCALATION_EXPECTED_KEYS = frozenset(
     set(_RESOLVER_EXPECTED_KEYS) | {"escalation_event_id"}
 )
+_RESOLVER_RESUME_RETRY_EVENT_KIND = "spawn_failed"
+_RESOLVER_RESUME_RETRY_RUN_STATUS = "spawn_failed"
+_RESOLVER_RESUME_RETRY_RUN_OUTCOME = "spawn_failed"
+
+
+@dataclass(frozen=True)
+class _D4ResolvedPreflightProvenance:
+    """The anchored Resolver resolution facts shared by D4 dispatch paths."""
+
+    resolved: sqlite3.Row
+    resolved_payload: dict[str, Any]
+    preflight: sqlite3.Row
+    preflight_payload: dict[str, Any]
+    resolver_run: sqlite3.Row
+    preflight_event_id: int
 
 
 def _d4_event_payload(row: sqlite3.Row) -> Optional[dict[str, Any]]:
@@ -3455,6 +3470,103 @@ def _d4_event_payload(row: sqlite3.Row) -> Optional[dict[str, Any]]:
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _d4_latest_non_benign_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    before_id: Optional[int] = None,
+) -> Optional[sqlite3.Row]:
+    """Return only the newest lifecycle event, ignoring audit/comment noise."""
+    benign = tuple(sorted(_RESOLVER_ESCALATION_BENIGN_EVENT_KINDS))
+    placeholders = ", ".join("?" for _ in benign)
+    query = (
+        "SELECT id, kind, payload, run_id FROM task_events "
+        f"WHERE task_id = ? AND kind NOT IN ({placeholders})"
+    )
+    params: list[Any] = [task_id, *benign]
+    if before_id is not None:
+        query += " AND id < ?"
+        params.append(int(before_id))
+    query += " ORDER BY id DESC LIMIT 1"
+    return conn.execute(query, params).fetchone()
+
+
+def _d4_resolved_preflight_provenance(
+    conn: sqlite3.Connection,
+    task_id: str,
+    resolved: Optional[sqlite3.Row],
+    *,
+    expected_run_id: Optional[int] = None,
+) -> Optional[_D4ResolvedPreflightProvenance]:
+    """Resolve one event's exact preflight anchor and Resolver run.
+
+    The returned chain is task-local and position-checked: the resolved event
+    must point at the newest preflight before it, and both the source event and
+    Resolver run must belong to ``task_id``. Callers add action-specific CAS
+    checks (resume versus escalation) on top of these shared facts.
+    """
+    if resolved is None or resolved["kind"] != "human_input_preflight_resolved":
+        return None
+    resolved_payload = _d4_event_payload(resolved)
+    if not isinstance(resolved_payload, dict):
+        return None
+    resolver_run_id = _d4_positive_event_id(resolved["run_id"])
+    if resolver_run_id is None:
+        return None
+    if expected_run_id is not None and resolver_run_id != expected_run_id:
+        return None
+    try:
+        resolved_event_id = int(resolved["id"])
+    except (TypeError, ValueError):
+        return None
+    preflight_event_id = _d4_positive_event_id(
+        resolved_payload.get("preflight_event_id")
+    )
+    if preflight_event_id is None or preflight_event_id >= resolved_event_id:
+        return None
+    latest_preflight = conn.execute(
+        "SELECT id FROM task_events "
+        "WHERE task_id = ? AND kind = ? AND id < ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, PRODUCT_WORKFLOW_PRECHECK_EVENT, resolved_event_id),
+    ).fetchone()
+    if latest_preflight is None or int(latest_preflight["id"]) != preflight_event_id:
+        return None
+    source = conn.execute(
+        "SELECT id, task_id, kind, payload, run_id FROM task_events "
+        "WHERE id = ? AND task_id = ?",
+        (preflight_event_id, task_id),
+    ).fetchone()
+    source_payload = _d4_event_payload(source) if source is not None else None
+    if (
+        source is None
+        or int(source["id"]) >= resolved_event_id
+        or source["kind"] != PRODUCT_WORKFLOW_PRECHECK_EVENT
+        or not isinstance(source_payload, dict)
+        or (
+            "task_id" in source_payload
+            and source_payload["task_id"] != task_id
+        )
+    ):
+        return None
+    resolver_run = conn.execute(
+        "SELECT id, task_id, status, profile, step_key, outcome, ended_at, "
+        "claim_lock, claim_expires, worker_pid "
+        "FROM task_runs WHERE id = ?",
+        (resolver_run_id,),
+    ).fetchone()
+    if resolver_run is None or resolver_run["task_id"] != task_id:
+        return None
+    return _D4ResolvedPreflightProvenance(
+        resolved=resolved,
+        resolved_payload=resolved_payload,
+        preflight=source,
+        preflight_payload=source_payload,
+        resolver_run=resolver_run,
+        preflight_event_id=preflight_event_id,
+    )
 
 
 def _d4_positive_event_id(value: Any) -> Optional[int]:
@@ -3475,20 +3587,10 @@ def _latest_resolver_escalation(
     block makes the prior escalation stale even if a caller manually leaves
     the task row looking blocked.
     """
-    rows = conn.execute(
-        "SELECT id, kind, payload, run_id FROM task_events "
-        "WHERE task_id = ? ORDER BY id ASC",
-        (task_id,),
-    ).fetchall()
-    latest_lifecycle: Optional[tuple[sqlite3.Row, Optional[dict[str, Any]]]] = None
-    for row in rows:
-        payload = _d4_event_payload(row)
-        if row["kind"] in _RESOLVER_ESCALATION_BENIGN_EVENT_KINDS:
-            continue
-        latest_lifecycle = (row, payload)
-    if latest_lifecycle is None:
+    row = _d4_latest_non_benign_event(conn, task_id)
+    if row is None:
         return None
-    row, payload = latest_lifecycle
+    payload = _d4_event_payload(row)
     if row["kind"] != "blocked" or not isinstance(payload, dict):
         return None
     if payload.get("kind") != "resolver_escalation":
@@ -3804,11 +3906,13 @@ def reenter_resolver_escalation(
                 )
 
             resolved = _d4_prior_task_event(conn, task_id, escalation_event_id)
-            resolved_payload = _d4_event_payload(resolved) if resolved is not None else None
-            preflight_event_id = (
-                _d4_positive_event_id(resolved_payload.get("preflight_event_id"))
-                if isinstance(resolved_payload, dict) else None
+            provenance = _d4_resolved_preflight_provenance(
+                conn, task_id, resolved, expected_run_id=escalation_run_id
             )
+            if provenance is None:
+                raise TaskSnapshotConflict("resolver re-entry", {"provenance": "resolved"})
+            resolved_payload = provenance.resolved_payload
+            preflight_event_id = provenance.preflight_event_id
             current = _resolver_escalation_snapshot(
                 row,
                 escalation_event_id=escalation_event_id,
@@ -3827,43 +3931,15 @@ def reenter_resolver_escalation(
             ):
                 raise TaskSnapshotConflict("resolver re-entry", current)
 
-            if (
-                resolved is None
-                or resolved["kind"] != "human_input_preflight_resolved"
-                or resolved["run_id"] != escalation_run_id
-                or not isinstance(resolved_payload, dict)
-                or resolved_payload.get("action") != "escalate"
-                or preflight_event_id is None
-            ):
+            if resolved_payload.get("action") != "escalate":
                 raise TaskSnapshotConflict("resolver re-entry", {"provenance": "resolved"})
 
-            source = conn.execute(
-                "SELECT id, task_id, kind, payload, run_id FROM task_events "
-                "WHERE id = ? AND task_id = ?",
-                (preflight_event_id, task_id),
-            ).fetchone()
-            source_payload = _d4_event_payload(source) if source is not None else None
-            if (
-                source is None
-                or source["kind"] != PRODUCT_WORKFLOW_PRECHECK_EVENT
-                or not isinstance(source_payload, dict)
-            ):
-                raise TaskSnapshotConflict("resolver re-entry", {"provenance": "preflight"})
-            if (
-                "task_id" in source_payload
-                and source_payload["task_id"] != task_id
-            ):
-                raise TaskSnapshotConflict("resolver re-entry", {"provenance": "task"})
+            source = provenance.preflight
+            source_payload = provenance.preflight_payload
 
-            run = conn.execute(
-                "SELECT id, task_id, status, outcome, profile, step_key, ended_at "
-                "FROM task_runs WHERE id = ?",
-                (escalation_run_id,),
-            ).fetchone()
+            run = provenance.resolver_run
             if (
-                run is None
-                or run["task_id"] != task_id
-                or run["status"] != _RESOLVER_ESCALATION_RUN_STATUS
+                run["status"] != _RESOLVER_ESCALATION_RUN_STATUS
                 or run["outcome"] != _RESOLVER_ESCALATION_RUN_OUTCOME
                 or run["ended_at"] is None
                 or not isinstance(run["profile"], str)
@@ -11979,6 +12055,40 @@ def complete_task(
         )
         if product_transition is not None:
             return product_transition
+        if (
+            lifecycle_scope is not None
+            and lifecycle_scope["workflow_template_id"]
+            == PRODUCT_WORKFLOW_TEMPLATE_ID
+            and meta is None
+        ):
+            connection_board = _known_board_slug_for_connection(conn)
+            database_rows = conn.execute("PRAGMA database_list").fetchall()
+            main_database = next(
+                (row for row in database_rows if row["name"] == "main"),
+                None,
+            )
+            database_path = (
+                str(main_database["file"] or "")
+                if main_database is not None
+                else ""
+            )
+            reason = "product board metadata is unavailable"
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_product_board_resolution",
+                    {
+                        "board": board,
+                        "connection_board": connection_board,
+                        "database_path": database_path,
+                    },
+                )
+            raise ProductWorkflowStateError(
+                task_id,
+                lifecycle_scope["current_step_key"],
+                reason,
+            )
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
@@ -19928,6 +20038,170 @@ def _pin_test_target_or_block(
         return False
 
 
+def _resolver_resume_retry_provenance(
+    conn: sqlite3.Connection,
+    task_id: str,
+    failed: sqlite3.Row,
+) -> Optional[tuple[_D4ResolvedPreflightProvenance, sqlite3.Row, dict[str, Any]]]:
+    """Return one bounded, not-started retry after a Resolver resume."""
+    if failed["kind"] != _RESOLVER_RESUME_RETRY_EVENT_KIND:
+        return None
+    failed_payload = _d4_event_payload(failed)
+    if not isinstance(failed_payload, dict):
+        return None
+    failed_event_id = _d4_positive_event_id(failed["id"])
+    if failed_event_id is None:
+        return None
+    failed_run_id = _d4_positive_event_id(failed["run_id"])
+    if failed_run_id is None:
+        return None
+    resolved = conn.execute(
+        "SELECT id, kind, payload, run_id FROM task_events "
+        "WHERE task_id = ? AND kind = 'human_input_preflight_resolved' "
+        "AND id < ? ORDER BY id DESC LIMIT 1",
+        (task_id, failed_event_id),
+    ).fetchone()
+    provenance = _d4_resolved_preflight_provenance(conn, task_id, resolved)
+    if provenance is None:
+        return None
+    resolver_run_id = _d4_positive_event_id(provenance.resolver_run["id"])
+    if resolver_run_id is None:
+        return None
+    later_runs = conn.execute(
+        "SELECT id, task_id, profile, step_key, status, outcome, ended_at, "
+        "claim_lock, claim_expires, worker_pid "
+        "FROM task_runs WHERE task_id = ? AND id > ? ORDER BY id ASC LIMIT 2",
+        (task_id, resolver_run_id),
+    ).fetchall()
+    if len(later_runs) != 1:
+        return None
+    failed_run = later_runs[0]
+    if failed_run["id"] != failed_run_id:
+        return None
+    if (
+        failed_run["status"] != _RESOLVER_RESUME_RETRY_RUN_STATUS
+        or failed_run["outcome"] != _RESOLVER_RESUME_RETRY_RUN_OUTCOME
+        or failed_run["ended_at"] is None
+        or failed_run["claim_lock"] is not None
+        or failed_run["claim_expires"] is not None
+        or failed_run["worker_pid"] is not None
+    ):
+        return None
+
+    # The failed attempt must be the dispatch authorized by this resume.
+    # Run count alone misses assignments/refreshes that invalidate authority.
+    benign = tuple(sorted(_RESOLVER_ESCALATION_BENIGN_EVENT_KINDS))
+    placeholders = ", ".join("?" for _ in benign)
+    dispatch_events = conn.execute(
+        "SELECT kind, run_id FROM task_events "
+        "WHERE task_id = ? AND id > ? AND id < ? "
+        f"AND kind NOT IN ({placeholders}) ORDER BY id ASC LIMIT 3",
+        (task_id, provenance.resolved["id"], failed_event_id, *benign),
+    ).fetchall()
+    if (
+        tuple(event["kind"] for event in dispatch_events)
+        not in (("claimed",), ("claimed", "executor_stamped"))
+        or any(event["run_id"] != failed_run_id for event in dispatch_events)
+    ):
+        return None
+    return provenance, failed_run, failed_payload
+
+
+def _can_bypass_story_refresh_after_resolver_resume(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    """Return whether the current Resolver resume authorizes one dispatch."""
+    meta = product_board_metadata(board)
+    if (
+        meta is None
+        or task.workflow_template_id != PRODUCT_WORKFLOW_TEMPLATE_ID
+        or task.current_step_key not in {"architecture", "development"}
+        or task.running
+        or task.blocked
+        or task.current_run_id is not None
+        or task.claim_lock is not None
+    ):
+        return False
+    latest = _d4_latest_non_benign_event(conn, task.id)
+    if latest is None:
+        return False
+
+    failed_run: Optional[sqlite3.Row] = None
+    failed_payload: Optional[dict[str, Any]] = None
+    if latest["kind"] == "human_input_preflight_resolved":
+        provenance = _d4_resolved_preflight_provenance(conn, task.id, latest)
+    elif latest["kind"] == _RESOLVER_RESUME_RETRY_EVENT_KIND:
+        retry = _resolver_resume_retry_provenance(conn, task.id, latest)
+        if retry is None:
+            return False
+        provenance, failed_run, failed_payload = retry
+    else:
+        return False
+    if provenance is None:
+        return False
+
+    step_key = task.current_step_key
+    resume_status = _column_status_for_step(meta, step_key)
+    if (
+        resume_status not in VALID_STATUSES
+        or resume_status in {"running", "blocked", "done", "archived"}
+    ):
+        return False
+    resolved_payload = provenance.resolved_payload
+    source_payload = provenance.preflight_payload
+    resolver_run = provenance.resolver_run
+    if (
+        task.status != resume_status
+        or resolved_payload.get("action") != "resume"
+        or resolved_payload.get("resolver_profile") != RESOLVER_PROFILE
+        or resolved_payload.get("step_key") != step_key
+        or resolved_payload.get("status") != resume_status
+        or source_payload.get("hermes_assignee") != RESOLVER_PROFILE
+        or source_payload.get("step_key") != step_key
+        or source_payload.get("resume_status") != resume_status
+        or resolver_run["profile"] != RESOLVER_PROFILE
+        or resolver_run["step_key"] != step_key
+        or resolver_run["status"] != "completed"
+        or resolver_run["outcome"] != "preflight_resolved"
+        or resolver_run["ended_at"] is None
+        or resolver_run["claim_lock"] is not None
+        or resolver_run["claim_expires"] is not None
+        or resolver_run["worker_pid"] is not None
+    ):
+        return False
+    if failed_run is not None:
+        if (
+            failed_payload is None
+            or failed_payload.get("retry_status") != resume_status
+            or failed_run["step_key"] != step_key
+        ):
+            return False
+
+    try:
+        original_assignee = _d4_canonical_assignee(
+            source_payload.get("original_assignee"), field="original_assignee"
+        )
+        resolved_assignee = _d4_canonical_assignee(
+            resolved_payload.get("assignee"), field="resolved_assignee"
+        )
+        current_assignee = _d4_canonical_assignee(
+            task.assignee, field="current_assignee"
+        )
+        failed_assignee = (
+            _d4_canonical_assignee(failed_run["profile"], field="failed_assignee")
+            if failed_run is not None else None
+        )
+    except TaskSnapshotConflict:
+        return False
+    return (
+        original_assignee == resolved_assignee == current_assignee
+        and (failed_run is None or failed_assignee == original_assignee)
+    )
+
+
 def _story_refresh_preflight(
     conn: sqlite3.Connection,
     task: Task,
@@ -19945,6 +20219,26 @@ def _story_refresh_preflight(
         or epic_id_for_task(conn, task.id) is None
     ):
         return None, None
+
+    # A recovery assignee must inspect the exact state that raised the pending
+    # preflight, even when an ordinary story refresh would otherwise be safe.
+    # Refresh is deferred until the preflight resolves; reassignment to any
+    # profile other than the one recorded by the preflight does not bypass it.
+    preflight = _latest_unresolved_product_preflight(conn, task.id)
+    if preflight is not None:
+        _event_id, payload = preflight
+        recovery_assignee = _canonical_assignee(payload.get("hermes_assignee"))
+        if (
+            recovery_assignee
+            and _canonical_assignee(task.assignee) == recovery_assignee
+        ):
+            return None, None
+
+    if _can_bypass_story_refresh_after_resolver_resume(
+        conn, task, board=board
+    ):
+        return None, None
+
     if task.workspace_kind != "worktree":
         return None, RefreshResult(
             "error", error="product story refresh requires a worktree workspace"
