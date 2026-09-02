@@ -19905,7 +19905,11 @@ def _pin_test_target_or_block(
     *,
     board: Optional[str] = None,
 ) -> bool:
-    if task.workflow_template_id != "product" or task.current_step_key != "test":
+    if (
+        task.workflow_template_id != "product"
+        or task.current_step_key != "test"
+        or has_unresolved_product_preflight(conn, task.id)
+    ):
         return True
     try:
         _prepare_test_target(conn, task.id, workspace, board=board)

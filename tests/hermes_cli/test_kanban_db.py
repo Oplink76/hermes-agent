@@ -4238,6 +4238,65 @@ def test_spawn_one_v2_success_sets_running_flag(kanban_home, tmp_path, monkeypat
     assert row["status"] == "running"
 
 
+def test_spawn_one_v2_resolver_preflight_from_test_skips_test_target_pinning(
+    kanban_home, tmp_path, monkeypatch
+):
+    board = "v2-spawn-test-resolver-preflight"
+    _v2_product_board(board)
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    spawned: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(kb, "_stamp_run_executor_identity", lambda *_args: None)
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append((task.assignee, workspace))
+        return 4242
+
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Test finding needs Resolver",
+            board=board,
+            assignee="tester",
+            workflow_template_id="product",
+            current_step_key="test",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+        )
+        tester = kb.claim_task(conn, task_id, board=board)
+        assert tester is not None and tester.current_run_id is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="Required smoke is not exposed through the trusted runner",
+            kind="capability",
+            attempted_resolutions=["Ran the allowed repository test runner"],
+            expected_run_id=tester.current_run_id,
+            board=board,
+            human_escalation_assignee="resolver",
+        )
+        assert kb.has_unresolved_product_preflight(conn, task_id)
+
+        pid = kb._spawn_one_v2(
+            conn, task_id, board=board, spawn_fn=fake_spawn
+        )
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert pid == 4242
+    assert spawned == [("resolver", str(repo))]
+    assert task is not None
+    assert task.status == "running"
+    assert task.blocked is False
+    assert not [
+        event
+        for event in events
+        if event.kind == "spawn_failed"
+        and "test target preparation" in str(event.payload)
+    ]
+
+
 def test_spawn_one_v2_stamps_runtime_identity_before_spawn(
     kanban_home, tmp_path, monkeypatch
 ):
