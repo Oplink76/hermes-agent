@@ -159,6 +159,128 @@ def test_dispatch_holds_dirty_story_without_claiming(
     assert attention.payload["dirty_paths"] == ["operator-note.txt"]
 
 
+@pytest.mark.parametrize(
+    "advance_epic", [False, True], ids=["epic-ancestor", "epic-advanced"]
+)
+def test_dispatch_prioritizes_recorded_recovery_assignee_before_story_refresh(
+    kanban_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    advance_epic: bool,
+) -> None:
+    board = f"story-refresh-resolver-{advance_epic}"
+    repo = _repository(tmp_path)
+    _board(board, repo)
+    _epic_id, story_id, story_worktree, epic_branch = _story_card(
+        board, repo, step="development"
+    )
+
+    if advance_epic:
+        _git(repo, "checkout", epic_branch)
+        _commit(repo, "epic.txt", "from epic\n", "fixture: advance epic")
+        _git(repo, "checkout", "main")
+
+    spawned: list[tuple[str | None, str]] = []
+
+    def fake_spawn(task: kb.Task, workspace: str) -> int:
+        spawned.append((task.assignee, workspace))
+        return 4242
+
+    monkeypatch.setattr(
+        kb, "_stamp_run_executor_identity", lambda *_args, **_kwargs: None
+    )
+
+    with kb.connect(board=board) as conn:
+        ordinary = kb.claim_task(conn, story_id)
+        assert ordinary is not None and ordinary.current_run_id is not None
+        (story_worktree / "worker-change.txt").write_text(
+            "preserved implementation\n", encoding="utf-8"
+        )
+        assert kb.block_task(
+            conn,
+            story_id,
+            reason="The governed worker needs recovery",
+            kind="needs_input",
+            attempted_resolutions=["ran permitted verification"],
+            expected_run_id=ordinary.current_run_id,
+            board=board,
+            human_escalation_assignee="resolver",
+        )
+
+        pid = kb._spawn_one_v2(
+            conn,
+            story_id,
+            board=board,
+            spawn_fn=fake_spawn,
+        )
+        task = kb.get_task(conn, story_id)
+        events = kb.list_events(conn, story_id)
+
+    assert pid == 4242
+    assert spawned == [("resolver", str(story_worktree))]
+    assert task is not None and task.status == "running" and task.assignee == "resolver"
+    assert (story_worktree / "worker-change.txt").read_text(
+        encoding="utf-8"
+    ) == "preserved implementation\n"
+    refresh_kinds = {
+        "story_refresh_checked",
+        "story_refreshed",
+        "story_refresh_conflict",
+        "story_refresh_attention_required",
+    }
+    assert not refresh_kinds.intersection(event.kind for event in events)
+
+
+def test_dispatch_does_not_bypass_refresh_after_recovery_card_is_reassigned(
+    kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    board = "story-refresh-resolver-reassigned"
+    repo = _repository(tmp_path)
+    _board(board, repo)
+    _epic_id, story_id, story_worktree, _epic_branch = _story_card(
+        board, repo, step="development"
+    )
+    spawned: list[str] = []
+    monkeypatch.setattr(
+        kb, "_stamp_run_executor_identity", lambda *_args, **_kwargs: None
+    )
+
+    with kb.connect(board=board) as conn:
+        ordinary = kb.claim_task(conn, story_id)
+        assert ordinary is not None and ordinary.current_run_id is not None
+        assert kb.block_task(
+            conn,
+            story_id,
+            reason="The governed worker needs recovery",
+            kind="needs_input",
+            expected_run_id=ordinary.current_run_id,
+            board=board,
+            human_escalation_assignee="resolver",
+        )
+        assert kb.assign_task(conn, story_id, "developer")
+        (story_worktree / "worker-change.txt").write_text(
+            "preserve\n", encoding="utf-8"
+        )
+
+        pid = kb._spawn_one_v2(
+            conn,
+            story_id,
+            board=board,
+            spawn_fn=lambda task, workspace: spawned.append(task.id) or 4242,
+        )
+        task = kb.get_task(conn, story_id)
+        events = kb.list_events(conn, story_id)
+
+    assert pid is None
+    assert spawned == []
+    assert task is not None and task.status == "ready" and task.assignee == "developer"
+    attention = [
+        event for event in events if event.kind == "story_refresh_attention_required"
+    ]
+    assert len(attention) == 1
+    assert attention[0].payload["kind"] == "dirty"
+
+
 def test_dispatch_routes_isolated_conflict_to_development_rework(
     kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

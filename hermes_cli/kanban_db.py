@@ -19935,6 +19935,21 @@ def _story_refresh_preflight(
         or epic_id_for_task(conn, task.id) is None
     ):
         return None, None
+
+    # A recovery assignee must inspect the exact state that raised the pending
+    # preflight, even when an ordinary story refresh would otherwise be safe.
+    # Refresh is deferred until the preflight resolves; reassignment to any
+    # profile other than the one recorded by the preflight does not bypass it.
+    preflight = _latest_unresolved_product_preflight(conn, task.id)
+    if preflight is not None:
+        _event_id, payload = preflight
+        recovery_assignee = _canonical_assignee(payload.get("hermes_assignee"))
+        if (
+            recovery_assignee
+            and _canonical_assignee(task.assignee) == recovery_assignee
+        ):
+            return None, None
+
     if task.workspace_kind != "worktree":
         return None, RefreshResult(
             "error", error="product story refresh requires a worktree workspace"
