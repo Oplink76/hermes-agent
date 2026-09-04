@@ -20,6 +20,7 @@ branch, clone) — not mocked subprocess.run — so they exercise the actual
 ``git status`` / ``git cherry`` semantics the guard depends on.
 """
 
+import json
 import subprocess
 from types import SimpleNamespace
 
@@ -96,6 +97,392 @@ def test_clean_fully_merged_branch_is_safe_to_switch(repo_pair):
     )
     assert safe is True
     assert reason == ""
+
+
+@pytest.mark.parametrize("shape", ["diverged", "ahead", "detached", "parked_target"])
+def test_update_refuses_without_touching_local_history_or_services(
+    repo_pair, monkeypatch, capsys, shape
+):
+    """September 2 shape: three local fixes must survive Update unchanged."""
+    _git(repo_pair, "checkout", "-q", "main")
+    if shape == "ahead":
+        _git(repo_pair, "merge", "--ff-only", "origin/main")
+    local_commits = []
+    for index in range(3):
+        path = repo_pair / f"fix-{index}.txt"
+        path.write_text(f"local infrastructure fix {index}\n")
+        _git(repo_pair, "add", path.name)
+        _git(repo_pair, "commit", "-qm", f"local fix {index}")
+        local_commits.append(_git(repo_pair, "rev-parse", "HEAD").stdout.strip())
+    if shape == "detached":
+        _git(repo_pair, "checkout", "-q", "--detach")
+    elif shape == "parked_target":
+        _git(repo_pair, "checkout", "-q", "old-feature")
+    else:
+        (repo_pair / "a.txt").write_text("uncommitted user edit\n")
+        (repo_pair / "scratch.txt").write_text("untracked user work\n")
+    before_head = _git(repo_pair, "rev-parse", "HEAD").stdout
+    before_refs = _git(repo_pair, "show-ref", "--heads").stdout
+    before_status = _git(repo_pair, "status", "--porcelain").stdout
+    before_files = {p.name: p.read_bytes() for p in repo_pair.iterdir() if p.is_file()}
+    _patch_update_flow(monkeypatch, repo_pair)
+    effects = []
+    monkeypatch.setattr(hermes_main, "_pause_windows_gateways_for_update", lambda: effects.append("pause"))
+    monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *a: effects.append("eol"))
+
+    class ReachedDependencies(Exception):
+        pass
+
+    monkeypatch.setattr(hermes_main, "_abort_dependency_sync_if_self_locked", lambda *a, **k: (_ for _ in ()).throw(ReachedDependencies()))
+    with pytest.raises((SystemExit, ReachedDependencies)):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout == before_head
+    assert _git(repo_pair, "show-ref", "--heads").stdout == before_refs
+    assert _git(repo_pair, "status", "--porcelain").stdout == before_status
+    assert {p.name: p.read_bytes() for p in repo_pair.iterdir() if p.is_file()} == before_files
+    for sha in local_commits:
+        assert _git(repo_pair, "merge-base", "--is-ancestor", sha, "main", check=False).returncode == 0
+    assert _git(repo_pair, "stash", "list").stdout == ""
+    assert effects == []
+    output = capsys.readouterr().out
+    assert "Update refused" in output
+    assert "Update complete" not in output
+    from hermes_cli import update_receipt
+
+    receipt = json.loads((update_receipt._receipt_dir() / "latest.json").read_text())
+    assert receipt["outcome"] == "refused"
+    assert receipt["stop_reason"].startswith("git_")
+
+
+@pytest.mark.parametrize("relation", ["equal", "fast_forward", "local_commits", "unknown"])
+def test_git_relation_probes_real_history_without_mutation(repo_pair, relation):
+    local = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+    remote = _git(repo_pair, "rev-parse", "origin/main").stdout.strip()
+    if relation == "equal":
+        remote = local
+    elif relation == "local_commits":
+        local, remote = remote, local
+    elif relation == "unknown":
+        remote = "0" * 40
+    before = _git(repo_pair, "show-ref").stdout
+    assert update_cmd._git_update_relation(GIT, repo_pair, local, remote) == relation
+    assert _git(repo_pair, "show-ref").stdout == before
+
+
+def test_git_probe_error_refuses_before_service_pause(repo_pair, monkeypatch):
+    _git(repo_pair, "checkout", "-q", "main")
+    _patch_update_flow(monkeypatch, repo_pair)
+    real_run = subprocess.run
+    effects = []
+
+    def fail_probe(cmd, **kwargs):
+        if cmd[1:3] == ["merge-base", "--is-ancestor"]:
+            return subprocess.CompletedProcess(cmd, 128, "", "object unavailable")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fail_probe)
+    monkeypatch.setattr(hermes_main, "_pause_windows_gateways_for_update", lambda: effects.append("pause"))
+    before = _git(repo_pair, "rev-parse", "HEAD").stdout
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+    assert effects == []
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout == before
+
+
+def test_rewritten_upstream_does_not_discard_patch_equivalent_local_tip(repo_pair, monkeypatch):
+    _git(repo_pair, "checkout", "-q", "main")
+    _git(repo_pair, "merge", "--ff-only", "origin/main")
+    local = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+    origin = repo_pair.parent / "origin"
+    _git(origin, "commit", "--amend", "-qm", "rewritten upstream message")
+    _patch_update_flow(monkeypatch, repo_pair)
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout.strip() == local
+    assert _git(repo_pair, "cherry", "origin/main").stdout.startswith("- ")
+
+
+def test_configured_custom_merge_requires_recovery_tag(repo_pair, monkeypatch):
+    import hermes_cli.config as config
+
+    (repo_pair / "feature.txt").write_text("local custom work\n")
+    _git(repo_pair, "add", "feature.txt")
+    _git(repo_pair, "commit", "-qm", "custom work")
+    before = _git(repo_pair, "rev-parse", "HEAD").stdout
+    _patch_update_flow(monkeypatch, repo_pair)
+    monkeypatch.setattr(config, "load_config", lambda: {"updates": {"parked_branch_strategy": "update_in_place"}})
+    real_run = subprocess.run
+
+    def deny_tag(cmd, **kwargs):
+        if cmd[1] == "tag":
+            return subprocess.CompletedProcess(cmd, 1, "", "ref permission denied")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", deny_tag)
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout == before
+    assert not (repo_pair / "b.txt").exists()
+
+
+def test_intentional_lockfile_edit_is_preserved_on_safe_update(repo_pair, monkeypatch):
+    _git(repo_pair, "checkout", "-q", "main")
+    # A tracked lockfile exists on both sides, with a local user-only edit.
+    origin = repo_pair.parent / "origin"
+    (origin / "package-lock.json").write_text('{"lockfileVersion":3}\n')
+    _git(origin, "add", "package-lock.json")
+    _git(origin, "commit", "-qm", "add lockfile")
+    _git(repo_pair, "fetch", "-q", "origin", "main")
+    _git(repo_pair, "merge", "--ff-only", "origin/main")
+    (origin / "new.txt").write_text("new remote feature\n")
+    _git(origin, "add", "new.txt")
+    _git(origin, "commit", "-qm", "new remote feature")
+    edited = '{"lockfileVersion":3,"userChange":true}\n'
+    (repo_pair / "package-lock.json").write_text(edited)
+    _patch_update_flow(monkeypatch, repo_pair)
+
+    class ReachedDependencies(Exception):
+        pass
+
+    monkeypatch.setattr(hermes_main, "_abort_dependency_sync_if_self_locked", lambda *a, **k: (_ for _ in ()).throw(ReachedDependencies()))
+    with pytest.raises(ReachedDependencies):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+    assert (repo_pair / "package-lock.json").read_text() == edited
+    assert (repo_pair / "new.txt").read_text() == "new remote feature\n"
+
+
+def test_changed_local_ref_after_admission_is_not_overwritten(repo_pair, monkeypatch):
+    _git(repo_pair, "checkout", "-q", "main")
+    _patch_update_flow(monkeypatch, repo_pair)
+    late_sha = []
+
+    def simulate_concurrent_commit():
+        (repo_pair / "late.txt").write_text("user commit during update\n")
+        _git(repo_pair, "add", "late.txt")
+        _git(repo_pair, "commit", "-qm", "concurrent user work")
+        late_sha.append(_git(repo_pair, "rev-parse", "HEAD").stdout)
+
+    monkeypatch.setattr(hermes_main, "_pause_windows_gateways_for_update", simulate_concurrent_commit)
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout == late_sha[0]
+    assert (repo_pair / "late.txt").read_text() == "user commit during update\n"
+
+
+def test_parked_lockfile_edit_refuses_with_actionable_unblock(repo_pair, monkeypatch, capsys):
+    edited = '{"userPinnedResolution":true}\n'
+    (repo_pair / "package-lock.json").write_text(edited)
+    _git(repo_pair, "add", "package-lock.json")
+    _patch_update_flow(monkeypatch, repo_pair)
+    before = _git(repo_pair, "rev-parse", "HEAD").stdout
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+    assert (repo_pair / "package-lock.json").read_text() == edited
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout == before
+    assert _git(repo_pair, "stash", "list").stdout == ""
+    out = capsys.readouterr().out
+    assert "Lockfile-only edits" in out
+    assert "Commit or stash" in out
+    assert f"git -C {repo_pair} status" in out
+
+
+@pytest.mark.parametrize("concurrent_change", ["commit", "tracked_edit", "branch_switch"])
+def test_syntax_failure_never_resets_concurrent_user_work(repo_pair, monkeypatch, concurrent_change):
+    _git(repo_pair, "checkout", "-q", "main")
+    _patch_update_flow(monkeypatch, repo_pair)
+    snapshot = {}
+
+    def check_syntax(root):
+        if concurrent_change == "commit":
+            (root / "late.txt").write_text("late user work\n")
+            _git(root, "add", "late.txt")
+            _git(root, "commit", "-qm", "user work during validation")
+        elif concurrent_change == "tracked_edit":
+            (root / "a.txt").write_text("late tracked edit\n")
+        else:
+            _git(root, "checkout", "-qb", "unrelated")
+        snapshot["head"] = _git(root, "rev-parse", "HEAD").stdout
+        snapshot["status"] = _git(root, "status", "--porcelain").stdout
+        snapshot["files"] = {p.name: p.read_bytes() for p in root.iterdir() if p.is_file()}
+        return False, "hermes_cli/config.py", "bad candidate syntax"
+
+    monkeypatch.setattr(update_cmd, "_validate_critical_files_syntax", check_syntax)
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout == snapshot["head"]
+    assert _git(repo_pair, "status", "--porcelain").stdout == snapshot["status"]
+    assert {p.name: p.read_bytes() for p in repo_pair.iterdir() if p.is_file()} == snapshot["files"]
+
+
+def test_bad_fetched_syntax_refuses_before_source_or_service_mutation(repo_pair, monkeypatch):
+    origin = repo_pair.parent / "origin"
+    critical = origin / "hermes_cli" / "config.py"
+    critical.parent.mkdir()
+    critical.write_text("def broken(:\n")
+    _git(origin, "add", "hermes_cli/config.py")
+    _git(origin, "commit", "-qm", "bad upstream syntax")
+    _git(repo_pair, "checkout", "-q", "main")
+    _patch_update_flow(monkeypatch, repo_pair)
+    before = _git(repo_pair, "rev-parse", "HEAD").stdout
+    paused = []
+    monkeypatch.setattr(hermes_main, "_pause_windows_gateways_for_update", lambda: paused.append(True))
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+    assert paused == []
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout == before
+    assert not (repo_pair / "b.txt").exists()
+    assert not (repo_pair / "hermes_cli").exists()
+
+
+def test_deleted_critical_file_in_candidate_does_not_block_update(repo_pair, monkeypatch):
+    origin = repo_pair.parent / "origin"
+    critical = origin / "hermes_constants.py"
+    critical.write_text("OLD_SETTING = True\n")
+    _git(origin, "add", "hermes_constants.py")
+    _git(origin, "commit", "-qm", "old critical module")
+    _git(repo_pair, "checkout", "-q", "main")
+    _git(repo_pair, "fetch", "-q", "origin", "main")
+    _git(repo_pair, "merge", "--ff-only", "origin/main")
+    _git(origin, "rm", "hermes_constants.py")
+    _git(origin, "commit", "-qm", "remove obsolete critical module")
+    _patch_update_flow(monkeypatch, repo_pair)
+    class ReachedDependencies(Exception):
+        pass
+    monkeypatch.setattr(hermes_main, "_abort_dependency_sync_if_self_locked", lambda *a, **k: (_ for _ in ()).throw(ReachedDependencies()))
+    with pytest.raises(ReachedDependencies):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+    assert not (repo_pair / "hermes_constants.py").exists()
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout == _git(origin, "rev-parse", "HEAD").stdout
+
+
+def test_candidate_blob_read_failure_is_unknown_not_missing_file(repo_pair, monkeypatch):
+    origin = repo_pair.parent / "origin"
+    (origin / "hermes_constants.py").write_text("VALID = True\n")
+    _git(origin, "add", "hermes_constants.py")
+    _git(origin, "commit", "-qm", "valid critical module")
+    _git(repo_pair, "checkout", "-q", "main")
+    _patch_update_flow(monkeypatch, repo_pair)
+    original = _git(repo_pair, "rev-parse", "HEAD").stdout
+    real_run = subprocess.run
+    def fail_blob(cmd, **kwargs):
+        if cmd[1:3] == ["cat-file", "blob"]:
+            raise subprocess.CalledProcessError(128, cmd, stderr="object read failure")
+        return real_run(cmd, **kwargs)
+    monkeypatch.setattr(subprocess, "run", fail_blob)
+    monkeypatch.setattr(hermes_main, "_pause_windows_gateways_for_update", lambda: pytest.fail("paused despite unknown candidate"))
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+    from hermes_cli import update_receipt
+    receipt = json.loads((update_receipt._receipt_dir() / "latest.json").read_text())
+    assert receipt["stop_reason"] == "git_unknown"
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout == original
+    assert not (repo_pair / "hermes_constants.py").exists()
+
+
+def test_same_sha_branch_switch_before_merge_refuses_without_updating_wrong_branch(repo_pair, monkeypatch):
+    _git(repo_pair, "checkout", "-q", "main")
+    _patch_update_flow(monkeypatch, repo_pair)
+    original = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+    real_run = subprocess.run
+    switched = False
+
+    def concurrent_switch(cmd, **kwargs):
+        nonlocal switched
+        result = real_run(cmd, **kwargs)
+        if cmd[1] == "rev-list" and not switched:
+            switched = True
+            _git(repo_pair, "checkout", "-qb", "unrelated-work")
+        return result
+
+    monkeypatch.setattr(subprocess, "run", concurrent_switch)
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+    assert switched
+    assert _git(repo_pair, "rev-parse", "unrelated-work").stdout.strip() == original
+    assert _git(repo_pair, "rev-parse", "main").stdout.strip() == original
+
+
+def test_invalid_update_config_refuses_with_receipt_before_pause(repo_pair, monkeypatch):
+    import hermes_cli.config as config
+    from hermes_cli import update_receipt
+
+    _patch_update_flow(monkeypatch, repo_pair)
+    before = _git(repo_pair, "show-ref", "--heads").stdout
+    def unreadable():
+        raise ValueError("invalid config")
+    monkeypatch.setattr(config, "load_config", unreadable)
+    monkeypatch.setattr(hermes_main, "_pause_windows_gateways_for_update", lambda: pytest.fail("paused before admission"))
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+    receipt = json.loads((update_receipt._receipt_dir() / "latest.json").read_text())
+    assert receipt["outcome"] == "refused"
+    assert receipt["stop_reason"] == "git_config_unavailable"
+    assert _git(repo_pair, "show-ref", "--heads").stdout == before
+
+
+def test_in_place_update_does_not_require_unused_main_to_be_fast_forwardable(repo_pair, monkeypatch):
+    import hermes_cli.config as config
+
+    _git(repo_pair, "checkout", "-q", "main")
+    (repo_pair / "main-only.txt").write_text("unpublished main work\n")
+    _git(repo_pair, "add", "main-only.txt")
+    _git(repo_pair, "commit", "-qm", "main work")
+    main_before = _git(repo_pair, "rev-parse", "main").stdout
+    _git(repo_pair, "checkout", "-q", "old-feature")
+    (repo_pair / "custom.txt").write_text("custom work\n")
+    _git(repo_pair, "add", "custom.txt")
+    _git(repo_pair, "commit", "-qm", "custom work")
+    custom_before = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+    _patch_update_flow(monkeypatch, repo_pair)
+    monkeypatch.setattr(config, "load_config", lambda: {"updates": {"parked_branch_strategy": "update_in_place"}})
+    class ReachedDependencies(Exception):
+        pass
+    monkeypatch.setattr(hermes_main, "_abort_dependency_sync_if_self_locked", lambda *a, **k: (_ for _ in ()).throw(ReachedDependencies()))
+    with pytest.raises(ReachedDependencies):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+    assert _git(repo_pair, "branch", "--show-current").stdout.strip() == "old-feature"
+    assert _git(repo_pair, "rev-parse", "main").stdout == main_before
+    assert _git(repo_pair, "merge-base", "--is-ancestor", custom_before, "HEAD").returncode == 0
+    assert (repo_pair / "custom.txt").read_text() == "custom work\n"
+    assert (repo_pair / "b.txt").read_text() == "three\n"
+
+
+def test_divergent_parked_target_warning_explains_reconciliation_not_checkout_retry(repo_pair, monkeypatch, capsys):
+    _git(repo_pair, "checkout", "-q", "main")
+    (repo_pair / "local.txt").write_text("local\n")
+    _git(repo_pair, "add", "local.txt")
+    _git(repo_pair, "commit", "-qm", "local")
+    local = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+    remote = _git(repo_pair, "rev-parse", "origin/main").stdout.strip()
+    _git(repo_pair, "checkout", "-q", "old-feature")
+    _patch_update_flow(monkeypatch, repo_pair)
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+    out = capsys.readouterr().out
+    assert "local commits" in out.lower()
+    assert "main" in out and local in out and remote in out
+    assert "checkout main && hermes update" not in out
+
+
+def test_merge_uses_fetched_commit_even_if_remote_tracking_ref_moves(repo_pair, monkeypatch):
+    _git(repo_pair, "checkout", "-q", "main")
+    _patch_update_flow(monkeypatch, repo_pair)
+    fetched_sha = _git(repo_pair, "rev-parse", "origin/main").stdout.strip()
+
+    def simulate_concurrent_fetch():
+        # Another fetch may change the mutable remote-tracking ref. The
+        # admitted immutable commit must still be the merge input.
+        _git(repo_pair, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+    class ReachedDependencies(Exception):
+        pass
+
+    monkeypatch.setattr(hermes_main, "_pause_windows_gateways_for_update", simulate_concurrent_fetch)
+    monkeypatch.setattr(hermes_main, "_abort_dependency_sync_if_self_locked", lambda *a, **k: (_ for _ in ()).throw(ReachedDependencies()))
+    with pytest.raises(ReachedDependencies):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout.strip() == fetched_sha
 
 
 def test_dirty_tree_blocks_auto_switch(repo_pair):
@@ -185,7 +572,8 @@ def test_skip_warning_names_branch_behind_count_and_commands(repo_pair, capsys):
     assert "CODE UPDATE SKIPPED" in out
     assert "old-feature" in out
     assert "2 commit(s) BEHIND" in out
-    assert f"git -C {repo_pair} checkout main && hermes update" in out
+    assert f"git -C {repo_pair} status" in out
+    assert "Commit or stash" in out
 
 
 def test_skip_warning_dirty_reason(repo_pair, capsys):
@@ -256,8 +644,6 @@ def _patch_update_flow(monkeypatch, repo, run_real_git=True):
         lambda *a, **k: "https://github.com/NousResearch/hermes-agent.git",
     )
     monkeypatch.setattr(hermes_main, "_is_fork", lambda *a, **k: False)
-    monkeypatch.setattr(hermes_main, "_discard_lockfile_churn", lambda *a, **k: None)
-    monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *a, **k: None)
     monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *a, **k: None)
     monkeypatch.setattr(hermes_main, "_clear_bytecode_cache", lambda *a, **k: 0)
     monkeypatch.setattr(hermes_main, "_record_bytecode_fingerprint", lambda *a, **k: None)

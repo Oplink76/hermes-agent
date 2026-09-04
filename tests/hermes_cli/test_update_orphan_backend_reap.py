@@ -253,7 +253,11 @@ def _run_guard(detect_side_effect, orphan_return):
         pass
 
     class _RootSentinel:
-        def __truediv__(self, _other):
+        def __truediv__(self, other):
+            # Git admission now precedes the holder sweep. This fixture
+            # isolates the process guard; no repository is being updated.
+            if other == ".git":
+                return SimpleNamespace(exists=lambda: False)
             raise _PastGuard
 
     killed: list[list[int]] = []

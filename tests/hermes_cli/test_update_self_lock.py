@@ -232,7 +232,7 @@ def test_abort_helper_resumes_paused_gateways_before_exit():
 # ---------------------------------------------------------------------------
 
 
-def test_pre_fetch_flow_has_no_self_lock_preflight():
+def test_pre_fetch_flow_has_no_self_lock_preflight(monkeypatch, tmp_path):
     """#86780 regression: a loaded native module must not block the git fetch.
 
     The old preflight sat between the venv-holder sweep and the fetch, so a
@@ -242,16 +242,31 @@ def test_pre_fetch_flow_has_no_self_lock_preflight():
     only; the stretch of _cmd_update_impl between the venv-holder sweep and
     the fetch must not consult the detector at all.
     """
-    import inspect
+    from types import SimpleNamespace
 
-    src = inspect.getsource(update_cmd._cmd_update_impl)
-    fetch_idx = src.index("Fetching updates")
-    pre_fetch = src[:fetch_idx]
-    assert "_detect_self_loaded_native_modules()" not in pre_fetch
-    assert "_m()._abort_dependency_sync_if_self_locked" not in pre_fetch
-    # ... and it must still guard the dependency sync after the code swap.
-    post_fetch = src[fetch_idx:]
-    assert "_m()._abort_dependency_sync_if_self_locked" in post_fetch
+    class FetchReached(Exception):
+        pass
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(cli_main, "_is_windows", lambda: False)
+    monkeypatch.setattr(cli_main, "_run_pre_update_backup", lambda *a: None)
+    monkeypatch.setattr(cli_main, "_capture_active_lazy_features", lambda: [])
+    monkeypatch.setattr(cli_main, "_capture_active_tool_dependencies", lambda: [])
+
+    def deny_early_dependency_guard(*args, **kwargs):
+        pytest.fail("native-module guard ran before Git fetch")
+
+    monkeypatch.setattr(cli_main, "_abort_dependency_sync_if_self_locked", deny_early_dependency_guard)
+
+    def observe_fetch(cmd, **kwargs):
+        if cmd[1:3] == ["fetch", "origin"]:
+            raise FetchReached
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", observe_fetch)
+    with pytest.raises(FetchReached):
+        cli_main._cmd_update_impl(SimpleNamespace(yes=True), gateway_mode=False)
 
 
 def test_zip_update_guards_dependency_sync():

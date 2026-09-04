@@ -28,7 +28,7 @@ from hermes_constants import get_hermes_home
 
 def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
     """Simulate git commands where HEAD advances from pre_sha to post_sha."""
-    calls = {"n": 0}
+    state = {"merged": False}
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
@@ -39,11 +39,13 @@ def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
         if "rev-list" in joined:
             return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
 
-        if joined.endswith("rev-parse HEAD"):
-            if calls["n"] == 0:
-                calls["n"] += 1
-                return SimpleNamespace(returncode=0, stdout=f"{pre_sha}\n", stderr="")
+        if cmd[1:3] == ["merge", "--ff-only"]:
+            state["merged"] = True
+        if "rev-parse" in joined and cmd[-1] == "FETCH_HEAD":
             return SimpleNamespace(returncode=0, stdout=f"{post_sha}\n", stderr="")
+        if "rev-parse" in joined and cmd[-1] in {"HEAD", "refs/heads/main"}:
+            sha = post_sha if state["merged"] else pre_sha
+            return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
 
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -62,7 +64,7 @@ def _make_up_to_date_side_effect(sha="abc123"):
         if "rev-list" in joined:
             return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
 
-        if joined.endswith("rev-parse HEAD"):
+        if "rev-parse" in joined and cmd[-1] in {"HEAD", "FETCH_HEAD", "refs/heads/main"}:
             return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
 
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -117,6 +119,10 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     monkeypatch.setattr(
         hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
     )
+    monkeypatch.setattr(hermes_gateway, "_get_service_pids", lambda **k: set())
+    monkeypatch.setattr("hermes_cli.update_cmd._restart_macos_launchd_gateways", lambda *a, **k: None)
+    monkeypatch.setattr(hermes_main, "_capture_active_lazy_features", lambda: [])
+    monkeypatch.setattr(hermes_main, "_capture_active_tool_dependencies", lambda: [])
     monkeypatch.setattr(
         "hermes_cli.update_receipt.collect_fleet_versions",
         lambda **k: [],
