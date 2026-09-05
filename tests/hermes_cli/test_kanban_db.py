@@ -8880,6 +8880,135 @@ def test_recovery_runs_never_replace_product_writer_or_test_authority(
         assert [tuple(row) for row in conn.execute("SELECT * FROM task_runs ORDER BY id")] == before
 
 
+@pytest.mark.parametrize("step", ["development", "test", "review"])
+@pytest.mark.parametrize("failure", ["identity", "crash", "limit"])
+def test_custom_recovery_purpose_survives_failed_claim(
+    kanban_home, monkeypatch, step, failure,
+):
+    """A failed recovery claim must never displace ordinary writer/Test evidence."""
+    board = "custom-recovery-failure"
+    _v2_product_board(board)
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
+    ordinary_profile = {"development": "developer", "test": "tester", "review": "reviewer"}[step]
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn, title="Recovery purpose", assignee=ordinary_profile,
+            workflow_template_id="product", current_step_key=step, board=board,
+        )
+        writer_id = kb._synthesize_ended_run(
+            conn, tid, outcome="advanced", step_key="development",
+            metadata={"executor": {"profile": "developer", "provider": "codex", "model": "fixture",
+                                   "effort": "high", "surface": "hermes-primary"}},
+        )
+        pins = {"test_branch": "story/fixture", "test_head_sha": "a" * 40}
+        test_id = kb._synthesize_ended_run(
+            conn, tid, outcome="advanced", step_key="test",
+            metadata={**pins, "workflow_outcome": {"verdict": "passed"},
+                      "ai_provenance": {"tester": {"agent": "codex"}}},
+        )
+        assert kb.block_task(
+            conn, tid, board=board, kind="needs_input", reason="Needs diagnosis",
+            human_escalation_assignee="custom-recovery",
+        )
+        history = [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_runs WHERE task_id=? ORDER BY id", (tid,),
+        )]
+        at_identity = []
+
+        def identity(task):
+            at_identity.append(kb.get_run(conn, task.current_run_id).metadata)
+            if failure in {"identity", "limit"}:
+                raise kb.WorkerRuntimeIdentityError("fixture identity unavailable")
+            return {"profile": task.assignee, "provider": "claude-cli", "model": "fixture",
+                    "effort": "high", "surface": "hermes-primary", "source": "dispatcher", "version": 1}
+
+        monkeypatch.setattr(kb, "_resolve_worker_runtime_identity", identity)
+        if failure == "crash":
+            claimed = (kb.claim_review_task(conn, tid) if step == "review"
+                       else kb.claim_task(conn, tid, board=board))
+            assert claimed is not None
+            kb._stamp_run_executor_identity(conn, claimed)
+            kb._set_worker_pid(conn, tid, 987654321)
+            monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+            monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+            monkeypatch.setattr(kb, "_classify_worker_exit", lambda pid: ("nonzero_exit", 1))
+            assert kb.detect_crashed_workers(conn) == [tid]
+        else:
+            kb.dispatch_once(conn, board=board, failure_limit=1 if failure == "limit" else 5,
+                             spawn_fn=lambda *args, **kwargs: pytest.fail("identity failure must prevent spawn"))
+
+        run = max(kb.list_runs(conn, tid, include_active=True), key=lambda item: item.id)
+        assert run.outcome == {"identity": "spawn_failed", "crash": "crashed", "limit": "gave_up"}[failure]
+        assert at_identity == [{"resolver": {"profile": "custom-recovery"}}]
+        assert run.metadata["resolver"] == {"profile": "custom-recovery"}
+        assert kb._latest_product_step_executor(conn, tid, "development")["provider"] == "codex"
+        assert kb._latest_test_target(conn, tid) == pins
+        records = kb._terminal_run_records(conn, tid)
+        assert run.id not in {record.run_id for record in records}
+        assert kb.latest_test_authority(records, "a" * 40).run_id == test_id
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_runs WHERE task_id=? AND id<=? ORDER BY id", (tid, history[-1][0]),
+        )] == history
+        assert kb.get_run(conn, writer_id).outcome == "advanced"
+
+
+@pytest.mark.parametrize("decision", ["resume", "repair", "escalate"])
+def test_same_assignee_recovery_purpose_ends_at_canonical_resolution(kanban_home, decision):
+    board = "same-assignee-purpose"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(conn, title="Same worker, different purpose", assignee="developer",
+                             workflow_template_id="product", current_step_key="development", board=board)
+        ordinary = kb.claim_task(conn, tid, board=board)
+        assert not (kb.get_run(conn, ordinary.current_run_id).metadata or {}).get("resolver")
+        assert kb.block_task(conn, tid, board=board, kind="needs_input", reason="Needs diagnosis",
+                             expected_run_id=ordinary.current_run_id, human_escalation_assignee="developer")
+        recovery = kb.claim_task(conn, tid, board=board)
+        assert kb.get_run(conn, recovery.current_run_id).metadata == {"resolver": {"profile": "developer"}}
+        with pytest.raises(ValueError, match="preflight"):
+            kb.complete_task(conn, tid, board=board, expected_run_id=recovery.current_run_id, summary="Bypass")
+        request = _resolver_request(kb.resolver_expected_snapshot(conn, tid), decision=decision)
+        if decision == "repair":
+            request["repair"] = {"workflow": {"phase": "development", "assignee": "developer"}}
+        assert kb.resolve_product_preflight(conn, tid, board=board, request=request,
+                                            resolver_profile="developer", resolver_model="test-model")
+        ended = kb.get_run(conn, recovery.current_run_id)
+        assert ended.metadata["resolver"] == {"profile": "developer", "model": "test-model"}
+        assert not any(e.kind == "dispatcher_metadata_conflict" for e in kb.list_events(conn, tid))
+        if decision != "escalate":
+            next_run = kb.claim_task(conn, tid, board=board)
+            assert "resolver" not in (kb.get_run(conn, next_run.current_run_id).metadata or {})
+            assert kb.get_run(conn, recovery.current_run_id) == ended
+
+
+@pytest.mark.parametrize("preflight", ["absent", "different_assignee", "different_phase"])
+def test_unmatched_recovery_preflight_does_not_hide_ordinary_failure(kanban_home, preflight):
+    board = "ordinary-purpose"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(conn, title="Ordinary custom worker", assignee="custom-tester",
+                             workflow_template_id="product", current_step_key="test", board=board)
+        kb._synthesize_ended_run(conn, tid, outcome="advanced", step_key="test", metadata={
+            "workflow_outcome": {"verdict": "passed"}, "test_branch": "story/fixture", "test_head_sha": "a" * 40,
+        })
+        if preflight != "absent":
+            assert kb.block_task(conn, tid, board=board, kind="needs_input", reason="Needs diagnosis",
+                                 human_escalation_assignee="custom-recovery")
+            kb.assign_task(conn, tid, "custom-tester")
+            if preflight == "different_phase":
+                # Model a stale persisted preflight after a phase change.
+                conn.execute("UPDATE tasks SET assignee='custom-recovery', current_step_key='development' WHERE id=?", (tid,))
+                conn.commit()
+        claimed = kb.claim_task(conn, tid, board=board)
+        assert "resolver" not in (kb.get_run(conn, claimed.current_run_id).metadata or {})
+        kb._record_spawn_failure(conn, tid, "ordinary failure", failure_limit=5)
+        failed = kb.get_run(conn, claimed.current_run_id)
+        assert "resolver" not in (failed.metadata or {})
+        assert failed.id in {r.run_id for r in kb._terminal_run_records(conn, tid)}
+        if preflight != "different_phase":
+            assert kb._latest_test_target(conn, tid) == {}
+
+
 @pytest.mark.parametrize("optimistic_metadata", [False, True])
 def test_newer_failed_ordinary_test_invalidates_an_older_pin(kanban_home, optimistic_metadata):
     with kb.connect() as conn:

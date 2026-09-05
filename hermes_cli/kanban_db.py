@@ -2583,6 +2583,23 @@ def _latest_unresolved_product_preflight(
     return int(rows[0]["id"]), (payload if isinstance(payload, dict) else {})
 
 
+def _recovery_metadata_for_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: Optional[str],
+    step_key: Optional[str],
+) -> dict:
+    """Bind run purpose before identity resolution or spawning can fail."""
+    entry = _latest_unresolved_product_preflight(conn, task_id)
+    if entry is None:
+        return {}
+    _, preflight = entry
+    if (preflight.get("hermes_assignee") == assignee
+            and preflight.get("step_key") == step_key):
+        return {"resolver": {"profile": assignee}}
+    return {}
+
+
 def resolver_expected_snapshot(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10238,6 +10255,10 @@ def _end_run(
         active_metadata = {}
     dispatcher_metadata_conflicts: dict[str, dict[str, Any]] = {}
     if isinstance(active_metadata, dict):
+        # Canonical resolution can enrich this marker with its model; ordinary
+        # worker completion cannot supply it (reserved-metadata guards).
+        if "resolver" in active_metadata:
+            final_metadata.setdefault("resolver", active_metadata["resolver"])
         for key in (
             "test_branch",
             "test_head_sha",
@@ -10809,13 +10830,16 @@ def claim_task(
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        run_metadata = _recovery_metadata_for_claim(
+            conn, task_id, trow["assignee"], trow["current_step_key"]
+        )
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, metadata
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -10825,6 +10849,7 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                json.dumps(run_metadata) if run_metadata else None,
             ),
         )
         run_id = run_cur.lastrowid
@@ -10907,13 +10932,16 @@ def claim_review_task(
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        run_metadata = _recovery_metadata_for_claim(
+            conn, task_id, trow["assignee"], trow["current_step_key"]
+        )
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, metadata
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -10923,6 +10951,7 @@ def claim_review_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                json.dumps(run_metadata) if run_metadata else None,
             ),
         )
         run_id = run_cur.lastrowid
