@@ -12,19 +12,45 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.main import cmd_update
+
+
+@pytest.fixture(autouse=True)
+def isolated_update_checkout(monkeypatch, tmp_path):
+    """Prompt tests have no authority over the host checkout or services."""
+    from hermes_cli import main, update_inventory
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(main, "_run_pre_update_backup", lambda *a: None)
+    monkeypatch.setattr(main, "_capture_active_lazy_features", lambda: [])
+    monkeypatch.setattr(main, "_capture_active_tool_dependencies", lambda: [])
+    monkeypatch.setattr("hermes_cli.update_inventory.collect_runtime_inventory", lambda: update_inventory.UpdatePlan())
+    monkeypatch.setattr("hermes_cli.update_receipt.collect_fleet_versions", lambda **k: [])
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda **k: [])
+    monkeypatch.setattr("hermes_cli.gateway.find_profile_gateway_processes", lambda **k: [])
+    monkeypatch.setattr("hermes_cli.gateway._get_service_pids", lambda **k: set())
+    monkeypatch.setattr("hermes_cli.update_cmd._restart_macos_launchd_gateways", lambda *a, **k: None)
 
 
 def _make_run_side_effect(
     branch="main", verify_ok=True, commit_count="1", dirty=False
 ):
     """Minimal subprocess.run side_effect for the update flow."""
+    state = {"merged": False}
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
 
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{branch}\n", stderr="")
+        if "rev-parse" in joined and cmd[-1] in {"HEAD", "FETCH_HEAD", "refs/heads/main"}:
+            sha = "b" if state["merged"] or cmd[-1] == "FETCH_HEAD" else "a"
+            return subprocess.CompletedProcess(cmd, 0, stdout=sha * 40, stderr="")
+        if cmd[1:3] == ["merge", "--ff-only"]:
+            state["merged"] = True
         if "rev-parse" in joined and "--verify" in joined:
             return subprocess.CompletedProcess(
                 cmd, 0 if verify_ok else 128, stdout="", stderr=""

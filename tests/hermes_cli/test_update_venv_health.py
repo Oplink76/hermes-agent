@@ -177,7 +177,11 @@ def _run_update_until_guard(args):
         pass
 
     class _RootSentinel:
-        def __truediv__(self, _other):
+        def __truediv__(self, other):
+            # Git admission now precedes the holder sweep. This fixture
+            # isolates the process guard; no repository is being updated.
+            if other == ".git":
+                return SimpleNamespace(exists=lambda: False)
             raise _PastGuard
 
     with patch.object(cli_main, "_is_windows", return_value=True), patch.object(

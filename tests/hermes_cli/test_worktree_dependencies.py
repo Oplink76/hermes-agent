@@ -129,6 +129,63 @@ def test_matching_manifests_copy_isolated_node_modules(kanban_home, tmp_path):
     assert target == workspace
 
 
+def test_trailing_slash_node_modules_ignore_is_accepted(kanban_home, tmp_path):
+    """A conventional directory-only ignore must not block provisioning."""
+    repo = _repo_with_node_dependencies(tmp_path)
+    (repo / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "Use conventional directory ignore")
+
+    with kb.connect() as conn:
+        task_id, _target = _task_for(repo, conn)
+        task = kb.get_task(conn, task_id)
+        workspace, _branch = kb._resolve_worktree_workspace(task, conn=conn)
+
+    assert (workspace / "node_modules" / "fixture-dependency" / "index.js").is_file()
+
+
+def test_stale_primary_dependency_is_installed_instead_of_certified(
+    kanban_home, tmp_path, monkeypatch
+):
+    """Matching manifests do not prove the primary installed version."""
+    repo = _repo_with_node_dependencies(tmp_path)
+    package = json.loads((repo / "package.json").read_text())
+    package["dependencies"] = {"fixture-dependency": "2.0.0"}
+    lock = json.loads((repo / "package-lock.json").read_text())
+    lock["packages"][""]["dependencies"] = package["dependencies"]
+    lock["packages"]["node_modules/fixture-dependency"] = {"version": "2.0.0"}
+    (repo / "package.json").write_text(json.dumps(package), encoding="utf-8")
+    (repo / "package-lock.json").write_text(json.dumps(lock), encoding="utf-8")
+    _git(repo, "add", "package.json", "package-lock.json")
+    _git(repo, "commit", "-m", "Require dependency version two")
+    installed = repo / "node_modules" / "fixture-dependency"
+    (installed / "package.json").write_text(
+        '{"name":"fixture-dependency","version":"1.0.0"}\n', encoding="utf-8"
+    )
+    install_calls = []
+
+    def install(target):
+        install_calls.append(target)
+        dependency = target / "node_modules" / "fixture-dependency"
+        dependency.mkdir(parents=True)
+        (dependency / "package.json").write_text(
+            '{"name":"fixture-dependency","version":"2.0.0"}\n', encoding="utf-8"
+        )
+
+    monkeypatch.setattr(wd, "_run_real_install", install)
+    with kb.connect() as conn:
+        task_id, _target = _task_for(repo, conn)
+        task = kb.get_task(conn, task_id)
+        workspace, _branch = kb._resolve_worktree_workspace(task, conn=conn)
+
+    assert install_calls == [workspace]
+    installed_version = json.loads(
+        (workspace / "node_modules" / "fixture-dependency" / "package.json").read_text()
+    )["version"]
+    assert installed_version == "2.0.0"
+    assert not (workspace / "node_modules" / "fixture-dependency" / "index.js").exists()
+
+
 def test_manifest_mismatch_runs_real_install_in_dispatcher_context(
     kanban_home, tmp_path, monkeypatch
 ):

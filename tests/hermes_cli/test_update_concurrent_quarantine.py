@@ -1060,11 +1060,14 @@ def test_update_gate_still_aborts_on_non_gateway_concurrent(
 
 @patch.object(cli_main, "_is_windows", return_value=True)
 def test_update_impl_refuses_before_terminating_gateway_ancestor(
-    _winp, monkeypatch, capsys
+    _winp, monkeypatch, capsys, tmp_path
 ):
     """#98814: the live holder path must gate the destructive call itself."""
     import gateway.status as status_mod
     import hermes_cli.gateway as gateway_cli
+
+    # A process-guard test must not fetch or inspect the developer checkout.
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", tmp_path)
 
     holder = (
         300,
@@ -1122,5 +1125,4 @@ def test_stop_service_refuses_pid_reuse_before_sc_stop(monkeypatch):
         )
 
     assert calls == []
-
 

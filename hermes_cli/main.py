@@ -5154,7 +5154,6 @@ _LAZY_COMMAND_EXPORTS = {
         "_detect_venv_python_processes",
         "_desktop_owns_gateway_lifecycle",
         "_defer_update_for_self_lock",
-        "_discard_lockfile_churn",
         "_discard_stashed_changes",
         "_park_stashed_changes",
         "_ensure_acp_launcher",

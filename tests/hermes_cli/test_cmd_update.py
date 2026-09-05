@@ -12,6 +12,7 @@ from hermes_cli.main import cmd_update, PROJECT_ROOT
 
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
     """Build a side_effect function for subprocess.run that simulates git commands."""
+    state = {"merged": False}
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
@@ -19,6 +20,11 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
         # git rev-parse --abbrev-ref HEAD  (get current branch)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{branch}\n", stderr="")
+        if "rev-parse" in joined and cmd[-1] in {"HEAD", "FETCH_HEAD", f"refs/heads/{branch}"}:
+            advanced = state["merged"] or (cmd[-1] == "FETCH_HEAD" and commit_count != "0")
+            return subprocess.CompletedProcess(cmd, 0, stdout=("b" if advanced else "a") * 40, stderr="")
+        if cmd[1:3] == ["merge", "--ff-only"]:
+            state["merged"] = True
 
         # git rev-parse --verify origin/{branch}  (check remote branch exists)
         if "rev-parse" in joined and "--verify" in joined:
@@ -38,6 +44,27 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
 @pytest.fixture
 def mock_args():
     return SimpleNamespace()
+
+
+@pytest.fixture(autouse=True)
+def isolated_source_checkout(monkeypatch, tmp_path):
+    """Never use the host source tree as a mocked Update destination."""
+    import sys
+    from hermes_cli import main, update_inventory
+
+    (tmp_path / ".git").mkdir()
+    desktop = tmp_path / "apps" / "desktop"
+    desktop.mkdir(parents=True)
+    (desktop / "package.json").write_text("{}")
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(sys.modules[__name__], "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(main, "_run_pre_update_backup", lambda *a: None)
+    monkeypatch.setattr(main, "_capture_active_lazy_features", lambda: [])
+    monkeypatch.setattr(main, "_capture_active_tool_dependencies", lambda: [])
+    monkeypatch.setattr("hermes_cli.update_inventory.collect_runtime_inventory", lambda: update_inventory.UpdatePlan())
+    monkeypatch.setattr("hermes_cli.update_receipt.collect_fleet_versions", lambda **k: [])
+    monkeypatch.setattr("hermes_cli.gateway._get_service_pids", lambda **k: set())
+    monkeypatch.setattr("hermes_cli.update_cmd._restart_macos_launchd_gateways", lambda *a, **k: None)
 
 
 # ---------------------------------------------------------------------------
@@ -468,12 +495,13 @@ class TestCmdUpdateBranchFallback:
             branch="main", verify_ok=True, commit_count="0"
         )
 
-        # The first two reads bracket the upstream sync (aaaaaaa -> bbbbbbb:
-        # the sync moved HEAD). The NEXT two bracket the pull inside the
-        # normal update path (bbbbbbb -> ccccccc) — the head-moved no-op
-        # guard added after this PR exits 1 when that pair is equal, so the
-        # mock must show the pull advancing HEAD too.
-        shas = iter(["aaaaaaa", "bbbbbbb", "bbbbbbb", "ccccccc"])
+        # The upstream sync moves HEAD once. Merging the older admitted
+        # origin afterward is a no-op, not a second imaginary code change.
+        state = {"head": "a" * 40}
+
+        def upstream_sync(*args, **kwargs):
+            state["head"] = "b" * 40
+            return True
 
         with patch.object(
             hm,
@@ -482,7 +510,7 @@ class TestCmdUpdateBranchFallback:
         ), patch.object(
             update_cmd,
             "_capture_head_sha",
-            side_effect=lambda *_args, **_kwargs: next(shas, "ccccccc"),
+            side_effect=lambda *args, **kwargs: "a" * 40 if len(args) > 2 and args[2] == "FETCH_HEAD" else state["head"],
         ), patch(
             # The full post-update path runs the fleet version check, which
             # reads the REAL machine's profile gateway_state.json files —
@@ -506,7 +534,7 @@ class TestCmdUpdateBranchFallback:
             "hermes_cli.gateway._get_service_pids",
             return_value=set(),
         ), patch.object(
-            hm, "_sync_with_upstream_if_needed"
+            hm, "_sync_with_upstream_if_needed", side_effect=upstream_sync
         ), patch.object(
             hm,
             "_reload_updated_runtime_modules",
@@ -806,20 +834,32 @@ class TestCmdUpdateBranchFlag:
         - ``commit_count``    rev-list count returned (0 = up-to-date, >0 = behind)
         """
 
+        state = {"branch": current_branch, "merged": False}
+
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
 
             if "rev-parse" in joined and "--abbrev-ref" in joined:
-                return subprocess.CompletedProcess(cmd, 0, stdout=f"{current_branch}\n", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{state['branch']}\n", stderr="")
+            if "rev-parse" in joined and cmd[-1] in {"HEAD", "FETCH_HEAD", f"refs/heads/{target_branch}"}:
+                advanced = state["merged"] or cmd[-1] == "FETCH_HEAD"
+                return subprocess.CompletedProcess(cmd, 0, stdout=("b" if advanced else "a") * 40, stderr="")
+            if cmd[1:3] == ["merge", "--ff-only"]:
+                state["merged"] = True
 
-            if "checkout" in joined and "-B" in joined:
+            if "checkout" in joined and "-b" in joined:
                 rc = 128 if track_fails else 0
                 err = f"fatal: '{target_branch}' did not match any file(s) known to git\n" if track_fails else ""
+                if not track_fails:
+                    state["branch"] = target_branch
+                    state["merged"] = True
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
 
-            if "checkout" in joined and "-B" not in joined and "rev-parse" not in joined:
+            if "checkout" in joined and "-b" not in joined and "rev-parse" not in joined:
                 rc = 128 if checkout_fails else 0
                 err = f"error: pathspec '{target_branch}' did not match\n" if checkout_fails else ""
+                if not checkout_fails:
+                    state["branch"] = target_branch
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
 
             if "rev-list" in joined:
@@ -842,14 +882,15 @@ class TestCmdUpdateBranchFlag:
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
 
-        # rev-list must compare against origin/bb/gui, not origin/main
+        # The named branch is fetched once, then all decisions use its SHA.
+        assert "git fetch origin bb/gui" in commands
         rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert any("origin/bb/gui" in c for c in rev_list_cmds), rev_list_cmds
+        assert any("HEAD.." + "b" * 40 in c for c in rev_list_cmds), rev_list_cmds
         assert not any("origin/main" in c for c in rev_list_cmds), rev_list_cmds
 
         # the ff-only merge must target origin/bb/gui
         merge_cmds = [c for c in commands if "merge --ff-only" in c]
-        assert any("origin/bb/gui" in c and "origin/main" not in c for c in merge_cmds), merge_cmds
+        assert any("b" * 40 in c and "origin/main" not in c for c in merge_cmds), merge_cmds
 
 
     @patch("shutil.which", return_value=None)
@@ -1157,8 +1198,8 @@ class TestNodeRuntimeNpmResolution:
             env=ANY,
         )
 
-    def test_git_failure_zip_fallback_rebuilds_missing_desktop(self, tmp_path, monkeypatch):
-        """The Windows ZIP fallback keeps Desktop intact when replacing ``apps/``.
+    def test_unknown_git_history_refuses_archive_overwrite_and_preserves_desktop(self, tmp_path, monkeypatch):
+        """Unknown Git history cannot authorize the Windows archive fallback.
 
         Contract updated for the #70337/#87331 release-dir graft: the built
         desktop app (release/win-unpacked/Hermes.exe) is preserved THROUGH
@@ -1216,7 +1257,6 @@ class TestNodeRuntimeNpmResolution:
         )
         monkeypatch.setattr(hm, "_refresh_active_memory_provider_dependencies", lambda: None)
         monkeypatch.setattr(hm, "_build_web_ui", lambda *_args: None)
-        monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *_args: None)
         monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *_args: None)
         monkeypatch.setattr(
             update_cmd,
@@ -1247,15 +1287,16 @@ class TestNodeRuntimeNpmResolution:
             ),
             patch("hermes_cli.model_catalog.seed_cache_from_checkout", return_value=False),
         ):
-            update_cmd._cmd_update_impl(
-                SimpleNamespace(yes=True, force=True, force_venv=True, branch=None),
-                gateway_mode=False,
-            )
+            with pytest.raises(SystemExit, match="1"):
+                update_cmd._cmd_update_impl(
+                    SimpleNamespace(yes=True, force=True, force_venv=True, branch=None),
+                    gateway_mode=False,
+                )
 
         # Release-dir graft (#70337): the packaged exe SURVIVES the swap, so
         # the rebuild hook observed it present (False), and the bytes are the
         # original build — never deleted, never rebuilt from nothing.
-        assert desktop_builds == [False]
+        assert desktop_builds == []
         assert packaged_exe.exists()
         assert packaged_exe.read_bytes() == b"desktop"
 

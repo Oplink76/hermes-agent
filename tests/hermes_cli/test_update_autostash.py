@@ -241,25 +241,27 @@ def test_fetch_is_scoped_to_target_branch(monkeypatch, tmp_path):
     assert commands == [["git", "status", "--porcelain"]]
 
 
-def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path, capsys):
+def test_cmd_update_refuses_instead_of_reset_when_ff_only_fails(monkeypatch, tmp_path, capsys):
     _setup_update_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
     side_effect, recorded = _make_update_side_effect(ff_only_fails=True)
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
-    hermes_main.cmd_update(SimpleNamespace())
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
     reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
-    assert reset_calls == [["git", "reset", "--hard", "origin/main"]]
-    assert "Fast-forward not possible" in capsys.readouterr().out
+    assert reset_calls == []
+    assert "Update refused" in capsys.readouterr().out
 
 
-def test_cmd_update_switches_to_main_from_detached_head(monkeypatch, tmp_path, capsys):
+def test_cmd_update_refuses_to_abandon_detached_head(monkeypatch, tmp_path, capsys):
     _setup_update_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
     side_effect, recorded = _make_update_side_effect(current_branch="HEAD")
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
-    hermes_main.cmd_update(SimpleNamespace())
-    assert [c for c in recorded if "checkout" in c and "main" in c]
-    assert "detached HEAD" in capsys.readouterr().out
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+    assert not [c for c in recorded if "checkout" in c]
+    assert "detached_head" in capsys.readouterr().out
 
 
 def test_cmd_update_fetch_is_scoped_to_target_branch(monkeypatch, tmp_path):
@@ -425,7 +427,7 @@ def test_real_repository_restore_keeps_stash_when_recovery_ref_fails(
 
 
 # ---------------------------------------------------------------------------
-# ff-only fallback to reset --hard on diverged history
+# ff-only failure refuses without a reset
 # ---------------------------------------------------------------------------
 
 def _make_update_side_effect(
@@ -438,6 +440,7 @@ def _make_update_side_effect(
 ):
     """Build a subprocess.run side_effect for cmd_update tests."""
     recorded = []
+    state = {"merged": False}
 
     def side_effect(cmd, **kwargs):
         recorded.append(cmd)
@@ -448,6 +451,10 @@ def _make_update_side_effect(
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
+        if "rev-parse" in joined and cmd[-1] in {"HEAD", "refs/heads/main"}:
+            return SimpleNamespace(stdout=("b" if state["merged"] else "a") * 40, stderr="", returncode=0)
+        if "rev-parse" in joined and cmd[-1] == "FETCH_HEAD":
+            return SimpleNamespace(stdout="b" * 40, stderr="", returncode=0)
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
@@ -459,6 +466,7 @@ def _make_update_side_effect(
                     stderr="fatal: Not possible to fast-forward, aborting.\n",
                     returncode=128,
                 )
+            state["merged"] = True
             return SimpleNamespace(stdout="Updating abc..def\n", stderr="", returncode=0)
         if "reset" in joined and "--hard" in joined:
             if reset_fails:

@@ -2138,7 +2138,7 @@ def _reviewer_agent_from_metadata(metadata: Optional[dict]) -> Optional[str]:
 def _latest_product_writer_agent(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     rows = conn.execute(
         """
-        SELECT metadata FROM task_runs
+        SELECT profile, outcome, metadata FROM task_runs
          WHERE task_id = ?
            AND metadata IS NOT NULL AND metadata != ''
          ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
@@ -2150,6 +2150,8 @@ def _latest_product_writer_agent(conn: sqlite3.Connection, task_id: str) -> Opti
             metadata = json.loads(row["metadata"] or "{}")
         except Exception:
             metadata = {}
+        if not _ordinary_product_evidence(row["profile"], row["outcome"], metadata):
+            continue
         writer = _writer_agent_from_metadata(metadata if isinstance(metadata, dict) else {})
         if writer:
             return writer
@@ -2171,6 +2173,21 @@ def _executor_from_run_metadata(metadata: object) -> Optional[dict[str, Any]]:
     return cleaned
 
 
+def _ordinary_product_evidence(profile: object, outcome: object, metadata: object) -> bool:
+    """Recovery attempts carry no product authority, even at a product phase.
+
+    Durable stamps cover configured Resolver roles. The literal profile is a
+    conservative fallback for historical recovery runs without those stamps.
+    Failed ordinary attempts remain eligible records so they invalidate older
+    success; eligibility is deliberately not an outcome-success filter.
+    """
+    return (
+        str(profile or "").strip().casefold() != "resolver"
+        and outcome not in ("preflight", "preflight_resolved")
+        and not (isinstance(metadata, dict) and "resolver" in metadata)
+    )
+
+
 def _latest_product_step_executor(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2178,9 +2195,8 @@ def _latest_product_step_executor(
 ) -> Optional[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT metadata FROM task_runs
+        SELECT profile, outcome, metadata FROM task_runs
          WHERE task_id = ? AND step_key = ?
-           AND metadata IS NOT NULL AND metadata != ''
          ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
         """,
         (task_id, step_key),
@@ -2189,10 +2205,12 @@ def _latest_product_step_executor(
         try:
             metadata = json.loads(row["metadata"] or "{}")
         except (TypeError, ValueError):
+            metadata = {}
+        if not _ordinary_product_evidence(row["profile"], row["outcome"], metadata):
             continue
-        executor = _executor_from_run_metadata(metadata)
-        if executor is not None:
-            return executor
+        # Missing identity on the latest ordinary attempt is not permission to
+        # borrow an older developer's identity.
+        return _executor_from_run_metadata(metadata)
     return None
 
 
@@ -2301,6 +2319,15 @@ def _record_product_provenance_rejection(
         )
 
 
+def _reject_worker_recovery_metadata(
+    conn: sqlite3.Connection, task_id: str, step: str, metadata: Optional[dict],
+) -> None:
+    if isinstance(metadata, dict) and "resolver" in metadata:
+        reason = "resolver metadata is reserved for canonical recovery, not ordinary completion"
+        _record_product_provenance_rejection(conn, task_id, step_key=step, reason=reason)
+        raise ProductProvenanceError(reason, task_id, step)
+
+
 def _validate_product_ai_provenance(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2309,6 +2336,7 @@ def _validate_product_ai_provenance(
     meta: Optional[dict],
 ) -> None:
     step = str(step_key or "")
+    _reject_worker_recovery_metadata(conn, task_id, step, metadata)
     if step not in PRODUCT_PROVENANCE_REQUIRED_STEPS:
         return
     if not _product_ai_provenance_required(meta):
@@ -2553,6 +2581,23 @@ def _latest_unresolved_product_preflight(
     except Exception:
         payload = {}
     return int(rows[0]["id"]), (payload if isinstance(payload, dict) else {})
+
+
+def _recovery_metadata_for_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: Optional[str],
+    step_key: Optional[str],
+) -> dict:
+    """Bind run purpose before identity resolution or spawning can fail."""
+    entry = _latest_unresolved_product_preflight(conn, task_id)
+    if entry is None:
+        return {}
+    _, preflight = entry
+    if (preflight.get("hermes_assignee") == assignee
+            and preflight.get("step_key") == step_key):
+        return {"resolver": {"profile": assignee}}
+    return {}
 
 
 def resolver_expected_snapshot(
@@ -10210,6 +10255,10 @@ def _end_run(
         active_metadata = {}
     dispatcher_metadata_conflicts: dict[str, dict[str, Any]] = {}
     if isinstance(active_metadata, dict):
+        # Canonical resolution can enrich this marker with its model; ordinary
+        # worker completion cannot supply it (reserved-metadata guards).
+        if "resolver" in active_metadata:
+            final_metadata.setdefault("resolver", active_metadata["resolver"])
         for key in (
             "test_branch",
             "test_head_sha",
@@ -10781,13 +10830,16 @@ def claim_task(
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        run_metadata = _recovery_metadata_for_claim(
+            conn, task_id, trow["assignee"], trow["current_step_key"]
+        )
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, metadata
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -10797,6 +10849,7 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                json.dumps(run_metadata) if run_metadata else None,
             ),
         )
         run_id = run_cur.lastrowid
@@ -10879,13 +10932,16 @@ def claim_review_task(
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        run_metadata = _recovery_metadata_for_claim(
+            conn, task_id, trow["assignee"], trow["current_step_key"]
+        )
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, metadata
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -10895,6 +10951,7 @@ def claim_review_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                json.dumps(run_metadata) if run_metadata else None,
             ),
         )
         run_id = run_cur.lastrowid
@@ -11571,6 +11628,7 @@ def _validate_ordinary_product_outcome(
     if row is None:
         return None, None, None
     phase = str(row["current_step_key"] or "").strip()
+    _reject_worker_recovery_metadata(conn, task_id, phase, metadata)
     if phase not in PRODUCT_POSITIVE_OUTCOME_STEPS.values():
         return None, None, None
     run_id = (
@@ -18144,11 +18202,14 @@ def _terminal_run_records(
     development_writer_provider: Optional[str] = None
     for run in ended_runs:
         metadata = run.metadata if isinstance(run.metadata, dict) else {}
+        if not _ordinary_product_evidence(run.profile, run.outcome, metadata):
+            continue
         phase = str(run.step_key or "")
         if phase == "development":
             development_executor = _executor_from_run_metadata(metadata)
-            if development_executor is not None:
-                development_writer_provider = development_executor["provider"]
+            development_writer_provider = (
+                development_executor["provider"] if development_executor else None
+            )
         writer_provider = _writer_agent_from_metadata(metadata)
         if phase == "test" and not writer_provider:
             writer_provider = development_writer_provider
@@ -18162,6 +18223,14 @@ def _terminal_run_records(
                 metadata=metadata,
             )
         except OutcomeValidationError:
+            outcome = None
+        if (
+            outcome is not None
+            and outcome.verdict in {"passed", "approved"}
+            and run.outcome not in {"advanced", "completed"}
+        ):
+            # A worker's optimistic blob cannot turn a crashed/reclaimed run
+            # into success. Retain the attempt to invalidate older evidence.
             outcome = None
         records.append(
             TerminalRunRecord(
@@ -19295,26 +19364,15 @@ def _latest_test_target(
     conn: sqlite3.Connection,
     task_id: str,
 ) -> Optional[dict[str, str]]:
-    """Return only the latest ended Test pin; never fall back to older runs."""
-    row = conn.execute(
-        "SELECT metadata FROM task_runs "
-        "WHERE task_id = ? AND step_key = 'test' AND ended_at IS NOT NULL "
-        "ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    if row is None:
+    """Return the latest ordinary successful Test pin, never an older success."""
+    records = _terminal_run_records(conn, task_id)
+    latest = next((record for record in reversed(records) if record.phase == "test"), None)
+    if latest is None:
         return None
-    try:
-        metadata = json.loads(row["metadata"] or "{}")
-    except (TypeError, ValueError):
+    passed = latest_test_authority(records, latest.test_head_sha or "")
+    if passed is None:
         return {}
-    if not isinstance(metadata, dict):
-        return {}
-    branch = str(metadata.get("test_branch") or "").strip()
-    head = str(metadata.get("test_head_sha") or "").strip()
-    if not branch or not _FULL_GIT_SHA_RE.fullmatch(head):
-        return {}
-    return {"test_branch": branch, "test_head_sha": head}
+    return {"test_branch": passed.branch, "test_head_sha": passed.source_sha}
 
 
 def _evidence_pin(
@@ -19771,11 +19829,12 @@ def _prepare_review_target(
     predecessor_base = ""
     if product_review:
         tested_target = _latest_test_target(conn, task_id)
-        if tested_target:
-            if tested_target["test_branch"] != workspace_branch:
-                raise ReviewTargetPreparationError("review branch does not match tested branch")
-            if tested_target["test_head_sha"] != head_sha:
-                raise ReviewTargetPreparationError("review head does not match tested SHA")
+        if not tested_target:
+            raise ReviewTargetPreparationError("product Review requires a successful applicable Test pin")
+        if tested_target["test_branch"] != workspace_branch:
+            raise ReviewTargetPreparationError("review branch does not match tested branch")
+        if tested_target["test_head_sha"] != head_sha:
+            raise ReviewTargetPreparationError("review head does not match tested SHA")
         base_ref = _review_target_branch(
             conn, task_id, actual_workspace, board=board
         )

@@ -34,6 +34,7 @@ import subprocess
 import sys
 import time as _time
 from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -522,8 +523,8 @@ def _check_and_apply_config_migration(
 # update/install. Most are imported on every CLI startup; ``web_server.py``
 # is the desktop/dashboard backend path that a fresh Windows install launches
 # right away. If any of these fail to parse after a pull, the user can be
-# left with a bricked CLI or desktop backend. The post-pull syntax guard
-# validates these and auto-rolls-back on failure.
+# left with a bricked CLI or desktop backend. Validate the fetched versions
+# before mutation, and retain a post-merge guard for custom-branch merges.
 _UPDATE_CRITICAL_FILES = (
     "hermes_cli/main.py",
     "hermes_cli/config.py",
@@ -536,11 +537,11 @@ _UPDATE_CRITICAL_FILES = (
     "hermes_constants.py",
 )
 
-def _capture_head_sha(git_cmd, cwd) -> str | None:
-    """Return the current HEAD SHA, or None if it can't be resolved."""
+def _capture_head_sha(git_cmd, cwd, ref="HEAD") -> str | None:
+    """Resolve a commit identity, or None when Git cannot prove it."""
     try:
         result = subprocess.run(
-            git_cmd + ["rev-parse", "HEAD"],
+            git_cmd + ["rev-parse", ref],
             cwd=cwd,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -628,8 +629,8 @@ def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]
     These are the files imported on every ``hermes`` startup; if any of them
     has a syntax error (orphan merge-conflict markers, bad ref to a name
     that no longer exists, etc.) the CLI can't bootstrap at all. We validate
-    them after a successful ``git pull`` so we can auto-roll-back instead of
-    leaving the user with a bricked install.
+    them after a successful merge to catch custom-branch combinations. Bad
+    fetched versions are rejected separately before any checkout mutation.
 
     The compiled ``.pyc`` is written to a temp directory rather than the
     source tree's ``__pycache__/`` so we don't race with concurrent test
@@ -642,6 +643,39 @@ def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]
     file parsed cleanly.
     """
     return _validate_python_files_syntax(root, _UPDATE_CRITICAL_FILES)
+
+
+def _validate_git_candidate_syntax(git_cmd, cwd, target_sha):
+    """Validate immutable Git blobs outside the checkout; Git errors propagate."""
+    import tempfile
+
+    tree = subprocess.run(
+        git_cmd + ["ls-tree", "-rz", target_sha, "--", *_UPDATE_CRITICAL_FILES],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+        check=True, timeout=15,
+    )
+    if Path(tempfile.gettempdir()).resolve().is_relative_to(Path(cwd).resolve()):
+        raise OSError("syntax validation requires a temporary directory outside the checkout")
+    with tempfile.TemporaryDirectory(prefix="hermes-candidate-syntax-") as staging:
+        present = []
+        for entry in tree.stdout.split("\0"):
+            if not entry:
+                continue
+            metadata, separator, path = entry.partition("\t")
+            fields = metadata.split()
+            if (not separator or len(fields) != 3 or fields[0] not in {"100644", "100755"}
+                    or fields[1] != "blob" or path not in _UPDATE_CRITICAL_FILES):
+                raise ValueError("unverifiable critical-file entry in candidate tree")
+            blob = subprocess.run(
+                git_cmd + ["cat-file", "blob", f"{target_sha}:{path}"],
+                cwd=cwd, capture_output=True, check=True, timeout=15,
+            )
+            destination = Path(staging) / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(blob.stdout)
+            present.append(path)
+        # Missing paths are legitimate upstream deletions, not probe failures.
+        return _validate_python_files_syntax(staging, present)
 
 
 # Modules imported on every agent startup. Unlike _UPDATE_CRITICAL_FILES (which
@@ -1351,7 +1385,7 @@ def _branch_head_suffix(git_cmd=None, cwd=None) -> str:
 
 
 def _assess_parked_branch_switch(
-    git_cmd: list[str], cwd: Path, current_branch: str, target_branch: str
+    git_cmd: list[str], cwd: Path, current_branch: str, target_branch: str,
 ) -> tuple[bool, str]:
     """Decide whether it is safe to auto-switch a parked feature branch back
     to the update target.
@@ -1426,13 +1460,16 @@ def _print_parked_branch_skip_warning(
     current_branch: str,
     target_branch: str,
     reason: str,
+    *,
+    local_sha: str | None = None,
+    remote_sha: str | None = None,
 ) -> None:
     """LOUD block explaining why the code update was skipped on a parked
     branch, with the behind-count and the exact commands to resolve."""
     behind = None
     try:
         behind_result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{target_branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{remote_sha or 'origin/' + target_branch}", "--count"],
             cwd=cwd, capture_output=True,
             text=True, encoding="utf-8", errors="replace",
         )
@@ -1445,6 +1482,10 @@ def _print_parked_branch_skip_warning(
         why = "the working tree has uncommitted changes"
     elif reason == "disabled":
         why = "updates.auto_switch_parked_branch is set to false in config.yaml"
+    elif reason == "local_commits":
+        why = f"local commits on '{target_branch}' are not contained in the fetched update"
+    elif reason == "unknown":
+        why = f"the local '{target_branch}' history could not be verified"
     else:
         why = (
             f"the branch state could not be verified against "
@@ -1456,19 +1497,27 @@ def _print_parked_branch_skip_warning(
     print(bar)
     print(f"⚠ CODE UPDATE SKIPPED — checkout is parked on '{current_branch}'")
     print(f"  Not auto-switching to {target_branch}: {why}.")
+    if local_sha or remote_sha:
+        print(f"  Local target: {local_sha or 'unknown'}; fetched: {remote_sha or 'unknown'}")
     if behind is not None and behind > 0:
         print(
             f"  This checkout is {behind} commit(s) BEHIND "
             f"origin/{target_branch} — the code you are running is stale."
         )
     print()
-    print("  To resolve, inspect the branch and switch back yourself:")
     print(f"    git -C {cwd} status")
-    print(f"    git -C {cwd} checkout {target_branch} && hermes update")
-    print(
-        "  (commit or stash your work on the branch first if you want to "
-        "keep it)"
-    )
+    if reason == "dirty":
+        print("  Commit or stash your changes on this branch, then re-run hermes update.")
+        print("  Lockfile-only edits are no longer assumed to be disposable npm churn.")
+        print("  Discard an edit yourself only after inspecting it and deciding it is unwanted.")
+    elif reason == "local_commits":
+        print(f"  Preserve/push the local commits on '{target_branch}' and reconcile its history")
+        print("  with the fetched update before retrying; merely switching branches will not fix this.")
+    elif reason == "unknown":
+        print("  Repair Git and verify the local history before retrying; no archive overwrite was attempted.")
+    else:
+        print("  Inspect the branch and switch back yourself:")
+        print(f"    git -C {cwd} checkout {target_branch} && hermes update")
     print(bar)
 
 
@@ -7539,48 +7588,6 @@ def _ensure_non_trampoline_git(git_cmd: list) -> list:
     return [str(real_git)] + list(git_cmd[1:])
 
 
-def _discard_lockfile_churn(git_cmd, repo_root):
-    """Restore tracked ``package-lock.json`` files that npm dirtied locally.
-
-    npm rewrites lockfiles non-deterministically at install/build time. On a
-    managed install those diffs are never intentional, so we discard them so
-    ``hermes update`` sees a clean tree instead of autostashing every run.
-    Best-effort; only ever touches files named ``package-lock.json``.
-    """
-    try:
-        diff = subprocess.run(
-            git_cmd + ["diff", "--name-only"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        if diff.returncode != 0:
-            return
-        dirty_package_dirs = {
-            Path(line.strip()).parent
-            for line in diff.stdout.splitlines()
-            if line.strip().endswith("package.json")
-        }
-        dirty = [
-            line.strip()
-            for line in diff.stdout.splitlines()
-            if line.strip().endswith("package-lock.json")
-            and Path(line.strip()).parent not in dirty_package_dirs
-        ]
-        if not dirty:
-            return
-        subprocess.run(
-            git_cmd + ["checkout", "--", *dirty],
-            cwd=repo_root,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            check=False,
-        )
-        print(f"→ Discarded npm lockfile churn ({len(dirty)} file(s))")
-    except Exception:
-        # Never let lockfile cleanup block an update.
-        pass
-
 def _normalize_managed_eol(git_cmd, repo_root):
     """Take a managed checkout off ``core.autocrlf=true`` without leaving it dirty.
 
@@ -7892,6 +7899,167 @@ def _refuse_update_if_venv_foreign_owned(project_root) -> None:
     sys.exit(1)
 
 
+@dataclass(frozen=True)
+class _GitUpdatePlan:
+    current_branch: str
+    local_sha: str
+    target_branch: str
+    target_sha: str
+    target_local_sha: str | None
+    in_place: bool = False
+    parked_reason: str = ""
+
+
+def _git_update_relation(git_cmd, cwd, local_sha, remote_sha) -> str:
+    """Read-only relation; probe failures never authorize a destructive fallback."""
+    if not local_sha or not remote_sha:
+        return "unknown"
+    try:
+        result = subprocess.run(
+            git_cmd + ["merge-base", "--is-ancestor", local_sha, remote_sha],
+            cwd=cwd, capture_output=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if result.returncode == 0:
+        return "equal" if local_sha == remote_sha else "fast_forward"
+    return "local_commits" if result.returncode == 1 else "unknown"
+
+
+def _refuse_git_update(reason, local_sha, remote_sha):
+    from hermes_cli.update_receipt import finalize_update_receipt, record_step
+
+    next_action = "Preserve and reconcile local work explicitly, then retry hermes update."
+    if reason in {"unknown", "fetch_failed"}:
+        next_action = (
+            "Git history could not be verified; automatic archive fallback is disabled. "
+            "Repair Git/connectivity and retry, or recover into a separate install without overwriting this checkout."
+        )
+    elif reason == "config_unavailable":
+        next_action = "Repair the update configuration, then retry; no update strategy was assumed."
+    elif reason == "candidate_syntax":
+        next_action = "Fetched critical code failed syntax validation. Retry once a fix lands upstream; the checkout was not changed."
+    detail = (
+        f"{reason}; local={local_sha or 'unknown'}; fetched={remote_sha or 'unknown'}. "
+        f"{next_action}"
+    )
+    print(f"✗ Update refused: {detail}")
+    record_step("git_history_admission", False, detail)
+    finalize_update_receipt("refused", stop_reason=f"git_{reason}")
+    raise SystemExit(1)
+
+
+def _prepare_git_update(git_cmd, cwd, branch, *, switch_branch=False):
+    """Fetch/admit before touching source, dependencies, or services."""
+    from hermes_cli.gitlock import clear_stale_git_locks, clear_stale_tmp_packs
+
+    clear_stale_git_locks(cwd)
+    clear_stale_tmp_packs(cwd)
+    print("→ Fetching updates...")
+    try:
+        fetched = subprocess.run(
+            git_cmd + ["fetch", "origin", branch], cwd=cwd, capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Unknown Git history is not permission to overwrite a checkout
+        # using the archive fallback.
+        _refuse_git_update("fetch_failed", _capture_head_sha(git_cmd, cwd), None)
+    if fetched.returncode != 0:
+        _print_fetch_failure(fetched.stderr)
+        _refuse_git_update("fetch_failed", _capture_head_sha(git_cmd, cwd), None)
+    local_sha = _capture_head_sha(git_cmd, cwd)
+    target_sha = _capture_head_sha(git_cmd, cwd, "FETCH_HEAD")
+    current = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"], cwd=cwd,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    current_branch = current.stdout.strip()
+    if current.returncode or not current_branch or not local_sha or not target_sha:
+        _refuse_git_update("unknown", local_sha, target_sha)
+    if current_branch == "HEAD":
+        _refuse_git_update("detached_head", local_sha, target_sha)
+
+    target_local_sha = local_sha
+    in_place = False
+    reason = ""
+    if current_branch != branch:
+        safe, reason = _assess_parked_branch_switch(
+            git_cmd, cwd, current_branch, branch,
+        )
+        if not safe:
+            _m()._print_parked_branch_skip_warning(git_cmd, cwd, current_branch, branch, reason)
+            print("⚠ Update finished — code update SKIPPED")
+            _refuse_git_update(reason, target_local_sha or local_sha, target_sha)
+        try:
+            from hermes_cli.config import load_config
+
+            config = (load_config() or {}).get("updates", {})
+        except Exception as exc:
+            logger.debug("Could not read update strategy: %s", exc)
+            _refuse_git_update("config_unavailable", local_sha, target_sha)
+        in_place = (
+            reason.startswith("unmerged:") and not switch_branch
+            and isinstance(config, dict)
+            and config.get("parked_branch_strategy") == "update_in_place"
+        )
+        # The configured in-place path never reads or writes the local target
+        # branch. Only a switch needs that branch's history admitted/pinned.
+        target_local_sha = None
+        if not in_place:
+            exists = subprocess.run(
+                git_cmd + ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+                cwd=cwd, capture_output=True,
+            )
+            if exists.returncode not in {0, 1}:
+                _refuse_git_update("unknown", local_sha, target_sha)
+            if exists.returncode == 0:
+                target_local_sha = _capture_head_sha(git_cmd, cwd, f"refs/heads/{branch}")
+                target_relation = _git_update_relation(git_cmd, cwd, target_local_sha, target_sha)
+                if target_relation not in {"equal", "fast_forward"}:
+                    _m()._print_parked_branch_skip_warning(
+                        git_cmd, cwd, current_branch, branch, target_relation,
+                        local_sha=target_local_sha, remote_sha=target_sha,
+                    )
+                    _refuse_git_update(target_relation, target_local_sha, target_sha)
+    relation = _git_update_relation(
+        git_cmd, cwd, local_sha if in_place else (target_local_sha or target_sha), target_sha,
+    )
+    if relation == "unknown" or (relation == "local_commits" and not in_place):
+        _refuse_git_update(relation, target_local_sha or local_sha, target_sha)
+    try:
+        syntax_ok, failing_path, syntax_error = _validate_git_candidate_syntax(git_cmd, cwd, target_sha)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        logger.debug("Could not validate fetched Git candidate: %s", exc)
+        _refuse_git_update("unknown", local_sha, target_sha)
+    if not syntax_ok:
+        from hermes_cli.update_receipt import record_step
+
+        detail = f"fetched={target_sha}; path={failing_path}; {syntax_error}"
+        print(f"✗ Candidate syntax check failed: {detail}")
+        record_step("candidate_syntax", False, detail)
+        _refuse_git_update("candidate_syntax", local_sha, target_sha)
+    return _GitUpdatePlan(current_branch, local_sha, branch, target_sha, target_local_sha, in_place, reason)
+
+
+def _verify_git_update_identity(git_cmd, cwd, plan, *, after_switch=False, expected_sha=None):
+    expected_branch = plan.current_branch if plan.in_place or not after_switch else plan.target_branch
+    if expected_sha is None:
+        expected_sha = plan.local_sha if plan.in_place or not after_switch else (plan.target_local_sha or plan.target_sha)
+    current = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"], cwd=cwd,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    actual_sha = _capture_head_sha(git_cmd, cwd)
+    if current.returncode or current.stdout.strip() != expected_branch or actual_sha != expected_sha:
+        _refuse_git_update("checkout_changed", actual_sha, plan.target_sha)
+    if not after_switch and plan.target_local_sha is not None:
+        target_local = _capture_head_sha(git_cmd, cwd, f"refs/heads/{plan.target_branch}")
+        if target_local != plan.target_local_sha:
+            _refuse_git_update("target_changed", target_local, plan.target_sha)
+    return actual_sha
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
@@ -8028,6 +8196,19 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
     except Exception:
         pass
+
+    # Git admission precedes every service pause and source cleanup. The
+    # update lock and snapshot above remain in force; only remote refs move.
+    git_cmd = ["git"]
+    if sys.platform == "win32":
+        git_cmd += ["-c", "windows.appendAtomically=false"]
+    git_cmd = _ensure_non_trampoline_git(git_cmd)
+    branch = _m()._resolve_update_branch(args)
+    git_preflight = None
+    if (_m().PROJECT_ROOT / ".git").exists():
+        git_preflight = _prepare_git_update(
+            git_cmd, _m().PROJECT_ROOT, branch, switch_branch=switch_branch,
+        )
 
     _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
     if _windows_gateway_resume:
@@ -8255,24 +8436,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
             capture_output=True,
         )
 
-    # Build git command once — reused for fork detection and the update itself.
-    git_cmd = ["git"]
-    if sys.platform == "win32":
-        git_cmd = ["git", "-c", "windows.appendAtomically=false"]
-    # A broken Git-for-Windows trampoline refuses every git call with a
-    # "BUG (fork bomb)" guard instead of running; swap in a real binary up
-    # front so the normal git path survives instead of degrading to ZIP
-    # (#87876).
-    git_cmd = _ensure_non_trampoline_git(git_cmd)
-
-    # Discard npm lockfile churn before any stash/branch logic. npm rewrites
-    # tracked package-lock.json files non-deterministically at install/build
-    # time (platform-specific optional deps, ideallyInert annotations, etc.),
-    # which is never an intentional edit on a managed install but leaves the
-    # tree dirty — forcing an autostash on every update and making branch
-    # switches fragile. Restoring them first lets the common case (only
-    # lockfile churn) update with a clean tree.
-    _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
+    if not use_zip_update and git_preflight is None:
+        _refuse_git_update("unknown", None, None)
+    if git_preflight is not None:
+        _verify_git_update_identity(git_cmd, _m().PROJECT_ROOT, git_preflight)
+    # Lockfiles can contain intentional user edits. Preserve them through
+    # the ordinary autostash instead of guessing that a diff is npm churn.
     # Same rationale, different generator: line-ending churn is machine-made
     # dirt on a managed checkout, so clear it (and stop generating it) before
     # the stash/branch logic rather than autostashing the entire tree.
@@ -8303,36 +8472,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # Fetch and pull
     try:
 
-        # Resolve the target branch up front so the fetch can be scoped to it.
-        # A bare `git fetch origin` pulls every ref, and this repo carries
-        # thousands of auto-generated branches — an unscoped fetch can stall for
-        # minutes on a non-single-branch checkout. Fetch only what we update
-        # against.
-        branch = _m()._resolve_update_branch(args)
-
-        # Self-heal abandoned git lock files (e.g. .git/shallow.lock left by a
-        # crashed fetch) before the fetch — otherwise the update fails with
-        # "Unable to create .../shallow.lock: File exists" and never reaches
-        # the network.
-        from hermes_cli.gitlock import clear_stale_git_locks, clear_stale_tmp_packs
-
-        cleared = clear_stale_git_locks(_m().PROJECT_ROOT)
-        if cleared:
-            print("  (removed stale git lock(s): %s)" % ", ".join(cleared))
-        swept = clear_stale_tmp_packs(_m().PROJECT_ROOT)
-        if swept:
-            print("  (removed %d aborted-fetch pack temp file(s))" % len(swept))
-
-        print("→ Fetching updates...")
-        fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
-            cwd=_m().PROJECT_ROOT,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        if fetch_result.returncode != 0:
-            _print_fetch_failure(fetch_result.stderr)
-            sys.exit(1)
+        # The target was fetched/admitted before pausing services. Never
+        # resolve a moving origin ref as the merge input after admission.
+        target_sha = git_preflight.target_sha
 
         # Get current branch (returns literal "HEAD" when detached)
         result = subprocess.run(
@@ -8372,57 +8514,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
         #                    stop before the post-update steps reinforce the
         #                    stale tree.
         parked_branch_switched = False
-        in_place_update = False
+        in_place_update = git_preflight.in_place
         if current_branch != branch and current_branch != "HEAD":
-            switch_safe, switch_block_reason = _m()._assess_parked_branch_switch(
-                git_cmd, _m().PROJECT_ROOT, current_branch, branch
-            )
-            if not switch_safe:
-                _m()._print_parked_branch_skip_warning(
-                    git_cmd,
-                    _m().PROJECT_ROOT,
-                    current_branch,
-                    branch,
-                    switch_block_reason,
-                )
-                print()
-                print(
-                    "⚠ Update finished — code update SKIPPED"
-                    f"{_branch_head_suffix(git_cmd, _m().PROJECT_ROOT)}"
-                )
-                _m()._resume_windows_gateways_after_update(
-                    _windows_gateway_resume
-                )
-                sys.exit(1)
+            # Reuse the admitted decision; never re-read config or weaker
+            # mutable-origin evidence after the service pause.
+            switch_block_reason = git_preflight.parked_reason
             if switch_block_reason.startswith("unmerged:"):
-                _in_place_configured = False
-                try:
-                    from hermes_cli.config import load_config as _load_cfg
-
-                    _upd_cfg = (_load_cfg() or {}).get("updates", {})
-                    _in_place_configured = (
-                        isinstance(_upd_cfg, dict)
-                        and _upd_cfg.get("parked_branch_strategy", "switch")
-                        == "update_in_place"
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "Could not read updates.parked_branch_strategy: %s", exc
-                    )
-                if _in_place_configured and not switch_branch:
-                    # The merge source must exist upstream; --branch typos
-                    # previously surfaced through the checkout failing, which
-                    # does not run on this path.
-                    verify_ref = subprocess.run(
-                        git_cmd + ["rev-parse", "--verify", "--quiet", f"origin/{branch}"],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
-                    )
-                    if verify_ref.returncode != 0:
-                        print(f"✗ Branch '{branch}' does not exist locally or on origin.")
-                        sys.exit(1)
-                    in_place_update = True
+                if in_place_update:
                     print(
                         f"  ℹ On branch '{current_branch}' — updating it in place from "
                         f"origin/{branch} (no branch switch; local commits preserved)."
@@ -8461,7 +8559,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # the common case when the requested branch exists upstream
                 # but was never checked out locally.
                 track_result = subprocess.run(
-                    git_cmd + ["checkout", "-B", branch, f"origin/{branch}"],
+                    git_cmd + ["checkout", "-b", branch, target_sha],
                     cwd=_m().PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
@@ -8490,6 +8588,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
         )
 
+        _verify_git_update_identity(
+            git_cmd, _m().PROJECT_ROOT, git_preflight, after_switch=True,
+        )
+        admitted_merge_head = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+
         # Check if there are updates. On shallow checkouts `rev-list --count`
         # walks the truncated graph and can report the entire remote ancestry
         # (e.g. "Found 9980 new commit(s)" on a depth-1 install — #53479).
@@ -8497,7 +8600,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # 0), so keep it, but treat the shallow NUMBER as unknown and recover
         # the real one via the GitHub compare API when possible.
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{target_sha}", "--count"],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -8522,11 +8625,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 cwd=_m().PROJECT_ROOT, capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
             ).stdout.strip()
-            target_sha = subprocess.run(
-                git_cmd + ["rev-parse", f"origin/{branch}"],
-                cwd=_m().PROJECT_ROOT, capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            ).stdout.strip()
             counted = _github_compare_behind(head_sha, target_sha)
             # counted == 0 means local-ahead (remote tip reachable from HEAD):
             # not behind, fall through to the up-to-date path.
@@ -8543,6 +8641,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Non-fork checkouts have no upstream question: origin IS the official
         # repo, so "Already up to date!" is fully verified there.
         upstream_checked = True
+        upstream_moved = False
         if commit_count == 0 and is_fork and branch == "main":
             pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
             upstream_checked = _m()._sync_with_upstream_if_needed(
@@ -8553,6 +8652,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
             post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
             if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
+                upstream_moved = True
+                admitted_merge_head = post_sync_sha
                 synced_count = _count_commits_between(
                     git_cmd,
                     _m().PROJECT_ROOT,
@@ -8762,21 +8863,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         print("→ Pulling updates...")
         update_succeeded = False
-        # Capture the pre-pull SHA so we can auto-roll-back if the new code
-        # has a syntax error in a critical-path file (PR #28452 incident:
-        # orphan merge-conflict markers in hermes_cli/config.py bricked
-        # every user who ran ``hermes update`` for the 7 minutes between
-        # the bad commit and the fix landing).
+        safety_tag = None
+        # Keep the pre-merge identity for explicit recovery if a custom merge
+        # produces invalid code. Never use it to reset a user's checkout.
         pre_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
         try:
+            pre_pull_sha = _verify_git_update_identity(
+                git_cmd, _m().PROJECT_ROOT, git_preflight,
+                after_switch=True, expected_sha=admitted_merge_head,
+            )
             # Merge the ref we already fetched above (→ Fetching updates...)
             # instead of `git pull`, which performs a SECOND network fetch of
             # the same branch (~0.5-1.5 s of redundant round-trip per update).
             # `merge --ff-only origin/<branch>` is byte-identical in effect to
             # `pull --ff-only origin <branch>` given the fresh tracking ref;
-            # the divergence fallback below is unchanged.
+            # the admission snapshot pins the merge even if another fetch runs.
             pull_result = subprocess.run(
-                git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
+                git_cmd + ["merge", "--ff-only", target_sha],
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
@@ -8797,21 +8900,28 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     ).stdout
                     or ""
                 ).strip()
-                if _cur_branch and _cur_branch != branch:
+                if in_place_update and git_preflight.in_place and _cur_branch == current_branch:
                     print(
                         f"  ⚠ Checkout is on custom branch '{_cur_branch}' — "
                         f"merging origin/{branch} instead of resetting so local commits survive..."
                     )
-                    # Best-effort safety tag; recovery anchor if anything goes wrong.
-                    subprocess.run(
+                    # Required recovery anchor for an explicitly configured merge.
+                    safety_tag = f"pre-update-{_time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+                    tagged = subprocess.run(
                         git_cmd
-                        + ["tag", f"pre-update-{_time.strftime('%Y%m%d-%H%M%S')}"],
+                        + ["tag", safety_tag, pre_pull_sha],
                         cwd=_m().PROJECT_ROOT,
                         capture_output=True,
                         check=False,
                     )
+                    if tagged.returncode != 0:
+                        _refuse_git_update("safety_tag_failed", pre_pull_sha, target_sha)
+                    from hermes_cli.update_receipt import record_step
+
+                    record_step("custom_branch_merge_intent", True,
+                                f"local={pre_pull_sha}; fetched={target_sha}; recovery={safety_tag}")
                     merge_result = subprocess.run(
-                        git_cmd + ["merge", "--no-edit", f"origin/{branch}"],
+                        git_cmd + ["merge", "--no-edit", target_sha],
                         cwd=_m().PROJECT_ROOT,
                         capture_output=True,
                         text=True, encoding="utf-8", errors="replace",
@@ -8836,33 +8946,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         )
                         sys.exit(1)
                 else:
-                    # Same branch as the update target — a true upstream
-                    # force-push/rebase. Local changes are already stashed;
-                    # reset to match the remote exactly (original behaviour).
-                    print(
-                        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                    )
-                    reset_result = subprocess.run(
-                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
-                    )
-                    if reset_result.returncode != 0:
-                        print(f"✗ Failed to reset to origin/{branch}.")
-                        if reset_result.stderr.strip():
-                            print(f"  {reset_result.stderr.strip()}")
-                        print(
-                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
-                        )
-                        sys.exit(1)
+                    _refuse_git_update("fast_forward_failed", pre_pull_sha, target_sha)
 
-            # Post-pull syntax guard: validate critical-path files actually
-            # parse before declaring the update successful. If a bad commit
-            # made it through CI (e.g. admin-merge bypass of a failing
-            # ruff check), this catches it on the user side and rolls back
-            # so the CLI stays bootable. The user can then retry ``hermes
-            # update`` later once a fix lands upstream.
+            # A custom merge can combine valid parents into invalid code.
+            # Never auto-reset here: another process may have committed or
+            # edited files during validation. Recovery requires an explicit
+            # operator decision, even when the pre-merge anchor is known.
             syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(
                 _m().PROJECT_ROOT
             )
@@ -8875,27 +8964,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     # ~6 lines so the user sees the actual SyntaxError text.
                     for line in str(syntax_error).splitlines()[:6]:
                         print(f"    {line}")
+                from hermes_cli.update_receipt import finalize_update_receipt, record_step
+
+                actual_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+                detail = (
+                    f"pre_merge={pre_pull_sha}; current={actual_sha}; "
+                    f"checkout={_branch_head_label(git_cmd, _m().PROJECT_ROOT)}; "
+                    f"recovery_tag={safety_tag}; snapshot={pre_update_snapshot_id}; path={failing_path}"
+                )
+                record_step("syntax_post_merge", False, detail)
+                finalize_update_receipt("failed", stop_reason="syntax_post_merge")
+                print("  Code was applied but failed validation. No automatic rollback was performed.")
+                print(f"  Recovery evidence: {detail}")
+                print("  Inspect and commit/stash any new work before choosing recovery:")
+                print(f"    git -C {shlex.quote(str(_m().PROJECT_ROOT))} status")
                 if pre_pull_sha:
-                    print()
-                    print(f"→ Rolling back to {pre_pull_sha[:10]}...")
-                    rollback_result = subprocess.run(
-                        git_cmd + ["reset", "--hard", pre_pull_sha],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
-                    )
-                    if rollback_result.returncode == 0:
-                        print("  ✓ Rollback complete — your install is unchanged.")
-                        print("  Try ``hermes update`` again later once a fix lands.")
-                    else:
-                        print("  ✗ Rollback failed. Recover manually with:")
-                        print(f"    cd {_m().PROJECT_ROOT} && git reset --hard {pre_pull_sha}")
-                        if rollback_result.stderr.strip():
-                            print(f"    ({rollback_result.stderr.strip().splitlines()[0]})")
-                else:
-                    print()
-                    print("  Could not capture pre-pull SHA — recover manually with:")
-                    print(f"    cd {_m().PROJECT_ROOT} && git reflog && git reset --hard <prev-sha>")
+                    print("  Only after saving your work and explicitly choosing rollback:")
+                    print(f"    git -C {shlex.quote(str(_m().PROJECT_ROOT))} reset --hard {safety_tag or pre_pull_sha}")
                 sys.exit(1)
 
             update_succeeded = True
@@ -8944,7 +9029,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # and post-pull HEAD; if they match, surface the no-op instead of
         # claiming success.
         post_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-        if pre_pull_sha and post_pull_sha == pre_pull_sha:
+        if pre_pull_sha and post_pull_sha == pre_pull_sha and not upstream_moved:
             print()
             print("✗ Code did not move — update was a no-op.")
             print(

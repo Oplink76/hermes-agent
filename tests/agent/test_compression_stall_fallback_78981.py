@@ -115,7 +115,11 @@ def test_stalled_summary_attempts_configured_fallback_chain():
 
     try:
         msgs, prompt = _run(
-            worker, chain=[CHAIN_ENTRY], timeouts=timeouts, messages=original
+            worker, chain=[CHAIN_ENTRY], timeouts=timeouts, messages=original,
+            # The first call also lazily imports thread-context callbacks.
+            # Allow cold CI startup before testing an idle stall; a 200 ms
+            # ceiling can expire before the primary worker even starts.
+            idle=2.0, ceiling=5.0,
         )
     finally:
         worker.release.set()

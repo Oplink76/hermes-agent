@@ -259,6 +259,37 @@ def _copy_source_is_isolated(source_root: Path, node_modules: Path) -> bool:
         return False
 
 
+def _installed_dependencies_match_lock(project_dir: Path) -> bool:
+    """Return whether lock-declared installed package versions are present."""
+    lockfile = _applicable_lockfile(project_dir)
+    if lockfile is None:
+        return False
+    try:
+        data = json.loads(lockfile.read_text(encoding="utf-8"))
+        packages = data.get("packages") if isinstance(data, dict) else None
+        if not isinstance(packages, dict):
+            return False
+        for package_path, expected in packages.items():
+            if (
+                not package_path
+                or "node_modules" not in Path(package_path).parts
+                or not isinstance(expected, dict)
+                or expected.get("link") is True
+            ):
+                continue
+            manifest = project_dir / package_path / "package.json"
+            if not manifest.is_file():
+                if expected.get("optional") is True or expected.get("devOptional") is True:
+                    continue
+                return False
+            installed = json.loads(manifest.read_text(encoding="utf-8"))
+            if not isinstance(installed, dict) or installed.get("version") != expected.get("version"):
+                return False
+        return True
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+
+
 def _validate_supported_project(project_dir: Path) -> None:
     manager = _read_package_manager(project_dir / "package.json")
     unsupported_lock = next(
@@ -308,7 +339,7 @@ def _ensure_dependency_tree_is_untracked_and_ignored(
             "--quiet",
             "--no-index",
             "--",
-            relative,
+            relative + "/",
         ],
         capture_output=True,
         text=True,
@@ -515,6 +546,7 @@ def provision_node_dependencies(primary_root: Path, worktree_root: Path) -> None
             copy_from_primary = (
                 _manifests_match(source_dir, target_dir)
                 and source_node_modules.is_dir()
+                and _installed_dependencies_match_lock(source_dir)
                 and all(
                     _copy_source_is_isolated(
                         primary_root,

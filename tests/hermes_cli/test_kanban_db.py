@@ -6835,6 +6835,46 @@ def test_product_test_completion_moves_to_review_status(kanban_home):
     assert task.assignee == "reviewer-profile"
 
 
+@pytest.mark.parametrize("entrypoint", ["legacy", "v2", "handoff"])
+@pytest.mark.parametrize("verdict", ["passed", "changes_requested"])
+def test_ordinary_test_cannot_forge_recovery_purpose(kanban_home, tmp_path, entrypoint, verdict):
+    board = "reserved-recovery-purpose"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+    path = kb.board_metadata_path(board)
+    board_metadata = json.loads(path.read_text())
+    board_metadata["product_workflow"]["handoff_v2"] = entrypoint != "legacy"
+    board_metadata["product_workflow"]["ai_provenance_required"] = False
+    path.write_text(json.dumps(board_metadata))
+    with kb.connect(board=board) as conn:
+        tid, workspace, _ = _seed_product_test_worktree(conn, board, repo)
+        claimed = kb.claim_task(conn, tid, board=board)
+        assert claimed and claimed.current_run_id
+        pins = kb._prepare_test_target(conn, tid, workspace, board=board)
+        kb._synthesize_ended_run(conn, tid, outcome="advanced", step_key="test", metadata={
+            **pins, "workflow_outcome": {"verdict": "passed"},
+            "ai_provenance": {"writer": {"agent": "codex"}, "tester": {"agent": "codex"}},
+        })
+        kb._synthesize_ended_run(conn, tid, outcome="crashed", step_key="test", metadata=pins)
+        assert not kb._latest_test_target(conn, tid)
+        before = kb.get_run(conn, claimed.current_run_id)
+        outcome = {"verdict": verdict}
+        if verdict == "changes_requested":
+            outcome.update({"target_step": "development", "findings": ["Fixture failed"]})
+        finish = kb.handoff if entrypoint == "handoff" else kb.complete_task
+        with pytest.raises(kb.ProductProvenanceError, match="resolver.*reserved|reserved.*resolver"):
+            finish(
+                conn, tid, board=board, expected_run_id=claimed.current_run_id,
+                summary="Ordinary Test cannot opt out of product evidence",
+                metadata={"resolver": {}, "workflow_outcome": outcome, **pins,
+                          "ai_provenance": {"tester": {"agent": "codex"}, "writer": {"agent": "codex"}}},
+            )
+        assert kb.get_run(conn, claimed.current_run_id) == before
+        assert kb.get_task(conn, tid).current_step_key == "test"
+        assert not kb._latest_test_target(conn, tid)
+
+
 def test_product_development_completion_requires_writer_provenance(kanban_home):
     kb.create_board("prod", preset="product")
     with kb.connect(board="prod") as conn:
@@ -8328,7 +8368,7 @@ def test_dispatch_review_spawns_when_ready_empty(
 
 
 def _seed_product_review_worktree(
-    conn, board: str, repo: Path, *, dirty=False, base_ref="main"
+    conn, board: str, repo: Path, *, dirty=False, base_ref="main", tested=True
 ):
     tid = kb.create_task(
         conn,
@@ -8360,6 +8400,14 @@ def _seed_product_review_worktree(
         capture_output=True,
         text=True,
     ).stdout.strip()
+    if tested:
+        kb._synthesize_ended_run(
+            conn, tid, outcome="advanced", step_key="test",
+            metadata={"test_branch": branch, "test_head_sha": head_sha,
+                      "workflow_outcome": {"verdict": "passed"},
+                      "ai_provenance": {"writer": {"agent": "fixture-writer"},
+                                        "tester": {"agent": "fixture-tester"}}},
+        )
     return tid, workspace, base_sha, head_sha
 
 
@@ -8777,6 +8825,224 @@ def test_pinned_review_target_survives_run_completion(
         "review_base_sha": base_sha,
         "review_head_sha": head_sha,
     }
+
+
+@pytest.mark.parametrize("recovery_signal", ["metadata", "preflight", "preflight_resolved", "profile"])
+def test_recovery_runs_never_replace_product_writer_or_test_authority(
+    kanban_home, recovery_signal,
+):
+    def executor(profile, provider):
+        return {"profile": profile, "provider": provider, "model": "fixture",
+                "effort": "high", "surface": "hermes-primary"}
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Recovery evidence", assignee="custom-developer")
+        writer = executor("custom-developer", "codex")
+        kb._synthesize_ended_run(conn, tid, outcome="advanced", step_key="development",
+                                 metadata={"executor": writer, "ai_provenance": {"writer": {"agent": "codex"}}})
+        recovery = {"executor": executor("custom-recovery", "claude-cli"),
+                    "ai_provenance": {"writer": {"agent": "claude-cli"}}}
+        if recovery_signal == "metadata":
+            recovery["resolver"] = {}  # Presence, not truthiness, is the durable stamp.
+        recovery_outcome = recovery_signal if recovery_signal.startswith("preflight") else "advanced"
+        recovery_dev = kb._synthesize_ended_run(
+            conn, tid, outcome=recovery_outcome, step_key="development", metadata=recovery,
+        )
+        kb.assign_task(conn, tid, "custom-tester")
+        test_metadata = {
+            "workflow_outcome": {"verdict": "passed"},
+            "ai_provenance": {"tester": {"agent": "codex"}},
+            "test_branch": "story/fixture", "test_head_sha": "a" * 40,
+        }
+        tested_run = kb._synthesize_ended_run(
+            conn, tid, outcome="advanced", step_key="test", metadata=test_metadata,
+        )
+        recovery_test = kb._synthesize_ended_run(
+            conn, tid, outcome=recovery_outcome, step_key="test", metadata=recovery,
+        )
+        if recovery_signal == "profile":
+            # Reconstruct historical records predating durable stamps. Modern
+            # routing correctly refuses creating such an unstamped Resolver run.
+            conn.execute("UPDATE task_runs SET profile='resolver' WHERE id IN (?, ?)",
+                         (recovery_dev, recovery_test))
+        before = [tuple(row) for row in conn.execute("SELECT * FROM task_runs ORDER BY id")]
+        selected_writer = kb._latest_product_step_executor(conn, tid, "development")
+        selected_test = kb._latest_test_target(conn, tid)
+        records = kb._terminal_run_records(conn, tid)
+
+        assert selected_writer["provider"] == "codex"
+        assert kb._latest_product_writer_agent(conn, tid) == "codex"
+        assert selected_test == {"test_branch": "story/fixture", "test_head_sha": "a" * 40}
+        assert not {recovery_dev, recovery_test} & {record.run_id for record in records}
+        passed = kb.latest_test_authority(records, "a" * 40)
+        assert passed is not None and passed.run_id == tested_run
+        assert passed.writer_provider == passed.tester_provider == "codex"
+        assert [tuple(row) for row in conn.execute("SELECT * FROM task_runs ORDER BY id")] == before
+
+
+@pytest.mark.parametrize("step", ["development", "test", "review"])
+@pytest.mark.parametrize("failure", ["identity", "crash", "limit"])
+def test_custom_recovery_purpose_survives_failed_claim(
+    kanban_home, monkeypatch, step, failure,
+):
+    """A failed recovery claim must never displace ordinary writer/Test evidence."""
+    board = "custom-recovery-failure"
+    _v2_product_board(board)
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
+    ordinary_profile = {"development": "developer", "test": "tester", "review": "reviewer"}[step]
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn, title="Recovery purpose", assignee=ordinary_profile,
+            workflow_template_id="product", current_step_key=step, board=board,
+        )
+        writer_id = kb._synthesize_ended_run(
+            conn, tid, outcome="advanced", step_key="development",
+            metadata={"executor": {"profile": "developer", "provider": "codex", "model": "fixture",
+                                   "effort": "high", "surface": "hermes-primary"}},
+        )
+        pins = {"test_branch": "story/fixture", "test_head_sha": "a" * 40}
+        test_id = kb._synthesize_ended_run(
+            conn, tid, outcome="advanced", step_key="test",
+            metadata={**pins, "workflow_outcome": {"verdict": "passed"},
+                      "ai_provenance": {"tester": {"agent": "codex"}}},
+        )
+        assert kb.block_task(
+            conn, tid, board=board, kind="needs_input", reason="Needs diagnosis",
+            human_escalation_assignee="custom-recovery",
+        )
+        history = [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_runs WHERE task_id=? ORDER BY id", (tid,),
+        )]
+        at_identity = []
+
+        def identity(task):
+            at_identity.append(kb.get_run(conn, task.current_run_id).metadata)
+            if failure in {"identity", "limit"}:
+                raise kb.WorkerRuntimeIdentityError("fixture identity unavailable")
+            return {"profile": task.assignee, "provider": "claude-cli", "model": "fixture",
+                    "effort": "high", "surface": "hermes-primary", "source": "dispatcher", "version": 1}
+
+        monkeypatch.setattr(kb, "_resolve_worker_runtime_identity", identity)
+        if failure == "crash":
+            claimed = (kb.claim_review_task(conn, tid) if step == "review"
+                       else kb.claim_task(conn, tid, board=board))
+            assert claimed is not None
+            kb._stamp_run_executor_identity(conn, claimed)
+            kb._set_worker_pid(conn, tid, 987654321)
+            monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+            monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+            monkeypatch.setattr(kb, "_classify_worker_exit", lambda pid: ("nonzero_exit", 1))
+            assert kb.detect_crashed_workers(conn) == [tid]
+        else:
+            kb.dispatch_once(conn, board=board, failure_limit=1 if failure == "limit" else 5,
+                             spawn_fn=lambda *args, **kwargs: pytest.fail("identity failure must prevent spawn"))
+
+        run = max(kb.list_runs(conn, tid, include_active=True), key=lambda item: item.id)
+        assert run.outcome == {"identity": "spawn_failed", "crash": "crashed", "limit": "gave_up"}[failure]
+        assert at_identity == [{"resolver": {"profile": "custom-recovery"}}]
+        assert run.metadata["resolver"] == {"profile": "custom-recovery"}
+        assert kb._latest_product_step_executor(conn, tid, "development")["provider"] == "codex"
+        assert kb._latest_test_target(conn, tid) == pins
+        records = kb._terminal_run_records(conn, tid)
+        assert run.id not in {record.run_id for record in records}
+        assert kb.latest_test_authority(records, "a" * 40).run_id == test_id
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_runs WHERE task_id=? AND id<=? ORDER BY id", (tid, history[-1][0]),
+        )] == history
+        assert kb.get_run(conn, writer_id).outcome == "advanced"
+
+
+@pytest.mark.parametrize("decision", ["resume", "repair", "escalate"])
+def test_same_assignee_recovery_purpose_ends_at_canonical_resolution(kanban_home, decision):
+    board = "same-assignee-purpose"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(conn, title="Same worker, different purpose", assignee="developer",
+                             workflow_template_id="product", current_step_key="development", board=board)
+        ordinary = kb.claim_task(conn, tid, board=board)
+        assert not (kb.get_run(conn, ordinary.current_run_id).metadata or {}).get("resolver")
+        assert kb.block_task(conn, tid, board=board, kind="needs_input", reason="Needs diagnosis",
+                             expected_run_id=ordinary.current_run_id, human_escalation_assignee="developer")
+        recovery = kb.claim_task(conn, tid, board=board)
+        assert kb.get_run(conn, recovery.current_run_id).metadata == {"resolver": {"profile": "developer"}}
+        with pytest.raises(ValueError, match="preflight"):
+            kb.complete_task(conn, tid, board=board, expected_run_id=recovery.current_run_id, summary="Bypass")
+        request = _resolver_request(kb.resolver_expected_snapshot(conn, tid), decision=decision)
+        if decision == "repair":
+            request["repair"] = {"workflow": {"phase": "development", "assignee": "developer"}}
+        assert kb.resolve_product_preflight(conn, tid, board=board, request=request,
+                                            resolver_profile="developer", resolver_model="test-model")
+        ended = kb.get_run(conn, recovery.current_run_id)
+        assert ended.metadata["resolver"] == {"profile": "developer", "model": "test-model"}
+        assert not any(e.kind == "dispatcher_metadata_conflict" for e in kb.list_events(conn, tid))
+        if decision != "escalate":
+            next_run = kb.claim_task(conn, tid, board=board)
+            assert "resolver" not in (kb.get_run(conn, next_run.current_run_id).metadata or {})
+            assert kb.get_run(conn, recovery.current_run_id) == ended
+
+
+@pytest.mark.parametrize("preflight", ["absent", "different_assignee", "different_phase"])
+def test_unmatched_recovery_preflight_does_not_hide_ordinary_failure(kanban_home, preflight):
+    board = "ordinary-purpose"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(conn, title="Ordinary custom worker", assignee="custom-tester",
+                             workflow_template_id="product", current_step_key="test", board=board)
+        kb._synthesize_ended_run(conn, tid, outcome="advanced", step_key="test", metadata={
+            "workflow_outcome": {"verdict": "passed"}, "test_branch": "story/fixture", "test_head_sha": "a" * 40,
+        })
+        if preflight != "absent":
+            assert kb.block_task(conn, tid, board=board, kind="needs_input", reason="Needs diagnosis",
+                                 human_escalation_assignee="custom-recovery")
+            kb.assign_task(conn, tid, "custom-tester")
+            if preflight == "different_phase":
+                # Model a stale persisted preflight after a phase change.
+                conn.execute("UPDATE tasks SET assignee='custom-recovery', current_step_key='development' WHERE id=?", (tid,))
+                conn.commit()
+        claimed = kb.claim_task(conn, tid, board=board)
+        assert "resolver" not in (kb.get_run(conn, claimed.current_run_id).metadata or {})
+        kb._record_spawn_failure(conn, tid, "ordinary failure", failure_limit=5)
+        failed = kb.get_run(conn, claimed.current_run_id)
+        assert "resolver" not in (failed.metadata or {})
+        assert failed.id in {r.run_id for r in kb._terminal_run_records(conn, tid)}
+        if preflight != "different_phase":
+            assert kb._latest_test_target(conn, tid) == {}
+
+
+@pytest.mark.parametrize("optimistic_metadata", [False, True])
+def test_newer_failed_ordinary_test_invalidates_an_older_pin(kanban_home, optimistic_metadata):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Failed later Test", assignee="tester")
+        pins = {"test_branch": "story/fixture", "test_head_sha": "a" * 40}
+        kb._synthesize_ended_run(conn, tid, outcome="advanced", step_key="test", metadata={
+            **pins, "workflow_outcome": {"verdict": "passed"},
+            "ai_provenance": {"writer": {"agent": "codex"}, "tester": {"agent": "codex"}},
+        })
+        failed_metadata = dict(pins)
+        if optimistic_metadata:
+            failed_metadata.update({"workflow_outcome": {"verdict": "passed"},
+                                    "ai_provenance": {"writer": {"agent": "codex"}, "tester": {"agent": "codex"}}})
+        kb._synthesize_ended_run(conn, tid, outcome="crashed", step_key="test", metadata=failed_metadata)
+        assert not kb._latest_test_target(conn, tid)
+        assert kb.latest_test_authority(kb._terminal_run_records(conn, tid), "a" * 40) is None
+
+
+@pytest.mark.parametrize("missing_test", [True, False])
+def test_product_review_requires_a_successful_applicable_test_pin(
+    kanban_home, tmp_path, missing_test,
+):
+    board = "review-needs-test"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+    with kb.connect(board=board) as conn:
+        tid, workspace, _, _ = _seed_product_review_worktree(conn, board, repo, tested=False)
+        if not missing_test:
+            kb._synthesize_ended_run(conn, tid, outcome="advanced", step_key="test",
+                                     metadata={"workflow_outcome": {"verdict": "passed"}})
+        assert kb.claim_task(conn, tid, board=board) is not None
+        with pytest.raises(kb.ReviewTargetPreparationError, match="successful.*Test|Test.*pin"):
+            kb._prepare_review_target(conn, tid, workspace, board=board)
 
 
 def test_terminal_run_records_fill_test_writer_from_preceding_development_executor(
