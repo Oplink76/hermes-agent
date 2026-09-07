@@ -1096,6 +1096,39 @@ app.include_router(_skills_routes.router)
 app.include_router(_tools_routes.router)
 app.include_router(_analytics_routes.router)
 app.include_router(_chat_ws_routes.router)
+@app.get("/.well-known/hermes-inbox")
+def get_hermes_inbox_guide(request: Request, board: Optional[str] = None):
+    """Return safe, copy-ready directions for governed work intake."""
+
+    from hermes_cli import kanban_db, kanban_intake
+    from hermes_cli.kanban_inbox_guide import build_inbox_guide
+
+    if not board:
+        raise HTTPException(status_code=400, detail="board query parameter is required")
+    try:
+        normalized = kanban_db._normalize_board_slug(board)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not normalized:
+        raise HTTPException(status_code=400, detail="board query parameter is required")
+    if not kanban_db.board_exists(normalized):
+        raise HTTPException(
+            status_code=404,
+            detail=f"board {normalized!r} does not exist",
+        )
+    metadata = kanban_db.read_board_metadata(normalized)
+    if not kanban_intake.qualification_required(metadata):
+        raise HTTPException(
+            status_code=409,
+            detail="This board does not require qualified intake",
+        )
+    origin = str(request.base_url).rstrip("/")
+    return build_inbox_guide(
+        board=normalized,
+        origin=origin,
+    )
+
+
 app.include_router(_dashboard_ui_routes.router)
 
 # Plugin API routes and the dashboard auth routes (/login, /auth/*, /api/auth/*)
@@ -1574,39 +1607,6 @@ def start_server(
                 await server.shutdown()
 
     _run_serve(_serve, config, host, port)
-
-
-@app.get("/.well-known/hermes-inbox")
-def get_hermes_inbox_guide(request: Request, board: Optional[str] = None):
-    """Return safe, copy-ready directions for governed work intake."""
-
-    from hermes_cli import kanban_db, kanban_intake
-    from hermes_cli.kanban_inbox_guide import build_inbox_guide
-
-    if not board:
-        raise HTTPException(status_code=400, detail="board query parameter is required")
-    try:
-        normalized = kanban_db._normalize_board_slug(board)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not normalized:
-        raise HTTPException(status_code=400, detail="board query parameter is required")
-    if not kanban_db.board_exists(normalized):
-        raise HTTPException(
-            status_code=404,
-            detail=f"board {normalized!r} does not exist",
-        )
-    metadata = kanban_db.read_board_metadata(normalized)
-    if not kanban_intake.qualification_required(metadata):
-        raise HTTPException(
-            status_code=409,
-            detail="This board does not require qualified intake",
-        )
-    origin = str(request.base_url).rstrip("/")
-    return build_inbox_guide(
-        board=normalized,
-        origin=origin,
-    )
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

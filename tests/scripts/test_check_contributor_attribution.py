@@ -69,6 +69,28 @@ def test_exact_upstream_commit_is_exempt(tmp_path):
     assert result.missing == ()
 
 
+def test_large_sync_uses_bounded_git_walks_without_exempting_fork_authors(tmp_path, monkeypatch):
+    import scripts.check_contributor_attribution as checker
+
+    repo = make_repo(tmp_path)
+    base = commit_as(repo, "base", email=next(iter(AUTHOR_MAP)))
+    mirrored = [commit_as(repo, f"upstream {i}", email="official@example.com") for i in range(20)]
+    git(repo, "update-ref", "refs/remotes/upstream/main", mirrored[-1])
+    fork_commit = commit_as(repo, "fork", email="unmapped@example.com")
+    calls = []
+    original = checker._run_git
+
+    def counted(repo, *args):
+        calls.append(args)
+        return original(repo, *args)
+
+    monkeypatch.setattr(checker, "_run_git", counted)
+    result = checker.check_contributors(repo, base=base, head=fork_commit, upstream="upstream/main")
+    assert result.exempt_upstream_commits == tuple(mirrored)
+    assert [item.commit for item in result.missing] == [fork_commit]
+    assert len(calls) <= 4, "mirrored history must not require one Git process per commit"
+
+
 def test_branch_name_does_not_exempt_fork_commit(tmp_path):
     repo, base, upstream_commit, _head = make_sync_history(tmp_path)
     fork_commit = commit_as(repo, "fork change", email="unknown@example.com")

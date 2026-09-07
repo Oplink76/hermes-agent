@@ -6070,37 +6070,10 @@ def create_task(
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
-                # Determine task status from parent status, unless the caller
-                # parks it directly in blocked for human-ops review or in
-                # triage for a specifier.
-                if initial_status == "blocked":
-                    task_status = "blocked"
-                    if parents:
-                        missing = _find_missing_parents(conn, parents)
-                        if missing:
-                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                elif triage:
-                    task_status = "triage"
-                else:
-                    task_status = "ready"
-                    if parents:
-                        missing = _find_missing_parents(conn, parents)
-                        if missing:
-                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                        # If any parent is not yet done, we're todo.
-                        rows = conn.execute(
-                            "SELECT status FROM tasks WHERE id IN "
-                            "(" + ",".join("?" * len(parents)) + ")",
-                            parents,
-                        ).fetchall()
-                        if any(r["status"] != "done" for r in rows):
-                            task_status = "todo"
-                # Even in triage mode we still need to validate parent ids
-                # so the eventual link rows don't dangle.
-                if triage and parents:
-                    missing = _find_missing_parents(conn, parents)
-                    if missing:
-                        raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                from hermes_cli.kanban_db_graph import initial_task_state
+                task_status, tenant = initial_task_state(
+                    conn, parents, initial_status, triage, tenant
+                )
                 if work_item_kind == "epic":
                     task_status = "todo"
 
@@ -15152,97 +15125,10 @@ def deploy_epic(
     )
 
 
-def resolve_workspace(
-    task: Task,
-    *,
-    board: Optional[str] = None,
-    conn: Optional[sqlite3.Connection] = None,
-) -> Path:
-    """Resolve (and create if needed) the workspace for a task.
-
-    - ``scratch``: a fresh dir under ``<board-root>/workspaces/<id>/``,
-      where ``<board-root>`` is the active board's root. The path is the
-      same for the dispatcher and every profile worker, so handoff is
-      path-stable.
-    - ``dir:<path>``: the path stored in ``workspace_path``.  Created
-      if missing.  MUST be absolute — relative paths are rejected to
-      prevent confused-deputy traversal where ``../../../tmp/attacker``
-      resolves against the dispatcher's CWD instead of a meaningful
-      root.  Users who want a kanban-root-relative workspace should
-      compute the absolute path themselves.
-    - ``worktree``: a real linked git worktree. If ``workspace_path`` names
-      a repo root, Hermes treats it as an anchor and materializes a linked
-      worktree at ``<repo>/.worktrees/<task-id>``. If ``workspace_path`` names
-      a concrete target path, Hermes creates/reuses that linked worktree. With
-      no ``workspace_path``, Hermes anchors on the board's ``default_workdir``
-      and materializes ``<repo>/.worktrees/<task-id>`` per task; if no
-      ``default_workdir`` is configured it raises rather than guessing from the
-      dispatcher's CWD. When ``branch_name`` is empty, Hermes uses
-      ``wt/<task-id>``.
-
-    Persist the resolved path back to the task row via ``set_workspace_path``
-    so subsequent runs reuse the same directory.
-    """
-    kind = task.workspace_kind or "scratch"
-    if kind == "scratch":
-        if task.workspace_path:
-            # Legacy scratch tasks that were set to an explicit path get the
-            # same absolute-path guard as dir: — consistent with the
-            # threat model.
-            p = Path(task.workspace_path).expanduser()
-            if not p.is_absolute():
-                raise ValueError(
-                    f"task {task.id} has non-absolute workspace_path "
-                    f"{task.workspace_path!r}; workspace paths must be absolute"
-                )
-        else:
-            p = workspaces_root(board=board) / task.id
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-    if kind == "dir":
-        if not task.workspace_path:
-            raise ValueError(
-                f"task {task.id} has workspace_kind=dir but no workspace_path"
-            )
-        p = Path(task.workspace_path).expanduser()
-        if not p.is_absolute():
-            raise ValueError(
-                f"task {task.id} has non-absolute workspace_path "
-                f"{task.workspace_path!r}; use an absolute path "
-                f"(relative paths are ambiguous against the dispatcher's CWD)"
-            )
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-    if kind == "worktree":
-        p, _branch_name = _resolve_worktree_workspace(
-            task, board=board, conn=conn
-        )
-        return p
-    raise ValueError(f"unknown workspace_kind: {kind}")
 
 
-def set_workspace_path(
-    conn: sqlite3.Connection, task_id: str, path: Path | str
-) -> None:
-    path = str(path)
-    _validate_resolver_cas_fields({"workspace_path": path})
-    with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
-            (path, task_id),
-        )
 
 
-def set_branch_name(
-    conn: sqlite3.Connection, task_id: str, branch_name: str
-) -> None:
-    branch_name = str(branch_name)
-    _validate_resolver_cas_fields({"branch_name": branch_name})
-    with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET branch_name = ? WHERE id = ?",
-            (branch_name, task_id),
-        )
 
 
 def _persist_source_completion_metadata(
@@ -16507,9 +16393,9 @@ def _story_refresh_preflight(
         # dispatch and every later Development dispatch inspect the same
         # durable story worktree rather than the board's repository root.
         if task.workspace_path != str(workspace):
-            set_workspace_path(conn, task.id, str(workspace))
+            _kb_workspace.set_workspace_path(conn, task.id, str(workspace))
         if task.branch_name != branch:
-            set_branch_name(conn, task.id, branch)
+            _kb_workspace.set_branch_name(conn, task.id, branch)
         request = RefreshRequest(
             repo_root=repo_root,
             story_id=task.id,
@@ -16761,7 +16647,7 @@ def _spawn_one_v2(
                 claimed, board=board, base_branch=base_branch, conn=conn
             )
         else:
-            workspace = resolve_workspace(claimed, board=board, conn=conn)
+            workspace = _kb_workspace.resolve_workspace(claimed, board=board, conn=conn)
     except Exception as exc:
         _record_spawn_failure(
             conn, claimed.id, f"workspace: {exc}",
@@ -16769,9 +16655,9 @@ def _spawn_one_v2(
         )
         return None
     # Persist the resolved workspace path so the worker can cd there.
-    set_workspace_path(conn, claimed.id, str(workspace))
+    _kb_workspace.set_workspace_path(conn, claimed.id, str(workspace))
     if claimed.workspace_kind == "worktree":
-        set_branch_name(
+        _kb_workspace.set_branch_name(
             conn, claimed.id,
             resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
         )
@@ -18323,40 +18209,10 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # Split-module bindings are intentionally installed at the tail: the siblings
 # import this facade as ``_kb`` and need its row models and core transitions to
 # be fully defined before their implementations are loaded.
-from hermes_cli.kanban_db_connect import (  # noqa: E402
-    _INITIALIZED_PATHS,
-    _is_busy_error,
-    connect,
-    connect_closing,
-    init_db,
-    repair_db,
-    write_txn,
-)
-from hermes_cli.kanban_db_workspace import (  # noqa: E402
-    _cleanup_workspace,
-    _is_managed_scratch_path,
-    _managed_scratch_path_info,
-    _maybe_emit_scratch_tip,
-    _scratch_workspace,
-    resolve_workspace,
-    set_branch_name,
-    set_workspace_path,
-)
-from hermes_cli.kanban_db_dispatch import (  # noqa: E402
-    DEFAULT_FAILURE_LIMIT,
-    DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
-    DispatchResult,
-    _clear_failure_counter,
-    _defer_reclaim_for_live_worker,
-    _pid_alive,
-    _record_task_failure,
-    _default_spawn,
-    _set_worker_pid,
-    _terminate_reclaimed_worker,
-    _worker_survived_termination,
-    _worker_terminal_timeout_env,
-    dispatch_once,
-)
+from hermes_cli.kanban_db_connect import _INITIALIZED_PATHS, _is_busy_error, init_db, write_txn  # noqa: E402
+from hermes_cli import kanban_db_workspace as _kb_workspace  # noqa: E402
+from hermes_cli.kanban_db_workspace import _cleanup_workspace, _is_managed_scratch_path, _managed_scratch_path_info, _maybe_emit_scratch_tip, _scratch_workspace  # noqa: E402
+from hermes_cli.kanban_db_dispatch import DEFAULT_FAILURE_LIMIT, DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS, DispatchResult, _clear_failure_counter, _defer_reclaim_for_live_worker, _pid_alive, _record_task_failure, _default_spawn, _set_worker_pid, _terminate_reclaimed_worker, _worker_survived_termination, _worker_terminal_timeout_env  # noqa: E402
 
 
 GENERIC_BOARD_COLUMNS: list[dict[str, str]] = [
@@ -18765,3 +18621,60 @@ def _ensure_qualification_boundary_objects(conn: sqlite3.Connection) -> None:
         END;
         """
     )
+
+
+_PLUGIN_COMPAT_LAZY = {
+    'DEFAULT_BUSY_TIMEOUT_MS': ('hermes_cli.kanban_db_connect', 'DEFAULT_BUSY_TIMEOUT_MS'),
+    'DEFAULT_LOG_BACKUP_COUNT': ('hermes_cli.kanban_db_dispatch', 'DEFAULT_LOG_BACKUP_COUNT'),
+    'DEFAULT_LOG_ROTATE_BYTES': ('hermes_cli.kanban_db_dispatch', 'DEFAULT_LOG_ROTATE_BYTES'),
+    'DERIVED_MAX_IN_PROGRESS_CEILING': ('hermes_cli.kanban_db_dispatch', 'DERIVED_MAX_IN_PROGRESS_CEILING'),
+    'DERIVED_MAX_IN_PROGRESS_FLOOR': ('hermes_cli.kanban_db_dispatch', 'DERIVED_MAX_IN_PROGRESS_FLOOR'),
+    'KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS': ('hermes_cli.kanban_db_dispatch', 'KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS'),
+    'KanbanDbCorruptError': ('hermes_cli.kanban_db_connect', 'KanbanDbCorruptError'),
+    'MEMORY_GUARD_MB_PER_WORKER': ('hermes_cli.kanban_db_dispatch', 'MEMORY_GUARD_MB_PER_WORKER'),
+    'RepairResult': ('hermes_cli.kanban_db_connect', 'RepairResult'),
+    'add_notify_sub': ('hermes_cli.kanban_db_notify', 'add_notify_sub'),
+    'advance_notify_cursor': ('hermes_cli.kanban_db_notify', 'advance_notify_cursor'),
+    'check_respawn_guard': ('hermes_cli.kanban_db_dispatch', 'check_respawn_guard'),
+    'claim_unseen_events_for_sub': ('hermes_cli.kanban_db_notify', 'claim_unseen_events_for_sub'),
+    'configured_max_in_progress': ('hermes_cli.kanban_db_dispatch', 'configured_max_in_progress'),
+    'connect': ('hermes_cli.kanban_db_connect', 'connect'),
+    'connect_closing': ('hermes_cli.kanban_db_connect', 'connect_closing'),
+    'count_notify_subs': ('hermes_cli.kanban_db_notify', 'count_notify_subs'),
+    'count_running_tasks': ('hermes_cli.kanban_db_dispatch', 'count_running_tasks'),
+    'count_running_tasks_other_boards': ('hermes_cli.kanban_db_dispatch', 'count_running_tasks_other_boards'),
+    'derive_default_max_in_progress': ('hermes_cli.kanban_db_dispatch', 'derive_default_max_in_progress'),
+    'detect_crashed_workers': ('hermes_cli.kanban_db_dispatch', 'detect_crashed_workers'),
+    'detect_stale_running': ('hermes_cli.kanban_db_dispatch', 'detect_stale_running'),
+    'dispatch_once': ('hermes_cli.kanban_db_dispatch', 'dispatch_once'),
+    'enforce_max_runtime': ('hermes_cli.kanban_db_dispatch', 'enforce_max_runtime'),
+    'has_spawnable_ready': ('hermes_cli.kanban_db_dispatch', 'has_spawnable_ready'),
+    'has_spawnable_review': ('hermes_cli.kanban_db_dispatch', 'has_spawnable_review'),
+    'heartbeat_worker': ('hermes_cli.kanban_db_dispatch', 'heartbeat_worker'),
+    'list_notify_subs': ('hermes_cli.kanban_db_notify', 'list_notify_subs'),
+    'purge_stale_done_notify_subs': ('hermes_cli.kanban_db_notify', 'purge_stale_done_notify_subs'),
+    'reap_worker_zombies': ('hermes_cli.kanban_db_dispatch', 'reap_worker_zombies'),
+    'reconcile_orphaned_running': ('hermes_cli.kanban_db_dispatch', 'reconcile_orphaned_running'),
+    'remove_notify_sub': ('hermes_cli.kanban_db_notify', 'remove_notify_sub'),
+    'repair_db': ('hermes_cli.kanban_db_connect', 'repair_db'),
+    'resolve_max_in_progress': ('hermes_cli.kanban_db_dispatch', 'resolve_max_in_progress'),
+    'resolve_workspace': ('hermes_cli.kanban_db_workspace', 'resolve_workspace'),
+    'review_dispatch_enabled': ('hermes_cli.kanban_db_dispatch', 'review_dispatch_enabled'),
+    'rewind_notify_cursor': ('hermes_cli.kanban_db_notify', 'rewind_notify_cursor'),
+    'run_daemon': ('hermes_cli.kanban_db_dispatch', 'run_daemon'),
+    'set_branch_name': ('hermes_cli.kanban_db_workspace', 'set_branch_name'),
+    'set_workspace_path': ('hermes_cli.kanban_db_workspace', 'set_workspace_path'),
+    'unseen_events_for_sub': ('hermes_cli.kanban_db_notify', 'unseen_events_for_sub'),
+    'worker_log_rotation_config': ('hermes_cli.kanban_db_dispatch', 'worker_log_rotation_config'),
+}
+
+
+def __getattr__(name):  # PEP 562 — lazy so no import cycles
+    target = _PLUGIN_COMPAT_LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    from hermes_cli.plugin_compat import warn_once
+    warn_once(__name__, name, *target)
+    return getattr(importlib.import_module(target[0]), target[1])
+# ---- END PLUGIN-COMPAT ----

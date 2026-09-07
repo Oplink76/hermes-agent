@@ -140,7 +140,8 @@ def export_board(
         # The snapshot is a private file with no other writers, so plain
         # commit/close is enough — no need for the board DB's WAL dance.
         with contextlib.closing(sqlite3.connect(str(staged / "kanban.db"))) as snapshot:
-            kb._register_governance_write_authorizer(snapshot)
+            from hermes_cli.kanban_db_connect import _register_governance_write_authorizer
+            _register_governance_write_authorizer(snapshot)
             with kb.authorized_governance_write():
                 _scrub_local_state(snapshot)
             snapshot.commit()

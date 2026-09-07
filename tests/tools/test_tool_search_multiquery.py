@@ -527,7 +527,7 @@ class TestConfigAndSchema:
         from tools.tool_search import ToolSearchConfig
 
         cfg = ToolSearchConfig.from_raw(DEFAULT_CONFIG["tools"]["tool_search"])
-        assert cfg.max_search_limit == 25
+        assert cfg.max_search_limit == 20  # Fork-configured cap.
         assert cfg.search_default_limit == 5
         assert 1 <= cfg.search_default_limit <= cfg.max_search_limit <= 50
 

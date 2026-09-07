@@ -1481,6 +1481,16 @@ def run_conversation(
             should_review_memory=s._should_review_memory,
         )
 
+    if agent.provider in {"claude-cli", "codex-cli", "cowork"}:
+        from agent.local_agent_provider import run_local_agent_turn
+        return run_local_agent_turn(
+            agent, messages=s.messages, active_system_prompt=s.active_system_prompt,
+            conversation_history=conversation_history, effective_task_id=s.effective_task_id,
+            turn_id=s.turn_id, user_message=s.user_message,
+            original_user_message=s.original_user_message,
+            should_review_memory=s._should_review_memory,
+        )
+
     while (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         if _run_phase(begin_iteration, agent, s).action == "break":
             break

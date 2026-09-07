@@ -550,6 +550,10 @@ class SessionSchemaMixin:
             # A corrupt vtable may fail even a LIMIT 0 probe; still include it in the drop-and-recreate.
             include_trigram = True
 
+        if not self._should_enable_trigram_fts(cursor):
+            self._drop_trigram_fts(cursor)
+            include_trigram = False
+
         drop_sql = "".join(f"DROP TRIGGER IF EXISTS {trigger};" for trigger in _FTS_TRIGGERS)
         if include_trigram:
             drop_sql += "DROP TABLE IF EXISTS messages_fts_trigram;"
@@ -1018,12 +1022,75 @@ class SessionSchemaMixin:
         except sqlite3.OperationalError:
             pass  # Index already exists
 
+    @staticmethod
+    def _drop_trigram_fts(cursor: sqlite3.Cursor) -> None:
+        """Drop optional trigram search data without risking canonical rows."""
+        for trigger in _FTS_TRIGRAM_TRIGGERS:
+            try:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            except sqlite3.OperationalError:
+                pass
+        try:
+            cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+        except sqlite3.OperationalError:
+            pass
+
+
+    @staticmethod
+    def _trigram_message_cap() -> Optional[int]:
+        raw = os.environ.get("HERMES_FTS_TRIGRAM_MAX_MESSAGES")
+        if raw is None or raw.strip() == "":
+            return DEFAULT_FTS_TRIGRAM_MAX_MESSAGES
+        value = raw.strip().lower()
+        if value in {"0", "none", "false", "off", "unlimited"}:
+            return None
+        try:
+            return max(0, int(value))
+        except ValueError:
+            logger.warning(
+                "Invalid HERMES_FTS_TRIGRAM_MAX_MESSAGES=%r; using default %d",
+                raw,
+                DEFAULT_FTS_TRIGRAM_MAX_MESSAGES,
+            )
+            return DEFAULT_FTS_TRIGRAM_MAX_MESSAGES
+
+
+    def _should_enable_trigram_fts(self, cursor: sqlite3.Cursor) -> bool:
+        if os.environ.get("HERMES_DISABLE_FTS_TRIGRAM", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            return False
+        cap = self._trigram_message_cap()
+        if cap is None:
+            return True
+        try:
+            row = cursor.execute("SELECT COUNT(*) FROM messages").fetchone()
+            count = int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
+        except sqlite3.Error:
+            return True
+        if count > cap:
+            logger.warning(
+                "Disabling trigram FTS for %s: %d messages exceeds cap %d; "
+                "CJK search will fall back to LIKE. Set "
+                "HERMES_FTS_TRIGRAM_MAX_MESSAGES=0 to keep trigram unlimited.",
+                self.db_path,
+                count,
+                cap,
+            )
+            return False
+        return True
+
+
     def _init_fts(self, cursor: sqlite3.Cursor) -> None:
         """Create/repair the FTS objects on an FTS5-capable runtime. The DDL runs even when the
         vtable exists so CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation.
         OPT-IN v23 boundary: a legacy v22 inline install keeps its inline schema + triggers
         (the v23 DDL would create the trigram source VIEW and leave a mixed state)."""
         legacy_fts = self._db_has_legacy_inline_fts(cursor)
+        trigram_allowed = self._should_enable_trigram_fts(cursor)
+        if not trigram_allowed:
+            self._drop_trigram_fts(cursor)
+            self._trigram_available = False
         if not self._fts_stale:
             self._migrate_bounded_tool_fts_triggers(cursor, legacy=legacy_fts)
         if self._fts_stale:
@@ -1042,7 +1109,7 @@ class SessionSchemaMixin:
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", base_sql)
             if self._fts_enabled:
                 # Trigram is optional; without it CJK search falls back to LIKE.
-                trigram_enabled = self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
+                trigram_enabled = trigram_allowed and self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
                 self._trigram_available = trigram_enabled
                 if base_triggers_missing or (trigram_enabled and trigram_triggers_missing):
                     self._run_admitted_startup_rebuild(

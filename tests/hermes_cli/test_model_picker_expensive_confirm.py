@@ -112,7 +112,7 @@ def test_prompt_toolkit_picker_selects_each_primary_local_agent(
     )
     self_._close_model_picker = _bound(cli_mod.HermesCLI._close_model_picker, self_)
     self_._confirm_and_apply_model_switch_result = (
-        lambda selected, persist, **_kwargs: captured.update(
+        lambda selected, persist, _origin=None, **_kwargs: captured.update(
             applied=selected,
             persist=persist,
         )

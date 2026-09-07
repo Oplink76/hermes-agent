@@ -956,6 +956,12 @@ def _build_client(agent, api_key, base_url, fallback_model):
     _provider_timeout = get_provider_request_timeout(agent.provider, agent.model)
     if agent.api_mode == "anthropic_messages":
         _init_anthropic_client(agent, api_key, base_url, _provider_timeout)
+    elif agent.provider in {"claude-cli", "codex-cli", "cowork"}:
+        from cli_emulated_routes import CLI_EMULATED_ROUTES
+        agent.client = None
+        agent._client_kwargs = {}
+        agent.api_key = api_key or "local-agent-virtual-provider"
+        agent.base_url = CLI_EMULATED_ROUTES.get(agent.provider, "cli://cowork")
     elif agent.provider == "moa":
         _init_moa_client(agent, api_key)
     elif agent.api_mode == "bedrock_converse":
@@ -1032,7 +1038,10 @@ def _init_fallback_chain(agent, fallback_model):
     sync_credential_pool_entry_id(agent)
 
     # Ordered backups tried when the primary is exhausted (legacy single-dict or list).
-    agent._fallback_chain = _fallback_entries(fallback_model)
+    agent._fallback_chain = (
+        [] if os.environ.get("HERMES_DISABLE_PROVIDER_FALLBACK") == "1"
+        else _fallback_entries(fallback_model)
+    )
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
     # Legacy attribute kept for backward compat (tests, external callers)

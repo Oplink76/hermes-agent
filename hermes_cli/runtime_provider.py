@@ -476,28 +476,6 @@ def _openrouter_should_use_pool(requested_provider, model_cfg, explicit_api_key,
     return requested_provider in {"openrouter", "auto"} and not has_custom_endpoint and not bool(explicit_api_key or explicit_base_url)
 
 
-    from cli_emulated_routes import CLI_EMULATED_ROUTES
-
-    if requested_provider in CLI_EMULATED_ROUTES:
-        return {
-            "provider": requested_provider,
-            "api_mode": "chat_completions",
-            "base_url": CLI_EMULATED_ROUTES[requested_provider],
-            "api_key": "cli-acting-virtual-provider",
-            "source": "cli-acting-virtual-provider",
-            "requested_provider": requested_provider,
-        }
-
-    if requested_provider == "cowork":
-        return {
-            "provider": "cowork",
-            "api_mode": "chat_completions",
-            "base_url": "cli://cowork",
-            "api_key": "cowork-virtual-provider",
-            "source": "cowork-virtual-provider",
-            "requested_provider": requested_provider,
-        }
-
     # Azure Anthropic short-circuit: when explicitly targeting an Azure endpoint
     # with provider="anthropic", bypass _resolve_named_custom_runtime (which would
     # return provider="custom" with chat_completions api_mode and no valid key).
@@ -798,6 +776,28 @@ def _resolve_vertex_runtime(requested_provider: str) -> Dict[str, Any]:
 
 def _resolve_requested_shortcuts(requested_provider, explicit_api_key, explicit_base_url, target_model) -> Optional[Dict[str, Any]]:
     """Providers decided on the REQUESTED name alone, before custom / pool / generic paths."""
+    from cli_emulated_routes import CLI_EMULATED_ROUTES
+
+    if requested_provider in CLI_EMULATED_ROUTES:
+        return {
+            "provider": requested_provider,
+            "api_mode": "chat_completions",
+            "base_url": CLI_EMULATED_ROUTES[requested_provider],
+            "api_key": "cli-acting-virtual-provider",
+            "source": "cli-acting-virtual-provider",
+            "requested_provider": requested_provider,
+        }
+
+    if requested_provider == "cowork":
+        return {
+            "provider": "cowork",
+            "api_mode": "chat_completions",
+            "base_url": "cli://cowork",
+            "api_key": "cowork-virtual-provider",
+            "source": "cowork-virtual-provider",
+            "requested_provider": requested_provider,
+        }
+
     if requested_provider == "moa":
         return _runtime("moa", "chat_completions", "moa://local", "moa-virtual-provider", source="moa-virtual-provider",
                         requested_provider=requested_provider)

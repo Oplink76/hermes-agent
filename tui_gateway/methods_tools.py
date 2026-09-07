@@ -855,9 +855,24 @@ def _(rid, params: dict) -> dict:
                 except Exception as e:
                     return _err(rid, 5030, f"slash worker start failed: {e}")
     try:
-        payload = {"output": worker.run(cmd) or "(no output)"}
+        worker_result = (
+            worker.run_result(cmd) if hasattr(worker, "run_result")
+            else {"output": worker.run(cmd), "agent_seed": ""}
+        )
+        payload = {"output": str(worker_result.get("output") or "(no output)")}
+        if agent_seed := str(worker_result.get("agent_seed") or ""):
+            seed_resp = _methods["prompt.submit"](
+                f"{rid}:agent_seed", {"session_id": sid, "text": agent_seed},
+            )
+            if "error" in seed_resp:
+                payload["warning"] = (
+                    "agent workflow seed was created but could not start: "
+                    + str(seed_resp.get("error", {}).get("message") or "unknown error")
+                )
+            else:
+                payload["agent_seed_started"] = True
         if warning := _mirror_slash_side_effects(sid, session, cmd):
-            payload["warning"] = warning
+            payload["warning"] = "\n".join(filter(None, (payload.get("warning"), warning)))
         if base in _SESSION_CONTROL_SLASHES:
             _publish_session_control_snapshot(sid, session)
         return _ok(rid, payload)

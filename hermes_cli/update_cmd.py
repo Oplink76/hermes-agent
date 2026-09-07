@@ -297,117 +297,8 @@ def _print_curator_first_run_notice() -> None:
     )
 
 def _print_fts_optimize_available_notice() -> None:
-    """Advertise the opt-in v23 search-index optimization after `hermes update`.
-
-    Only fires when the current profile's state.db is still on the legacy
-    (pre-v23) inline FTS layout. Leads with the reclaimable-space figure and
-    points at the exact command. Honors ``sessions.fts_optimize_notice``:
-    ``advise`` (default) prints an advisory notice, ``require`` prints a
-    firmer required-upgrade notice, ``off`` suppresses it. Silent for
-    fresh/already-optimized installs.
-    """
-    mode = "advise"
-    try:
-        from hermes_cli.config import load_config
-
-        mode = str(
-            ((load_config() or {}).get("sessions") or {}).get(
-                "fts_optimize_notice", "advise"
-            )
-        ).strip().lower()
-    except Exception:
-        mode = "advise"
-    if mode == "off":
-        return
-
-    try:
-        from hermes_constants import get_hermes_home
-        from hermes_state import SessionDB
-    except Exception:
-        return
-    db_path = get_hermes_home() / "state.db"
-    if not db_path.exists():
-        return
-    try:
-        size_gb = db_path.stat().st_size / (1024 ** 3)
-    except OSError:
-        return
-    # Skip the notice for trivially small DBs — the win isn't worth the nag.
-    if size_gb < 0.5:
-        return
-    db = None
-    interrupted = False
-    try:
-        db = SessionDB(db_path=db_path, read_only=True)
-        # read_only opens skip schema init, so probe the layout directly.
-        row = db._conn.execute(
-            "SELECT sql FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'messages_fts'"
-        ).fetchone()
-        # An interrupted `optimize-storage` run: the table is already the
-        # v23 shape, but backfill markers / demoted trash tables remain.
-        # Offer the command again — re-running resumes and finishes it.
-        interrupted = bool(
-            db._conn.execute(
-                "SELECT 1 FROM state_meta "
-                "WHERE key = 'fts_rebuild_high_water' LIMIT 1"
-            ).fetchone()
-            or db._conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                "AND name LIKE 'fts\\_v22\\_trash\\_%' ESCAPE '\\' LIMIT 1"
-            ).fetchone()
-            or db._conn.execute(
-                "SELECT 1 FROM state_meta WHERE key IN "
-                "('fts_cjk_rebuild_high_water', 'fts_cjk_stale') LIMIT 1"
-            ).fetchone()
-        )
-    except Exception:
-        return
-    finally:
-        if db is not None:
-            try:
-                db.close()
-            except Exception:
-                pass
-    sql = (row[0] if row else "") or ""
-    if not sql or ("tool_name" in sql and not interrupted):
-        # v23 layout already present (fresh/optimized) — nothing to offer.
-        return
-
-    if interrupted:
-        print()
-        print("◆ Session database optimization incomplete")
-        print(
-            "  A previous `hermes sessions optimize-storage` run was "
-            "interrupted. Search still works; re-run the command to resume "
-            "and finish reclaiming disk:"
-        )
-        print("    hermes sessions optimize-storage")
-        return
-
-    # Concrete size framing — lead with the savings the user cares about.
-    est_reclaim = size_gb * 0.6
-    print()
-    if mode == "require":
-        print("◆ Session database upgrade required")
-        print(
-            f"  Your search index uses the OLD storage layout and should be "
-            f"upgraded. The new layout typically frees ~60% of state.db "
-            f"(≈{est_reclaim:.1f} GB of your current {size_gb:.1f} GB) and is "
-            f"required for continued optimal operation."
-        )
-    else:
-        print("◆ Reclaim ~60% of your session database disk")
-        print(
-            f"  Your search index uses the old storage layout. Upgrading it "
-            f"typically frees ~60% of state.db — about {est_reclaim:.1f} GB "
-            f"of your current {size_gb:.1f} GB."
-        )
-    print("  Run when convenient:  hermes sessions optimize-storage")
-    print(
-        "  It runs in the foreground with a progress bar, is safe to "
-        "interrupt/re-run, and never changes your conversations."
-    )
+    from hermes_cli import update_cmd_maint
+    return update_cmd_maint._print_fts_optimize_available_notice()
 
 def _print_curator_recent_run_notice() -> None:
     """Print the most recent curator run summary, exactly once.
@@ -704,7 +595,7 @@ def _branch_head_label(git_cmd=None, cwd=None) -> str | None:
         branch = subprocess.run(
             cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
             cwd=root, capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
+            text=True, encoding="utf-8", errors="replace", **_no_prompt_git_kwargs(),
         )
         sha = subprocess.run(
             cmd + ["rev-parse", "--short", "HEAD"],
@@ -877,7 +768,7 @@ def _prepare_git_update(git_cmd, cwd, branch, *, switch_branch=False):
         fetched = subprocess.run(
             git_cmd + ["fetch", "origin", branch], cwd=cwd, capture_output=True,
             text=True, encoding="utf-8", errors="replace",
-        )
+        **_no_prompt_git_kwargs(),)
     except (OSError, subprocess.SubprocessError):
         # Unknown Git history is not permission to overwrite a checkout
         # using the archive fallback.
@@ -1478,40 +1369,8 @@ def _write_gateway_update_exit_code(ok: bool) -> None:
 
 
 def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
-    """Replace *state_path* with the snapshot image at *snap_state*.
-
-    Shared by both post-update auto-restore paths (the ZIP update and the git
-    pull). The destination's stale sidecars are cleared before the copy, so the
-    restored image cannot be silently overwritten by the corrupt database's WAL
-    replay — see :func:`_clear_stale_sqlite_sidecars`.
-
-    Refuses (returns ``False``) while another process still holds the database
-    or its sidecars open: copying a snapshot over a live writer's inode makes
-    the writer's page cache and WAL index disagree with the file bytes, and
-    its next checkpoint writes pages at offsets that no longer mean what it
-    thinks — the #90950 page-1 clobber. ``None`` (scan unavailable) proceeds:
-    the updater has already drained gateways, and refusing on "unknown" would
-    disable auto-restore on every non-Linux host.
-
-    Returns ``True`` when the restored file passes an integrity check. Raises
-    ``OSError`` if the copy itself fails, which callers already report.
-    """
-    from hermes_cli.backup import _foreign_db_holder_pids, verify_sqlite_integrity
-
-    holders = _foreign_db_holder_pids(state_path)
-    if holders:
-        print(
-            f"  ✗ Auto-restore refused: process(es) {holders} still hold "
-            "state.db or its WAL open. Stop them (hermes gateway stop), "
-            "then restore manually with /snapshot restore."
-        )
-        return False
-    _clear_stale_sqlite_sidecars(state_path)
-    shutil.copy2(snap_state, state_path)
-    restored = verify_sqlite_integrity(
-        state_path, check_header=True, run_pragma=True
-    )
-    return bool(restored.get("valid"))
+    from hermes_cli import update_cmd_maint
+    return update_cmd_maint._restore_state_db_from_snapshot(state_path, snap_state)
 
 
 def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> bool:
@@ -2586,7 +2445,7 @@ def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
             cwd=cwd,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
-        )
+        **_no_prompt_git_kwargs(),)
         return result.returncode == 0
     except Exception:
         return False
@@ -2681,7 +2540,7 @@ def _sync_with_upstream_if_needed(
             cwd=cwd,
             capture_output=True,
             check=True,
-        )
+        **_no_prompt_git_kwargs(),)
     except subprocess.CalledProcessError:
         print("  ✗ Failed to fetch upstream. Skipping upstream sync.")
         return False
@@ -2720,6 +2579,7 @@ def _sync_with_upstream_if_needed(
             git_cmd + ["pull", "--ff-only", "upstream", "main"],
             cwd=cwd,
             check=True,
+            **_no_prompt_git_kwargs(),
         )
     except subprocess.CalledProcessError:
         print(

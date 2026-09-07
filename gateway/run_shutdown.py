@@ -1805,6 +1805,11 @@ class GatewayShutdownMixin:
         """PID/lock release, clean-shutdown marker, restart markers, terminal runtime status."""
         from gateway.run import _hermes_home, _planned_restart_notification_path, _shutdown_gateway_health_export
         from utils import atomic_json_write
+        try:
+            from gateway.runtime_identity import remove_runtime_identity
+            remove_runtime_identity()
+        except Exception:
+            logger.debug("runtime identity cleanup error", exc_info=True)
         from gateway.status import remove_pid_file, release_gateway_runtime_lock
         remove_pid_file()
         release_gateway_runtime_lock()

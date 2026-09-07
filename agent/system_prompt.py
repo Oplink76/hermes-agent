@@ -269,9 +269,28 @@ def _profile_name_for_home(home: Path) -> str:
         return "default"
 
 
+def _task_scoped_claude_capability(agent: Any) -> Optional[str]:
+    if str(getattr(agent, "provider", "") or "") != "claude-cli":
+        return None
+    if os.environ.get("HERMES_WORK_INBOX_INTAKE"):
+        return "product-owner-intake"
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        from agent.transports.hermes_tools_mcp_server import CLAUDE_TASK_CAPABILITY_BY_PROFILE
+        return CLAUDE_TASK_CAPABILITY_BY_PROFILE.get((os.environ.get("HERMES_PROFILE") or "").strip())
+    return None
+
+
+def _prompt_tool_names(agent: Any) -> set[str]:
+    capability = _task_scoped_claude_capability(agent)
+    if capability:
+        from agent.transports.hermes_tools_mcp_server import CAPABILITY_SETS
+        return set(CAPABILITY_SETS[capability])
+    return set(agent.valid_tool_names or ())
+
+
 def _tool_guidance_block(agent: Any) -> Optional[str]:
     """Tool-aware behavioral guidance, injected only when the tools are loaded."""
-    names = agent.valid_tool_names
+    names = _prompt_tool_names(agent)
     # With both memory stores disabled no store is built, so the full guidance
     # would steer the model at a tool that always answers "Memory is not
     # available"; with only USER.md enabled the narrower block is used.
@@ -283,9 +302,10 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
             memory_guidance = USER_PROFILE_GUIDANCE
     # Kanban lifecycle: resolved once at __init__ (_kanban_worker_guidance);
     # the kanban_show fallback covers code paths that bypass agent_init.
-    _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
+    _kanban_guidance = "" if _task_scoped_claude_capability(agent) else getattr(agent, "_kanban_worker_guidance", None)
     if _kanban_guidance is None and "kanban_show" in names:
-        _kanban_guidance = KANBAN_GUIDANCE
+        from agent.prompt_builder import RESOLVER_KANBAN_GUIDANCE
+        _kanban_guidance = RESOLVER_KANBAN_GUIDANCE if os.environ.get("HERMES_PROFILE") == "resolver" else KANBAN_GUIDANCE
     tool_guidance = [
         memory_guidance,
         SESSION_SEARCH_GUIDANCE if "session_search" in names else None,
@@ -298,16 +318,16 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
 def _skills_prompt(agent: Any) -> str:
     """Skills index (empty without skills tools).  Focus mode demotes non-coding
     categories to names-only — never hidden, every name stays visible."""
-    if not any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage']):
+    if not any(name in _prompt_tool_names(agent) for name in ['skills_list', 'skill_view', 'skill_manage']):
         return ""
     import model_tools
-    avail_toolsets = {model_tools.get_toolset_for_tool(tool_name) for tool_name in agent.valid_tool_names} - {None, ""}
+    avail_toolsets = {model_tools.get_toolset_for_tool(tool_name) for tool_name in _prompt_tool_names(agent)} - {None, ""}
     try:
         from agent.coding_context import coding_compact_skill_categories
         _compact_cats = coding_compact_skill_categories(platform=agent.platform, cwd=resolve_context_cwd())
     except Exception:
         _compact_cats = frozenset()
-    return _pb.build_skills_system_prompt(available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
+    return _pb.build_skills_system_prompt(available_tools=_prompt_tool_names(agent), available_toolsets=avail_toolsets,
                                          compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent))
 
 
@@ -496,7 +516,7 @@ def _identity_parts(agent: Any, ctx_len: Optional[int]) -> Tuple[List[str], bool
 def _guidance_parts(agent: Any) -> List[str]:
     """Universal + tool-aware + model-gated guidance blocks, each gated by its config.yaml key."""
     parts: List[str] = []
-    if agent.valid_tool_names:
+    if _prompt_tool_names(agent):
         parts += [
             text for flag, text in (
                 ("_task_completion_guidance", TASK_COMPLETION_GUIDANCE),
@@ -504,7 +524,7 @@ def _guidance_parts(agent: Any) -> List[str]:
             ) if getattr(agent, flag, True)
         ]
     parts.append(_tool_guidance_block(agent))  # None/empty entries are dropped by _join_tier
-    if not agent.valid_tool_names:
+    if not _prompt_tool_names(agent):
         return parts
     # Steering only lands inside tool results, so only reachable with tools.
     parts.append(STEER_CHANNEL_NOTE)
@@ -518,7 +538,7 @@ def _guidance_parts(agent: Any) -> List[str]:
             parts.append(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
     if _model_gate(getattr(agent, "_execution_guidance", "auto"), agent.model, EXECUTION_GUIDANCE_MODELS):
         from agent.prompt_builder import execution_guidance_text
-        parts.append(execution_guidance_text(agent.valid_tool_names))
+        parts.append(execution_guidance_text(_prompt_tool_names(agent)))
     return parts
 
 
@@ -548,7 +568,7 @@ def _coding_parts(agent: Any) -> Tuple[List[str], List[str], List[str]]:
     """
     try:
         from agent.coding_context import coding_system_prompt_parts
-        if not agent.valid_tool_names:
+        if not _prompt_tool_names(agent):
             return [], [], []
         cwd = resolve_context_cwd()
         cwd_key = str(cwd) if cwd is not None else ""
@@ -556,7 +576,7 @@ def _coding_parts(agent: Any) -> Tuple[List[str], List[str], List[str]]:
         # "" is a real pinned value (no workspace here) — only a cwd mismatch re-probes.
         replay = pinned[1] if pinned is not None and pinned[0] == cwd_key else None
         parts = coding_system_prompt_parts(platform=agent.platform, cwd=cwd, model=agent.model,
-                                           valid_tool_names=agent.valid_tool_names, workspace_block=replay)
+                                           valid_tool_names=_prompt_tool_names(agent), workspace_block=replay)
         if replay is None:
             agent._frozen_workspace_snapshot = (cwd_key, parts[1][0] if parts[1] else "")
         return parts
@@ -619,11 +639,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # index is built; this slot holds its position.
     _help_guidance_slot = len(stable_parts)
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
+    if os.environ.get("HERMES_WORK_INBOX_INTAKE") and not _task_scoped_claude_capability(agent):
+        from agent.transports.hermes_tools_mcp_server import CAPABILITY_INSTRUCTIONS
+        stable_parts.append(CAPABILITY_INSTRUCTIONS["product-owner-intake"])
     stable_parts.extend(_guidance_parts(agent))
     skills_prompt = _skills_prompt(agent)
     # Skill-pointer variant requires BOTH skill_view AND the hermes-agent skill
     # in the rendered index (pure string check — inherits the index's stability).
-    if "skill_view" in (agent.valid_tool_names or set()) and "- hermes-agent:" in skills_prompt:
+    if "skill_view" in (_prompt_tool_names(agent) or set()) and "- hermes-agent:" in skills_prompt:
         stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
     stable_parts.extend(_alibaba_identity_part(agent))
     # Coding posture: the operating brief stays in the stable prefix. The

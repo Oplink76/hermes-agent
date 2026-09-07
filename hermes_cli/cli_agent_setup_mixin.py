@@ -188,7 +188,7 @@ class CLIAgentSetupMixin:
                 explicit_base_url=self._explicit_base_url)
         except Exception as exc:
             _primary_exc = exc
-        if _primary_exc is not None:
+        if _primary_exc is not None and os.environ.get("HERMES_DISABLE_PROVIDER_FALLBACK") != "1":
             runtime = self._resolve_fallback_runtime(_primary_exc)
             if runtime is not None:
                 _primary_exc = None

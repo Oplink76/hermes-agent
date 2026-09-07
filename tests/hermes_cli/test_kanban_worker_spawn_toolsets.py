@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from hermes_cli import kanban_db_dispatch
 
 
 def _make_task(kb, *, assignee: str):
@@ -127,7 +128,7 @@ agent:
 
     from hermes_cli import kanban_db as kb
 
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kanban_db_dispatch, "_resolve_hermes_argv", lambda: ["hermes"])
 
     captured = {}
 
@@ -168,7 +169,7 @@ def test_default_spawn_never_boots_the_tui(monkeypatch, tmp_path):
 
     from hermes_cli import kanban_db as kb
 
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kanban_db_dispatch, "_resolve_hermes_argv", lambda: ["hermes"])
 
     captured = {}
 

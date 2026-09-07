@@ -920,6 +920,17 @@ class GatewayInboundMixin:
         )
         if plain_handler is not None:
             return True, await plain_handler(event)
+        if canonical in {"project-create", "project-import"}:
+            from hermes_cli.project_workflows import (
+                build_project_create_prompt, build_project_import_prompt, project_workflow_usage,
+            )
+            request = event.get_command_args().strip()
+            if not request:
+                return True, project_workflow_usage()
+            create = canonical == "project-create"
+            builder = build_project_create_prompt if create else build_project_import_prompt
+            ack = "Starting project creation workflow…" if create else "Starting project import workflow…"
+            return await self._hm_rewrite_turn_to_prompt(event, source, canonical, ack, lambda: builder(request))
         if canonical in self._HM_CANONICAL_COMMANDS:
             return await getattr(self, f"_hm_cmd_{canonical}")(event, source, _quick_key)
         return False, None
@@ -1189,6 +1200,9 @@ class GatewayInboundMixin:
             return _paused_notice
 
         _quick_key = self._session_key_for_source(source)
+        _override_reply = await self._kanban_override_instruction(event, _quick_key)
+        if _override_reply is not None:
+            return _override_reply
         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
             return _reply

@@ -829,6 +829,8 @@ def _lap_user_provider_rows(b: _PickerBuild, user_providers: dict) -> None:
     from hermes_cli.config import coerce_provider_id, is_provider_enabled
     ep_groups: dict[tuple, dict] = {}
     for ep_name, ep_cfg in user_providers.items():
+        if ep_name.lower() in {"claude-cli", "codex-cli", "cowork"}:
+            continue
         if not isinstance(ep_cfg, dict) or not is_provider_enabled(ep_cfg) or ep_name.lower() in b.seen_slugs:
             continue
         display_name = coerce_provider_id(ep_cfg.get("name")) or ep_name

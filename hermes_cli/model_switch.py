@@ -1315,6 +1315,11 @@ def _creds_for_current_provider(st: _Switch) -> None:
 def _resolve_switch_credentials(st: _Switch) -> Optional[ModelSwitchResult]:
     """COMMON PATH part 1: credentials, direct-alias endpoint override, and the api_mode for the
     final (provider, base_url) before validation."""
+    if st.target_provider in {"claude-cli", "codex-cli", "cowork"} and isinstance(st.user_providers, dict):
+        from hermes_cli.providers import resolve_user_provider
+        shadow = resolve_user_provider(st.target_provider, st.user_providers)
+        if shadow is not None and shadow.base_url:
+            return st.fail(f"'{st.target_provider}' is a reserved provider identity; its endpoint cannot be overridden")
     st.provider_label = _switch_provider_label(st)
     st.api_key, st.base_url = st.current_api_key, st.current_base_url
     if st.provider_changed or st.explicit_provider:

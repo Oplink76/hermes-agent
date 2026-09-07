@@ -789,7 +789,7 @@ def _resolve_static_model_alias(
 
     # Current provider first, then native vendors, then aggregators / borrow-list providers the user
     # is already on — so `sonnet` resolves to anthropic before any re-exposing provider.
-    skip = current_keys | _AGGREGATOR_PROVIDERS | _BORROWED_MODEL_PROVIDERS
+    skip = current_keys | _AGGREGATOR_PROVIDERS | _BORROWED_MODEL_PROVIDERS | _LOCAL_AGENT_PROVIDERS
     candidates = [
         *current_keys, *(p for p in _PROVIDER_MODELS if p not in skip),
         *(p for p in _AGGREGATOR_PROVIDERS if p in current_keys),

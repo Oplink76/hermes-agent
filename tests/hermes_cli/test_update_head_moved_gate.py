@@ -19,6 +19,11 @@ import hermes_cli.main_install_repair as main_install_repair
 from hermes_cli import update_cmd
 
 
+@pytest.fixture(autouse=True)
+def _isolate_gateway_fleet(isolated_update_runtime):
+    pass
+
+
 def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
     """Simulate git commands where HEAD advances from pre_sha to post_sha."""
     state = {"merged": False}
@@ -132,7 +137,7 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
         hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
     )
     monkeypatch.setattr(hermes_gateway, "_get_service_pids", lambda **k: set())
-    monkeypatch.setattr("hermes_cli.update_cmd._restart_macos_launchd_gateways", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.update_cmd_fleet._restart_macos_launchd_gateways", lambda *a, **k: None)
     monkeypatch.setattr(hermes_main, "_capture_active_lazy_features", lambda: [])
     monkeypatch.setattr(hermes_main, "_capture_active_tool_dependencies", lambda: [])
 

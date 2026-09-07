@@ -204,11 +204,11 @@ def test_product_development_budget_exhaustion_routes_directly(
     record = MagicMock(name="record_task_failure")
     route = MagicMock(name="handle_development_budget_exhaustion", return_value=True)
     conn = SimpleNamespace(close=lambda: None)
-    monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
+    monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
     monkeypatch.setattr(
         "hermes_cli.kanban_db.handle_development_budget_exhaustion", route
     )
-    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
 
     result = _finalize(
         _LimitAgent(),

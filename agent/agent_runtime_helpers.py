@@ -1853,6 +1853,13 @@ def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mo
 
 def _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new_norm) -> None:
     """Build the client for the switched-to destination (MoA facade / native Anthropic / OpenAI wire)."""
+    if new_norm in {"claude-cli", "codex-cli", "cowork"}:
+        from cli_emulated_routes import CLI_EMULATED_ROUTES
+        agent.api_key = api_key or "local-agent-virtual-provider"
+        agent.base_url = CLI_EMULATED_ROUTES.get(new_norm, "cli://cowork")
+        agent._client_kwargs = {}
+        agent.client = None
+        return
     if new_norm == "moa":
         from agent.moa_loop import build_moa_facade
         # MoA speaks only chat.completions via the MoAClient facade; the aggregator's real transport

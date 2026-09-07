@@ -61,6 +61,13 @@ def _record_kanban_budget_exhausted(
         from hermes_cli import kanban_db_dispatch as _kbd
         _conn = _kbc.connect()
         try:
+            try:
+                handled = _kb.handle_development_budget_exhaustion(_conn, kanban_task)
+            except Exception:
+                logger.warning("Development budget routing failed for task %s; recording terminal failure", kanban_task, exc_info=True)
+                handled = False
+            if handled:
+                return
             _kbd._record_task_failure(
                 _conn,
                 kanban_task,

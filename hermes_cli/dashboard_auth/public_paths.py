@@ -1,4 +1,4 @@
-"""Shared allowlist of ``/api/*`` paths that bypass dashboard auth. Imported by BOTH gates —
+"""Shared allowlist of exact paths that bypass dashboard auth. Imported by BOTH gates —
 ``web_server.auth_middleware`` (loopback / ``--insecure``) and
 ``dashboard_auth.middleware.gated_auth_middleware`` (OAuth cookie) — so the lists cannot drift
 again (a drift once 401'd ``/api/status`` and broke the portal's cookie-less liveness probe).
@@ -7,6 +7,8 @@ who ``curl``s the hostname; otherwise gate it and bootstrap after login."""
 from __future__ import annotations
 
 PUBLIC_API_PATHS: frozenset[str] = frozenset({
+    # Public directions only; handler validates the board and excludes credentials/task data.
+    "/.well-known/hermes-inbox",
     # Minimal process liveness probe for desktop/backend boot handshakes; avoids
     # gateway config, platform discovery, MCP setup and cold plugin imports.
     "/api/health",

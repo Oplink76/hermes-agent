@@ -4312,15 +4312,13 @@ class SlackAdapter(BasePlatformAdapter):
             return
         thread_ts = self._session_thread_ts(event, ts, is_dm, assistant_meta)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
-        # Detect mentions authored only inside Block Kit blocks too (#52387).
+        # Mentions may live only in Block Kit blocks.
+        # See #52387.
         routing_text = _slack_mention_detection_text(event) or original_text or ""
-        is_broadcast_wake = self._slack_message_matches_broadcast_mention(
-            routing_text,
-            event.get("blocks") or [],
-        )
+        is_broadcast_wake = self._slack_message_matches_broadcast_mention(routing_text, event.get("blocks") or [])
         is_mentioned = bool(
             (bot_uid and f"<@{bot_uid}>" in routing_text)
-            or self._slack_message_matches_mention_patterns(routing_text))
+            or self._slack_message_matches_mention_patterns(routing_text) or is_broadcast_wake)
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
         # Internal triggers (reactions) skip the mention requirement but NOT
@@ -4343,47 +4341,40 @@ class SlackAdapter(BasePlatformAdapter):
         if _claim_ts:
             self._remember_processed_message_ts(_claim_ts)
         if is_mentioned:
-            # Strip the bot mention / broadcast wake token from the text before
-            # handing it to the agent.
-            text = text.replace(f"<@{bot_uid}>", "").strip()
             if is_broadcast_wake:
-                text = self._strip_slack_broadcast_mentions(text)
-                if not text:
-                    text = "[Slack channel broadcast wake]"
-            # Re-run command normalization against the canonical Slack text,
-            # not the block-augmented agent text. Otherwise quoted/forwarded
-            # rich-text payload can become accidental command arguments.
-            # Handles both ``@bot !cmd`` (bang hidden behind the mention when
-            # the first probe ran) and ``@bot /cmd`` (typed slash addressed
-            # at the bot).
-            mention_stripped = original_text.replace(f"<@{bot_uid}>", "").strip()
-            if mention_stripped.startswith("/"):
-                command_text = mention_stripped
-            else:
-                command_text = _rewrite_known_bang_command(mention_stripped)
-            if command_text.startswith("/"):
-                original_text = command_text
-                text = command_text
-                # Refresh command classification: the command token was
-                # hidden behind the leading mention on the first probe.
-                command_probe_text = command_text
-                is_command_text = True
-            # Register this thread so all future messages auto-trigger the bot.
-            # Skipped in strict/thread-gated mode: strict_mention=true and
-            # thread_require_mention=true bots must be re-mentioned for
-            # follow-up thread turns, so remembering the thread would defeat
-            # the feature (and re-enable agent-to-agent ack loops).
-            #
-            # Use the session-scoped ``thread_ts`` (which falls back to the
-            # message ts for top-level mentions) rather than the raw event
-            # thread_ts: a top-level @mention STARTS a thread, and replies to
-            # it must auto-trigger the bot too (#24848).
-            if (
-                thread_ts
-                and not self._slack_strict_mention()
-                and not self._slack_thread_require_mention()
-            ):
-                self._register_mentioned_thread(thread_ts, team_id=team_id)
+                text = self._strip_slack_broadcast_mentions(text) or "[Slack channel broadcast wake]"
+            text, original_text, command_probe_text, is_command_text = self._apply_bot_mention(
+                text, original_text, command_probe_text, is_command_text, bot_uid, thread_ts,
+                team_id)
+        # Thread history stays out of ``text``: prepending would push a command off char zero.
+        (
+            channel_context, thread_root_media_urls, thread_root_media_types,
+        ) = await self._hydrate_thread_context(
+            channel_id=channel_id, event_thread_ts=event_thread_ts, ts=ts, user_id=user_id,
+            team_id=team_id, is_thread_reply=is_thread_reply, is_mentioned=is_mentioned,
+            is_dm=is_dm)
+        # Thread-root media is delivered ahead of the trigger message's own files.
+        media_urls, media_types, text = await self._collect_inbound_media(
+            event, channel_id, team_id, text, thread_root_media_urls, thread_root_media_types)
+        msg_event = await self._build_message_event(
+            event, text=text, original_text=original_text, command_probe_text=command_probe_text,
+            is_command_text=is_command_text, channel_id=channel_id, team_id=team_id, ts=ts,
+            user_id=user_id, thread_ts=thread_ts, is_dm=is_dm, media_urls=media_urls,
+            media_types=media_types, channel_context=channel_context)
+        # React only when directly addressed; MPIMs are shared, so they need a
+        # mention like any channel.
+        if (is_one_to_one_dm or is_mentioned) and self._reactions_enabled():
+            self._track_reacting_message(team_id, ts)
+        # App-context is per-turn UI state: in the user message, not SessionSource (would rebuild
+        # the agent per view switch and leak stale context). Inert label, never a channel body.
+        context_channel_id = agent_context.get("context_channel_id", "")
+        if context_channel_id and context_channel_id != channel_id and not is_command_text:
+            msg_event.text = (
+                f"[Slack app context: user is viewing channel {context_channel_id}]\n\n"
+                f"{msg_event.text}")
+        if ts:
+            self._remember_processed_message_ts(ts)
+        await self.handle_message(msg_event)
 
     async def _build_message_event(
         self, event: dict, *, text: str, original_text: str, command_probe_text: str,
