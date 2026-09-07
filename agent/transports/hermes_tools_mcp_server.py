@@ -1,43 +1,8 @@
 """Hermes tools exposed through a role-scoped stdio MCP server.
 
-The default capability set preserves the historical codex_app_server surface.
-Task-scoped external runtimes select a smaller immutable surface with
-``HERMES_MCP_CAPABILITY_SET``.
-
-This module exposes a curated subset of those Hermes tools to Codex and
-task-scoped Claude subprocesses via stdio MCP. Codex registers it as a
-normal MCP server (per `~/.codex/config.toml [mcp_servers.hermes-tools]`);
-Claude receives a strict inline server entry for one task-scoped turn.
-
-Scope (what we expose):
-  - web_search, web_extract              — Firecrawl, no codex equivalent
-  - browser_navigate / _click / _type /  — Camofox/Browserbase automation
-    _snapshot / _scroll / _back / _press /
-    _get_images / _console / _vision
-  - vision_analyze                       — image inspection by vision model
-  - image_generate                       — image generation
-  - skill_view, skills_list              — Hermes' skill library
-  - text_to_speech                       — TTS
-  - kanban_* (complete/block/comment/    — kanban worker + orchestrator
-    heartbeat/show/list/create/            handoff (stateless: read env var,
-    unblock/link)                          write ~/.hermes/kanban.db)
-
-What we DO NOT expose:
-  - terminal / shell                     — codex's own shell tool
-  - read_file / write_file / patch       — codex's apply_patch + shell
-  - search_files / process               — codex's shell
-  - clarify                              — codex's own UX
-  - delegate_task / memory /             — `_AGENT_LOOP_TOOLS` in Hermes
-    session_search / todo                  (model_tools.py). They require
-                                           the running AIAgent context to
-                                           dispatch (mid-loop state), so a
-                                           stateless MCP callback can't
-                                           drive them. See the inline
-                                           comment on EXPOSED_TOOLS below.
-
-Run with: python -m agent.transports.hermes_tools_mcp_server
-Spawned by: CodexAppServerSession.ensure_started() or the task-scoped
-            Claude primary adapter.
+Codex owns the loop and tool list there, so a curated subset of Hermes tools is
+exposed over stdio MCP; codex registers it via ``~/.codex/config.toml
+[mcp_servers.hermes-tools]``. Run: ``python -m agent.transports.hermes_tools_mcp_server``.
 """
 
 from __future__ import annotations
@@ -54,14 +19,7 @@ from pydantic import WithJsonSchema
 logger = logging.getLogger(__name__)
 
 # JSON Schema type -> Python type mapping for signature generation
-_JSON_TO_PY = {
-    "string": str,
-    "integer": int,
-    "number": float,
-    "boolean": bool,
-    "array": list,
-    "object": dict,
-}
+_JSON_TO_PY = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
 
 
 def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict[str, type]]:
@@ -99,18 +57,22 @@ def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict
     return inspect.Signature(params, return_annotation=str), annots
 
 
-# Codex-app compatibility tools. Each name MUST match a registered Hermes tool that
-# `model_tools.handle_function_call()` can dispatch.
-#
-# What we deliberately DO NOT expose:
-#   - terminal / shell / read_file / write_file / patch / search_files /
-#     process — codex's built-ins cover these and approval routes through
-#     codex's own UI.
-#   - delegate_task / memory / session_search / todo — these are
-#     `_AGENT_LOOP_TOOLS` in Hermes (model_tools.py:493). They require
-#     the running AIAgent context to dispatch (mid-loop state), so a
-#     stateless MCP callback can't drive them. Hermes' default runtime
-#     keeps these working; the codex_app_server runtime cannot.
+# Each name MUST match a registered Hermes tool ``model_tools.handle_function_call()`` can dispatch.
+# NOT exposed: terminal/file/search/process/clarify (codex built-ins + its own approval UI);
+# delegate_task/memory/session_search/todo (need the running AIAgent context).
+EXPOSED_TOOLS: tuple[str, ...] = (
+    "web_search", "web_extract",
+    "browser_navigate", "browser_click", "browser_type", "browser_press", "browser_snapshot", "browser_scroll",
+    "browser_back", "browser_get_images", "browser_console", "browser_vision",
+    "vision_analyze", "image_generate", "skill_view", "skills_list", "text_to_speech",
+    # Kanban handoff tools: stateless (read HERMES_KANBAN_TASK, write kanban.db).
+    # Without them a codex-runtime worker can't report completion and hangs.
+    "kanban_complete", "kanban_block", "kanban_request_review", "kanban_request_changes", "kanban_comment",
+    "kanban_heartbeat", "kanban_show", "kanban_list",
+    # Orchestrator-only (the kanban tool gates them on HERMES_KANBAN_TASK unset).
+    "kanban_create", "kanban_unblock", "kanban_link",
+)
+
 CODEX_APP_TOOLS: tuple[str, ...] = (
     "web_search",
     "web_extract",
@@ -152,6 +114,8 @@ CODEX_APP_TOOLS: tuple[str, ...] = (
     "kanban_unblock",
     "kanban_link",
 )
+
+
 
 PRODUCT_OWNER_TOOLS: tuple[str, ...] = (
     "kanban_show",
@@ -241,23 +205,14 @@ def selected_tool_names(environ=None) -> tuple[str, ...]:
 
 
 def _build_server() -> Any:
-    """Create the MCP server with Hermes tools attached. Lazy imports
-    so the module can be imported without the mcp package installed
-    (we degrade to a clear error only when actually run)."""
+    """Create the MCP server with Hermes tools attached (lazy imports: importable without ``mcp``)."""
     try:
-        # mcp 2.0 removed `mcp.server.fastmcp`; `mcp.server.MCPServer` is the
-        # same decorator/add_tool surface under the new name.
+        # mcp 2.0 renamed `mcp.server.fastmcp` to `mcp.server.MCPServer` (same surface).
         from mcp.server import MCPServer
     except ImportError as exc:  # pragma: no cover - install hint
-        raise ImportError(
-            f"hermes-tools MCP server requires the 'mcp' package: {exc}"
-        ) from exc
+        raise ImportError(f"hermes-tools MCP server requires the 'mcp' package: {exc}") from exc
 
-    # Discover Hermes tools so dispatch works.
-    from model_tools import (
-        get_tool_definitions,
-        handle_function_call,
-    )
+    from model_tools import get_tool_definitions, handle_function_call
 
     capability_set = (
         os.environ.get("HERMES_MCP_CAPABILITY_SET") or "codex-app"
@@ -270,8 +225,7 @@ def _build_server() -> Any:
         ),
     )
 
-    # Pull authoritative Hermes tool schemas for the ones we expose, so
-    # MCP clients see the same parameter docs Hermes gives the model.
+    # Authoritative Hermes schemas so MCP clients see the same parameter docs the model does.
     all_defs = {
         td["function"]["name"]: td["function"]
         for td in (
@@ -284,65 +238,43 @@ def _build_server() -> Any:
         if isinstance(td, dict) and td.get("type") == "function"
     }
 
+    def _make_handler(tool_name: str, schema: dict | None, description: str):
+        # The SDK derives the input schema from the callable's signature, so synthesize it from the JSON Schema.
+        sig, annots = _signature_from_schema(schema)
+
+        def _dispatch(**kwargs: Any) -> str:
+            try:
+                # Drop None so unset optionals aren't forwarded to the handler.
+                return handle_function_call(tool_name, {k: v for k, v in kwargs.items() if v is not None})
+            except Exception as exc:
+                logger.exception("tool %s raised", tool_name)
+                return json.dumps({"error": str(exc), "tool": tool_name})
+
+        _dispatch.__name__ = tool_name
+        _dispatch.__doc__ = description
+        _dispatch.__signature__ = sig
+        _dispatch.__annotations__ = {**annots, "return": str}
+        return _dispatch
+
+
     selected = selected_tool_names()
     exposed_count = 0
 
     for name in selected:
         spec = all_defs.get(name)
         if spec is None:
-            logger.debug(
-                "skipping %s — not registered in this Hermes process", name
-            )
+            logger.debug("skipping %s — not registered in this Hermes process", name)
             continue
-
         description = spec.get("description") or f"Hermes {name} tool"
         params_schema = spec.get("parameters") or {"type": "object", "properties": {}}
-
-        # The SDK wants a Python callable and derives the input schema from
-        # its signature — there is no inputSchema parameter on either the
-        # decorator or add_tool(). So build a closure that takes the arguments
-        # dict, dispatches via handle_function_call, returns the result
-        # string, and carries a __signature__ synthesized from the Hermes
-        # JSON Schema (see _signature_from_schema) for the SDK to read.
-        def _make_handler(tool_name: str, schema: dict | None):
-            sig, annots = _signature_from_schema(schema)
-
-            def _dispatch(**kwargs: Any) -> str:
-                try:
-                    # Filter out None values before dispatch so unset optionals
-                    # aren't forwarded to the handler.
-                    args = {k: v for k, v in kwargs.items() if v is not None}
-                    return handle_function_call(tool_name, args or {})
-                except Exception as exc:
-                    logger.exception("tool %s raised", tool_name)
-                    return json.dumps({"error": str(exc), "tool": tool_name})
-
-            _dispatch.__name__ = tool_name
-            _dispatch.__doc__ = description
-            _dispatch.__signature__ = sig
-            _dispatch.__annotations__ = {**annots, "return": str}
-            return _dispatch
-
         try:
-            mcp.add_tool(
-                _make_handler(name, params_schema),
-                name=name,
-                description=description,
-            )
+            mcp.add_tool(_make_handler(name, params_schema, description), name=name, description=description)
         except TypeError:
-            # Older mcp SDK signature — fall back to decorator-style. The
-            # synthesized __signature__ on the handler still drives schema
-            # generation there.
-            handler = _make_handler(name, params_schema)
-            handler = mcp.tool(name=name, description=description)(handler)
-
+            # Older mcp SDK: decorator-style registration; __signature__ still drives schema.
+            mcp.tool(name=name, description=description)(_make_handler(name, params_schema, description))
         exposed_count += 1
 
-    logger.info(
-        "hermes-tools MCP server registered %d/%d tools",
-        exposed_count,
-        len(selected),
-    )
+    logger.info("hermes-tools MCP server registered %d/%d tools", exposed_count, len(EXPOSED_TOOLS))
     return mcp
 
 
@@ -350,15 +282,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     """Entry point for `python -m agent.transports.hermes_tools_mcp_server`."""
     argv = argv or sys.argv[1:]
     verbose = "--verbose" in argv or "-v" in argv
-
-    log_level = logging.INFO if verbose else logging.WARNING
     logging.basicConfig(
-        level=log_level,
+        level=logging.INFO if verbose else logging.WARNING,
         stream=sys.stderr,  # MCP uses stdio for protocol — logs MUST go to stderr
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-
-    # Quiet mode: keep Hermes' own banners off stdout (which is the MCP wire).
+    # Keep Hermes' own banners off stdout (the MCP wire).
     os.environ.setdefault("HERMES_QUIET", "1")
     os.environ.setdefault("HERMES_REDACT_SECRETS", "true")
 
@@ -367,13 +296,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     except ImportError as exc:
         sys.stderr.write(f"hermes-tools MCP server cannot start: {exc}\n")
         return 2
-
-    # MCPServer.run() defaults to stdio transport, which is what codex
-    # spawns us on.
     try:
-        server.run()
+        server.run()  # defaults to stdio transport, which codex spawns us on
     except KeyboardInterrupt:
-        return 0
+        pass
     except Exception as exc:
         logger.exception("hermes-tools MCP server crashed")
         sys.stderr.write(f"hermes-tools MCP server error: {exc}\n")

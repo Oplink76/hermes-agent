@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from hermes_cli import kanban_db_dispatch
 from hermes_cli import kanban_db
 
 PRODUCT_OWNER_PROFILE = "productowner"
@@ -173,7 +174,7 @@ def _spawn_product_owner_intake(
         env["TERMINAL_CWD"] = candidate
 
     cmd = [
-        *kanban_db._resolve_hermes_argv(),
+        *kanban_db_dispatch._resolve_hermes_argv(),
         "-p",
         profile,
         "--cli",

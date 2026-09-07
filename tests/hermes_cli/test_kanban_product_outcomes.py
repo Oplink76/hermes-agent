@@ -11,6 +11,8 @@ from typing import Any
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
+import hermes_cli.kanban_db_dispatch as kanban_db_dispatch
 from hermes_cli import kanban_product_outcomes as outcomes
 from hermes_cli.kanban_product_outcomes import (
     ApprovedCandidate,
@@ -43,7 +45,7 @@ def _v2_product_board(name: str) -> None:
 
 
 def _seed_product_card(board: str, *, step: str, assignee: str) -> tuple[str, int]:
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = kb.create_task(
             conn,
             title="Story: canonical outcome",
@@ -216,7 +218,7 @@ def test_missing_canonical_outcome_rejects_before_product_mutation(
     task_id, expected_run_id = _seed_product_card(
         board, step="review", assignee="reviewer"
     )
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         before = conn.execute(
             "SELECT status, current_step_key, assignee, current_run_id, rework_count "
             "FROM tasks WHERE id = ?",
@@ -266,7 +268,7 @@ def test_privileged_metadata_cannot_bypass_ordinary_completion(
     board = f"impersonation-{phase}-{claimed}"
     _v2_product_board(board)
     task_id, expected_run_id = _seed_product_card(board, step=phase, assignee=assignee)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         with pytest.raises(ProductOutcomeError) as raised:
             kb.complete_task(
                 conn,
@@ -294,7 +296,7 @@ def test_run_410_advances_and_records_only_safe_leak_observation(kanban_home):
     task_id, expected_run_id = _seed_product_card(
         board, step="review", assignee="reviewer"
     )
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         assert kb.complete_task(
             conn,
             task_id,
@@ -345,7 +347,7 @@ def test_production_preflight_repairs_use_structural_resolver_path(
     board = f"resolver-fixture-{run_id}"
     _v2_product_board(board)
     row = _production_envelope(run_id)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id, first_run_id = _seed_product_card(
             board, step="test", assignee="tester"
         )
@@ -403,9 +405,9 @@ def test_rejected_completion_then_clean_exit_is_a_protocol_violation(
     board = "rejected-completion-clean-exit"
     _v2_product_board(board)
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
-    monkeypatch.setattr(kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
+    monkeypatch.setattr(kanban_db_dispatch, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = kb.create_task(
             conn,
             title="Story: rejected completion",
@@ -432,7 +434,7 @@ def test_rejected_completion_then_clean_exit_is_a_protocol_violation(
                 board=board,
             )
         assert raised.value.code == "missing"
-        assert kb.detect_crashed_workers(conn) == [task_id]
+        assert kanban_db_dispatch.detect_crashed_workers(conn) == [task_id]
         task = kb.get_task(conn, task_id)
         run = kb.get_run(conn, claimed.current_run_id)
         events = kb.list_events(conn, task_id)

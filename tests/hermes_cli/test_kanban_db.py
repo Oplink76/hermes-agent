@@ -18,7 +18,14 @@ from pathlib import Path, PurePosixPath
 import pytest
 
 import hermes_state
+import hermes_state_wal
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
+import hermes_cli.kanban_db_workspace as kanban_db_workspace
+import shutil as shutil
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli.kanban_repository import (
     VerificationCommand,
     VerificationProfile,
@@ -85,7 +92,7 @@ def test_legacy_agent_memory_metadata_remains_readable_through_get_run(
         "unrelated": {"worker_session_id": "session-old"},
     }
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = kb.create_task(
             conn, title="Legacy run", initial_status="running", board=board
         )
@@ -105,7 +112,7 @@ def test_legacy_agent_memory_metadata_remains_readable_through_get_run(
 
 
 def test_init_creates_expected_tables(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         rows = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         ).fetchall()
@@ -126,7 +133,7 @@ def test_epic_record_schema_creates_only_the_three_additive_tables(kanban_home):
         "epic_release_members",
     }
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tables = {
             row["name"]
             for row in conn.execute(
@@ -146,7 +153,7 @@ def test_epic_record_migration_adds_only_three_tables_and_is_idempotent(tmp_path
         "epic_release_members",
     }
 
-    with kb.connect(db_path) as conn:
+    with kanban_db_connect.connect(db_path) as conn:
         modern_tables = {
             row["name"]
             for row in conn.execute(
@@ -158,7 +165,7 @@ def test_epic_record_migration_adds_only_three_tables_and_is_idempotent(tmp_path
         conn.execute("DROP TABLE story_integration_intents")
 
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-    with kb.connect(db_path) as conn:
+    with kanban_db_connect.connect(db_path) as conn:
         migrated_tables = {
             row["name"]
             for row in conn.execute(
@@ -170,7 +177,7 @@ def test_epic_record_migration_adds_only_three_tables_and_is_idempotent(tmp_path
     assert migrated_tables == modern_tables
 
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-    with kb.connect(db_path) as conn:
+    with kanban_db_connect.connect(db_path) as conn:
         rerun_tables = {
             row["name"]
             for row in conn.execute(
@@ -265,7 +272,7 @@ def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypa
     monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
 
     db_path = tmp_path / "kanban.db"
-    with kb._cross_process_init_lock(db_path):
+    with kbc._cross_process_init_lock(db_path):
         # Acquired exactly once via the non-blocking byte-range lock.
         assert [call[1:] for call in calls] == [(fake_msvcrt.LK_NBLCK, 1)]
 
@@ -330,7 +337,7 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     conn.commit()
     conn.close()
 
-    with kb.connect(db_path) as migrated:
+    with kbc.connect(db_path) as migrated:
         task_columns = {
             row["name"] for row in migrated.execute("PRAGMA table_info(tasks)")
         }
@@ -359,7 +366,7 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 
 def test_fresh_db_has_running_blocked_and_rework_columns(kanban_home):
     """New state-model and bounded-rework columns exist on fresh DBs."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     assert "running" in cols
     assert "blocked" in cols
@@ -403,7 +410,7 @@ def test_legacy_db_gains_running_and_blocked_columns_without_data_loss(tmp_path)
     conn.commit()
     conn.close()
 
-    with kb.connect(db_path) as migrated:
+    with kanban_db_connect.connect(db_path) as migrated:
         cols = {row["name"] for row in migrated.execute("PRAGMA table_info(tasks)")}
         row = migrated.execute(
             "SELECT title, status, created_at, running, blocked, rework_count FROM tasks "
@@ -422,7 +429,7 @@ def test_legacy_db_gains_running_and_blocked_columns_without_data_loss(tmp_path)
     assert row["rework_count"] == 0
 
     # Idempotent: connecting again does not error or duplicate columns.
-    with kb.connect(db_path) as migrated_again:
+    with kanban_db_connect.connect(db_path) as migrated_again:
         cols_again = [
             row["name"] for row in migrated_again.execute("PRAGMA table_info(tasks)")
         ]
@@ -483,7 +490,7 @@ def test_legacy_status_honors_custom_meta_column_status(kanban_home):
 
 def test_legacy_status_accepts_real_sqlite_row(kanban_home):
     """The helper must also accept a real ``sqlite3.Row``, not just a dict."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         row = conn.execute(
             "SELECT 'development' AS current_step_key, 1 AS running, 0 AS blocked"
         ).fetchone()
@@ -504,7 +511,7 @@ def _v2_product_board(name: str) -> None:
 
 
 def _seed_v2_card(board: str, *, step: str = "development") -> str:
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -517,7 +524,7 @@ def _seed_v2_card(board: str, *, step: str = "development") -> str:
 def _seed_stale_terminal_card(board: str, *, phase: str = "development") -> tuple[str, int, int]:
     task_id = _seed_v2_card(board, step=phase)
     completed_at = 1_700_000_123
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         with kb.authorized_governance_write(), kb.write_txn(conn):
             conn.execute(
                 """
@@ -546,7 +553,7 @@ def test_clear_terminal_state_clears_only_the_stale_generic_terminal_flag(kanban
     _v2_product_board(board)
     task_id, completed_at, event_id = _seed_stale_terminal_card(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         before = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
         before_runs = [
             tuple(row)
@@ -608,7 +615,7 @@ def test_clear_terminal_state_refuses_stale_cas_fields(kanban_home, field):
     board = f"clear-terminal-stale-{field}"
     _v2_product_board(board)
     task_id, completed_at, event_id = _seed_stale_terminal_card(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         before = {
             "task": tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()),
             "events": [
@@ -640,7 +647,7 @@ def test_clear_terminal_state_refuses_non_done_status(kanban_home):
     board = "clear-terminal-non-done"
     _v2_product_board(board)
     task_id, completed_at, event_id = _seed_stale_terminal_card(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
         conn.commit()
         before = {
@@ -664,7 +671,7 @@ def test_clear_terminal_state_refuses_already_terminal_phase(kanban_home):
     board = "clear-terminal-terminal-phase"
     _v2_product_board(board)
     task_id, completed_at, event_id = _seed_stale_terminal_card(board, phase="done")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         before = {
             "task": tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()),
             "events": len(kb.list_events(conn, task_id)),
@@ -699,14 +706,14 @@ def test_clear_terminal_state_refuses_empty_actor_or_reason(kanban_home, field, 
         "reason": "required reason",
     }
     values[field] = value
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         with pytest.raises(ValueError, match=field):
             kb.clear_terminal_state(conn, kb.ClearTerminalStateRequest(**values))
 
 
 @pytest.mark.parametrize("step", sorted(kb.PRODUCT_WORKFLOW_STEP_SET))
 def test_create_task_accepts_each_product_step(kanban_home, step):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn,
             title="Story: valid state",
@@ -718,7 +725,7 @@ def test_create_task_accepts_each_product_step(kanban_home, step):
 
 
 def test_create_task_infers_missing_product_step_from_explicit_intent(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn,
             title="Implementation work",
@@ -730,7 +737,7 @@ def test_create_task_infers_missing_product_step_from_explicit_intent(kanban_hom
 
 
 def test_create_task_allows_custom_workflow_step(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn,
             title="Custom flow",
@@ -742,7 +749,7 @@ def test_create_task_allows_custom_workflow_step(kanban_home):
 
 
 def test_create_task_keeps_legacy_step_without_product_template(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="Legacy flow", current_step_key="in_progress")
         task = kb.get_task(conn, tid)
     assert task is not None
@@ -751,13 +758,13 @@ def test_create_task_keeps_legacy_step_without_product_template(kanban_home):
 
 
 def test_create_task_rejects_unknown_project(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         with pytest.raises(ValueError, match="unknown project"):
             kb.create_task(conn, title="Lost governance", project_id="missing-project")
 
 
 def test_decomposed_child_preserves_complete_execution_context(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         root_id = kb.create_task(
             conn,
             title="Context root",
@@ -853,7 +860,7 @@ def test_product_rejection_routes_backward(
 ):
     board = f"rework-{step}-{target}"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story: rework",
@@ -898,7 +905,7 @@ def test_rework_directive_is_append_only_with_one_active_row(kanban_home):
     _v2_product_board(board)
     rejected_sha = "a" * 40
     replacement_sha = "b" * 40
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story: durable directive",
@@ -951,7 +958,7 @@ def test_rework_directive_routes_with_exact_sha_and_precedes_attempts(
     board = "rework-directive-context"
     _v2_product_board(board)
     rejected_sha = "e" * 40
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story: visible rework",
@@ -1009,7 +1016,7 @@ def test_rework_directive_resolves_only_after_new_development_sha(
         text=True,
     ).stdout.strip()
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story: resolve rework",
@@ -1069,7 +1076,7 @@ def test_rework_directive_resolves_only_after_new_development_sha(
 def test_product_rework_requires_nonempty_string_findings(kanban_home, findings):
     board = "rework-findings"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story: rework",
@@ -1102,7 +1109,7 @@ def test_product_rework_requires_nonempty_string_findings(kanban_home, findings)
 def test_product_rework_requires_expected_run_id(kanban_home):
     board = "rework-run-required"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story: rework",
@@ -1160,7 +1167,7 @@ def test_product_positive_rework_outcome_uses_forward_handoff(
 ):
     board = f"rework-positive-{step}"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story: accepted",
@@ -1216,7 +1223,7 @@ def test_product_positive_rework_verdict_must_match_phase(
 ):
     board = f"rework-positive-invalid-{step}"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story: invalid verdict",
@@ -1251,7 +1258,7 @@ def test_product_positive_rework_rejects_same_run_phase_change_before_handoff(
 ):
     board = "rework-positive-phase-cas"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story: phase-bound verdict",
@@ -1304,7 +1311,7 @@ def test_product_positive_rework_rejects_same_run_phase_change_before_handoff(
 def test_invalid_product_rework_does_not_commit_workflow_repair(kanban_home):
     board = "rework-invalid-no-repair"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story: legacy tester card",
@@ -1348,7 +1355,7 @@ def test_invalid_product_rework_does_not_commit_workflow_repair(kanban_home):
 def test_fourth_product_rejection_routes_to_human_block(kanban_home):
     board = "rework-limit"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story: bounded rework",
@@ -1551,14 +1558,14 @@ def test_create_task_refuses_resolver_assignee(kanban_home):
     A brand-new card has no preflight, so the Resolver it would spawn
     would hold `resolver_readonly` and no lifecycle exit at all.
     """
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         with pytest.raises(ValueError, match="resolver"):
             kb.create_task(conn, title="Ordinary goal", assignee="resolver")
         assert kb.list_tasks(conn) == []
 
 
 def test_assign_task_refuses_resolver_without_unresolved_preflight(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="Ordinary goal", assignee="developer")
         with pytest.raises(ValueError, match="resolver"):
             kb.assign_task(conn, tid, "resolver")
@@ -1570,7 +1577,7 @@ def test_assign_task_allows_resolver_on_unresolved_preflight(kanban_home):
     """The valid path: a product card already displaced to a preflight."""
     board = "resolver-assign-valid"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _run_id = _route_task_to_resolver(conn, board)
         assert kb.has_unresolved_product_preflight(conn, tid)
         conn.execute(
@@ -1596,17 +1603,17 @@ def test_dispatch_refuses_resolver_routing_before_creating_a_run(
     def fake_spawn(task, workspace):
         spawned_ids.append(task.id)
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="Ordinary goal", assignee="developer")
         # Bypass the routing guard the way the incident's cards got there.
         conn.execute("UPDATE tasks SET assignee='resolver' WHERE id=?", (tid,))
         conn.commit()
 
-        dry = kb.dispatch_once(conn, spawn_fn=fake_spawn, dry_run=True)
+        dry = kbd.dispatch_once(conn, spawn_fn=fake_spawn, dry_run=True)
         assert tid not in [row[0] for row in dry.spawned]
         assert tid in dry.skipped_nonspawnable
 
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
         task = kb.get_task(conn, tid)
         runs = conn.execute(
             "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (tid,)
@@ -1635,7 +1642,7 @@ def test_dispatch_allows_resolver_on_unresolved_preflight(
     def fake_spawn(task, workspace):
         spawned_ids.append(task.id)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _run_id = _route_task_to_resolver(conn, board)
         conn.execute(
             "UPDATE tasks SET claim_lock=NULL, claim_expires=NULL, "
@@ -1643,7 +1650,7 @@ def test_dispatch_allows_resolver_on_unresolved_preflight(
             (tid,),
         )
         conn.commit()
-        kb.dispatch_once(conn, spawn_fn=fake_spawn, board=board)
+        kbd.dispatch_once(conn, spawn_fn=fake_spawn, board=board)
 
     assert spawned_ids == [tid]
 
@@ -1651,7 +1658,7 @@ def test_dispatch_allows_resolver_on_unresolved_preflight(
 def test_complete_task_refuses_unresolved_preflight_without_mutation(kanban_home):
     board = "resolver-complete-refusal"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         before = _resolver_state(conn, tid)
         with pytest.raises(ValueError, match="use kanban_resolve"):
@@ -1682,7 +1689,7 @@ def test_complete_task_rejects_unresolved_test_review_without_mutation(
     """Ordinary completion validates Test/Review before the Resolver path."""
     board = f"resolver-complete-outcome-{step}"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board, step=step)
         before = _resolver_state(conn, tid)
         with pytest.raises(kb.ProductOutcomeError) as raised:
@@ -1716,7 +1723,7 @@ def test_complete_task_rejects_unresolved_test_review_without_mutation(
 def test_resolve_product_preflight_resume_uses_complete_snapshot(kanban_home):
     board = "resolver-entry-resume"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         request = _resolver_request(_resolver_expected(conn, tid, run_id))
         assert kb.resolve_product_preflight(
@@ -1749,7 +1756,7 @@ def test_resolve_product_preflight_rejects_legacy_fix_task_shape_without_mutatio
     """
     board = "resolver-legacy-fix-shape"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         fix_id = kb.create_task(
             conn,
@@ -1783,7 +1790,7 @@ def test_resolve_product_preflight_rejects_legacy_fix_task_shape_without_mutatio
 def test_resolve_product_preflight_escalates_without_completion_gate(kanban_home):
     board = "resolver-entry-escalate"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         request = _resolver_request(
             _resolver_expected(conn, tid, run_id),
@@ -1807,7 +1814,7 @@ def test_resolve_product_preflight_escalates_without_completion_gate(kanban_home
 def test_resolve_product_preflight_rejects_stale_event_with_zero_mutation(kanban_home):
     board = "resolver-stale-event"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         expected = _resolver_expected(conn, tid, run_id)
         expected["preflight_event_id"] += 1
@@ -1827,7 +1834,7 @@ def test_resolve_product_preflight_rejects_stale_event_with_zero_mutation(kanban
 def test_resolve_product_preflight_rejects_changed_snapshot_field_with_zero_mutation(kanban_home):
     board = "resolver-stale-field"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         expected = _resolver_expected(conn, tid, run_id)
         expected["branch_name"] = "changed-after-inspection"
@@ -1847,7 +1854,7 @@ def test_resolve_product_preflight_rejects_changed_snapshot_field_with_zero_muta
 def test_resolve_product_preflight_rejects_wrong_run_profile(kanban_home):
     board = "resolver-wrong-run-profile"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         conn.execute("UPDATE task_runs SET profile='developer' WHERE id=?", (run_id,))
         conn.commit()
@@ -1869,7 +1876,7 @@ def test_resolve_product_preflight_rejects_preflight_routed_to_other_profile(
 ):
     board = "resolver-wrong-preflight-profile"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         preflight = conn.execute(
             "SELECT id, payload FROM task_events "
@@ -1904,7 +1911,7 @@ def test_resolver_repair_rejects_overbound_governed_assignee_atomically(kanban_h
     metadata.setdefault("product_workflow", {}).setdefault("assignees", {})["developer"] = "D" * 300
     kb.board_metadata_path(board).write_text(json.dumps(metadata), encoding="utf-8")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         request = _resolver_request(
             _resolver_expected(conn, tid, run_id),
@@ -1940,7 +1947,7 @@ def test_resolver_repair_rejects_overbound_derived_workspace_path_atomically(
             board_slug=board,
         )
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         request = _resolver_request(
             _resolver_expected(conn, tid, run_id),
@@ -1963,7 +1970,7 @@ def test_resolver_repair_rejects_overbound_derived_workspace_path_atomically(
 def test_resolver_workflow_repair_is_atomic_and_returns_to_ordinary_role(kanban_home):
     board = "resolver-workflow-repair"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         request = _resolver_request(
             _resolver_expected(conn, tid, run_id),
@@ -1990,7 +1997,7 @@ def test_resolver_workflow_repair_is_atomic_and_returns_to_ordinary_role(kanban_
 def test_resolver_repair_requires_at_least_one_semantic_field(kanban_home):
     board = "resolver-empty-repair"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         before = _resolver_state(conn, tid)
         with pytest.raises(ValueError, match="repair"):
@@ -2012,7 +2019,7 @@ def test_resolver_repair_requires_at_least_one_semantic_field(kanban_home):
 def test_resolver_repair_rejects_unknown_project(kanban_home):
     board = "resolver-unknown-project"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         before = _resolver_state(conn, tid)
         with pytest.raises(ValueError, match="unknown project"):
@@ -2045,7 +2052,7 @@ def test_resolver_repair_derives_project_worktree_and_branch(kanban_home, tmp_pa
             primary_path=str(repo),
             board_slug=board,
         )
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         request = _resolver_request(
             _resolver_expected(conn, tid, run_id),
@@ -2079,7 +2086,7 @@ def test_resolver_project_adoption_preserves_existing_canonical_worktree(
     resolver_home = kanban_home / "profiles" / "resolver"
     resolver_home.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(resolver_home))
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Legacy project adoption",
@@ -2089,8 +2096,8 @@ def test_resolver_project_adoption_preserves_existing_canonical_worktree(
         )
         existing_workspace = repo / ".worktrees" / tid
         existing_workspace.mkdir(parents=True)
-        kb.set_workspace_path(conn, tid, existing_workspace)
-        kb.set_branch_name(conn, tid, f"wt/{tid}")
+        kanban_db_workspace.set_workspace_path(conn, tid, existing_workspace)
+        kanban_db_workspace.set_branch_name(conn, tid, f"wt/{tid}")
         _tid, run_id = _route_existing_task_to_resolver(conn, tid, board)
 
         assert kb.resolve_product_preflight(
@@ -2121,7 +2128,7 @@ def test_resolver_project_adoption_rewrites_unsafe_workspace_path(
 
     board = "resolver-project-unsafe-adoption"
     repo, project_id = _resolver_project_fixture(kanban_home, tmp_path, board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Unsafe project adoption",
@@ -2131,8 +2138,8 @@ def test_resolver_project_adoption_rewrites_unsafe_workspace_path(
         )
         monkeypatch.chdir(repo)
         unsafe_workspace = Path(".worktrees") / tid
-        kb.set_workspace_path(conn, tid, unsafe_workspace)
-        kb.set_branch_name(conn, tid, f"wt/{tid}")
+        kanban_db_workspace.set_workspace_path(conn, tid, unsafe_workspace)
+        kanban_db_workspace.set_branch_name(conn, tid, f"wt/{tid}")
         _tid, run_id = _route_existing_task_to_resolver(conn, tid, board)
 
         assert kb.resolve_product_preflight(
@@ -2161,7 +2168,7 @@ def test_resolver_project_adoption_rewrites_unsafe_workspace_path(
 def test_resolver_repair_rejects_phase_assignee_mismatch(kanban_home):
     board = "resolver-role-mismatch"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         before = _resolver_state(conn, tid)
         with pytest.raises(ValueError, match="assignee"):
@@ -2184,7 +2191,7 @@ def test_resolver_repair_rejects_phase_assignee_mismatch(kanban_home):
 def test_resolver_repair_cannot_target_release_done_or_archived(kanban_home, phase):
     board = f"resolver-terminal-{phase}"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         before = _resolver_state(conn, tid)
         with pytest.raises(ValueError, match="phase"):
@@ -2206,7 +2213,7 @@ def test_resolver_repair_cannot_target_release_done_or_archived(kanban_home, pha
 def test_framework_fault_can_only_escalate(kanban_home):
     board = "resolver-framework-only-escalate"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         with pytest.raises(ValueError, match="must escalate"):
             kb.resolve_product_preflight(
@@ -2227,7 +2234,7 @@ def test_framework_fault_can_only_escalate(kanban_home):
 def test_resolver_repair_does_not_change_test_or_review_runs(kanban_home):
     board = "resolver-preserve-runs"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board, step="test")
         prior_before = [
             tuple(row) for row in conn.execute(
@@ -2260,7 +2267,7 @@ def test_resolver_repair_does_not_change_test_or_review_runs(kanban_home):
 def test_successful_repair_appends_audit_and_needs_ole_events(kanban_home):
     board = "resolver-repair-audit"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         request = _resolver_request(
             _resolver_expected(conn, tid, run_id),
@@ -2304,7 +2311,7 @@ def test_resolver_cannot_change_epic_membership_or_dependencies(
 ):
     board = "resolver-immutable-relations"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         parent = kb.create_task(conn, title="Dependency", board=board)
         kb.link_tasks(conn, parent, tid)
@@ -2331,7 +2338,7 @@ def test_resolver_cannot_change_epic_membership_or_dependencies(
 def test_resolver_cannot_override_release_classification(kanban_home):
     board = "resolver-immutable-release"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         before = _resolver_state(conn, tid)
         request = _resolver_request(
@@ -2366,8 +2373,8 @@ def _route_project_task_with_audited_handoff(
     )
     task = kb.get_task(conn, tid)
     assert task is not None
-    workspace = kb.resolve_workspace(task, board=board)
-    kb.set_workspace_path(conn, tid, workspace)
+    workspace = kanban_db_workspace.resolve_workspace(task, board=board)
+    kanban_db_workspace.set_workspace_path(conn, tid, workspace)
     task = kb.get_task(conn, tid)
     assert task is not None and task.branch_name
     sha = _commit_file(workspace, "feature.py", "value = 1\n", "feature")
@@ -2422,7 +2429,7 @@ def test_adopt_handoff_sha_requires_same_task_development_handoff_event(
 ):
     board = "resolver-adopt-same-task"
     repo, project_id = _resolver_project_fixture(kanban_home, tmp_path, board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id, _workspace, sha = _route_project_task_with_audited_handoff(
             conn, board, repo, project_id,
         )
@@ -2452,7 +2459,7 @@ def test_adopt_handoff_sha_requires_current_project_branch_head(
 ):
     board = "resolver-adopt-current-head"
     repo, project_id = _resolver_project_fixture(kanban_home, tmp_path, board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id, workspace, old_sha = _route_project_task_with_audited_handoff(
             conn, board, repo, project_id,
         )
@@ -2479,7 +2486,7 @@ def test_development_handoff_uses_valid_adopted_sha_when_tree_is_clean(
 ):
     board = "resolver-adopt-clean-handoff"
     repo, project_id = _resolver_project_fixture(kanban_home, tmp_path, board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id, workspace, sha = _route_project_task_with_audited_handoff(
             conn, board, repo, project_id,
         )
@@ -2515,7 +2522,7 @@ def test_development_handoff_uses_valid_adopted_sha_when_tree_is_clean(
 def test_invalid_adopted_sha_leaves_task_and_git_untouched(kanban_home, tmp_path):
     board = "resolver-adopt-invalid-atomic"
     repo, project_id = _resolver_project_fixture(kanban_home, tmp_path, board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id, workspace, _sha = _route_project_task_with_audited_handoff(
             conn, board, repo, project_id,
         )
@@ -2552,7 +2559,7 @@ def test_product_preflight_resolver_validation_precedes_rework(
 ):
     board = f"resolver-before-rework-{step}"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board, step=step)
         target = "development"
         with pytest.raises(ValueError, match="kanban_resolve"):
@@ -2581,7 +2588,7 @@ def test_product_preflight_resolver_validation_precedes_rework(
 def test_product_preflight_requires_structured_resolver_action(kanban_home):
     board = "resolver-required"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         context = kb.build_worker_context(conn, tid)
         assert "## Required resolver action" in context
@@ -2612,7 +2619,7 @@ def test_product_preflight_resolver_action_requires_exact_shape(
 ):
     board = "resolver-exact-shape"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         request = _resolver_request(_resolver_expected(conn, tid, run_id))
         request.update(request_mutation)
@@ -2634,7 +2641,7 @@ def test_product_preflight_resolver_action_requires_exact_shape(
 def test_product_preflight_resume_restores_original_step(kanban_home):
     board = "resolver-resume"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         assert _resolve_preflight(
             conn, tid, run_id, board,
@@ -2652,7 +2659,7 @@ def test_product_preflight_resume_restores_original_step(kanban_home):
 def test_product_preflight_escalate_enters_human_block(kanban_home):
     board = "resolver-escalate"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, run_id = _route_task_to_resolver(conn, board)
         assert _resolve_preflight(
             conn, tid, run_id, board,
@@ -2673,7 +2680,7 @@ def test_product_preflight_escalate_enters_human_block(kanban_home):
 def test_story_title_infers_product_without_role_on_product_board(kanban_home):
     board = "story-intent"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(conn, title="Story: explicit user intent", board=board)
         task = kb.get_task(conn, tid)
     assert task is not None
@@ -2688,7 +2695,7 @@ def test_set_phase_v2_board_updates_step_and_syncs_status(kanban_home, monkeypat
     tid = _seed_v2_card(board, step="development")
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.set_phase(conn, tid, "review", board=board)
         row = conn.execute(
             "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
@@ -2708,7 +2715,7 @@ def test_set_running_v2_board_sets_flag_and_syncs_status(kanban_home, monkeypatc
     tid = _seed_v2_card(board, step="development")
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.set_running(conn, tid, True, board=board)
         row = conn.execute(
             "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
@@ -2728,7 +2735,7 @@ def test_set_blocked_v2_board_sets_flag_and_syncs_status(kanban_home, monkeypatc
     tid = _seed_v2_card(board, step="development")
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.set_blocked(conn, tid, True, board=board, reason="waiting on human")
         row = conn.execute(
             "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
@@ -2748,7 +2755,7 @@ def test_set_blocked_false_clears_back_to_phase_status(kanban_home, monkeypatch)
     _v2_product_board(board)
     tid = _seed_v2_card(board, step="development")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         kb.set_blocked(conn, tid, True, board=board)
         result = kb.set_blocked(conn, tid, False, board=board)
         row = conn.execute(
@@ -2771,7 +2778,7 @@ def test_set_blocked_false_clears_back_to_phase_status(kanban_home, monkeypatch)
 
 def test_set_phase_legacy_board_is_noop(kanban_home):
     """Legacy (non-v2) boards must be byte-for-byte unchanged."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="Legacy task")
         before = dict(conn.execute(
             "SELECT current_step_key, status, running, blocked FROM tasks WHERE id = ?",
@@ -2788,7 +2795,7 @@ def test_set_phase_legacy_board_is_noop(kanban_home):
 
 
 def test_set_running_legacy_board_is_noop(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="Legacy task")
         before = dict(conn.execute(
             "SELECT current_step_key, status, running, blocked FROM tasks WHERE id = ?",
@@ -2805,7 +2812,7 @@ def test_set_running_legacy_board_is_noop(kanban_home):
 
 
 def test_set_blocked_legacy_board_is_noop(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="Legacy task")
         before = dict(conn.execute(
             "SELECT current_step_key, status, running, blocked FROM tasks WHERE id = ?",
@@ -2826,7 +2833,7 @@ def test_set_phase_product_board_without_handoff_v2_is_noop(kanban_home, monkeyp
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     board = "product-no-v2"
     kb.create_board(board, name="Product No V2", preset="product")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn, title="Story", workflow_template_id="product", current_step_key="development",
         )
@@ -2843,7 +2850,7 @@ def test_set_phase_missing_task_returns_false(kanban_home, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     board = "v2-missing-phase"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.set_phase(conn, "does-not-exist", "review", board=board)
     assert result is False
 
@@ -2852,7 +2859,7 @@ def test_set_running_missing_task_returns_false(kanban_home, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     board = "v2-missing-running"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.set_running(conn, "does-not-exist", True, board=board)
     assert result is False
 
@@ -2861,7 +2868,7 @@ def test_set_blocked_missing_task_returns_false(kanban_home, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     board = "v2-missing-blocked"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.set_blocked(conn, "does-not-exist", True, board=board)
     assert result is False
 
@@ -2896,7 +2903,7 @@ def test_set_blocked_after_running_raises_limbo_and_leaves_card_unchanged(kanban
     _v2_product_board(board)
     tid = _seed_v2_card(board, step="development")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         kb.set_running(conn, tid, True, board=board)
         before = dict(conn.execute(
             "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
@@ -2923,7 +2930,7 @@ def test_set_running_after_blocked_raises_limbo_and_leaves_card_unchanged(kanban
     _v2_product_board(board)
     tid = _seed_v2_card(board, step="development")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         kb.set_blocked(conn, tid, True, board=board)
         before = dict(conn.execute(
             "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
@@ -2966,7 +2973,7 @@ def test_set_running_after_blocked_raises_limbo_and_leaves_card_unchanged(kanban
 
 
 def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="delayed recheck", assignee="ops")
         assert kb.schedule_task(conn, t, reason="run next week") is True
         task = kb.get_task(conn, t)
@@ -2993,11 +3000,11 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
     import json
     import hermes_cli.kanban_db as _kb
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, t, claimer=f"{host}:worker")
-        kb._set_worker_pid(conn, t, 12345)
+        kbd._set_worker_pid(conn, t, 12345)
         old_expires = int(time.time()) - 3600
         hb_at = int(time.time()) - 1800
         conn.execute(
@@ -3048,11 +3055,12 @@ def test_rate_limit_exit_requeues_without_counting_failure(
     ``consecutive_failures`` untouched — the breaker must never trip on a
     transient throttle, even across many quota-wall hits."""
     import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         host = _kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="rl", assignee="a")
 
@@ -3070,14 +3078,14 @@ def test_rate_limit_exit_requeues_without_counting_failure(
                 (pid, 0, tid),
             )
             conn.commit()
-            _kb._record_worker_exit(
+            _kbd._record_worker_exit(
                 pid, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE)
             )
 
-            crashed = kb.detect_crashed_workers(conn)
+            crashed = kbd.detect_crashed_workers(conn)
             # Rate-limited requeues are NOT crashes.
             assert tid not in crashed
-            rl = getattr(_kb.detect_crashed_workers, "_last_rate_limited", [])
+            rl = getattr(_kbd.detect_crashed_workers, "_last_rate_limited", [])
             assert tid in rl
 
             task = kb.get_task(conn, tid)
@@ -3116,7 +3124,7 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
     monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
     now = 5_000_000
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="rl-guard", assignee="a")
         # Seed a rate_limited run that just ended + the stamped error.
         kb.claim_task(conn, tid)
@@ -3136,12 +3144,12 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
 
         # Inside cooldown → defer with the rate-limit-specific reason.
         monkeypatch.setattr(_kb.time, "time", lambda: now + 100)
-        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+        assert kbd.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
 
         # Past cooldown → allowed (None), NOT trapped by blocker_auth even
         # though last_failure_error contains "rate-limited".
         monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
-        assert kb.check_respawn_guard(conn, tid) is None
+        assert kbd.check_respawn_guard(conn, tid) is None
 
 
 
@@ -3171,7 +3179,7 @@ def test_unblock_restores_product_step_assignee(
 ):
     board = f"unblock-restores-{step}"
     kb.ensure_product_board_defaults(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Escalated card",
@@ -3193,7 +3201,7 @@ def test_unblock_restores_product_step_assignee(
 def test_unblock_keeps_release_measure_unassigned(kanban_home):
     board = "unblock-keeps-release-unassigned"
     kb.ensure_product_board_defaults(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Release gate",
@@ -3215,7 +3223,7 @@ def test_unblock_keeps_release_measure_unassigned(kanban_home):
 def test_unblock_does_not_clear_unmapped_executable_phase(kanban_home):
     board = "unblock-keeps-unmapped-executable-phase"
     kb.ensure_product_board_defaults(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Temporarily unmapped phase",
@@ -3242,7 +3250,7 @@ def test_unblock_does_not_clear_unmapped_executable_phase(kanban_home):
 def test_unblock_keeps_custom_workflow_assignee_on_product_board(kanban_home):
     board = "unblock-keeps-custom-workflow-route"
     kb.ensure_product_board_defaults(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Custom workflow task",
@@ -3269,7 +3277,7 @@ def test_unblock_uses_custom_non_strict_product_assignee(kanban_home):
     meta["product_workflow"]["assignees"]["developer"] = "custom-developer"
     meta_path.write_text(json.dumps(meta), encoding="utf-8")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Custom-routed product task",
@@ -3289,7 +3297,7 @@ def test_unblock_uses_custom_non_strict_product_assignee(kanban_home):
 
 
 def test_unblock_keeps_non_product_assignee_unchanged(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn,
             title="Generic blocked task",
@@ -3308,7 +3316,7 @@ def test_unblock_keeps_non_product_assignee_unchanged(kanban_home):
 
 def test_unblock_resets_failure_counters(kanban_home):
     """unblock_task must reset consecutive_failures and last_failure_error."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         kb.claim_task(conn, t)
         assert kb.block_task(conn, t, reason="need input")
@@ -3334,7 +3342,7 @@ def test_recompute_ready_skips_tasks_at_failure_limit(kanban_home):
     budget would cycle forever: block → auto-recover (counter reset)
     → respawn → budget exhausted → block → …
     """
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="a")
         child = kb.create_task(conn, title="child", assignee="a",
                                parents=[parent])
@@ -3345,12 +3353,12 @@ def test_recompute_ready_skips_tasks_at_failure_limit(kanban_home):
         # Simulate the child having exhausted its budget twice,
         # hitting the default failure limit (2).
         kb.claim_task(conn, child)
-        kb._record_task_failure(
+        kbd._record_task_failure(
             conn, child, error="budget exhausted 1",
             outcome="timed_out", release_claim=True, end_run=True,
             failure_limit=2,
         )
-        kb._record_task_failure(
+        kbd._record_task_failure(
             conn, child, error="budget exhausted 2",
             outcome="timed_out", release_claim=True, end_run=True,
             failure_limit=2,
@@ -3375,11 +3383,11 @@ def test_recompute_ready_skips_tasks_at_failure_limit(kanban_home):
 def test_recompute_ready_recovers_below_limit(kanban_home):
     """recompute_ready auto-recovers blocked tasks that haven't hit the
     failure limit yet — the counter is preserved across recovery."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="task", assignee="a")
         kb.claim_task(conn, t)
         # One failure, below the default limit of 2.
-        kb._record_task_failure(
+        kbd._record_task_failure(
             conn, t, error="budget exhausted 1",
             outcome="timed_out", release_claim=True, end_run=True,
             failure_limit=2,
@@ -3412,7 +3420,7 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
     breaker — sticking a task prematurely (config limit > default) or
     letting a tripped task escape (config limit < default).
     """
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         # Config allows MORE retries than the default. A task blocked
         # with failures below the configured limit must still recover.
         t = kb.create_task(conn, title="lenient", assignee="a")
@@ -3466,7 +3474,7 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
 
 
 def test_approve_unblock_task_checks_snapshot_and_comments_atomically(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn,
             title="Approve blocked card",
@@ -3507,7 +3515,7 @@ def test_approve_unblock_task_checks_snapshot_and_comments_atomically(kanban_hom
 
 
 def test_approve_unblock_task_rejects_stale_snapshot_without_comment(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="Current title", initial_status="blocked")
 
         with pytest.raises(RuntimeError, match="refresh"):
@@ -3533,7 +3541,7 @@ def test_approve_unblock_task_rejects_stale_snapshot_without_comment(kanban_home
 
 
 def test_approve_unblock_task_uses_todo_when_parent_is_not_done(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         parent = kb.create_task(conn, title="parent")
         child = kb.create_task(conn, title="Blocked child", parents=[parent])
         conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (child,))
@@ -3555,7 +3563,7 @@ def test_approve_unblock_task_uses_todo_when_parent_is_not_done(kanban_home):
 
 
 def test_assign_refuses_while_running(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         kb.claim_task(conn, t)
         with pytest.raises(RuntimeError, match="currently running"):
@@ -3564,7 +3572,7 @@ def test_assign_refuses_while_running(kanban_home):
 
 
 def test_delete_archived_task_removes_related_rows(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parent = kb.create_task(conn, title="parent")
         tid = kb.create_task(conn, title="child", parents=[parent], assignee="worker")
         kb.add_comment(conn, tid, "user", "cleanup me")
@@ -3588,7 +3596,7 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
 
 
 def test_delete_task_removes_task_and_cascades(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="to-delete", assignee="alice")
         kb.add_comment(conn, t, "user", "comment")
         kb.add_comment(conn, t, "user", "another")
@@ -3614,9 +3622,9 @@ def test_worker_context_marks_product_test_as_evidence_only(
     _init_git_repo(repo)
     _v2_product_board_with_repo(board, repo)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _workspace, _branch = _seed_product_test_worktree(conn, board, repo)
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             board=board,
             spawn_fn=lambda *args, **kwargs: 5252,
@@ -3659,31 +3667,31 @@ def test_worker_context_marks_product_test_as_evidence_only(
 
 def test_respawn_guard_blocker_auth_on_authentication_error(kanban_home):
     """Full word 'Authentication' triggers blocker_auth (regex covers auth\\w*)."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="authn-task", assignee="alice")
         conn.execute(
             "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
             ("Authentication failed: invalid credentials", t),
         )
-        reason = kb.check_respawn_guard(conn, t)
+        reason = kbd.check_respawn_guard(conn, t)
     assert reason == "blocker_auth"
 
 
 def test_respawn_guard_blocker_auth_on_authorization_error(kanban_home):
     """Full word 'authorization' triggers blocker_auth (regex covers auth\\w*)."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="authz-task", assignee="alice")
         conn.execute(
             "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
             ("authorization denied for scope repo", t),
         )
-        reason = kb.check_respawn_guard(conn, t)
+        reason = kbd.check_respawn_guard(conn, t)
     assert reason == "blocker_auth"
 
 
 def test_respawn_guard_recent_success(kanban_home):
     """A completed run within the guard window triggers recent_success."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="already-done", assignee="alice")
         now = int(time.time())
         conn.execute(
@@ -3691,7 +3699,7 @@ def test_respawn_guard_recent_success(kanban_home):
             "VALUES (?, 'done', 'completed', ?, ?)",
             (t, now - 120, now - 60),
         )
-        reason = kb.check_respawn_guard(conn, t)
+        reason = kbd.check_respawn_guard(conn, t)
     assert reason == "recent_success"
 
 
@@ -3701,7 +3709,7 @@ def test_respawn_guard_advanced_outcome_does_not_park_pipeline(kanban_home):
     full guard window. This is the regression that stalled the Trading Company
     board when a parallel branch stamped step-advances as 'completed'."""
     kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = kb.create_task(
             conn,
             title="User story: pipeline hop",
@@ -3716,7 +3724,7 @@ def test_respawn_guard_advanced_outcome_does_not_park_pipeline(kanban_home):
             product_role_assignees={"developer": "developer-profile"},
         )
         latest = kb.latest_run(conn, tid)
-        reason = kb.check_respawn_guard(conn, tid)
+        reason = kbd.check_respawn_guard(conn, tid)
     assert latest.outcome == "advanced", "step-advance must not be 'completed'"
     assert reason is None, f"pipeline card wrongly parked: {reason}"
 
@@ -3726,7 +3734,7 @@ def test_respawn_guard_recent_success_bypassed_by_requeue(kanban_home):
     promote, unblock, reclaim) is a deliberate re-run and must bypass the
     recent_success guard — otherwise a manual done->ready just sits there
     until the window elapses."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="rerun-me", assignee="alice")
         now = int(time.time())
         conn.execute(
@@ -3735,54 +3743,54 @@ def test_respawn_guard_recent_success_bypassed_by_requeue(kanban_home):
             (t, now - 120, now - 60),
         )
         # Baseline: a recent completion defers the respawn.
-        assert kb.check_respawn_guard(conn, t) == "recent_success"
+        assert kbd.check_respawn_guard(conn, t) == "recent_success"
         # Operator drags done -> ready: a 'status' event after completion.
         conn.execute(
             "INSERT INTO task_events (task_id, kind, created_at) "
             "VALUES (?, 'status', ?)",
             (t, now - 10),
         )
-        assert kb.check_respawn_guard(conn, t) is None
+        assert kbd.check_respawn_guard(conn, t) is None
 
 
 def test_respawn_guard_stale_success_not_guarded(kanban_home):
     """A completed run outside the guard window does not block re-spawn."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="old-done", assignee="alice")
-        old_end = int(time.time()) - kb._RESPAWN_GUARD_SUCCESS_WINDOW - 60
+        old_end = int(time.time()) - kbd._RESPAWN_GUARD_SUCCESS_WINDOW - 60
         conn.execute(
             "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
             "VALUES (?, 'done', 'completed', ?, ?)",
             (t, old_end - 300, old_end),
         )
-        reason = kb.check_respawn_guard(conn, t)
+        reason = kbd.check_respawn_guard(conn, t)
     assert reason is None
 
 
 def test_respawn_guard_active_pr_in_comment(kanban_home):
     """A GitHub PR URL in a recent comment triggers active_pr."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         kb.add_comment(
             conn, t, "worker",
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
         )
-        reason = kb.check_respawn_guard(conn, t)
+        reason = kbd.check_respawn_guard(conn, t)
     assert reason == "active_pr"
 
 
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="old-pr", assignee="alice")
-        old_ts = int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW - 60
+        old_ts = int(time.time()) - kbd._RESPAWN_GUARD_PR_WINDOW - 60
         conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, 'worker', "
             "'PR: https://github.com/totemx-AI/subsidysmart/pull/10', ?)",
             (t, old_ts),
         )
-        reason = kb.check_respawn_guard(conn, t)
+        reason = kbd.check_respawn_guard(conn, t)
     assert reason is None
 
 
@@ -3805,13 +3813,13 @@ def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
     def fake_spawn(task, workspace):
         spawned_ids.append(task.id)
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="quota-storm", assignee="alice")
         conn.execute(
             "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
             ("rate limit exceeded: 429 Too Many Requests", t),
         )
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
 
     # Critical: task is NOT auto-blocked on first occurrence.
     assert t not in res.auto_blocked, (
@@ -3827,7 +3835,7 @@ def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
     assert t not in spawned_ids
     # Status stays ``ready`` so a future tick (or operator action) can
     # retry without manual unblock.
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         assert kb.get_task(conn, t).status == "ready"
 
 
@@ -3840,7 +3848,7 @@ def test_dispatch_respawn_guard_skips_recent_success(
     def fake_spawn(task, workspace):
         spawned_ids.append(task.id)
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="recent-winner", assignee="alice")
         now = int(time.time())
         conn.execute(
@@ -3848,12 +3856,12 @@ def test_dispatch_respawn_guard_skips_recent_success(
             "VALUES (?, 'done', 'completed', ?, ?)",
             (t, now - 300, now - 60),
         )
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
 
     assert (t, "recent_success") in res.respawn_guarded
     assert t not in spawned_ids
     assert t not in res.auto_blocked
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         assert kb.get_task(conn, t).status == "ready"  # not blocked, just skipped
 
 
@@ -3866,18 +3874,18 @@ def test_dispatch_respawn_guard_skips_active_pr(
     def fake_spawn(task, workspace):
         spawned_ids.append(task.id)
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         kb.add_comment(
             conn, t, "worker",
             "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
         )
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
 
     assert (t, "active_pr") in res.respawn_guarded
     assert t not in spawned_ids
     assert t not in res.auto_blocked
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         assert kb.get_task(conn, t).status == "ready"
 
 
@@ -3885,17 +3893,17 @@ def test_dispatch_respawn_guard_dry_run_no_auto_block(
     kanban_home, all_assignees_spawnable
 ):
     """In dry_run mode, blocker_auth tasks are recorded in respawn_guarded (not auto-blocked)."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="dry-quota", assignee="alice")
         conn.execute(
             "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
             ("quota exceeded", t),
         )
-        res = kb.dispatch_once(conn, dry_run=True)
+        res = kbd.dispatch_once(conn, dry_run=True)
 
     assert (t, "blocker_auth") in res.respawn_guarded
     assert t not in res.auto_blocked
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         assert kb.get_task(conn, t).status == "ready"  # dry_run: no writes
 
 
@@ -3908,9 +3916,9 @@ def test_dispatch_respawn_guard_allows_clean_task(
     def fake_spawn(task, workspace):
         spawned_ids.append(task.id)
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="clean-task", assignee="alice")
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
 
     assert t in spawned_ids
     assert not res.respawn_guarded
@@ -3921,7 +3929,7 @@ def test_dispatch_respawn_guard_emits_event_for_skipped_task(
     kanban_home, all_assignees_spawnable
 ):
     """dispatch_once emits a respawn_guarded task_event so operators can diagnose stuck-ready tasks."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="event-check", assignee="alice")
         now = int(time.time())
         conn.execute(
@@ -3929,7 +3937,7 @@ def test_dispatch_respawn_guard_emits_event_for_skipped_task(
             "VALUES (?, 'done', 'completed', ?, ?)",
             (t, now - 300, now - 60),
         )
-        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        kbd.dispatch_once(conn, spawn_fn=lambda task, ws: None)
         events = kb.list_events(conn, t)
 
     kinds = [e.kind for e in events]
@@ -3957,7 +3965,7 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
     _init_git_repo(repo)
     target = repo / ".worktrees" / "custom-task"
     branch = "wt/custom-task"
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(
             conn,
             title="ship",
@@ -3967,7 +3975,7 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         )
         task = kb.get_task(conn, t)
         assert task is not None
-        ws = kb.resolve_workspace(task)
+        ws = kbw.resolve_workspace(task)
 
     assert ws == target
     assert ws.exists()
@@ -4068,7 +4076,7 @@ def test_ensure_epic_branch_creates_off_head_idempotently(tmp_path):
 def test_story_base_branch_v2_story_with_epic_parent_returns_epic_branch(kanban_home):
     board = "v2-story-base-branch"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         story = kb.create_task(conn, title="Story", board=board)
         kb.add_epic_membership(conn, epic_id=epic, task_id=story)
@@ -4079,7 +4087,7 @@ def test_story_base_branch_v2_story_with_epic_parent_returns_epic_branch(kanban_
 def test_story_base_branch_no_parent_returns_none(kanban_home):
     board = "v2-story-base-branch-no-parent"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         story = kb.create_task(conn, title="Story", board=board)
         result = kb._story_base_branch(conn, story, board=board)
     assert result is None
@@ -4088,7 +4096,7 @@ def test_story_base_branch_no_parent_returns_none(kanban_home):
 def test_story_base_branch_non_v2_board_returns_none(kanban_home):
     board = "legacy-story-base-branch"
     kb.create_board(board, name="Legacy Board", preset="product")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         story = kb.create_task(conn, title="Story", board=board)
         kb.add_epic_membership(conn, epic_id=epic, task_id=story)
@@ -4103,7 +4111,7 @@ def test_resolve_worktree_workspace_default_base_branch_none_uses_head(kanban_ho
     head_sha = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
     ).stdout.strip()
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="ship", workspace_kind="worktree", workspace_path=str(repo))
         task = kb.get_task(conn, t)
         assert task is not None
@@ -4122,7 +4130,7 @@ def test_story_worktree_branches_off_epic_branch_contains_upstream_commit(kanban
     repo = tmp_path / "repo"
     _init_git_repo(repo)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         epic_branch = kb.epic_branch_for(epic)
 
@@ -4132,7 +4140,7 @@ def test_story_worktree_branches_off_epic_branch_contains_upstream_commit(kanban
     upstream_sha = _commit_file(repo, "upstream.txt", "upstream story code\n", "upstream story")
     subprocess.run(["git", "-C", str(repo), "checkout", "main"], check=True, capture_output=True, text=True)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         story = kb.create_task(
             conn, title="Story", board=board,
             workspace_kind="worktree", workspace_path=str(repo),
@@ -4163,7 +4171,7 @@ def test_spawn_one_v2_wires_story_base_branch_to_epic(kanban_home, tmp_path, mon
     import hermes_cli.profiles as profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         epic_branch = kb.epic_branch_for(epic)
 
@@ -4178,7 +4186,7 @@ def test_spawn_one_v2_wires_story_base_branch_to_epic(kanban_home, tmp_path, mon
         spawns.append((task.id, workspace))
         return 4242
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         story = kb.create_task(
             conn, title="Story", board=board,
             assignee="developer", workspace_kind="worktree", workspace_path=str(repo),
@@ -4215,7 +4223,7 @@ def test_spawn_one_v2_success_sets_running_flag(kanban_home, tmp_path, monkeypat
     def fake_spawn(task, workspace, board=None):
         return 4242
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -4253,7 +4261,7 @@ def test_spawn_one_v2_resolver_preflight_from_test_skips_test_target_pinning(
         spawned.append((task.assignee, workspace))
         return 4242
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = kb.create_task(
             conn,
             title="Test finding needs Resolver",
@@ -4319,7 +4327,7 @@ def test_spawn_one_v2_stamps_runtime_identity_before_spawn(
 
     monkeypatch.setattr(kb, "_stamp_run_executor_identity", stamp)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -4357,7 +4365,7 @@ def test_spawn_one_v2_failure_clears_running_flag(kanban_home, tmp_path, monkeyp
     def boom(task, workspace, board=None):
         raise RuntimeError("spawn failed")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -4394,7 +4402,7 @@ def test_spawn_then_handoff_running_flag_round_trip(kanban_home, tmp_path, monke
     def fake_spawn(task, workspace, board=None):
         return 4242
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -4442,7 +4450,7 @@ def test_handoff_releases_worker_claim_so_next_agent_can_spawn(kanban_home, tmp_
     def fake_spawn(task, workspace, board=None):
         return 4242
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -4501,7 +4509,7 @@ def test_apply_v2_flags_sets_flag_and_syncs_status(kanban_home, monkeypatch):
     tid = _seed_v2_card(board, step="development")
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         with kb.write_txn(conn):
             kb._apply_v2_flags(conn, tid, meta, running=True, blocked=False)
         row = conn.execute(
@@ -4517,7 +4525,7 @@ def test_apply_v2_flags_sets_flag_and_syncs_status(kanban_home, monkeypatch):
 
 def test_apply_v2_flags_legacy_board_is_noop(kanban_home):
     """meta=None (legacy board) -- flags and status must be untouched."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="Legacy task")
         before = dict(conn.execute(
             "SELECT current_step_key, status, running, blocked FROM tasks WHERE id = ?",
@@ -4539,7 +4547,7 @@ def test_apply_v2_flags_noop_when_not_handoff_v2_enabled(kanban_home, monkeypatc
     board = "product-no-v2-apply-flags"
     kb.create_board(board, name="Product No V2", preset="product")
     meta = kb.read_board_metadata(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn, title="Story", workflow_template_id="product", current_step_key="development",
         )
@@ -4564,7 +4572,7 @@ def test_claim_task_v2_board_sets_running_flag_and_consistent_status(kanban_home
     tid = _seed_v2_card(board, step="development")
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         claimed = kb.claim_task(conn, tid, claimer="host:1")
         row = conn.execute(
@@ -4582,7 +4590,7 @@ def test_claim_task_v2_board_sets_running_flag_and_consistent_status(kanban_home
 def test_claim_task_legacy_board_does_not_touch_flags(kanban_home):
     """Legacy (non-v2) boards: claim_task must remain byte-for-byte
     unchanged -- neither running nor blocked is touched by the claim."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="Legacy task", assignee="alice")
         claimed = kb.claim_task(conn, tid, claimer="host:1")
         row = conn.execute(
@@ -4615,7 +4623,7 @@ def test_dispatch_once_gateway_spawn_sets_running_flag(kanban_home, tmp_path, mo
         spawns.append((task.id, workspace))
         return 4242
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -4628,7 +4636,7 @@ def test_dispatch_once_gateway_spawn_sets_running_flag(kanban_home, tmp_path, mo
         )
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
 
-        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, board=board)
+        result = kbd.dispatch_once(conn, spawn_fn=fake_spawn, board=board)
 
         row = conn.execute(
             "SELECT current_step_key, running, blocked, status FROM tasks WHERE id = ?",
@@ -4653,7 +4661,7 @@ def test_task_from_row_exposes_running_and_blocked(kanban_home, monkeypatch):
     _v2_product_board(board)
     tid = _seed_v2_card(board, step="development")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute(
             "UPDATE tasks SET running = 1, blocked = 0 WHERE id = ?", (tid,)
         )
@@ -4703,7 +4711,7 @@ def test_dependency_source_base_selects_required_parent_receipt(kanban_home, tmp
     _init_git_repo(repo)
 
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         parent_id = kb.create_task(
             conn, title="Parent", workspace_kind="worktree", workspace_path=str(repo),
             source_commit_required=True,
@@ -4721,7 +4729,7 @@ def test_dependency_source_base_selects_required_parent_receipt(kanban_home, tmp
 def test_dependency_source_base_uses_latest_completed_receipt(kanban_home, tmp_path):
     repo = tmp_path / "completed-receipt-repo"
     _init_git_repo(repo)
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         parent_id = kb.create_task(
             conn, title="Parent", workspace_kind="worktree", workspace_path=str(repo),
             source_commit_required=True,
@@ -4749,7 +4757,7 @@ def test_dependency_source_base_uses_latest_completed_receipt(kanban_home, tmp_p
 def test_dependency_source_base_deduplicates_identical_receipts(kanban_home, tmp_path):
     repo = tmp_path / "duplicate-receipt-repo"
     _init_git_repo(repo)
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         parents = []
         shared_sha = _head_sha(repo)
         for title in ("One", "Two"):
@@ -4788,7 +4796,7 @@ def test_resolve_worktree_workspace_rejects_divergent_receipts_before_materializ
     target = repo / ".worktrees" / "child"
     monkeypatch.setattr(kb, "_story_base_branch", lambda *args, **kwargs: None)
     monkeypatch.setattr(kb, "_handoff_v2_enabled", lambda _meta: False)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         parents = []
         for title, sha in (("One", first_sha), ("Two", second_sha)):
             parent_id = kb.create_task(
@@ -4820,7 +4828,7 @@ def test_resolve_worktree_workspace_rejects_divergent_receipts_before_materializ
 def test_dependency_source_base_linear_multi_parent_uses_descendant(kanban_home, tmp_path):
     repo = tmp_path / "linear-multi-parent-repo"
     _init_git_repo(repo)
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         parent_ids = []
         for title in ("Ancestor", "Descendant"):
             parent_id = kb.create_task(conn, title=title, workspace_kind="worktree", workspace_path=str(repo), source_commit_required=True)
@@ -4840,7 +4848,7 @@ def test_dependency_source_flow_resolves_parent_and_child_worktrees(kanban_home,
     kb.create_board(board, name="Dependency Source E2E", preset="generic")
     repo = tmp_path / "dependency-source-e2e-repo"
     _init_git_repo(repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         parent_id = kb.create_task(
             conn, title="Parent", board=board, assignee="developer",
             workspace_kind="worktree", workspace_path=str(repo),
@@ -4868,7 +4876,7 @@ def test_dependency_source_flow_resolves_concrete_child_worktree_from_parent(kan
     kb.create_board(board, name="Dependency Source Concrete Child", preset="generic")
     repo = tmp_path / "dependency-source-concrete-child-repo"
     _init_git_repo(repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         parent_id = kb.create_task(
             conn, title="Parent", board=board, assignee="developer",
             workspace_kind="worktree", workspace_path=str(repo),
@@ -4904,7 +4912,7 @@ def test_complete_task_required_source_commits_before_terminal_update_and_persis
     _init_git_repo(repo)
     base_sha = _head_sha(repo)
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn,
             title="Commit before done",
@@ -4956,7 +4964,7 @@ def test_default_board_forbidden_dependency_chain_forwards_candidate_sha(
     board = "default"
     repo = tmp_path / "default-source-three-card-repo"
     _init_git_repo(repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         developer_id = kb.create_task(conn, title="Developer", board=board,
             assignee="developer", workspace_kind="worktree", workspace_path=str(repo),
             source_commit_required=True)
@@ -5000,7 +5008,7 @@ def test_complete_task_adopts_the_one_exact_commit_after_crash_before_receipt(
     repo = tmp_path / "adoption-repo"
     _init_git_repo(repo)
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn,
             title="Adopt exact commit",
@@ -5056,7 +5064,7 @@ def test_complete_task_forbidden_source_does_not_commit_worker_diff(
 ):
     repo = tmp_path / "forbidden-repo"
     _init_git_repo(repo)
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn,
             title="Evidence only",
@@ -5095,7 +5103,7 @@ def test_complete_task_forbidden_source_rejects_dirty_git_before_terminal_mutati
     repo = tmp_path / "dirty-forbidden-repo"
     _init_git_repo(repo)
     before_sha = _head_sha(repo)
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         parent_id = kb.create_task(
             conn,
             title="Evidence-only parent",
@@ -5132,7 +5140,7 @@ def test_complete_task_forbidden_source_allows_non_git_report_only_workspace(
 ):
     workspace = tmp_path / "report-only"
     workspace.mkdir()
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id = kb.create_task(
             conn,
             title="Report-only evidence",
@@ -5154,7 +5162,7 @@ def test_complete_task_forbidden_source_allows_non_git_report_only_workspace(
 def test_complete_task_required_source_raises_typed_failure_without_commit(
     kanban_home, tmp_path
 ):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn,
             title="Missing source",
@@ -5180,7 +5188,7 @@ def test_complete_task_required_source_rechecks_run_ownership_before_done(
 ):
     repo = tmp_path / "cas-repo"
     _init_git_repo(repo)
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn,
             title="CAS before done",
@@ -5226,7 +5234,7 @@ def test_complete_task_required_source_rechecks_run_ownership_before_done(
 def test_commit_worker_diff_dirty_worktree_returns_sha_and_cleans_tree(kanban_home, tmp_path):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn, title="ship it", workspace_kind="worktree", workspace_path=str(repo)
         )
@@ -5247,7 +5255,7 @@ def test_commit_worker_diff_dirty_worktree_returns_sha_and_cleans_tree(kanban_ho
 def test_commit_worker_diff_nothing_to_commit_returns_none(kanban_home, tmp_path):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn, title="ship it", workspace_kind="worktree", workspace_path=str(repo)
         )
@@ -5261,7 +5269,7 @@ def test_commit_worker_diff_nothing_to_commit_returns_none(kanban_home, tmp_path
 def test_commit_worker_diff_no_repo_returns_none(kanban_home, tmp_path):
     not_a_repo = tmp_path / "not-a-repo"
     not_a_repo.mkdir()
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn, title="ship it", workspace_kind="dir", workspace_path=str(not_a_repo)
         )
@@ -5271,7 +5279,7 @@ def test_commit_worker_diff_no_repo_returns_none(kanban_home, tmp_path):
 
 
 def test_commit_worker_diff_missing_workspace_path_returns_none(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="no workspace")
         result = kb._commit_worker_diff(conn, tid)
 
@@ -5285,7 +5293,7 @@ def test_commit_worker_diff_respects_gitignore(kanban_home, tmp_path):
     subprocess.run(["git", "-C", str(repo), "add", ".gitignore"], check=True, capture_output=True, text=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "add gitignore"], check=True, capture_output=True, text=True)
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn, title="ship it", workspace_kind="worktree", workspace_path=str(repo)
         )
@@ -5328,7 +5336,7 @@ def test_handoff_commit_first_gate_blocks_advance_on_clean_tree(kanban_home, tmp
     _v2_product_board(board)
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -5361,7 +5369,7 @@ def test_handoff_happy_path_commits_advances_and_emits_one_event(kanban_home, tm
     _v2_product_board(board)
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -5419,7 +5427,7 @@ def test_handoff_terminal_review_advances_with_no_next_assignee(kanban_home, tmp
     _v2_product_board(board)
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -5460,7 +5468,7 @@ def test_handoff_terminal_release_measure_does_not_auto_advance(kanban_home, tmp
     _v2_product_board(board)
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -5503,7 +5511,7 @@ def test_handoff_non_v2_board_is_noop(kanban_home, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     board = "product-no-v2-handoff"
     kb.create_board(board, name="Product No V2", preset="product")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -5532,7 +5540,7 @@ def test_handoff_noop_then_legacy_complete_task_advances_card(kanban_home, monke
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     board = "product-legacy-coexist"
     kb.create_board(board, name="Product Legacy Coexist", preset="product")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="User story: checkout",
@@ -5583,7 +5591,7 @@ def test_handoff_provenance_failure_raises_and_leaves_card_untouched(kanban_home
     _v2_product_board(board)
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -5623,7 +5631,7 @@ def test_complete_task_v2_non_terminal_routes_to_commit_first_handoff(kanban_hom
     _v2_product_board(board)
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -5688,7 +5696,7 @@ def test_complete_task_v2_no_diff_does_not_complete(kanban_home, tmp_path, monke
     _v2_product_board(board)
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -5734,7 +5742,7 @@ def test_complete_task_v2_clean_test_evidence_advances_without_commit(kanban_hom
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
         check=True, capture_output=True, text=True,
     ).stdout.strip()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -5793,7 +5801,7 @@ def test_standalone_release_measure_review_evidence_advances_without_commit(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
         check=True, capture_output=True, text=True,
     ).stdout.strip()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -5852,7 +5860,7 @@ def test_complete_task_v2_with_unresolved_preflight_resumes_instead_of_handoff(
     _v2_product_board(board)
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -5912,7 +5920,7 @@ def test_complete_task_v2_with_unresolved_preflight_resumes_instead_of_handoff(
 def test_complete_task_v2_terminal_release_measure_requires_release_evidence(kanban_home):
     board = "v2-complete-task-terminal"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -5940,7 +5948,7 @@ def test_complete_task_legacy_board_unchanged(kanban_home):
     (mirrors ``test_product_completion_advances_card_to_next_role``).
     """
     kb.create_board("prod-w1-legacy", preset="product")
-    with kb.connect(board="prod-w1-legacy") as conn:
+    with kanban_db_connect.connect(board="prod-w1-legacy") as conn:
         tid = kb.create_task(
             conn,
             title="User story: checkout",
@@ -5989,7 +5997,7 @@ def test_complete_task_v2_stale_reclaimed_worker_cannot_advance(kanban_home, tmp
     _v2_product_board(board)
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -6047,7 +6055,7 @@ def test_complete_task_v2_stale_reclaimed_worker_cannot_advance(kanban_home, tmp
 
 
 def test_end_run_expected_id_cannot_close_new_owner(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="owned run", assignee="developer")
         first = kb.claim_task(conn, tid, claimer="old")
         assert first is not None and first.current_run_id is not None
@@ -6089,7 +6097,7 @@ def test_complete_task_v2_owning_worker_still_advances_with_expected_run_id(
     _v2_product_board(board)
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -6139,7 +6147,7 @@ def test_handoff_cas_race_loses_ownership_between_commit_and_advance(
     _v2_product_board(board)
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -6206,7 +6214,7 @@ def test_spawn_after_handoff_fire_once_spawns_the_handed_off_card(kanban_home, t
         spawns.append((task.id, workspace))
         return 4242
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -6251,7 +6259,7 @@ def test_spawn_after_handoff_second_pass_spawns_nothing(kanban_home, tmp_path, m
         spawns.append((task.id, workspace))
         return 4242
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -6291,7 +6299,7 @@ def test_spawn_after_handoff_terminal_review_handoff_spawns_nothing(kanban_home,
         spawns.append((task.id, workspace))
         return 4242
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -6332,7 +6340,7 @@ def test_spawn_after_handoff_legacy_board_is_noop(kanban_home, monkeypatch):
         spawns.append((task.id, workspace))
         return 4242
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         kb.create_task(conn, title="legacy card", assignee="developer")
 
         spawned_ids = kb.spawn_after_handoff(conn, spawn_fn=fake_spawn)
@@ -6366,7 +6374,7 @@ def test_reconcile_recovers_dead_pid_then_spawns_next_pass_bounded(
     host = kb._claimer_id().split(":", 1)[0]
     stale_started_at = int(time.time()) - 3600  # past the crash grace window
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -6417,7 +6425,7 @@ def test_reconcile_no_thrash_on_healthy_running_card(kanban_home, tmp_path, monk
     host = kb._claimer_id().split(":", 1)[0]
     stale_started_at = int(time.time()) - 3600  # past the crash grace window
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -6465,7 +6473,7 @@ def test_reconcile_honors_crash_grace_period(kanban_home, tmp_path, monkeypatch)
     now = 5_000_000.0
     monkeypatch.setattr(kb.time, "time", lambda: now)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -6518,7 +6526,7 @@ def test_reconcile_skips_liveness_check_for_other_host_claim(
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
     stale_started_at = int(time.time()) - 3600  # past the crash grace window
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -6555,7 +6563,7 @@ def test_reconcile_spawns_stranded_ready_card_idempotently(kanban_home, tmp_path
         return os.getpid()  # a real, live pid so the second pass's own
         # dead-worker-recovery step doesn't reclaim it out from under us
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -6586,7 +6594,7 @@ def test_reconcile_legacy_board_is_noop(kanban_home, monkeypatch):
         spawns.append(task.id)
         return 4242
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         kb.create_task(conn, title="legacy card", assignee="developer")
 
         result = kb.reconcile(conn, spawn_fn=fake_spawn)
@@ -6620,7 +6628,7 @@ def test_reconcile_spawn_ready_false_recovers_but_skips_spawn(
         spawns.append(task.id)
         return 4242
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         dead_tid = kb.create_task(conn, title="Dead worker story", assignee="developer")
         conn.execute(
             "UPDATE tasks SET status='running', worker_pid=?, claim_lock=?, "
@@ -6652,11 +6660,11 @@ def test_reconcile_spawn_ready_false_recovers_but_skips_spawn(
 
 def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     """Completion artifacts from scratch workspaces survive workspace cleanup."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="render chart")
         task = kb.get_task(conn, t)
-        ws = kb.resolve_workspace(task)
-        kb.set_workspace_path(conn, t, ws)
+        ws = kbw.resolve_workspace(task)
+        kbw.set_workspace_path(conn, t, ws)
         artifact = ws / "chart.png"
         artifact.write_bytes(b"png-bytes")
 
@@ -6679,7 +6687,7 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     assert str(persisted) != str(artifact)
     assert run is not None
     assert run.metadata["artifacts"] == [str(persisted)]
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         attachments = kb.list_attachments(conn, t)
     assert [(a.filename, a.stored_path) for a in attachments] == [
         ("chart.png", str(persisted.resolve()))
@@ -6704,7 +6712,7 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
     """
     child_dir = tmp_path / "persistent-child"
     child_dir.mkdir()
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parent = kb.create_task(conn, title="scratch parent")
         child = kb.create_task(
             conn, title="dir child", workspace_kind="dir",
@@ -6712,8 +6720,8 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
         )
         kb.link_tasks(conn, parent, child)
         p_task = kb.get_task(conn, parent)
-        parent_ws = kb.resolve_workspace(p_task)
-        kb.set_workspace_path(conn, parent, parent_ws)
+        parent_ws = kbw.resolve_workspace(p_task)
+        kbw.set_workspace_path(conn, parent, parent_ws)
 
         kb.complete_task(conn, parent, result="handoff")
         assert parent_ws.exists(), "deferred while dir child active"
@@ -6739,23 +6747,23 @@ def test_is_managed_scratch_path_rejects_kanban_metadata_subtrees(kanban_home):
     """
     kanban_root = kanban_home / "kanban"
     kanban_root.mkdir(parents=True, exist_ok=True)
-    assert not kb._is_managed_scratch_path(kanban_root)
+    assert not kbw._is_managed_scratch_path(kanban_root)
 
     logs_dir = kanban_root / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
-    assert not kb._is_managed_scratch_path(logs_dir)
+    assert not kbw._is_managed_scratch_path(logs_dir)
 
     board_root = kanban_root / "boards" / "my-board"
     board_root.mkdir(parents=True, exist_ok=True)
     # The board root itself is NOT a managed scratch dir — only the
     # ``workspaces/`` child (and its descendants) are.
-    assert not kb._is_managed_scratch_path(board_root)
+    assert not kbw._is_managed_scratch_path(board_root)
 
     # Sibling subtrees of ``workspaces/`` under a board (e.g. its kanban.db
     # or board.json living next to ``workspaces/``) are also not managed.
     board_logs = board_root / "logs"
     board_logs.mkdir(parents=True, exist_ok=True)
-    assert not kb._is_managed_scratch_path(board_logs)
+    assert not kbw._is_managed_scratch_path(board_logs)
 
     # Now create the board's workspaces dir and a task scratch dir under it —
     # the latter is the only thing the guard should allow.
@@ -6763,10 +6771,10 @@ def test_is_managed_scratch_path_rejects_kanban_metadata_subtrees(kanban_home):
     board_workspaces.mkdir(parents=True, exist_ok=True)
     # The workspaces root itself is also NOT managed — deleting it would
     # wipe every task's scratch dir at once.
-    assert not kb._is_managed_scratch_path(board_workspaces)
+    assert not kbw._is_managed_scratch_path(board_workspaces)
     task_dir = board_workspaces / "task-42"
     task_dir.mkdir(parents=True, exist_ok=True)
-    assert kb._is_managed_scratch_path(task_dir)
+    assert kbw._is_managed_scratch_path(task_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -6779,7 +6787,7 @@ def test_is_managed_scratch_path_rejects_kanban_metadata_subtrees(kanban_home):
 
 def test_product_completion_advances_card_to_next_role(kanban_home):
     kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = kb.create_task(
             conn,
             title="User story: checkout",
@@ -6809,7 +6817,7 @@ def test_product_completion_advances_card_to_next_role(kanban_home):
 
 def test_product_test_completion_moves_to_review_status(kanban_home):
     kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = kb.create_task(
             conn,
             title="User story: checkout",
@@ -6847,7 +6855,7 @@ def test_ordinary_test_cannot_forge_recovery_purpose(kanban_home, tmp_path, entr
     board_metadata["product_workflow"]["handoff_v2"] = entrypoint != "legacy"
     board_metadata["product_workflow"]["ai_provenance_required"] = False
     path.write_text(json.dumps(board_metadata))
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, workspace, _ = _seed_product_test_worktree(conn, board, repo)
         claimed = kb.claim_task(conn, tid, board=board)
         assert claimed and claimed.current_run_id
@@ -6877,7 +6885,7 @@ def test_ordinary_test_cannot_forge_recovery_purpose(kanban_home, tmp_path, entr
 
 def test_product_development_completion_requires_writer_provenance(kanban_home):
     kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = kb.create_task(
             conn,
             title="User story: checkout",
@@ -6902,7 +6910,7 @@ def test_product_development_completion_requires_writer_provenance(kanban_home):
 
 def test_product_development_completion_records_writer_provenance(kanban_home):
     kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = kb.create_task(
             conn,
             title="User story: checkout",
@@ -6940,7 +6948,7 @@ def test_product_development_completion_records_writer_provenance(kanban_home):
 
 def test_product_review_completion_rejects_same_ai_as_writer(kanban_home):
     kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = kb.create_task(
             conn,
             title="User story: checkout",
@@ -6984,7 +6992,7 @@ def test_product_review_completion_rejects_same_ai_as_writer(kanban_home):
 
 def test_product_review_completion_accepts_different_ai_reviewer(kanban_home):
     kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = kb.create_task(
             conn,
             title="User story: checkout",
@@ -7053,7 +7061,7 @@ def test_dispatched_run_canonical_executor_overrides_writer_self_report(
     kanban_home, monkeypatch
 ):
     kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = kb.create_task(
             conn,
             title="Canonical writer identity",
@@ -7103,7 +7111,7 @@ def test_review_independence_uses_canonical_provider_not_worker_alias(
     kanban_home, monkeypatch
 ):
     kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = kb.create_task(
             conn,
             title="Canonical reviewer independence",
@@ -7177,7 +7185,7 @@ def test_review_rejects_partial_canonical_executor_identity(
 ):
     """A stamped reviewer must not compare against a legacy writer alias."""
     kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = kb.create_task(
             conn,
             title="Partial canonical reviewer identity",
@@ -7287,7 +7295,7 @@ def test_strict_product_run_requires_canonical_runtime_identity(
     kanban_home, monkeypatch
 ):
     """Governed product dispatch fails closed when identity is unresolved."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn,
             title="Governed identity required",
@@ -7318,7 +7326,7 @@ def test_strict_product_run_rejects_identity_that_cannot_be_persisted(
     kanban_home, monkeypatch
 ):
     """A resolved identity is not enough when its active run has ended."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn,
             title="Governed identity persistence required",
@@ -7373,7 +7381,7 @@ def test_dispatch_records_runtime_identity_failure_and_blocks(
 
     monkeypatch.setattr(kb, "_stamp_run_executor_identity", fail_stamp)
     spawned: list[str] = []
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn,
             title="Dispatch identity failure",
@@ -7387,7 +7395,7 @@ def test_dispatch_records_runtime_identity_failure_and_blocks(
                 (tid,),
             )
             conn.commit()
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             spawn_fn=lambda task, _workspace: spawned.append(task.id),
             failure_limit=1,
@@ -7403,7 +7411,7 @@ def test_dispatch_records_runtime_identity_failure_and_blocks(
 
 def test_product_human_block_routes_to_hermes_preflight_before_blocked(kanban_home):
     kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = kb.create_task(
             conn,
             title="User story: checkout",
@@ -7436,7 +7444,7 @@ def test_product_human_block_routes_to_hermes_preflight_before_blocked(kanban_ho
 
 def test_product_preflight_resolution_returns_card_to_original_assignee(kanban_home):
     kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = kb.create_task(
             conn,
             title="User story: checkout",
@@ -7475,7 +7483,7 @@ def test_product_preflight_resolution_returns_card_to_original_assignee(kanban_h
 
 def test_product_second_human_block_after_preflight_enters_blocked(kanban_home):
     kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = kb.create_task(
             conn,
             title="User story: checkout",
@@ -7512,9 +7520,9 @@ def test_product_second_human_block_after_preflight_enters_blocked(kanban_home):
 
 
 def test_list_runs_state_filter_requires_pair_and_valid_type(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="t", assignee="alice")
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         with pytest.raises(ValueError, match="both"):
             kb.list_runs(conn, tid, state_type="status", state_name=None)
         with pytest.raises(ValueError, match="both"):
@@ -7600,12 +7608,12 @@ class TestSharedBoardPaths:
         # Dispatcher creates the board and a task.
         self._set_home(monkeypatch, tmp_path, default_home)
         kb.init_db()
-        with kb.connect() as conn:
+        with kbc.connect() as conn:
             task_id = kb.create_task(conn, title="cross-profile")
 
         # Worker switches to the profile HERMES_HOME and reads.
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
-        with kb.connect() as conn:
+        with kbc.connect() as conn:
             task = kb.get_task(conn, task_id)
         assert task is not None
         assert task.title == "cross-profile"
@@ -7661,7 +7669,7 @@ class TestSharedBoardPaths:
             tenant=None,
             branch_name="wt/t_dispatch_env",
         )
-        kb._default_spawn(task, str(tmp_path / "ws"))
+        kbd._default_spawn(task, str(tmp_path / "ws"))
 
         env = captured["env"]
         assert env["HERMES_KANBAN_DB"] == str(default_home / "kanban.db")
@@ -7691,7 +7699,7 @@ class TestSharedBoardPaths:
 
 
 # ---------------------------------------------------------------------------
-# NFS / network-filesystem fallback (see hermes_state.apply_wal_with_fallback)
+# NFS / network-filesystem fallback (see hermes_state_wal.apply_wal_with_fallback)
 # ---------------------------------------------------------------------------
 
 def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch, caplog):
@@ -7721,16 +7729,16 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
 
     # These tests exercise the WAL-attempt path; assume a fixed SQLite so the
     # WAL-reset vulnerability gate doesn't short-circuit before the pragma.
-    import hermes_state as _hermes_state
+    import hermes_state_wal as _hermes_state_wal
     monkeypatch.setattr(
-        _hermes_state, "is_sqlite_wal_reset_vulnerable",
+        _hermes_state_wal, "is_sqlite_wal_reset_vulnerable",
         lambda version_info=None: False,
     )
-    _hermes_state._wal_fallback_warned_paths.clear()
+    _hermes_state_wal._wal_fallback_warned_paths.clear()
 
     # Clear module cache so a fresh connect() is attempted
     kb._INITIALIZED_PATHS.clear()
-    hermes_state._wal_fallback_warned_paths.clear()
+    hermes_state_wal._wal_fallback_warned_paths.clear()
 
     real_connect = _sqlite3.connect
 
@@ -7751,7 +7759,7 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
 
     with _patch("hermes_cli.kanban_db.sqlite3.connect", side_effect=wal_blocking_connect):
         with caplog.at_level("ERROR", logger="hermes_state"):
-            conn = kb.connect()
+            conn = kbc.connect()
 
     # One fallback error, naming kanban.db
     errors = [
@@ -7781,10 +7789,10 @@ def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplo
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
     kb._INITIALIZED_PATHS.clear()
-    hermes_state._wal_fallback_warned_paths.clear()
+    hermes_state_wal._wal_fallback_warned_paths.clear()
     # Assume a fixed SQLite so the WAL-reset gate doesn't short-circuit.
     monkeypatch.setattr(
-        hermes_state, "is_sqlite_wal_reset_vulnerable",
+        hermes_state_wal, "is_sqlite_wal_reset_vulnerable",
         lambda version_info=None: False,
     )
 
@@ -7807,7 +7815,7 @@ def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplo
         side_effect=wal_silent_noop_connect,
     ):
         with caplog.at_level("ERROR", logger="hermes_state"):
-            conn = kb.connect()
+            conn = kbc.connect()
 
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
     t = kb.create_task(conn, title="post-silent-fallback task")
@@ -7851,7 +7859,7 @@ def test_sqlite_connect_closes_tracked_conn_on_setup_failure(tmp_path, monkeypat
     monkeypatch.setattr(kb.sqlite3, "connect", failing_connect)
 
     with pytest.raises(sqlite3.OperationalError, match="simulated setup failure"):
-        kb._sqlite_connect(db_path)
+        kbc._sqlite_connect(db_path)
 
     with sqlite_safe_read._live_lock:
         after = sqlite_safe_read._live_connections.get(key, 0)
@@ -7868,7 +7876,7 @@ def test_unlink_tasks_promotes_only_named_child(kanban_home):
     Before the fix, child stayed 'todo' indefinitely after unlink; only the
     next dispatcher tick or a manual 'hermes kanban recompute' would promote it.
     """
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         a = kb.create_task(conn, title="parent-done")
         kb.complete_task(conn, a)
         c = kb.create_task(conn, title="parent-running")
@@ -7947,7 +7955,7 @@ def _unlink_db_state(conn, task_ids):
 
 
 def test_unlink_tasks_keeps_todo_with_remaining_unsatisfied_parent(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         removed_parent = kb.create_task(conn, title="removed parent")
         remaining_parent = kb.create_task(conn, title="remaining parent")
         child_id = kb.create_task(
@@ -7975,7 +7983,7 @@ def test_unlink_tasks_keeps_todo_with_remaining_unsatisfied_parent(kanban_home):
 
 @pytest.mark.parametrize("blocked_case", ["sticky", "failure_limit"])
 def test_unlink_tasks_preserves_ineligible_block(blocked_case, kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         parent_id = kb.create_task(conn, title=f"{blocked_case} parent")
         child_id = kb.create_task(conn, title=f"{blocked_case} child")
         if blocked_case == "sticky":
@@ -8005,7 +8013,7 @@ def test_unlink_tasks_preserves_ineligible_block(blocked_case, kanban_home):
 
 
 def test_unlink_tasks_missing_edge_and_stale_snapshot_are_atomic(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         parent_id = kb.create_task(conn, title="parent")
         other_parent = kb.create_task(conn, title="other parent")
         child_id = kb.create_task(conn, title="child", parents=[parent_id])
@@ -8056,6 +8064,8 @@ def test_add_column_if_missing_is_idempotent_on_race(kanban_home):
     """
     import sqlite3
 
+    from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute(
@@ -8063,14 +8073,14 @@ def test_add_column_if_missing_is_idempotent_on_race(kanban_home):
     )
 
     # First call adds the column — returns True.
-    added = kb._add_column_if_missing(conn, "tasks", "extra_col", "extra_col TEXT")
+    added = _add_column_if_missing(conn, "tasks", "extra_col", "extra_col TEXT")
     assert added is True
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     assert "extra_col" in cols
 
     # Second call on same connection — column already exists — must return
     # False without raising, simulating the race the dispatcher hits.
-    added_again = kb._add_column_if_missing(
+    added_again = _add_column_if_missing(
         conn, "tasks", "extra_col", "extra_col TEXT"
     )
     assert added_again is False
@@ -8123,7 +8133,7 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
     )
 
     # Running migration on an already-migrated schema must not raise.
-    kb._migrate_add_optional_columns(conn)
+    kbc._migrate_add_optional_columns(conn)
     conn.close()
 
 
@@ -8151,10 +8161,14 @@ def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeyp
     import shutil
     import sys
     import hermes_cli.kanban_db as kb
+    import hermes_cli.kanban_db_connect as kanban_db_connect
+    import hermes_cli.kanban_db_workspace as kanban_db_workspace
+    import shutil as shutil
+    from hermes_cli import kanban_db_dispatch as kbd
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: None)
-    argv = kb._resolve_hermes_argv()
+    argv = kbd._resolve_hermes_argv()
     assert argv == [sys.executable, "-m", "hermes_cli.main"]
 
 
@@ -8169,13 +8183,17 @@ def test_resolve_hermes_argv_module_actually_runs():
     """
     import subprocess
     import hermes_cli.kanban_db as kb
+    import hermes_cli.kanban_db_connect as kanban_db_connect
+    import hermes_cli.kanban_db_workspace as kanban_db_workspace
+    import shutil as shutil
+    from hermes_cli import kanban_db_dispatch as kbd
     import shutil
     import unittest.mock as mock
 
     with mock.patch.dict(os.environ, {}, clear=False):
         os.environ.pop("HERMES_BIN", None)
         with mock.patch.object(shutil, "which", return_value=None):
-            argv = kb._resolve_hermes_argv()
+            argv = kbd._resolve_hermes_argv()
     r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, (
         f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
@@ -8254,12 +8272,12 @@ def test_dispatch_max_in_progress_blocks_review_when_at_limit(
         spawns.append(task.id)
         return 42
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         running = kb.create_task(conn, title="running", assignee="alice")
         kb.claim_task(conn, running)
         review = kb.create_task(conn, title="review", assignee="bob")
         _set_task_status(conn, review, "review")
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=1)
+        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=1)
         review_task = kb.get_task(conn, review)
 
     assert not res.spawned
@@ -8287,14 +8305,14 @@ def _set_task_status(conn: sqlite3.Connection, task_id: str, status: str) -> Non
 
 def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
     """dispatch_once dry-run sees review tasks and reports them as spawned."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="review me", assignee="alice")
         _set_task_status(conn, t, "review")
-        res = kb.dispatch_once(conn, dry_run=True)
+        res = kbd.dispatch_once(conn, dry_run=True)
     assert len(res.spawned) == 1
     assert res.spawned[0][0] == t
     # Dry run must NOT mutate status.
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         assert kb.get_task(conn, t).status == "review"
 
 
@@ -8308,10 +8326,10 @@ def test_dispatch_review_does_not_force_profile_scoped_skill(
         spawned_tasks.append(task)
         return 42  # fake PID
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="review me", assignee="alice")
         _set_task_status(conn, t, "review")
-        res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
+        res = kbd.dispatch_once(conn, spawn_fn=capture_spawn)
     assert len(res.spawned) == 1
     assert len(spawned_tasks) == 1
     assert spawned_tasks[0].skills is None
@@ -8319,10 +8337,10 @@ def test_dispatch_review_does_not_force_profile_scoped_skill(
 
 def test_dispatch_review_skips_unassigned(kanban_home):
     """Unassigned review tasks go to skipped_unassigned, not spawned."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="review floater")
         _set_task_status(conn, t, "review")
-        res = kb.dispatch_once(conn, dry_run=True)
+        res = kbd.dispatch_once(conn, dry_run=True)
     assert t in res.skipped_unassigned
     assert not res.spawned
 
@@ -8337,13 +8355,13 @@ def test_dispatch_review_counts_toward_max_spawn(
         spawns.append(task.id)
         return 42
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         # Create 2 ready tasks + 1 review task, max_spawn=2
         t1 = kb.create_task(conn, title="ready 1", assignee="alice")
         t2 = kb.create_task(conn, title="ready 2", assignee="bob")
         t3 = kb.create_task(conn, title="review", assignee="alice")
         _set_task_status(conn, t3, "review")
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
+        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
     # Only 2 should spawn (ready tasks get priority in the loop)
     assert len(res.spawned) == 2
     assert len(spawns) == 2
@@ -8359,10 +8377,10 @@ def test_dispatch_review_spawns_when_ready_empty(
         spawns.append(task.id)
         return 42
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="review me", assignee="alice")
         _set_task_status(conn, t, "review")
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
     assert len(res.spawned) == 1
     assert spawns[0] == t
 
@@ -8384,8 +8402,8 @@ def _seed_product_review_worktree(
     task = kb.get_task(conn, tid)
     assert task is not None
     workspace, branch = kb._resolve_worktree_workspace(task, board=board)
-    kb.set_workspace_path(conn, tid, str(workspace))
-    kb.set_branch_name(conn, tid, branch)
+    kanban_db_workspace.set_workspace_path(conn, tid, str(workspace))
+    kanban_db_workspace.set_branch_name(conn, tid, branch)
     head_sha = _commit_file(
         workspace,
         "reviewed.txt",
@@ -8426,8 +8444,8 @@ def _seed_product_test_worktree(conn, board: str, repo: Path):
     task = kb.get_task(conn, tid)
     assert task is not None
     workspace, branch = kb._resolve_worktree_workspace(task, board=board, conn=conn)
-    kb.set_workspace_path(conn, tid, str(workspace))
-    kb.set_branch_name(conn, tid, branch)
+    kanban_db_workspace.set_workspace_path(conn, tid, str(workspace))
+    kanban_db_workspace.set_branch_name(conn, tid, branch)
     return tid, workspace, branch
 
 
@@ -8440,7 +8458,7 @@ def test_dispatch_pins_test_target_before_tester_spawn(
     _v2_product_board_with_repo(board, repo)
     observed = []
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, workspace, branch = _seed_product_test_worktree(conn, board, repo)
 
         def capture_spawn(task, launched_workspace, board=None):
@@ -8448,7 +8466,7 @@ def test_dispatch_pins_test_target_before_tester_spawn(
             observed.append((launched_workspace, run.metadata))
             return 5252
 
-        result = kb.dispatch_once(conn, board=board, spawn_fn=capture_spawn)
+        result = kbd.dispatch_once(conn, board=board, spawn_fn=capture_spawn)
 
     head_sha = _git_output(workspace, "rev-parse", "HEAD")
     assert result.spawned[0][0] == tid
@@ -8469,7 +8487,7 @@ def test_dispatch_pins_review_target_before_reviewer_spawn(
     _v2_product_board_with_repo(board, repo)
     observed = []
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, workspace, base_sha, head_sha = _seed_product_review_worktree(
             conn, board, repo
         )
@@ -8479,7 +8497,7 @@ def test_dispatch_pins_review_target_before_reviewer_spawn(
             observed.append((launched_workspace, run.metadata))
             return 4242
 
-        result = kb.dispatch_once(conn, board=board, spawn_fn=capture_spawn)
+        result = kbd.dispatch_once(conn, board=board, spawn_fn=capture_spawn)
 
     assert result.spawned[0][0] == tid
     assert observed == [
@@ -8505,7 +8523,7 @@ def test_default_review_dispatch_requires_structural_target_contract(
     head_sha = _commit_file(repo, "reviewed.txt", "candidate\n", "candidate")
     _set_generated_path_policy(board, repo)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Default review without product step",
@@ -8518,7 +8536,7 @@ def test_default_review_dispatch_requires_structural_target_contract(
         conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
         conn.commit()
 
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             board=board,
             spawn_fn=lambda *args, **kwargs: pytest.fail("review launched without contract"),
@@ -8557,7 +8575,7 @@ def test_default_review_dispatch_pins_completed_predecessor_target(
         _set_generated_path_policy(board, repo)
     observed = []
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         predecessor_id = kb.create_task(
             conn,
             title="Completed test gate",
@@ -8567,7 +8585,7 @@ def test_default_review_dispatch_pins_completed_predecessor_target(
             workspace_path=str(repo),
             source_commit_forbidden=True,
         )
-        kb.set_branch_name(conn, predecessor_id, "review-candidate")
+        kanban_db_workspace.set_branch_name(conn, predecessor_id, "review-candidate")
         conn.execute(
             "UPDATE tasks SET status='done', completed_at=1 WHERE id=?",
             (predecessor_id,),
@@ -8591,7 +8609,7 @@ def test_default_review_dispatch_pins_completed_predecessor_target(
             workspace_path=str(repo),
             source_commit_forbidden=True,
         )
-        kb.set_branch_name(conn, tid, "review-candidate")
+        kanban_db_workspace.set_branch_name(conn, tid, "review-candidate")
         conn.execute(
             "UPDATE tasks SET status='review', current_step_key=? WHERE id=?",
             (current_step_key, tid),
@@ -8603,7 +8621,7 @@ def test_default_review_dispatch_pins_completed_predecessor_target(
             observed.append((launched_workspace, run.step_key, run.metadata))
             return 4242
 
-        result = kb.dispatch_once(conn, board=board, spawn_fn=capture_spawn)
+        result = kbd.dispatch_once(conn, board=board, spawn_fn=capture_spawn)
         task = kb.get_task(conn, tid)
 
     assert result.spawned[0][0] == tid
@@ -8676,7 +8694,7 @@ def test_default_review_dispatch_rejects_invalid_target_contract_before_spawn(
         _init_git_repo(configured_repo)
     _set_generated_path_policy(board, configured_repo)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         predecessor_id = kb.create_task(
             conn,
             title="Completed Tester gate",
@@ -8686,7 +8704,7 @@ def test_default_review_dispatch_rejects_invalid_target_contract_before_spawn(
             workspace_path=str(repo),
             source_commit_forbidden=True,
         )
-        kb.set_branch_name(
+        kanban_db_workspace.set_branch_name(
             conn,
             predecessor_id,
             "main" if invalid_contract == "mismatched_branch" else "review-candidate",
@@ -8720,7 +8738,7 @@ def test_default_review_dispatch_rejects_invalid_target_contract_before_spawn(
             workspace_path=str(repo),
             source_commit_forbidden=invalid_contract != "missing_source_policy",
         )
-        kb.set_branch_name(conn, tid, "review-candidate")
+        kanban_db_workspace.set_branch_name(conn, tid, "review-candidate")
         conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
         conn.commit()
         if invalid_contract == "dirty_workspace":
@@ -8740,7 +8758,7 @@ def test_default_review_dispatch_rejects_invalid_target_contract_before_spawn(
 
             monkeypatch.setattr(kb, "_stamp_run_executor_identity", stamp_wrong_profile)
 
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             board=board,
             spawn_fn=lambda *args, **kwargs: 4242,
@@ -8765,7 +8783,7 @@ def test_non_review_source_forbidden_task_remains_outside_default_review_contrac
     _init_git_repo(repo)
     spawned = []
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Read-only inspection",
@@ -8775,7 +8793,7 @@ def test_non_review_source_forbidden_task_remains_outside_default_review_contrac
             workspace_path=str(repo),
             source_commit_forbidden=True,
         )
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             board=board,
             spawn_fn=lambda task, workspace: spawned.append((task.id, workspace)) or 4242,
@@ -8796,11 +8814,11 @@ def test_pinned_review_target_survives_run_completion(
     _init_git_repo(repo)
     _v2_product_board_with_repo(board, repo)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, workspace, base_sha, head_sha = _seed_product_review_worktree(
             conn, board, repo
         )
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             board=board,
             spawn_fn=lambda *args, **kwargs: 4242,
@@ -8835,7 +8853,7 @@ def test_recovery_runs_never_replace_product_writer_or_test_authority(
         return {"profile": profile, "provider": provider, "model": "fixture",
                 "effort": "high", "surface": "hermes-primary"}
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="Recovery evidence", assignee="custom-developer")
         writer = executor("custom-developer", "codex")
         kb._synthesize_ended_run(conn, tid, outcome="advanced", step_key="development",
@@ -8890,7 +8908,7 @@ def test_custom_recovery_purpose_survives_failed_claim(
     _v2_product_board(board)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
     ordinary_profile = {"development": "developer", "test": "tester", "review": "reviewer"}[step]
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn, title="Recovery purpose", assignee=ordinary_profile,
             workflow_template_id="product", current_step_key=step, board=board,
@@ -8928,13 +8946,13 @@ def test_custom_recovery_purpose_survives_failed_claim(
                        else kb.claim_task(conn, tid, board=board))
             assert claimed is not None
             kb._stamp_run_executor_identity(conn, claimed)
-            kb._set_worker_pid(conn, tid, 987654321)
+            kbd._set_worker_pid(conn, tid, 987654321)
             monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
             monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
-            monkeypatch.setattr(kb, "_classify_worker_exit", lambda pid: ("nonzero_exit", 1))
-            assert kb.detect_crashed_workers(conn) == [tid]
+            monkeypatch.setattr(kbd, "_classify_worker_exit", lambda pid: ("nonzero_exit", 1))
+            assert kbd.detect_crashed_workers(conn) == [tid]
         else:
-            kb.dispatch_once(conn, board=board, failure_limit=1 if failure == "limit" else 5,
+            kbd.dispatch_once(conn, board=board, failure_limit=1 if failure == "limit" else 5,
                              spawn_fn=lambda *args, **kwargs: pytest.fail("identity failure must prevent spawn"))
 
         run = max(kb.list_runs(conn, tid, include_active=True), key=lambda item: item.id)
@@ -8956,7 +8974,7 @@ def test_custom_recovery_purpose_survives_failed_claim(
 def test_same_assignee_recovery_purpose_ends_at_canonical_resolution(kanban_home, decision):
     board = "same-assignee-purpose"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(conn, title="Same worker, different purpose", assignee="developer",
                              workflow_template_id="product", current_step_key="development", board=board)
         ordinary = kb.claim_task(conn, tid, board=board)
@@ -8985,7 +9003,7 @@ def test_same_assignee_recovery_purpose_ends_at_canonical_resolution(kanban_home
 def test_unmatched_recovery_preflight_does_not_hide_ordinary_failure(kanban_home, preflight):
     board = "ordinary-purpose"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(conn, title="Ordinary custom worker", assignee="custom-tester",
                              workflow_template_id="product", current_step_key="test", board=board)
         kb._synthesize_ended_run(conn, tid, outcome="advanced", step_key="test", metadata={
@@ -9011,7 +9029,7 @@ def test_unmatched_recovery_preflight_does_not_hide_ordinary_failure(kanban_home
 
 @pytest.mark.parametrize("optimistic_metadata", [False, True])
 def test_newer_failed_ordinary_test_invalidates_an_older_pin(kanban_home, optimistic_metadata):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="Failed later Test", assignee="tester")
         pins = {"test_branch": "story/fixture", "test_head_sha": "a" * 40}
         kb._synthesize_ended_run(conn, tid, outcome="advanced", step_key="test", metadata={
@@ -9035,7 +9053,7 @@ def test_product_review_requires_a_successful_applicable_test_pin(
     repo = tmp_path / "repo"
     _init_git_repo(repo)
     _v2_product_board_with_repo(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, workspace, _, _ = _seed_product_review_worktree(conn, board, repo, tested=False)
         if not missing_test:
             kb._synthesize_ended_run(conn, tid, outcome="advanced", step_key="test",
@@ -9076,7 +9094,7 @@ def test_terminal_run_records_fill_test_writer_from_preceding_development_execut
         },
     }
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id = kb.create_task(conn, title="Chronological test writer")
         kb._synthesize_ended_run(
             conn,
@@ -9171,9 +9189,9 @@ def test_test_completion_rejects_source_head_movement(
     _init_git_repo(repo)
     _v2_product_board_with_repo(board, repo)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, workspace, _branch = _seed_product_test_worktree(conn, board, repo)
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             board=board,
             spawn_fn=lambda *args, **kwargs: 5252,
@@ -9216,9 +9234,9 @@ def test_test_completion_rejects_missing_dispatcher_pin(
     _init_git_repo(repo)
     _v2_product_board_with_repo(board, repo)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, workspace, _branch = _seed_product_test_worktree(conn, board, repo)
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             board=board,
             spawn_fn=lambda *args, **kwargs: 5252,
@@ -9260,9 +9278,9 @@ def test_test_completion_restores_declared_generated_path_and_uses_pinned_sha(
     _v2_product_board_with_repo(board, repo)
     _set_generated_path_policy(board, repo, "README.md")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, workspace, _branch = _seed_product_test_worktree(conn, board, repo)
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             board=board,
             spawn_fn=lambda *args, **kwargs: 5252,
@@ -9309,9 +9327,9 @@ def test_test_completion_preserves_nonignored_untracked_output_and_rejects(
     _init_git_repo(repo)
     _v2_product_board_with_repo(board, repo)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, workspace, _branch = _seed_product_test_worktree(conn, board, repo)
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             board=board,
             spawn_fn=lambda *args, **kwargs: 5252,
@@ -9347,9 +9365,9 @@ def test_test_completion_rejects_undeclared_tracked_mutation(
     _init_git_repo(repo)
     _v2_product_board_with_repo(board, repo)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, workspace, _branch = _seed_product_test_worktree(conn, board, repo)
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             board=board,
             spawn_fn=lambda *args, **kwargs: 5252,
@@ -9383,7 +9401,7 @@ def test_review_dispatch_requires_the_latest_test_sha_when_one_is_pinned(
     _init_git_repo(repo)
     _v2_product_board_with_repo(board, repo)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, workspace, _base_sha, head_sha = _seed_product_review_worktree(
             conn, board, repo
         )
@@ -9403,7 +9421,7 @@ def test_review_dispatch_requires_the_latest_test_sha_when_one_is_pinned(
                     },
                 },
             )
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             board=board,
             spawn_fn=lambda *args, **kwargs: 5252,
@@ -9425,7 +9443,7 @@ def test_review_completion_rejects_source_edit_without_authoring_a_commit(
     _init_git_repo(repo)
     _v2_product_board_with_repo(board, repo)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, workspace, _base_sha, head_sha = _seed_product_review_worktree(
             conn, board, repo
         )
@@ -9447,7 +9465,7 @@ def test_review_completion_rejects_source_edit_without_authoring_a_commit(
                     },
                 },
             )
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             board=board,
             spawn_fn=lambda *args, **kwargs: 5252,
@@ -9517,7 +9535,7 @@ def test_review_closure_keeps_dispatcher_pins_over_worker_claims(
         kb, "_resolve_worker_runtime_identity", lambda _task: reviewer_executor,
     )
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _workspace, pinned_base_sha, pinned_head_sha = (
             _seed_product_review_worktree(conn, board, repo)
         )
@@ -9552,7 +9570,7 @@ def test_review_closure_keeps_dispatcher_pins_over_worker_claims(
                     "test_head_sha": pinned_head_sha,
                 },
             )
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             board=board,
             spawn_fn=lambda *args, **kwargs: 4242,
@@ -9631,11 +9649,11 @@ def test_dispatch_blocks_dirty_review_target_before_spawn(
     _v2_product_board_with_repo(board, repo)
     spawned = []
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _workspace, _base_sha, _head_sha = _seed_product_review_worktree(
             conn, board, repo, dirty=True
         )
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             board=board,
             spawn_fn=lambda *args, **kwargs: spawned.append(args) or 4242,
@@ -9660,7 +9678,7 @@ def test_review_target_preparation_rejects_workspace_mismatch(
     _init_git_repo(other)
     _v2_product_board_with_repo(board, repo)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _workspace, _base_sha, _head_sha = _seed_product_review_worktree(
             conn, board, repo
         )
@@ -9702,7 +9720,7 @@ def test_dispatch_review_pins_against_board_checkout_branch(
     _v2_product_board_with_repo(board, repo)
     observed = []
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, workspace, base_sha, head_sha = _seed_product_review_worktree(
             conn, board, repo, base_ref="develop"
         )
@@ -9711,7 +9729,7 @@ def test_dispatch_review_pins_against_board_checkout_branch(
             observed.append(kb.get_run(conn, task.current_run_id).metadata)
             return 4242
 
-        result = kb.dispatch_once(conn, board=board, spawn_fn=capture_spawn)
+        result = kbd.dispatch_once(conn, board=board, spawn_fn=capture_spawn)
 
     assert result.spawned[0][0] == tid
     assert observed == [
@@ -9729,7 +9747,7 @@ def test_dispatch_custom_review_assignee_does_not_require_reviewer_pin(
 ):
     spawned = []
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn,
             title="custom non-Claude review",
@@ -9739,7 +9757,7 @@ def test_dispatch_custom_review_assignee_does_not_require_reviewer_pin(
         )
         conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
         conn.commit()
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             spawn_fn=lambda *args, **kwargs: spawned.append(args) or 4242,
         )
@@ -9756,7 +9774,7 @@ def test_unexpected_review_pin_failure_blocks_without_aborting_dispatch(
     _init_git_repo(repo)
     _v2_product_board_with_repo(board, repo)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _workspace, _base_sha, _head_sha = _seed_product_review_worktree(
             conn, board, repo
         )
@@ -9768,7 +9786,7 @@ def test_unexpected_review_pin_failure_blocks_without_aborting_dispatch(
             ),
         )
 
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             board=board,
             spawn_fn=lambda *args, **kwargs: 4242,
@@ -9795,7 +9813,7 @@ def test_review_git_output_decodes_unusual_bytes_lossily(
         observed.update(kwargs)
         return Result()
 
-    monkeypatch.setattr(kb.shutil, "which", lambda _name: "/usr/bin/git")
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/git")
     monkeypatch.setattr(kb.subprocess, "run", fake_run)
 
     assert kb._review_git_output(tmp_path, "status") == "ok"
@@ -9805,17 +9823,17 @@ def test_review_git_output_decodes_unusual_bytes_lossily(
 
 def test_has_spawnable_review_true(kanban_home):
     """has_spawnable_review returns True when review tasks exist with real profiles."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="review me", assignee="default")
         _set_task_status(conn, t, "review")
         # default profile should exist in the test env
-        assert kb.has_spawnable_review(conn) is True
+        assert kbd.has_spawnable_review(conn) is True
 
 
 def test_has_spawnable_review_false_on_empty(kanban_home):
     """has_spawnable_review returns False when no review tasks exist."""
-    with kb.connect() as conn:
-        assert kb.has_spawnable_review(conn) is False
+    with kanban_db_connect.connect() as conn:
+        assert kbd.has_spawnable_review(conn) is False
 
 
 def test_has_spawnable_review_false_when_only_terminal_lanes(
@@ -9824,20 +9842,20 @@ def test_has_spawnable_review_false_when_only_terminal_lanes(
     """has_spawnable_review returns False when review tasks are terminal lanes."""
     from hermes_cli import profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="review", assignee="orion-cc")
         _set_task_status(conn, t, "review")
-        assert kb.has_spawnable_review(conn) is False
+        assert kbd.has_spawnable_review(conn) is False
 
 
 def test_dispatch_review_skips_nonspawnable(kanban_home, monkeypatch):
     """Review tasks with non-existent profiles go to skipped_nonspawnable."""
     from hermes_cli import profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="review", assignee="orion-cc")
         _set_task_status(conn, t, "review")
-        res = kb.dispatch_once(conn, dry_run=True)
+        res = kbd.dispatch_once(conn, dry_run=True)
     assert t in res.skipped_nonspawnable
     assert not res.spawned
 
@@ -9851,7 +9869,7 @@ def test_dispatch_review_does_not_claim_ready_tasks(
     kanban_home, all_assignees_spawnable,
 ):
     """Review dispatch uses claim_review_task, which only claims review tasks."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="ready task", assignee="alice")
         # claim_review_task should NOT claim a ready task
         claimed = kb.claim_review_task(conn, t)
@@ -9906,8 +9924,8 @@ def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
     backups: set[Path] = set()
     for _ in range(10):
         kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-        with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
-            kb.connect(db_path=db_path)
+        with pytest.raises(kbc.KanbanDbCorruptError) as excinfo:
+            kbc.connect(db_path=db_path)
         assert excinfo.value.backup_path is not None
         backups.add(excinfo.value.backup_path)
 
@@ -9921,8 +9939,8 @@ def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
         f.seek(4096)
         f.write(b"\xAB" * 64)
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-    with pytest.raises(kb.KanbanDbCorruptError) as excinfo2:
-        kb.connect(db_path=db_path)
+    with pytest.raises(kbc.KanbanDbCorruptError) as excinfo2:
+        kbc.connect(db_path=db_path)
     second_backup = excinfo2.value.backup_path
     assert second_backup is not None
     assert second_backup != backup
@@ -9946,7 +9964,7 @@ def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
     monkeypatch.setattr(kb.sqlite3, "connect", flaky_connect)
 
     with pytest.raises(sqlite3.OperationalError):
-        kb.connect(db_path=db_path)
+        kbc.connect(db_path=db_path)
 
     # No .corrupt backup may be produced for a healthy-but-locked DB.
     backups = list(tmp_path.glob("*.corrupt.*"))
@@ -9954,7 +9972,7 @@ def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
 
     # And once the lock clears, normal access still works.
     monkeypatch.setattr(kb.sqlite3, "connect", real_connect)
-    with kb.connect(db_path=db_path) as conn:
+    with kbc.connect(db_path=db_path) as conn:
         kb.create_task(conn, title="still here")
         titles = [t.title for t in kb.list_tasks(conn)]
     assert "still here" in titles
@@ -9974,20 +9992,20 @@ def test_maybe_emit_scratch_tip_fires_once_per_install(kanban_home, caplog):
     """
     import logging
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t1 = kb.create_task(conn, title="first scratch")
         t2 = kb.create_task(conn, title="second scratch")
 
     # Sentinel must not exist yet on a fresh install.
-    assert not kb._scratch_tip_shown()
+    assert not kbw._scratch_tip_shown()
 
     with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
-        with kb.connect() as conn:
-            kb._maybe_emit_scratch_tip(conn, t1, "scratch")
+        with kbc.connect() as conn:
+            kbw._maybe_emit_scratch_tip(conn, t1, "scratch")
 
     # Sentinel is now set.
-    assert kb._scratch_tip_shown()
-    assert kb._scratch_tip_sentinel_path().exists()
+    assert kbw._scratch_tip_shown()
+    assert kbw._scratch_tip_sentinel_path().exists()
 
     # Warning was logged exactly once.
     tip_records = [
@@ -10000,7 +10018,7 @@ def test_maybe_emit_scratch_tip_fires_once_per_install(kanban_home, caplog):
     )
 
     # An event row was appended on the first task.
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         events = conn.execute(
             "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
             (t1,),
@@ -10014,8 +10032,8 @@ def test_maybe_emit_scratch_tip_fires_once_per_install(kanban_home, caplog):
     # Second scratch materialization on the same install stays silent.
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
-        with kb.connect() as conn:
-            kb._maybe_emit_scratch_tip(conn, t2, "scratch")
+        with kbc.connect() as conn:
+            kbw._maybe_emit_scratch_tip(conn, t2, "scratch")
     tip_records2 = [
         r for r in caplog.records
         if "scratch workspaces are ephemeral" in r.getMessage()
@@ -10024,7 +10042,7 @@ def test_maybe_emit_scratch_tip_fires_once_per_install(kanban_home, caplog):
         f"Tip should not re-fire after sentinel is set; got "
         f"{[r.getMessage() for r in tip_records2]!r}"
     )
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         events2 = conn.execute(
             "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
             (t2,),
@@ -10045,7 +10063,7 @@ def test_connect_sets_secure_delete_on(tmp_path):
     """secure_delete=ON must be active on every new connection."""
     db_path = tmp_path / "kanban.db"
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-    with kb.connect(db_path=db_path) as conn:
+    with kbc.connect(db_path=db_path) as conn:
         row = conn.execute("PRAGMA secure_delete").fetchone()
     assert row[0] == 1, f"expected secure_delete=1, got {row[0]}"
 
@@ -10056,7 +10074,7 @@ def test_connect_sets_synchronous_full(tmp_path):
     """synchronous must be FULL (=2), not NORMAL (=1)."""
     db_path = tmp_path / "kanban.db"
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-    with kb.connect(db_path=db_path) as conn:
+    with kanban_db_connect.connect(db_path=db_path) as conn:
         row = conn.execute("PRAGMA synchronous").fetchone()
     assert row[0] == 2, f"expected synchronous=2 (FULL), got {row[0]}"
 
@@ -10074,7 +10092,7 @@ def test_product_backlog_completion_advances_to_architecture(kanban_home, monkey
     board = "product-handoff"
     kb.create_board(board, name="Product Handoff", preset="product")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(conn, title="Story: choose a board", assignee="productowner")
         with kb.write_txn(conn):
             conn.execute(
@@ -10127,7 +10145,7 @@ def test_product_release_measure_can_satisfy_dependencies_for_autonomous_boards(
     meta.setdefault("product_workflow", {})["release_measure_unblocks_dependents"] = True
     meta_path.write_text(json.dumps(meta), encoding="utf-8")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         parent = kb.create_task(conn, title="Story: approved prerequisite")
         child = kb.create_task(conn, title="Story: next autonomous slice", assignee="architect")
         kb.link_tasks(conn, parent, child)
@@ -10166,7 +10184,7 @@ def test_product_release_measure_still_blocks_dependencies_without_autonomy_opt_
     board = "manual-release-product"
     kb.create_board(board, name="Manual Release Product", preset="product")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         parent = kb.create_task(conn, title="Story: release gate")
         child = kb.create_task(conn, title="Story: blocked child", assignee="architect")
         kb.link_tasks(conn, parent, child)
@@ -10203,12 +10221,12 @@ def test_connect_pragmas_applied_on_reconnect(tmp_path):
     db_path = tmp_path / "kanban.db"
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     # First connection: write a task and close.
-    with kb.connect(db_path=db_path) as conn:
+    with kanban_db_connect.connect(db_path=db_path) as conn:
         kb.create_task(conn, title="reconnect-check")
     # Force re-init path by discarding path cache.
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     # Second connection: pragmas must still be applied.
-    with kb.connect(db_path=db_path) as conn:
+    with kanban_db_connect.connect(db_path=db_path) as conn:
         assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
         assert conn.execute("PRAGMA cell_size_check").fetchone()[0] == 1
         assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2
@@ -10220,11 +10238,11 @@ def test_pragmas_not_accidentally_disabled_by_migrate_path(tmp_path):
     db_path = tmp_path / "legacy.db"
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     # Initialise with a fresh connect so schema + init run.
-    with kb.connect(db_path=db_path) as conn:
+    with kanban_db_connect.connect(db_path=db_path) as conn:
         kb.create_task(conn, title="pre-migration-task")
     # Simulate a re-entry through the init/migration path by discarding path cache.
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-    with kb.connect(db_path=db_path) as conn:
+    with kanban_db_connect.connect(db_path=db_path) as conn:
         assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
         assert conn.execute("PRAGMA cell_size_check").fetchone()[0] == 1
         assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2
@@ -10271,7 +10289,7 @@ def test_write_txn_preserves_original_exception_when_rollback_fails(kanban_home)
         def __getattr__(self, name):
             return getattr(self._real, name)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         wrapper = FailingConnWrapper(conn)
         with pytest.raises(sqlite3.OperationalError) as excinfo:
             with kb.write_txn(wrapper):
@@ -10299,7 +10317,7 @@ def test_write_txn_check_reads_correct_header_fields(tmp_path):
     way the file must never come back clean.
     """
     import struct
-    from hermes_cli.kanban_db import connect
+    from hermes_cli.kanban_db_connect import connect
     from hermes_cli.sqlite_safe_read import file_length_matches_header
 
     db = tmp_path / "synthetic.db"
@@ -10341,7 +10359,7 @@ def test_write_txn_check_reads_correct_header_fields(tmp_path):
 # connect_closing(): context manager that actually closes the FD
 # Regression coverage for #33159 (kanban.db FD leak — gateway crashes after
 # ~4 days). sqlite3.Connection's built-in __exit__ commits/rollbacks but
-# does NOT close, so `with kb.connect() as conn:` leaks the FD in
+# does NOT close, so `with kbc.connect() as conn:` leaks the FD in
 # long-lived processes (gateway run_slash, dashboard decompose handler).
 # `connect_closing()` is the leak-safe replacement.
 # ---------------------------------------------------------------------------
@@ -10358,7 +10376,7 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     """
     db_path = tmp_path / "kanban.db"
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-    with kb.connect(db_path=db_path) as conn:
+    with kbc.connect(db_path=db_path) as conn:
         pass
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
@@ -10408,14 +10426,14 @@ def test_product_worker_clean_exit_ignores_completion_like_prose(
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
+    monkeypatch.setattr(kbd, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
 
     kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = _make_running_product_card(conn, _kb, step="architecture")
         _add_handoff_comment(conn, tid)
 
-        kb.detect_crashed_workers(conn)
+        kbd.detect_crashed_workers(conn)
 
         task = kb.get_task(conn, tid)
         kinds = [event.kind for event in kb.list_events(conn, tid)]
@@ -10433,15 +10451,15 @@ def test_product_worker_clean_exit_blocks_without_protocol_completion(
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
+    monkeypatch.setattr(kbd, "_classify_worker_exit", lambda _pid: ("clean_exit", 0))
 
     kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = _make_running_product_card(
             conn, _kb, step="architecture", max_retries=5,
         )
         # deliberately NO handoff comment
-        kb.detect_crashed_workers(conn)
+        kbd.detect_crashed_workers(conn)
         task = kb.get_task(conn, tid)
 
     assert task.status == "blocked"
@@ -10455,13 +10473,13 @@ def test_product_worker_nonzero_exit_retains_retry_semantics(
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("nonzero_exit", 1))
+    monkeypatch.setattr(kbd, "_classify_worker_exit", lambda _pid: ("nonzero_exit", 1))
 
     kb.create_board("prod", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = _make_running_product_card(conn, _kb, step="development", assignee="developer")
         _add_handoff_comment(conn, tid)  # evidence present, but this is NOT a clean exit
-        kb.detect_crashed_workers(conn)
+        kbd.detect_crashed_workers(conn)
         task = kb.get_task(conn, tid)
 
     assert task.current_step_key == "development"
@@ -10470,6 +10488,9 @@ def test_product_worker_nonzero_exit_retains_retry_semantics(
 
 def test_handoff_v2_flag_defaults_off_and_reads_meta(kanban_home):
     import hermes_cli.kanban_db as kb
+    import hermes_cli.kanban_db_connect as kanban_db_connect
+    import hermes_cli.kanban_db_workspace as kanban_db_workspace
+    import shutil as shutil
     assert kb._handoff_v2_enabled({}) is False
     assert kb._handoff_v2_enabled({"product_workflow": {"handoff_v2": True}}) is True
     assert kb._handoff_v2_enabled({"product_workflow": {"handoff_v2": False}}) is False
@@ -10492,7 +10513,7 @@ def test_block_task_v2_board_sets_blocked_flag_via_real_entry(kanban_home, monke
     tid = _seed_v2_card(board, step="development")
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         assert kb.claim_task(conn, tid, claimer="host:1") is not None
 
@@ -10536,7 +10557,7 @@ def test_block_task_v2_board_clears_running_flag_on_running_card(kanban_home, mo
     tid = _seed_v2_card(board, step="development")
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         assert kb.claim_task(conn, tid, claimer="host:1") is not None
         pre = conn.execute(
@@ -10567,7 +10588,7 @@ def test_block_task_v2_board_dependency_lands_todo_without_clobbering_status(kan
     _v2_product_board(board)
     tid = _seed_v2_card(board, step="development")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         assert kb.claim_task(conn, tid, claimer="host:1") is not None
 
@@ -10592,7 +10613,7 @@ def test_unblock_task_v2_board_clears_blocked_and_running_flags(kanban_home, mon
     _v2_product_board(board)
     tid = _seed_v2_card(board, step="development")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         assert kb.claim_task(conn, tid, claimer="host:1") is not None
         assert kb.block_task(
@@ -10616,7 +10637,7 @@ def test_unblock_task_v2_board_clears_blocked_and_running_flags(kanban_home, mon
 def test_block_task_legacy_board_does_not_touch_flags(kanban_home):
     """Legacy (non-v2) boards: block_task/unblock_task must remain
     byte-for-byte unchanged -- neither flag is touched."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="Legacy task", assignee="alice")
         assert kb.block_task(conn, tid, reason="need input") is True
         row = conn.execute(
@@ -10657,11 +10678,11 @@ def test_release_stale_claims_v2_board_clears_running_flag(kanban_home, monkeypa
     tid = _seed_v2_card(board, step="development")
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         host = _kb._claimer_id().split(":", 1)[0]
         assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
-        kb._set_worker_pid(conn, tid, 12345)
+        kbd._set_worker_pid(conn, tid, 12345)
         conn.execute(
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
             (int(time.time()) - 3600, tid),
@@ -10685,11 +10706,11 @@ def test_release_stale_claims_legacy_board_flags_stay_zero(kanban_home, monkeypa
     unchanged; running/blocked stay 0 as they always were."""
     import hermes_cli.kanban_db as _kb
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, t, claimer=f"{host}:worker")
-        kb._set_worker_pid(conn, t, 12345)
+        kbd._set_worker_pid(conn, t, 12345)
         conn.execute(
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
             (int(time.time()) - 3600, t),
@@ -10715,7 +10736,7 @@ def test_reclaim_task_v2_board_clears_running_flag(kanban_home, monkeypatch):
     tid = _seed_v2_card(board, step="development")
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         assert kb.claim_task(conn, tid, claimer="host:1") is not None
         pre = conn.execute(
@@ -10746,11 +10767,11 @@ def test_detect_crashed_workers_v2_board_clears_running_flag(kanban_home, monkey
     tid = _seed_v2_card(board, step="development")
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         host = _kb._claimer_id().split(":", 1)[0]
         assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
-        kb._set_worker_pid(conn, tid, 90001)
+        kbd._set_worker_pid(conn, tid, 90001)
         # Past the launch-window grace period so the crash check isn't
         # skipped as "freshly claimed".
         conn.execute(
@@ -10758,7 +10779,7 @@ def test_detect_crashed_workers_v2_board_clears_running_flag(kanban_home, monkey
             (int(time.time()) - 3600, tid),
         )
 
-        crashed = kb.detect_crashed_workers(conn)
+        crashed = kbd.detect_crashed_workers(conn)
         row = conn.execute(
             "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
         ).fetchone()
@@ -10777,7 +10798,7 @@ def test_detect_crashed_workers_legacy_board_flags_stay_zero(kanban_home, monkey
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="iso", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
         conn.execute(
@@ -10787,7 +10808,7 @@ def test_detect_crashed_workers_legacy_board_flags_stay_zero(kanban_home, monkey
         )
         conn.commit()
 
-        crashed = kb.detect_crashed_workers(conn)
+        crashed = kbd.detect_crashed_workers(conn)
         row = conn.execute(
             "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
         ).fetchone()
@@ -10809,11 +10830,11 @@ def test_detect_stale_running_v2_board_clears_running_flag(kanban_home, monkeypa
     tid = _seed_v2_card(board, step="development")
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         host = _kb._claimer_id().split(":", 1)[0]
         assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
-        kb._set_worker_pid(conn, tid, os.getpid())
+        kbd._set_worker_pid(conn, tid, os.getpid())
 
         five_hours_ago = int(time.time()) - (5 * 3600)
         with kb.write_txn(conn):
@@ -10827,7 +10848,7 @@ def test_detect_stale_running_v2_board_clears_running_flag(kanban_home, monkeypa
             )
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-        stale = kb.detect_stale_running(
+        stale = kbd.detect_stale_running(
             conn, stale_timeout_seconds=14400, signal_fn=lambda *a, **k: None,
         )
         row = conn.execute(
@@ -10849,7 +10870,7 @@ def test_enforce_max_runtime_v2_board_clears_running_flag(kanban_home, monkeypat
     _v2_product_board(board)
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -10860,7 +10881,7 @@ def test_enforce_max_runtime_v2_board_clears_running_flag(kanban_home, monkeypat
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         host = kb._claimer_id().split(":", 1)[0]
         assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
-        kb._set_worker_pid(conn, tid, 12345)
+        kbd._set_worker_pid(conn, tid, 12345)
         old_started = int(time.time()) - 20
         conn.execute(
             "UPDATE tasks SET started_at = ? WHERE id = ?", (old_started, tid),
@@ -10871,7 +10892,7 @@ def test_enforce_max_runtime_v2_board_clears_running_flag(kanban_home, monkeypat
             (old_started, tid),
         )
 
-        timed_out = kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None)
+        timed_out = kbd.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None)
         row = conn.execute(
             "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
         ).fetchone()
@@ -10891,7 +10912,7 @@ def test_reconcile_v2_dead_worker_clears_running_flag(kanban_home, monkeypatch):
     _v2_product_board(board)
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -10901,7 +10922,7 @@ def test_reconcile_v2_dead_worker_clears_running_flag(kanban_home, monkeypatch):
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         host = kb._claimer_id().split(":", 1)[0]
         assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
-        kb._set_worker_pid(conn, tid, 99999)
+        kbd._set_worker_pid(conn, tid, 99999)
         pre = conn.execute(
             "SELECT running FROM tasks WHERE id = ?", (tid,),
         ).fetchone()
@@ -10942,7 +10963,7 @@ def test_dispatch_once_v2_board_spawn_failure_clears_running_flag(
     def boom(task, workspace, board=None):
         raise RuntimeError("spawn failed")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -10953,7 +10974,7 @@ def test_dispatch_once_v2_board_spawn_failure_clears_running_flag(
         )
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
 
-        result = kb.dispatch_once(conn, spawn_fn=boom, board=board, failure_limit=5)
+        result = kbd.dispatch_once(conn, spawn_fn=boom, board=board, failure_limit=5)
 
         row = conn.execute(
             "SELECT running, blocked, status FROM tasks WHERE id = ?", (tid,),
@@ -10974,9 +10995,9 @@ def test_dispatch_spawn_failure_legacy_board_flags_stay_zero(
     def boom(task, workspace):
         raise RuntimeError("spawn failed")
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="boom", assignee="alice")
-        kb.dispatch_once(conn, spawn_fn=boom)
+        kbd.dispatch_once(conn, spawn_fn=boom)
         row = conn.execute(
             "SELECT running, blocked, status FROM tasks WHERE id = ?", (t,),
         ).fetchone()
@@ -10996,7 +11017,7 @@ def test_record_task_failure_v2_board_breaker_trip_sets_blocked_clears_running(
     _v2_product_board(board)
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -11006,7 +11027,7 @@ def test_record_task_failure_v2_board_breaker_trip_sets_blocked_clears_running(
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         assert kb.claim_task(conn, tid, claimer="host:1") is not None
 
-        tripped = kb._record_task_failure(
+        tripped = kbd._record_task_failure(
             conn, tid, "boom",
             outcome="spawn_failed",
             failure_limit=1,
@@ -11032,7 +11053,7 @@ def test_complete_task_v2_terminal_done_sets_phase_and_clears_flags(kanban_home)
     _v2_product_board(board)
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="Story",
@@ -11070,7 +11091,7 @@ def test_complete_task_product_card_without_product_board_metadata_fails_closed(
     """A product-stamped nonterminal card must never use generic completion
     when its board cannot supply product lifecycle policy.
     """
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id = kb.create_task(
             conn,
             title="Story: require product board metadata",
@@ -11113,7 +11134,7 @@ def test_complete_task_release_measure_cannot_bypass_release_orchestration(
 ):
     board = "v2-release-evidence-gate"
     kb.ensure_product_board_defaults(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = kb.create_task(
             conn,
             title="Story: evidence gate",
@@ -11145,7 +11166,7 @@ def test_complete_task_legacy_board_terminal_flags_stay_zero(kanban_home):
     """Legacy board: complete_task's terminal transition is unchanged;
     running/blocked stay 0 and current_step_key is untouched (it isn't a v2
     phase field there)."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(
             conn, title="Legacy task", assignee="alice",
             current_step_key="in_progress",
@@ -11184,7 +11205,7 @@ def test_apply_v2_flags_for_status_running_sets_running_clears_blocked(kanban_ho
     _v2_product_board(board)
     tid = _seed_v2_card(board, step="development")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute(
             "UPDATE tasks SET running = 0, blocked = 1 WHERE id = ?", (tid,),
         )
@@ -11204,7 +11225,7 @@ def test_apply_v2_flags_for_status_blocked_sets_blocked_clears_running(kanban_ho
     _v2_product_board(board)
     tid = _seed_v2_card(board, step="development")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute(
             "UPDATE tasks SET running = 1, blocked = 0 WHERE id = ?", (tid,),
         )
@@ -11232,7 +11253,7 @@ def test_apply_v2_flags_for_status_other_statuses_clear_both_flags(
     _v2_product_board(board)
     tid = _seed_v2_card(board, step="development")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute(
             "UPDATE tasks SET running = 1, blocked = 1 WHERE id = ?", (tid,),
         )
@@ -11248,7 +11269,7 @@ def test_apply_v2_flags_for_status_other_statuses_clear_both_flags(
 
 def test_apply_v2_flags_for_status_legacy_board_is_noop(kanban_home):
     """meta=None (legacy board) -- flags must be untouched."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="Legacy task")
         conn.execute(
             "UPDATE tasks SET running = 1, blocked = 0 WHERE id = ?", (tid,),
@@ -11270,7 +11291,7 @@ def test_apply_v2_flags_for_status_noop_when_not_handoff_v2_enabled(kanban_home,
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     board = "product-no-v2-flags-for-status"
     kb.create_board(board, name="Product No V2", preset="product")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn, title="Story", workflow_template_id="product", current_step_key="development",
         )
@@ -11302,7 +11323,7 @@ def test_set_status_direct_v2_board_off_running_clears_running_flag(
     _v2_product_board(board)
     tid = _seed_v2_card(board, step="development")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         assert kb.claim_task(conn, tid, claimer="host:1") is not None
         pre = conn.execute("SELECT running FROM tasks WHERE id = ?", (tid,)).fetchone()
@@ -11331,7 +11352,7 @@ def test_set_status_direct_v2_board_running_to_blocked_sets_blocked_flag(kanban_
     tid = _seed_v2_card(board, step="development")
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         assert kb.claim_task(conn, tid, claimer="host:1") is not None
 
@@ -11350,7 +11371,7 @@ def test_set_status_direct_legacy_board_flags_stay_zero(kanban_home):
     """Legacy board: _set_status_direct behavior is unchanged; flags stay 0."""
     from plugins.kanban.dashboard.plugin_api import _set_status_direct
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="x", assignee="worker")
         kb.claim_task(conn, tid)
         assert _set_status_direct(conn, tid, "ready") is True
@@ -11371,7 +11392,7 @@ def test_schedule_task_v2_board_running_card_clears_flags(kanban_home, monkeypat
     _v2_product_board(board)
     tid = _seed_v2_card(board, step="development")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         assert kb.claim_task(conn, tid, claimer="host:1") is not None
         pre = conn.execute("SELECT running FROM tasks WHERE id = ?", (tid,)).fetchone()
@@ -11389,7 +11410,7 @@ def test_schedule_task_v2_board_running_card_clears_flags(kanban_home, monkeypat
 
 def test_schedule_task_legacy_board_flags_unchanged(kanban_home):
     """Legacy board: schedule_task behavior/flags unchanged (stay 0)."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         t = kb.create_task(conn, title="delayed recheck", assignee="ops")
         assert kb.schedule_task(conn, t, reason="run next week") is True
         row = conn.execute(
@@ -11409,7 +11430,7 @@ def test_archive_task_v2_board_running_card_clears_flags(kanban_home, monkeypatc
     _v2_product_board(board)
     tid = _seed_v2_card(board, step="development")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         assert kb.claim_task(conn, tid, claimer="host:1") is not None
         pre = conn.execute("SELECT running FROM tasks WHERE id = ?", (tid,)).fetchone()
@@ -11427,7 +11448,7 @@ def test_archive_task_v2_board_running_card_clears_flags(kanban_home, monkeypatc
 
 def test_archive_task_legacy_board_flags_unchanged(kanban_home):
     """Legacy board: archive_task behavior/flags unchanged (stay 0)."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="x", assignee="worker")
         assert kb.archive_task(conn, tid) is True
         row = conn.execute(
@@ -11444,7 +11465,7 @@ def test_archive_task_legacy_board_flags_unchanged(kanban_home):
 # ---------------------------------------------------------------------------
 
 def _make_epic_with_children(board: str, *, n_children: int = 2) -> tuple[str, list[str]]:
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         children = []
         for i in range(n_children):
@@ -11458,7 +11479,7 @@ def test_epic_ready_not_all_children_done_returns_false_verify_not_called(kanban
     board = "v2-epic-ready-not-all-done"
     _v2_product_board(board)
     epic, children = _make_epic_with_children(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         _set_task_status(conn, children[0], "done")
         # children[1] stays in its default (not-done) status.
         verify = unittest.mock.Mock(return_value=True)
@@ -11472,7 +11493,7 @@ def test_epic_ready_all_done_verify_true_returns_true(kanban_home):
     board = "v2-epic-ready-all-done-true"
     _v2_product_board(board)
     epic, children = _make_epic_with_children(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         for child in children:
             _set_task_status(conn, child, "done")
         seen_branches: list[str] = []
@@ -11491,7 +11512,7 @@ def test_epic_ready_all_done_verify_false_returns_false(kanban_home):
     board = "v2-epic-ready-all-done-false"
     _v2_product_board(board)
     epic, children = _make_epic_with_children(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         for child in children:
             _set_task_status(conn, child, "done")
         result = kb.epic_ready(conn, epic, board=board, verify_fn=lambda eb: False)
@@ -11502,7 +11523,7 @@ def test_epic_ready_all_done_verify_false_returns_false(kanban_home):
 def test_epic_ready_no_children_returns_false_verify_not_called(kanban_home):
     board = "v2-epic-ready-no-children"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic = kb.create_task(
             conn, title="Lonely Epic", board=board, work_item_kind="epic"
         )
@@ -11516,7 +11537,7 @@ def test_epic_ready_no_children_returns_false_verify_not_called(kanban_home):
 def test_epic_ready_non_v2_board_returns_false_verify_not_called(kanban_home):
     board = "legacy-epic-ready"
     kb.create_board(board, name="Legacy Board", preset="product")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         story = kb.create_task(conn, title="Story", board=board)
         kb.add_epic_membership(conn, epic_id=epic, task_id=story)
@@ -11613,8 +11634,8 @@ def _make_fact_ready_epic(board: str, repo: Path) -> tuple[str, list[str]]:
         text=True,
     )
 
-    with kb.connect(board=board) as conn:
-        kb.set_branch_name(conn, story_id, story_branch)
+    with kanban_db_connect.connect(board=board) as conn:
+        kanban_db_workspace.set_branch_name(conn, story_id, story_branch)
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET workflow_template_id='product', "
@@ -11894,7 +11915,7 @@ def test_merge_epic_preserves_explicit_injected_candidate_verification(
     epic, children = _make_fact_ready_epic(board, repo)
     injected = unittest.mock.Mock(return_value=True)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.merge_epic_to_main(
             conn, epic, board=board, candidate_verify_fn=injected
         )
@@ -11917,7 +11938,7 @@ def _verification_run_fixture(kanban_home, tmp_path, monkeypatch):
     )
     contract = _configure_candidate_verification(board, repo, command=command)
     candidate_sha = _git_output(repo, "rev-parse", "HEAD")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = kb.create_task(conn, title="Story", board=board)
     return repo, board, task_id, contract, candidate_sha, count_file
 
@@ -11942,7 +11963,7 @@ def test_parser_addition_preserves_exact_repository_verification_receipt_reuse(
     fixture = _verification_run_fixture(kanban_home, tmp_path, monkeypatch)
     _repo, board, task_id, _contract, _candidate_sha, count_file = fixture
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         first = _run_reusable_verification(conn, fixture)
         second = _run_reusable_verification(conn, fixture)
         event_count = conn.execute(
@@ -11964,9 +11985,9 @@ def test_configured_verification_reuses_receipt_after_connection_crash_boundary(
     fixture = _verification_run_fixture(kanban_home, tmp_path, monkeypatch)
     _repo, board, _task_id, _contract, _candidate_sha, count_file = fixture
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         first = _run_reusable_verification(conn, fixture)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         recovered = _run_reusable_verification(conn, fixture)
 
     assert first.reused is False
@@ -11998,7 +12019,7 @@ def test_verified_candidate_crash_reuses_persisted_receipt(
     apply = unittest.mock.Mock(side_effect=[False, True])
     monkeypatch.setattr(kb, "_fast_forward_target", apply)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         first = kb.merge_epic_to_main(conn, epic, board=board)
         second = kb.merge_epic_to_main(conn, epic, board=board)
         event_count = conn.execute(
@@ -12039,7 +12060,7 @@ def test_configured_verification_rejects_key_result_and_foreign_receipts(
     fixture = _verification_run_fixture(kanban_home, tmp_path, monkeypatch)
     _repo, board, task_id, _contract, _candidate_sha, count_file = fixture
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         first = _run_reusable_verification(conn, fixture)
         row = conn.execute(
             "SELECT id, payload FROM task_events WHERE task_id=? AND kind='repository_verification'",
@@ -12128,7 +12149,7 @@ def test_merge_epic_records_configured_profile_failure_as_attention_required(
 
     epic, children = _make_fact_ready_epic(board, repo)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.merge_epic_to_main(conn, epic, board=board)
         task = kb.get_task(conn, epic)
         verification_events = [
@@ -12338,7 +12359,7 @@ def test_merge_epic_to_main_happy_path_merges_and_never_pushes(kanban_home, tmp_
     board = "v2-merge-happy"
     _v2_product_board_with_repo(board, repo)
     epic, children = _make_epic_with_children(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         for child in children:
             _set_task_status(conn, child, "done")
 
@@ -12347,7 +12368,7 @@ def test_merge_epic_to_main_happy_path_merges_and_never_pushes(kanban_home, tmp_
 
     calls = _record_git_calls(monkeypatch)
     notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.merge_epic_to_main(
             conn, epic, board=board, verify_fn=lambda b: True, notify_fn=notify,
         )
@@ -12377,7 +12398,7 @@ def test_merge_epic_to_main_refuses_unignored_sibling_worktree(
     board = "v2-merge-untracked-worktree"
     _v2_product_board_with_repo(board, repo)
     epic, children = _make_epic_with_children(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         for child in children:
             _set_task_status(conn, child, "done")
 
@@ -12405,7 +12426,7 @@ def test_merge_epic_to_main_refuses_unignored_sibling_worktree(
 
     calls = _record_git_calls(monkeypatch)
     notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.merge_epic_to_main(
             conn, epic, board=board, verify_fn=lambda b: True, notify_fn=notify,
         )
@@ -12428,7 +12449,7 @@ def test_merge_epic_to_main_conflict_aborts_blocks_and_never_pushes(kanban_home,
     board = "v2-merge-conflict"
     _v2_product_board_with_repo(board, repo)
     epic, children = _make_epic_with_children(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         for child in children:
             _set_task_status(conn, child, "done")
 
@@ -12450,7 +12471,7 @@ def test_merge_epic_to_main_conflict_aborts_blocks_and_never_pushes(kanban_home,
 
     calls = _record_git_calls(monkeypatch)
     notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.merge_epic_to_main(
             conn, epic, board=board, verify_fn=lambda b: True, notify_fn=notify,
         )
@@ -12469,7 +12490,7 @@ def test_merge_epic_to_main_conflict_aborts_blocks_and_never_pushes(kanban_home,
     )
     assert status.stdout.strip() == "", "merge --abort must leave a clean tree"
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         row = conn.execute("SELECT blocked FROM tasks WHERE id = ?", (epic,)).fetchone()
     assert row["blocked"] == 1
 
@@ -12480,7 +12501,7 @@ def test_merge_epic_to_main_post_merge_verify_fails_resets_and_blocks(kanban_hom
     board = "v2-merge-verify-fail"
     _v2_product_board_with_repo(board, repo)
     epic, children = _make_epic_with_children(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         for child in children:
             _set_task_status(conn, child, "done")
 
@@ -12497,7 +12518,7 @@ def test_merge_epic_to_main_post_merge_verify_fails_resets_and_blocks(kanban_hom
 
     calls = _record_git_calls(monkeypatch)
     notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.merge_epic_to_main(
             conn, epic, board=board, verify_fn=verify, notify_fn=notify,
         )
@@ -12511,7 +12532,7 @@ def test_merge_epic_to_main_post_merge_verify_fails_resets_and_blocks(kanban_hom
     ).stdout.strip()
     assert post_sha == pre_sha, "reset --hard must undo the merge"
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         row = conn.execute("SELECT blocked FROM tasks WHERE id = ?", (epic,)).fetchone()
     assert row["blocked"] == 1
 
@@ -12522,13 +12543,13 @@ def test_merge_epic_to_main_not_ready_does_not_touch_git(kanban_home, tmp_path, 
     board = "v2-merge-not-ready"
     _v2_product_board_with_repo(board, repo)
     epic, children = _make_epic_with_children(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         _set_task_status(conn, children[0], "done")
         # children[1] stays not-done.
 
     calls = _record_git_calls(monkeypatch)
     notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.merge_epic_to_main(
             conn, epic, board=board, verify_fn=lambda b: True, notify_fn=notify,
         )
@@ -12543,14 +12564,14 @@ def test_merge_epic_to_main_non_v2_board_returns_none(kanban_home, tmp_path, mon
     _init_git_repo(repo)
     board = "legacy-merge-board"
     kb.create_board(board, name="Legacy Board", default_workdir=str(repo))
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         story = kb.create_task(conn, title="Story", board=board)
         kb.add_epic_membership(conn, epic_id=epic, task_id=story)
 
     calls = _record_git_calls(monkeypatch)
     notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.merge_epic_to_main(
             conn, epic, board=board, verify_fn=lambda b: True, notify_fn=notify,
         )
@@ -12599,7 +12620,7 @@ def _seed_epic_merged_event(board: str, epic: str, repo: Path) -> str:
         ["git", "-C", str(repo), "rev-parse", "main"], check=True, capture_output=True, text=True,
     ).stdout.strip()
     _commit_file(repo, "deploy_work.txt", "deploy work\n", "post-merge commit")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         with kb.write_txn(conn):
             kb._append_event(
                 conn, epic, "epic_merged",
@@ -12613,7 +12634,7 @@ def _make_deploy_epic(tmp_path: Path, board_name: str) -> tuple[str, Path, list[
     _init_git_repo(repo)
     _v2_product_board_with_repo(board_name, repo)
     epic, children = _make_epic_with_children(board_name)
-    with kb.connect(board=board_name) as conn:
+    with kanban_db_connect.connect(board=board_name) as conn:
         for child in children:
             _set_task_status(conn, child, "done")
     _seed_epic_merged_event(board_name, epic, repo)
@@ -12627,7 +12648,7 @@ def test_deploy_epic_happy_path_deploys_test_then_preprod_and_notifies(kanban_ho
     calls = _record_git_calls(monkeypatch)
     ops = _RecordingOpsClient()
     notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.deploy_epic(conn, epic, board=board, ops_client=ops, notify_fn=notify)
 
     assert ops.calls == [
@@ -12637,7 +12658,7 @@ def test_deploy_epic_happy_path_deploys_test_then_preprod_and_notifies(kanban_ho
     _assert_no_push(calls)
     assert not any(("remote" in cmd or "origin" in cmd) for cmd in calls)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         row = conn.execute("SELECT blocked FROM tasks WHERE id = ?", (epic,)).fetchone()
     assert row["blocked"] == 0
 
@@ -12659,14 +12680,14 @@ def test_deploy_epic_test_smoke_fails_stops_blocks_and_pages(kanban_home, tmp_pa
 
     ops = _RecordingOpsClient(smoke_fail={"test"})
     notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.deploy_epic(conn, epic, board=board, ops_client=ops, notify_fn=notify)
 
     assert ("build_roll", "preprod") not in ops.calls
     assert ("smoke", "preprod") not in ops.calls
     assert ops.calls == [("build_roll", "test"), ("smoke", "test")]
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         row = conn.execute(
             "SELECT blocked, running FROM tasks WHERE id = ?", (epic,)
         ).fetchone()
@@ -12686,7 +12707,7 @@ def test_deploy_epic_preprod_build_fails_blocks_and_pages(kanban_home, tmp_path,
 
     ops = _RecordingOpsClient(build_fail={"preprod"})
     notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.deploy_epic(conn, epic, board=board, ops_client=ops, notify_fn=notify)
 
     assert ops.calls == [
@@ -12694,7 +12715,7 @@ def test_deploy_epic_preprod_build_fails_blocks_and_pages(kanban_home, tmp_path,
     ]
     assert ("smoke", "preprod") not in ops.calls
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         row = conn.execute("SELECT blocked FROM tasks WHERE id = ?", (epic,)).fetchone()
     assert row["blocked"] == 1
 
@@ -12713,7 +12734,7 @@ def test_deploy_epic_message_shape_contains_epic_stories_range_and_status(kanban
 
     ops = _RecordingOpsClient()
     notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         kb.deploy_epic(conn, epic, board=board, ops_client=ops, notify_fn=notify)
 
     message = notify.call_args[0][0]
@@ -12734,7 +12755,7 @@ def test_notify_operations_failure_message_includes_reason(kanban_home, tmp_path
 
     notify = unittest.mock.Mock()
     envs_status = [{"env": "test", "built": True, "smoke_ok": False, "detail": "smoke check failed"}]
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         message = kb.notify_operations(
             conn, epic, board=board, envs_status=envs_status,
             failure=True, reason="deploy: test smoke failed", notify_fn=notify,
@@ -12751,7 +12772,7 @@ def test_deploy_epic_rejects_production_env_deploys_nothing(kanban_home, tmp_pat
 
     ops = _RecordingOpsClient()
     notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         with pytest.raises(ValueError):
             kb.deploy_epic(
                 conn, epic, board=board, envs=("test", "prod"),
@@ -12760,7 +12781,7 @@ def test_deploy_epic_rejects_production_env_deploys_nothing(kanban_home, tmp_pat
 
     assert ops.calls == []
     notify.assert_not_called()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         row = conn.execute("SELECT blocked FROM tasks WHERE id = ?", (epic,)).fetchone()
     assert row["blocked"] == 0
 
@@ -12784,7 +12805,7 @@ def test_deploy_epic_never_touches_git_push_or_remote(kanban_home, tmp_path, mon
 
     ops = _RecordingOpsClient()
     notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         kb.deploy_epic(conn, epic, board=board, ops_client=ops, notify_fn=notify)
 
     assert calls, "expected deploy_epic to run at least one local git subcommand"
@@ -12799,14 +12820,14 @@ def test_deploy_epic_non_v2_board_returns_none(kanban_home, tmp_path, monkeypatc
     _init_git_repo(repo)
     board = "legacy-deploy-board"
     kb.create_board(board, name="Legacy Board", default_workdir=str(repo))
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         story = kb.create_task(conn, title="Story", board=board)
         kb.add_epic_membership(conn, epic_id=epic, task_id=story)
 
     ops = _RecordingOpsClient()
     notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.deploy_epic(conn, epic, board=board, ops_client=ops, notify_fn=notify)
 
     assert result is None
@@ -12822,14 +12843,14 @@ def test_deploy_epic_default_ops_client_raises_not_implemented(kanban_home, tmp_
     epic, repo, children = _make_deploy_epic(tmp_path, board)
 
     notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.deploy_epic(conn, epic, board=board, notify_fn=notify)
 
     # build_roll("test") raises NotImplementedError inside the loop, which
     # deploy_epic treats like any other build failure: block + page.
     assert result is not None
     assert result["failure"] is True
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         row = conn.execute("SELECT blocked FROM tasks WHERE id = ?", (epic,)).fetchone()
     assert row["blocked"] == 1
     notify.assert_called_once()
@@ -12895,7 +12916,7 @@ def test_migrate_cards_to_v2_flags_reconciles_mixed_board(kanban_home, monkeypat
     meta = kb.read_board_metadata(board)
 
     statuses = ["running", "blocked", "ready", "todo", "review", "done", "scheduled", "archived"]
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         ids = []
         for status in statuses:
             step_key = "development" if status in ("running", "blocked") else status
@@ -12931,7 +12952,7 @@ def test_migrate_cards_to_v2_flags_idempotent(kanban_home, monkeypatch):
     kb.create_board(board, name="Migrate Idempotent", preset="product")
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid_running = kb.create_task(
             conn, title="running-card", workflow_template_id="product",
             current_step_key="development",
@@ -12972,7 +12993,7 @@ def test_migrate_cards_to_v2_flags_does_not_touch_status_or_phase(kanban_home, m
     board = "migrate-cards-preserves-status"
     kb.create_board(board, name="Migrate Preserves Status", preset="product")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn, title="card", workflow_template_id="product",
             current_step_key="development",
@@ -13008,7 +13029,7 @@ def test_migrate_cards_to_v2_flags_reconciles_phase_for_done(kanban_home, monkey
     kb.create_board(board, name="Migrate Done Phase", preset="product")
     meta = kb.read_board_metadata(board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn, title="legacy-done-card", workflow_template_id="product",
             current_step_key="release_measure",
@@ -13049,7 +13070,7 @@ def test_migrate_cards_to_v2_flags_leaves_non_done_phase_untouched(
     board = f"migrate-cards-phase-untouched-{status}"
     kb.create_board(board, name="Migrate Phase Untouched", preset="product")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn, title=f"card-{status}", workflow_template_id="product",
             current_step_key=step_key,
@@ -13073,7 +13094,7 @@ def test_migrate_cards_to_v2_flags_phase_for_done_idempotent(kanban_home, monkey
     board = "migrate-cards-done-phase-idempotent"
     kb.create_board(board, name="Migrate Done Phase Idempotent", preset="product")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid_already_done = kb.create_task(
             conn, title="already-done-card", workflow_template_id="product",
             current_step_key="done",
@@ -13141,7 +13162,7 @@ def test_project_bound_product_task_defaults_to_product_backlog_and_worktree(kan
             board_slug="prod",
         )
 
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = kb.create_task(conn, title="User story: isolated work", project_id=project_id, board="prod")
         task = kb.get_task(conn, tid)
         events = kb.list_events(conn, tid)
@@ -13158,7 +13179,7 @@ def test_project_bound_product_task_defaults_to_product_backlog_and_worktree(kan
 def test_generic_board_task_without_metadata_stays_plain(kanban_home):
     kb.create_board("generic", name="Generic")
 
-    with kb.connect(board="generic") as conn:
+    with kanban_db_connect.connect(board="generic") as conn:
         tid = kb.create_task(conn, title="plain", board="generic")
         task = kb.get_task(conn, tid)
         events = kb.list_events(conn, tid)
@@ -13184,7 +13205,7 @@ def test_project_bound_task_explicit_non_product_metadata_not_overwritten(kanban
             board_slug="prod",
         )
 
-    with kb.connect(board="prod") as conn:
+    with kanban_db_connect.connect(board="prod") as conn:
         tid = kb.create_task(
             conn,
             title="custom workflow",
@@ -13238,7 +13259,7 @@ def test_product_board_role_story_creation_gets_workflow_metadata(kanban_home, t
     repo = tmp_path / "repo"
     repo.mkdir()
     _write_product_board_enf(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="User story: Safe paper order evidence",
@@ -13258,7 +13279,7 @@ def test_product_board_claim_repairs_legacy_plain_architect_story(kanban_home, t
     repo = tmp_path / "repo"
     repo.mkdir()
     _write_product_board_enf(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid = kb.create_task(
             conn,
             title="User story: Legacy card",
@@ -13298,7 +13319,7 @@ def _make_done_standalone_story(board: str, repo, branch: str = "wt/story-1"):
     """Create a Done, epic-less product story whose branch (off main, one
     commit) exists in ``repo``. Returns (story_id, story_branch_sha)."""
     sha = _make_epic_branch(repo, branch)  # generic: branch off main + 1 commit
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         story = kb.create_task(
             conn, title="Story: standalone merge-back", board=board,
             branch_name=branch, workspace_kind="worktree", workspace_path=str(repo),
@@ -13316,7 +13337,7 @@ def test_merge_standalone_story_to_main_happy_merges_and_never_pushes(kanban_hom
 
     calls = _record_git_calls(monkeypatch)
     notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb._merge_standalone_story_to_main(
             conn, story, board=board, verify_fn=lambda b: True, notify_fn=notify,
         )
@@ -13351,7 +13372,7 @@ def test_release_reverifies_already_merged_standalone_story(
         observed.append((candidate / "epic_work.txt").read_text(encoding="utf-8"))
         return True
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb._merge_standalone_story_to_main(
             conn,
             story,
@@ -13376,7 +13397,7 @@ def test_merge_standalone_story_with_epic_returns_none(kanban_home, tmp_path):
     _init_git_repo(repo)
     board = "v2-standalone-has-epic"
     _v2_product_board_with_repo(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         story = kb.create_task(
             conn, title="Story", board=board,
@@ -13402,7 +13423,7 @@ def test_merge_standalone_story_conflict_aborts_blocks_never_pushes(kanban_home,
 
     calls = _record_git_calls(monkeypatch)
     notify = unittest.mock.Mock()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb._merge_standalone_story_to_main(
             conn, story, board=board, verify_fn=lambda b: True, notify_fn=notify,
         )
@@ -13429,7 +13450,7 @@ def test_merge_standalone_story_verify_failure_resets_and_blocks(kanban_home, tm
     ).stdout.strip()
 
     _record_git_calls(monkeypatch)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb._merge_standalone_story_to_main(
             conn, story, board=board, verify_fn=lambda b: False,  # suite red
         )
@@ -13455,7 +13476,7 @@ def test_reconcile_merge_after_green_OFF_does_not_merge(kanban_home, tmp_path, m
         ["git", "-C", str(repo), "rev-parse", "main"], capture_output=True, text=True
     ).stdout.strip()
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.reconcile(conn, board=board, spawn_fn=lambda *a, **k: None)
 
     assert result.merged_to_main == [], "must not merge when policy is off"
@@ -13484,7 +13505,7 @@ def test_reconcile_merge_after_green_ON_merges_one_standalone_per_pass(kanban_ho
     _v2_product_board_with_repo(board, repo)
     _enable_merge_after_green(board)
     story, sha = _make_done_standalone_story(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.reconcile(conn, board=board, spawn_fn=lambda *a, **k: None)
 
     assert story in result.merged_to_main
@@ -13516,7 +13537,7 @@ def test_block_task_uses_connection_board_for_omitted_escalation(
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board_a)))
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id = kb.create_task(
             conn,
             title="connection-board escalation",
@@ -13559,7 +13580,7 @@ def test_human_cli_block_uses_connection_board_for_omitted_escalation(
     monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
     monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board_a)))
 
-    with kb.connect(board=board_a) as conn:
+    with kanban_db_connect.connect(board=board_a) as conn:
         task_id = kb.create_task(
             conn,
             title="CLI connection-board escalation",
@@ -13581,7 +13602,7 @@ def test_human_cli_block_uses_connection_board_for_omitted_escalation(
     assert kanban._cmd_block(args) == 0
     capsys.readouterr()
 
-    with kb.connect(board=board_a) as conn:
+    with kanban_db_connect.connect(board=board_a) as conn:
         task = kb.get_task(conn, task_id)
         preflight = [
             event for event in kb.list_events(conn, task_id)
@@ -13659,7 +13680,7 @@ def _d4_escalated(conn, board: str, *, step: str = "development") -> tuple[str, 
 def test_d4_answer_reentry_happy_path_and_comments_are_tolerated(kanban_home):
     board = "d4-board"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         kb.add_comment(conn, tid, "operator", "I am checking the fixture.")
         conn.execute(
@@ -13690,7 +13711,7 @@ def test_d4_answer_reentry_happy_path_and_comments_are_tolerated(kanban_home):
 def test_d4_expected_snapshot_is_a_db_boundary_cas(kanban_home):
     board = "d4-cas"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         stale = dict(expected)
         stale["escalation_event_id"] += 1
@@ -13704,7 +13725,7 @@ def test_d4_expected_snapshot_is_a_db_boundary_cas(kanban_home):
 def test_d4_lifecycle_mutation_makes_escalation_stale(kanban_home):
     board = "d4-stale-lifecycle"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         conn.execute("UPDATE tasks SET current_step_key='review' WHERE id=?", (tid,))
         conn.execute(
@@ -13722,7 +13743,7 @@ def test_d4_lifecycle_mutation_makes_escalation_stale(kanban_home):
 def test_d4_provenance_rejects_malformed_cross_task_and_wrong_profile(kanban_home):
     board = "d4-provenance"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         resolved_id = expected["escalation_event_id"] - 1
         conn.execute("UPDATE task_events SET payload='not-json' WHERE id=?", (resolved_id,))
@@ -13733,7 +13754,7 @@ def test_d4_provenance_rejects_malformed_cross_task_and_wrong_profile(kanban_hom
                 expected=expected,
             )
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         resolved_id = expected["escalation_event_id"] - 1
         payload = {"action": "escalate", "preflight_event_id": expected["preflight_event_id"]}
@@ -13745,7 +13766,7 @@ def test_d4_provenance_rejects_malformed_cross_task_and_wrong_profile(kanban_hom
                 expected=expected,
             )
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         preflight = next(event for event in kb.list_events(conn, tid) if event.id == expected["preflight_event_id"])
         payload = dict(preflight.payload)
@@ -13762,7 +13783,7 @@ def test_d4_provenance_rejects_malformed_cross_task_and_wrong_profile(kanban_hom
 def test_d4_cross_task_preflight_reference_is_rejected(kanban_home):
     board = "d4-cross-task"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         _, _, other_expected = _d4_escalated(conn, board)
         resolved_id = expected["escalation_event_id"] - 1
@@ -13786,7 +13807,7 @@ def test_d4_cross_task_preflight_reference_is_rejected(kanban_home):
 def test_d4_rejects_same_task_historical_run_substitution(kanban_home):
     board = "d4-historical-run"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, first_run, first_expected = _d4_escalated(conn, board)
         kb.reenter_resolver_escalation(
             conn, tid, board=board, answer="first answer", answered_by="operator",
@@ -13812,7 +13833,7 @@ def test_d4_rejects_same_task_historical_run_substitution(kanban_home):
 def test_d4_rejects_blank_or_non_string_answered_by(kanban_home, bad_identity):
     board = "d4-identity"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         with pytest.raises(ValueError, match="answered_by"):
             kb.reenter_resolver_escalation(
@@ -13825,7 +13846,7 @@ def test_d4_rejects_blank_or_non_string_answered_by(kanban_home, bad_identity):
 def test_d4_rejects_blank_non_string_or_oversized_answer(kanban_home, bad_answer):
     board = "d4-answer"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         with pytest.raises(ValueError, match="answer"):
             kb.reenter_resolver_escalation(
@@ -13838,7 +13859,7 @@ def test_d4_rejects_blank_non_string_or_oversized_answer(kanban_home, bad_answer
 def test_d4_source_assignee_is_validated_before_coercion(kanban_home, raw_assignee):
     board = "d4-source-assignee"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         preflight = next(event for event in kb.list_events(conn, tid) if event.id == expected["preflight_event_id"])
         payload = dict(preflight.payload)
@@ -13855,7 +13876,7 @@ def test_d4_source_assignee_is_validated_before_coercion(kanban_home, raw_assign
 def test_d4_missing_or_none_assignee_uses_governed_backlog_derivation(kanban_home):
     board = "d4-backlog"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board, step="backlog")
         preflight = next(event for event in kb.list_events(conn, tid) if event.id == expected["preflight_event_id"])
         payload = dict(preflight.payload)
@@ -13874,7 +13895,7 @@ def test_d4_missing_or_none_assignee_uses_governed_backlog_derivation(kanban_hom
 def test_d4_release_measure_resume_preserves_canonical_none(kanban_home):
     board = "d4-release-measure"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board, step="release_measure")
         preflight = next(event for event in kb.list_events(conn, tid) if event.id == expected["preflight_event_id"])
         payload = dict(preflight.payload)
@@ -13892,7 +13913,7 @@ def test_d4_release_measure_resume_preserves_canonical_none(kanban_home):
 def test_d4_release_measure_resume_restores_none_after_fresh_resolver(kanban_home):
     board = "d4-release-measure-resume"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board, step="release_measure")
         preflight = next(
             event for event in kb.list_events(conn, tid)
@@ -13932,7 +13953,7 @@ def test_d4_configured_assignee_is_validated_before_helper_coercion(
     workflow.setdefault("assignees", dict(kb.PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES))
     workflow["assignees"]["developer"] = bad_configured_assignee
     kb.board_metadata_path(board).write_text(json.dumps(metadata), encoding="utf-8")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         preflight = next(
             event for event in kb.list_events(conn, tid)
@@ -13955,7 +13976,7 @@ def test_d4_configured_assignee_is_validated_before_helper_coercion(
 def test_d4_non_resolver_block_fails_closed(kanban_home):
     board = "d4-non-resolver-block"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         blocked = next(
             event for event in kb.list_events(conn, tid)
@@ -13978,7 +13999,7 @@ def test_d4_non_resolver_block_fails_closed(kanban_home):
 def test_d4_attempted_resolutions_are_bounded_and_one_event_is_written(kanban_home):
     board = "d4-bounds"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         blocked = next(event for event in kb.list_events(conn, tid) if event.id == expected["escalation_event_id"])
         payload = dict(blocked.payload)
@@ -14000,7 +14021,7 @@ def test_d4_attempted_resolutions_are_bounded_and_one_event_is_written(kanban_ho
 def test_d4_second_escalation_reentry_cycle_works(kanban_home):
     board = "d4-repeat"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, first_expected = _d4_escalated(conn, board)
         kb.reenter_resolver_escalation(
             conn, tid, board=board, answer="first", answered_by="operator",
@@ -14038,13 +14059,13 @@ def test_d4_second_escalation_reentry_cycle_works(kanban_home):
 def test_d4_concurrent_answers_have_exactly_one_winner_and_public_conflict(kanban_home):
     board = "d4-concurrent"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
     barrier = threading.Barrier(2)
     results = []
 
     def answer(answer_text):
-        with kb.connect(board=board) as conn:
+        with kanban_db_connect.connect(board=board) as conn:
             barrier.wait(timeout=5)
             try:
                 event_id = kb.reenter_resolver_escalation(
@@ -14064,7 +14085,7 @@ def test_d4_concurrent_answers_have_exactly_one_winner_and_public_conflict(kanba
     errors = [result[1] for result in results if result[0] == "error"]
     assert len(errors) == 1, results
     assert isinstance(errors[0], kb.TaskSnapshotConflict), errors
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         answer_events = [
             event for event in kb.list_events(conn, tid)
             if event.kind == kb.PRODUCT_WORKFLOW_PRECHECK_EVENT
@@ -14078,7 +14099,7 @@ def test_d4_real_dispatcher_claims_development_and_review_reentry(kanban_home, m
     original_claim_review = kb.claim_review_task
     for step, board in [("development", "d4-dispatch-dev"), ("review", "d4-dispatch-review")]:
         _v2_product_board(board)
-        with kb.connect(board=board) as conn:
+        with kanban_db_connect.connect(board=board) as conn:
             tid, _, expected = _d4_escalated(conn, board, step=step)
             kb.reenter_resolver_escalation(
                 conn, tid, board=board, answer="dispatch answer", answered_by="operator",
@@ -14092,8 +14113,8 @@ def test_d4_real_dispatcher_claims_development_and_review_reentry(kanban_home, m
                 calls.append(task_id), _claim(conn, task_id, **kwargs)
             )[1],
         )
-        with kb.connect(board=board) as conn:
-            result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: 9001, board=board)
+        with kanban_db_connect.connect(board=board) as conn:
+            result = kbd.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: 9001, board=board)
             task = kb.get_task(conn, tid)
             run = kb.get_run(conn, task.current_run_id) if task and task.current_run_id else None
         assert tid in [spawn[0] for spawn in result.spawned]
@@ -14127,7 +14148,7 @@ def test_d3_rejects_oversized_cas_metadata_before_create_mutation(kanban_home, f
         # be hidden behind the normal unknown-project error.
         kwargs["workspace_kind"] = "scratch"
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         with pytest.raises(ValueError, match=field):
             kb.create_task(conn, **kwargs)
         assert kb.list_tasks(conn) == []
@@ -14136,7 +14157,7 @@ def test_d3_rejects_oversized_cas_metadata_before_create_mutation(kanban_home, f
 def test_d4_rejects_coherently_forged_non_resolver_cycle_without_mutation(kanban_home):
     board = "d4-forged-resolver"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         blocked_id = expected["escalation_event_id"]
         preflight = next(
@@ -14177,7 +14198,7 @@ def test_d4_default_human_escalation_profile_accepts_resolver_cycle(kanban_home)
     board = "d4-default-human-profile"
     _v2_product_board(board)
     _set_human_escalation_profile(board, "default")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         event_id = kb.reenter_resolver_escalation(
             conn, tid, board=board, answer="answer", answered_by="operator",
@@ -14193,7 +14214,7 @@ def test_d4_rejects_coherently_forged_default_cycle_without_mutation(kanban_home
     board = "d4-forged-default"
     _v2_product_board(board)
     _set_human_escalation_profile(board, "default")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         blocked_id = expected["escalation_event_id"]
         preflight = next(
@@ -14245,7 +14266,7 @@ def test_d4_rejects_present_malformed_copied_evidence_atomically(
 ):
     board = f"d4-evidence-{field}-{type(bad_value).__name__}"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         blocked = next(event for event in kb.list_events(conn, tid) if event.id == expected["escalation_event_id"])
         payload = dict(blocked.payload)
@@ -14269,7 +14290,7 @@ def test_d4_rejects_present_malformed_copied_evidence_atomically(
 def test_d4_absent_optional_copied_evidence_remains_distinct_from_malformed(kanban_home):
     board = "d4-evidence-absent"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         blocked = next(event for event in kb.list_events(conn, tid) if event.id == expected["escalation_event_id"])
         payload = dict(blocked.payload)
@@ -14306,7 +14327,7 @@ def test_d4_absent_optional_copied_evidence_remains_distinct_from_malformed(kanb
 def test_d4_non_audit_events_invalidate_escalation_without_mutation(kanban_home, event_kind):
     board = f"d4-event-{event_kind}"
     _v2_product_board(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         tid, _, expected = _d4_escalated(conn, board)
         conn.execute(
             "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
@@ -14356,7 +14377,7 @@ def test_qualification_attempt_budget_counts_all_historical_runs_and_preserves_h
     metadata["qualification"]["max_total_attempts"] = 3
     metadata["qualification"]["required"] = True
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         intake_id = kb.create_qualification_intake(
             conn, raw_request="budget me", source="chat", created_at=10
         )
@@ -14433,7 +14454,7 @@ def _configure_task_row_and_events(conn, task_id):
 def test_configure_task_atomically_clears_contract_and_records_exact_event(
     kanban_home,
 ):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id = kb.create_task(
             conn,
             title="configure existing card",
@@ -14494,7 +14515,7 @@ def test_configure_task_atomically_clears_contract_and_records_exact_event(
     ],
 )
 def test_configure_task_allows_each_eligible_status(kanban_home, status, blocked):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id = kb.create_task(conn, title=f"eligible {status}")
         conn.execute(
             "UPDATE tasks SET status = ?, blocked = ? WHERE id = ?",
@@ -14519,7 +14540,7 @@ def test_configure_task_allows_each_eligible_status(kanban_home, status, blocked
 def test_configure_task_cas_rejects_stale_lifecycle_and_execution_fields(
     kanban_home, stale_field
 ):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id = kb.create_task(conn, title="stale card")
         task = kb.get_task(conn, task_id)
         assert task is not None
@@ -14550,7 +14571,7 @@ def test_configure_task_cas_rejects_stale_lifecycle_and_execution_fields(
 
 
 def test_configure_task_refuses_second_write_with_same_expectation(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id = kb.create_task(conn, title="single CAS write")
         task = kb.get_task(conn, task_id)
         assert task is not None
@@ -14586,7 +14607,7 @@ def test_configure_task_refuses_second_write_with_same_expectation(kanban_home):
 def test_configure_task_rejects_invalid_values_without_mutation(
     kanban_home, field, value
 ):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id = kb.create_task(conn, title="invalid contract")
         task = kb.get_task(conn, task_id)
         assert task is not None
@@ -14613,7 +14634,7 @@ def test_configure_task_rejects_invalid_values_without_mutation(
 def test_configure_task_rejects_incomplete_expected_snapshot_without_mutation(
     kanban_home,
 ):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id = kb.create_task(conn, title="incomplete expectation")
         task = kb.get_task(conn, task_id)
         assert task is not None
@@ -14639,7 +14660,7 @@ def test_configure_task_rejects_incomplete_expected_snapshot_without_mutation(
 def test_configure_task_refuses_terminal_status_without_mutation(
     kanban_home, status
 ):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id = kb.create_task(conn, title=f"terminal {status}")
         conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
         conn.commit()
@@ -14662,7 +14683,7 @@ def test_configure_task_refuses_terminal_status_without_mutation(
 
 
 def test_configure_task_refuses_active_current_run_without_mutation(kanban_home):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id = kb.create_task(conn, title="active run")
         claimed = kb.claim_task(conn, task_id)
         assert claimed is not None and claimed.current_run_id is not None
@@ -14695,7 +14716,7 @@ def test_engine_owned_integration_pending_refuses_public_lifecycle_paths(
         kb.subprocess, "run",
         lambda *_args, **_kwargs: pytest.fail("guarded path must not spawn Git"),
     )
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         story_id = kb.create_task(
             conn, title="Story", board=board,
             workflow_template_id="product", current_step_key="review",
@@ -14740,7 +14761,7 @@ def test_product_epic_and_legacy_reconcile_are_structurally_refused_without_git(
         kb.subprocess, "run",
         lambda *_args, **_kwargs: pytest.fail("guarded path must not spawn Git"),
     )
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         story_id = kb.create_task(conn, title="Story", board=board)
         kb.add_epic_membership(conn, epic_id=epic_id, task_id=story_id)
@@ -14823,7 +14844,7 @@ def test_integration_enqueued_accepts_test_by_development_provider_without_test_
             "reviewer": {"agent": "reviewer"},
         },
     }
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         story_id = kb.create_task(
             conn, title="Story", board=board, assignee="reviewer",

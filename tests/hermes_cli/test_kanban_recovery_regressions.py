@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -94,7 +95,7 @@ def test_default_merge_verifier_integrates_while_main_is_checked_out(
     _product_board(board, repo)
     monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         story_id = kb.create_task(
             conn,
             title="Story: verify real path",
@@ -138,7 +139,7 @@ def test_dirty_target_is_preserved_and_not_integrated(
         return real_run(command, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", spy_run)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         story_id = kb.create_task(
             conn,
             title="Story: preserve user work",
@@ -178,7 +179,7 @@ def test_old_completion_cannot_close_next_claim(
     _product_board(board, repo)
     monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = kb.create_task(
             conn,
             title="Story: race",
@@ -195,7 +196,7 @@ def test_old_completion_cannot_close_next_claim(
 
         def handoff_then_claim(*args, **kwargs):
             advanced = original_handoff(*args, **kwargs)
-            with kb.connect(board=board) as other:
+            with kanban_db_connect.connect(board=board) as other:
                 second = kb.claim_task(other, task_id, board=board, claimer="new")
                 assert second is not None and second.current_run_id is not None
                 raced["run_id"] = second.current_run_id
@@ -229,7 +230,7 @@ def test_role_only_card_remains_scratch_work(
     _product_board(board, repo)
     monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = kb.create_task(
             conn,
             title="Rotate staging API token",
@@ -253,7 +254,7 @@ def test_invalid_product_step_fails_closed_with_audit_event(
     _product_board(board, repo)
     monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         with pytest.raises(ValueError, match="invalid product workflow step"):
             kb.create_task(
                 conn,

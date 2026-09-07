@@ -35,6 +35,18 @@ def isolated_update_checkout(monkeypatch, tmp_path):
     monkeypatch.setattr("hermes_cli.update_cmd._restart_macos_launchd_gateways", lambda *a, **k: None)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_update(isolated_update_runtime, monkeypatch):
+    import shutil
+    from hermes_cli import managed_uv, update_cmd
+
+    monkeypatch.setattr(managed_uv, "resolve_uv", lambda **kw: shutil.which("uv"))
+    monkeypatch.setattr(managed_uv, "ensure_uv", lambda **kw: shutil.which("uv"))
+    monkeypatch.setattr(managed_uv, "update_managed_uv", lambda **kw: None)
+    monkeypatch.setattr(update_cmd, "_post_update_sqlite_runtime_status", lambda: (True, None))
+
+
+
 def _make_run_side_effect(
     branch="main", verify_ok=True, commit_count="1", dirty=False
 ):

@@ -35,7 +35,7 @@ from agent.cli_emulated_provider import (
     _run_process,
     resolve_cli_effort,
 )
-from tools.mcp_tool import discover_mcp_tools
+from tools.mcp_tool_discovery import discover_mcp_tools
 from tools.registry import registry
 
 

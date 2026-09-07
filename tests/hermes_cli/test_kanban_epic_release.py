@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 from hermes_cli.kanban_epic_release import (
     EpicReadiness,
     EpicReadinessMember,
@@ -94,7 +95,7 @@ def _insert_member(conn: sqlite3.Connection, snapshot_id: int) -> None:
 
 
 def test_epic_release_schema_has_exact_snapshot_and_member_columns(tmp_path):
-    with kb.connect(tmp_path / "fresh.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "fresh.db") as conn:
         snapshot_info = conn.execute(
             "PRAGMA table_info(epic_release_snapshots)"
         ).fetchall()
@@ -132,7 +133,7 @@ def test_epic_release_schema_has_exact_snapshot_and_member_columns(tmp_path):
 
 
 def test_epic_release_schema_round_trips_frozen_snapshot_and_member(tmp_path):
-    with kb.connect(tmp_path / "fresh.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "fresh.db") as conn:
         snapshot_id = _insert_snapshot(conn, status="ci_pending", pushed_sha=PUSHED_SHA)
         _insert_member(conn, snapshot_id)
         snapshot_row = conn.execute(
@@ -173,7 +174,7 @@ def test_epic_release_schema_round_trips_frozen_snapshot_and_member(tmp_path):
 
 
 def test_epic_release_schema_allows_only_one_active_snapshot_per_epic(tmp_path):
-    with kb.connect(tmp_path / "fresh.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "fresh.db") as conn:
         first_id = _insert_snapshot(conn)
         with pytest.raises(sqlite3.IntegrityError):
             _insert_snapshot(conn, status="ci_failed")
@@ -189,7 +190,7 @@ def test_epic_release_schema_allows_only_one_active_snapshot_per_epic(tmp_path):
 
 @pytest.mark.parametrize("status", ["pending", "done", ""])
 def test_epic_release_schema_refuses_illegal_status(tmp_path, status):
-    with kb.connect(tmp_path / "fresh.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "fresh.db") as conn:
         with pytest.raises(sqlite3.IntegrityError):
             _insert_snapshot(conn, status=status)
 
@@ -300,7 +301,7 @@ def _derive_ready(
 
 
 def test_fact_derived_readiness_accepts_exact_current_member_fact_and_candidate(tmp_path):
-    with kb.connect(tmp_path / "ready.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "ready.db") as conn:
         epic_id, story_id = _readiness_member(conn)
 
         result = _derive_ready(conn, epic_id, story_id)
@@ -395,7 +396,7 @@ def test_fact_derived_readiness_accepts_exact_current_member_fact_and_candidate(
 def test_fact_derived_readiness_reports_each_member_blocker(
     tmp_path, mutate, terminal_source_sha, blocker
 ):
-    with kb.connect(tmp_path / f"{blocker}.db") as conn:
+    with kanban_db_connect.connect(tmp_path / f"{blocker}.db") as conn:
         epic_id, story_id = _readiness_member(conn)
         mutate(conn, epic_id, story_id)
 
@@ -411,7 +412,7 @@ def test_fact_derived_readiness_reports_each_member_blocker(
 
 
 def test_fact_derived_readiness_requires_governed_non_empty_contribution(tmp_path):
-    with kb.connect(tmp_path / "empty.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "empty.db") as conn:
         epic_id, story_id = _readiness_member(conn)
         result = _derive_ready(
             conn,
@@ -425,7 +426,7 @@ def test_fact_derived_readiness_requires_governed_non_empty_contribution(tmp_pat
 
 
 def test_fact_derived_readiness_requires_members(tmp_path):
-    with kb.connect(tmp_path / "empty.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "empty.db") as conn:
         epic_id = kb.create_task(conn, title="Empty Epic", work_item_kind="epic")
 
         result = derive_epic_readiness(
@@ -441,7 +442,7 @@ def test_fact_derived_readiness_requires_members(tmp_path):
 
 
 def test_fact_derived_readiness_requires_candidate_lineage_and_epic_containment(tmp_path):
-    with kb.connect(tmp_path / "ancestry.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "ancestry.db") as conn:
         epic_id, story_id = _readiness_member(conn)
 
         result = _derive_ready(
@@ -458,7 +459,7 @@ def test_fact_derived_readiness_requires_candidate_lineage_and_epic_containment(
 
 
 def test_fact_derived_readiness_requires_epic_tip_to_contain_candidate(tmp_path):
-    with kb.connect(tmp_path / "tip.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "tip.db") as conn:
         epic_id, story_id = _readiness_member(conn)
 
         result = _derive_ready(
@@ -478,7 +479,7 @@ def test_fact_derived_readiness_blocks_when_ancestry_is_unavailable(tmp_path):
     def unavailable(_descendant, _ancestor):
         raise RuntimeError("repository unavailable")
 
-    with kb.connect(tmp_path / "unavailable.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "unavailable.db") as conn:
         epic_id, story_id = _readiness_member(conn)
 
         result = _derive_ready(
@@ -493,7 +494,7 @@ def test_fact_derived_readiness_blocks_when_ancestry_is_unavailable(tmp_path):
 
 
 def test_fact_derived_readiness_ignores_pruned_story_verification_events(tmp_path):
-    with kb.connect(tmp_path / "pruned.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "pruned.db") as conn:
         epic_id, story_id = _readiness_member(conn)
         event_id = conn.execute(
             "INSERT INTO task_events (task_id, kind, payload, created_at) "
@@ -594,7 +595,7 @@ def test_prepare_epic_release_snapshot_persists_once_and_replays_without_rebuild
         builder_calls.append((args, kwargs))
         return candidate
 
-    with kb.connect(tmp_path / "prepare.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "prepare.db") as conn:
         epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
         story_id = kb.create_task(conn, title="Story")
         kb.add_epic_membership(conn, epic_id=epic_id, task_id=story_id)
@@ -670,7 +671,7 @@ def test_prepare_epic_release_snapshot_changed_inputs_cleanup_only_new_candidate
         ) or True,
     )
 
-    with kb.connect(tmp_path / "changed.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "changed.db") as conn:
         epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
         story_id = kb.create_task(conn, title="Story")
         kb.add_epic_membership(conn, epic_id=epic_id, task_id=story_id)
@@ -727,7 +728,7 @@ def test_prepare_epic_release_snapshot_refuses_mismatching_active_snapshot_witho
         "a mismatching active snapshot must not be rebuilt"
     )
 
-    with kb.connect(tmp_path / "active-mismatch.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "active-mismatch.db") as conn:
         epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
         readiness = replace(readiness, epic_id=epic_id)
         candidate = replace(candidate, source_branch=kb.epic_branch_for(epic_id))
@@ -945,7 +946,7 @@ def test_invalidate_epic_release_snapshot_parametrized_drift_invalidates_only_af
 
     monkeypatch.setattr(kb, "delete_release_candidate_ref", wrap_delete)
 
-    with kb.connect(tmp_path / f"{case_name}.db") as conn:
+    with kanban_db_connect.connect(tmp_path / f"{case_name}.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         apply_drift(ctx, conn, monkeypatch)
         result = kb.invalidate_epic_release_snapshot(
@@ -983,7 +984,7 @@ def test_invalidate_epic_release_snapshot_exact_authority_leaves_snapshot_active
 
     monkeypatch.setattr(kb, "delete_release_candidate_ref", wrap_delete)
 
-    with kb.connect(tmp_path / "exact.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "exact.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         result = kb.invalidate_epic_release_snapshot(
             conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
@@ -1018,7 +1019,7 @@ def test_invalidate_epic_release_snapshot_without_active_snapshot_returns_missin
 
     monkeypatch.setattr(kb, "delete_release_candidate_ref", wrap_delete)
 
-    with kb.connect(tmp_path / "missing.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "missing.db") as conn:
         _, story_id, board_meta, _contract, readiness, _candidate = (
             _release_prepare_fixture(tmp_path, monkeypatch)
         )
@@ -1049,7 +1050,7 @@ def test_invalidate_epic_release_snapshot_repeated_invalidation_is_idempotent(
 
     monkeypatch.setattr(kb, "delete_release_candidate_ref", wrap_delete)
 
-    with kb.connect(tmp_path / "idempotent.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "idempotent.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         _drift_epic_tip(ctx, conn, monkeypatch)
         first = kb.invalidate_epic_release_snapshot(
@@ -1084,7 +1085,7 @@ def test_invalidate_epic_release_snapshot_preparation_replay_rebuilds_after_inva
     new_ref = RELEASE_CANDIDATE_REF + "-2"
     builder_calls: list = []
 
-    with kb.connect(tmp_path / "replay.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "replay.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         _drift_epic_tip(ctx, conn, monkeypatch)
 
@@ -1162,7 +1163,7 @@ def test_invalidate_stale_epic_release_snapshots_only_invalidates_drifted_epic(
 
     monkeypatch.setattr(kb, "delete_release_candidate_ref", wrap_delete)
 
-    with kb.connect(tmp_path / "bulk.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "bulk.db") as conn:
         ctx_a = _prepare_exact_snapshot(conn, monkeypatch, tmp_path, epic_label="A")
         ctx_b = _prepare_exact_snapshot(conn, monkeypatch, tmp_path, epic_label="B")
         # Drift ONLY epic A: its tip moves; epic B keeps its exact authority.
@@ -1210,7 +1211,7 @@ def test_invalidate_stale_epic_release_snapshots_only_invalidates_drifted_epic(
 def test_invalidate_stale_epic_release_snapshots_ungoverned_board_returns_empty(
     tmp_path, monkeypatch,
 ):
-    with kb.connect(tmp_path / "ungov.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "ungov.db") as conn:
         # No board metadata — product_board_metadata(None) returns None.
         results = kb.invalidate_stale_epic_release_snapshots(conn)
     assert results == ()
@@ -1255,7 +1256,7 @@ def test_build_release_handoff_returns_truthful_immutable_evidence_with_plain_ac
     tmp_path, monkeypatch,
 ):
     _handoff_observe(monkeypatch)
-    with kb.connect(tmp_path / "handoff.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "handoff.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         handoff = kb.build_epic_release_handoff(
             conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
@@ -1309,7 +1310,7 @@ def test_build_release_handoff_refuses_and_invalidates_on_local_target_mismatch(
     _handoff_observe(monkeypatch, local_head=moved)
     delete_calls = _handoff_delete_calls(monkeypatch)
 
-    with kb.connect(tmp_path / "handoff-local.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "handoff-local.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         with pytest.raises(EpicReleaseHandoffError) as exc_info:
             kb.build_epic_release_handoff(
@@ -1340,7 +1341,7 @@ def test_build_release_handoff_refuses_and_invalidates_on_remote_target_mismatch
     _handoff_observe(monkeypatch, remote_head=moved)
     delete_calls = _handoff_delete_calls(monkeypatch)
 
-    with kb.connect(tmp_path / "handoff-remote.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "handoff-remote.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         with pytest.raises(EpicReleaseHandoffError) as exc_info:
             kb.build_epic_release_handoff(
@@ -1370,7 +1371,7 @@ def test_build_release_handoff_refuses_without_invalidating_on_remote_unavailabi
     _handoff_observe(monkeypatch, remote_head=None, remote_available=False)
     delete_calls = _handoff_delete_calls(monkeypatch)
 
-    with kb.connect(tmp_path / "handoff-unavail.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "handoff-unavail.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         with pytest.raises(EpicReleaseHandoffError) as exc_info:
             kb.build_epic_release_handoff(
@@ -1400,7 +1401,7 @@ def test_build_release_handoff_remote_unavailable_then_available_handoff_succeed
     delete_calls = _handoff_delete_calls(monkeypatch)
     _handoff_observe(monkeypatch, remote_head=None, remote_available=False)
 
-    with kb.connect(tmp_path / "handoff-retry.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "handoff-retry.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         with pytest.raises(EpicReleaseHandoffError) as first:
             kb.build_epic_release_handoff(
@@ -1427,7 +1428,7 @@ def test_build_release_handoff_refuses_without_invalidating_on_local_unavailabil
     _handoff_observe(monkeypatch, local_head=None)
     delete_calls = _handoff_delete_calls(monkeypatch)
 
-    with kb.connect(tmp_path / "handoff-local-unavail.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "handoff-local-unavail.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         with pytest.raises(EpicReleaseHandoffError) as exc_info:
             kb.build_epic_release_handoff(
@@ -1449,7 +1450,7 @@ def test_build_release_handoff_refuses_and_invalidates_on_snapshot_authority_dri
     _handoff_observe(monkeypatch)
     delete_calls = _handoff_delete_calls(monkeypatch)
 
-    with kb.connect(tmp_path / "handoff-drift.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "handoff-drift.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         _drift_epic_tip(ctx, conn, monkeypatch)
         with pytest.raises(EpicReleaseHandoffError) as exc_info:
@@ -1479,7 +1480,7 @@ def test_build_release_handoff_refuses_and_invalidates_on_snapshot_authority_dri
 
 def test_build_release_handoff_refuses_without_active_snapshot(tmp_path, monkeypatch):
     _handoff_observe(monkeypatch)
-    with kb.connect(tmp_path / "handoff-none.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "handoff-none.db") as conn:
         _fixture_epic_id, _story_id, board_meta, _contract, readiness, _candidate = (
             _release_prepare_fixture(tmp_path, monkeypatch)
         )
@@ -1502,7 +1503,7 @@ def test_build_release_handoff_refuses_without_active_snapshot(tmp_path, monkeyp
 def test_build_release_handoff_refuses_on_ungoverned_board(tmp_path, monkeypatch):
     _handoff_observe(monkeypatch)
     monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: None)
-    with kb.connect(tmp_path / "handoff-ungov.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "handoff-ungov.db") as conn:
         epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
         with pytest.raises(EpicReleaseHandoffError) as exc_info:
             kb.build_epic_release_handoff(conn, epic_id, board="release-board")
@@ -1562,7 +1563,7 @@ def test_observe_epic_release_ci_not_yet_pushed_returns_ci_pending_preserved(
     run_calls = _ci_workflows(monkeypatch, {})
     delete_calls = _ci_delete_calls(monkeypatch)
 
-    with kb.connect(tmp_path / "ci-not-pushed.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "ci-not-pushed.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         result = kb.observe_epic_release_ci(
             conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
@@ -1592,7 +1593,7 @@ def test_observe_epic_release_ci_exact_sha_all_workflows_pass_released_and_ref_d
     )
     delete_calls = _ci_delete_calls(monkeypatch)
 
-    with kb.connect(tmp_path / "ci-released.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "ci-released.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         result = kb.observe_epic_release_ci(
             conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
@@ -1635,7 +1636,7 @@ def test_observe_epic_release_ci_failure_marks_ci_failed_then_same_sha_later_pas
     _ci_workflows(monkeypatch, {"CI": "failure", "Deploy Test": "success"})
     delete_calls = _ci_delete_calls(monkeypatch)
 
-    with kb.connect(tmp_path / "ci-failed.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "ci-failed.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         first = kb.observe_epic_release_ci(
             conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
@@ -1678,7 +1679,7 @@ def test_observe_epic_release_ci_different_sha_after_pinned_push_invalidates(
     _ci_workflows(monkeypatch, {"CI": None, "Deploy Test": None})
     delete_calls = _ci_delete_calls(monkeypatch)
 
-    with kb.connect(tmp_path / "ci-moved.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "ci-moved.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         first = kb.observe_epic_release_ci(
             conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
@@ -1712,7 +1713,7 @@ def test_observe_epic_release_ci_running_workflow_stays_ci_pending(
     _ci_workflows(monkeypatch, {"CI": None, "Deploy Test": None})
     delete_calls = _ci_delete_calls(monkeypatch)
 
-    with kb.connect(tmp_path / "ci-running.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "ci-running.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         result = kb.observe_epic_release_ci(
             conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
@@ -1737,7 +1738,7 @@ def test_observe_epic_release_ci_remote_unavailable_preserves_snapshot(
     run_calls = _ci_workflows(monkeypatch, {})
     delete_calls = _ci_delete_calls(monkeypatch)
 
-    with kb.connect(tmp_path / "ci-remote-unavail.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "ci-remote-unavail.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         result = kb.observe_epic_release_ci(
             conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
@@ -1761,7 +1762,7 @@ def test_observe_epic_release_ci_provider_unavailable_preserves_snapshot(
     _ci_workflows(monkeypatch, None)
     delete_calls = _ci_delete_calls(monkeypatch)
 
-    with kb.connect(tmp_path / "ci-provider-unavail.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "ci-provider-unavail.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         result = kb.observe_epic_release_ci(
             conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
@@ -1784,7 +1785,7 @@ def test_observe_epic_release_ci_authority_drift_invalidates_exactly(
     _ci_workflows(monkeypatch, {"CI": "success", "Deploy Test": "success"})
     delete_calls = _ci_delete_calls(monkeypatch)
 
-    with kb.connect(tmp_path / "ci-drift.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "ci-drift.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         _drift_epic_tip(ctx, conn, monkeypatch)
         result = kb.observe_epic_release_ci(
@@ -1809,7 +1810,7 @@ def test_observe_epic_release_ci_without_active_snapshot_returns_missing(
 ):
     _ci_observe(monkeypatch)
     _ci_workflows(monkeypatch, {})
-    with kb.connect(tmp_path / "ci-missing.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "ci-missing.db") as conn:
         _fixture_epic_id, _fixture_story_id, board_meta, _contract, readiness, _candidate = (
             _release_prepare_fixture(tmp_path, monkeypatch)
         )
@@ -1834,7 +1835,7 @@ def test_observe_epic_release_ci_refuses_on_ungoverned_board(
     tmp_path, monkeypatch,
 ):
     monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: None)
-    with kb.connect(tmp_path / "ci-ungov.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "ci-ungov.db") as conn:
         epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
         with pytest.raises(EpicReleaseCIObservationError) as exc_info:
             kb.observe_epic_release_ci(conn, epic_id, board="release-board")
@@ -1845,7 +1846,7 @@ def test_observe_epic_release_ci_refuses_on_ungoverned_board(
 def test_observe_epic_release_ci_refuses_inside_active_transaction(
     tmp_path, monkeypatch,
 ):
-    with kb.connect(tmp_path / "ci-txn.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "ci-txn.db") as conn:
         ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
         conn.execute("BEGIN IMMEDIATE")
         assert conn.in_transaction is True

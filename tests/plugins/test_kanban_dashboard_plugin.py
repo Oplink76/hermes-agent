@@ -22,6 +22,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_intake as intake
 
 
@@ -65,7 +67,7 @@ def client(kanban_home):
     original_request = test_client.request
 
     def snapshot(task_id, board=None):
-        with kb.connect(board=board) as conn:
+        with kbc.connect(board=board) as conn:
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None:
             return {
@@ -112,13 +114,13 @@ def client(kanban_home):
             kwargs["json"] = body
         elif method == "DELETE" and path.startswith("/attachments/"):
             attachment_id = int(path.rsplit("/", 1)[-1])
-            with kb.connect(board=board) as conn:
+            with kbc.connect(board=board) as conn:
                 attachment = kb.get_attachment(conn, attachment_id)
             task_id = attachment.task_id if attachment else "t_missing"
             kwargs["json"] = {**snapshot(task_id, board), **(body or {})}
         elif method != "GET" and path.startswith("/runs/"):
             run_id = int(path.split("/")[2])
-            with kb.connect(board=board) as conn:
+            with kbc.connect(board=board) as conn:
                 run = kb.get_run(conn, run_id)
             task_id = run.task_id if run else "t_missing"
             kwargs["json"] = {**snapshot(task_id, board), **(body or {})}
@@ -159,7 +161,7 @@ def test_board_empty(client):
 
 def test_product_board_uses_relay_style_columns_and_step_grouping(client):
     kb.create_board("prod", name="Product", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kbc.connect(board="prod") as conn:
         story_id = kb.create_task(
             conn,
             title="User story: visible quorum state",
@@ -196,7 +198,7 @@ def test_product_board_uses_relay_style_columns_and_step_grouping(client):
 
 def test_product_board_exposes_ai_provenance_on_cards_and_detail(client):
     kb.create_board("prod", name="Product", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kbc.connect(board="prod") as conn:
         tid = kb.create_task(
             conn,
             title="User story: audit trail",
@@ -239,7 +241,7 @@ def test_product_board_exposes_ai_provenance_on_cards_and_detail(client):
 
 def test_product_task_detail_ai_provenance_includes_read_only_evidence(client):
     kb.create_board("prod", name="Product", preset="product")
-    with kb.connect(board="prod") as conn:
+    with kbc.connect(board="prod") as conn:
         tid = kb.create_task(
             conn,
             title="User story: provenance evidence",
@@ -327,7 +329,7 @@ def test_product_task_detail_ai_provenance_includes_read_only_evidence(client):
 
 
 def test_approve_unblock_endpoint_validates_snapshot_and_writes_trace(client):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(
             conn,
             title="Approve from dashboard",
@@ -349,7 +351,7 @@ def test_approve_unblock_endpoint_validates_snapshot_and_writes_trace(client):
 
     assert response.status_code == 200
     assert response.json()["task"]["status"] == "ready"
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task = kb.get_task(conn, tid)
         comments = kb.list_comments(conn, tid)
     assert task is not None
@@ -363,7 +365,7 @@ def test_approve_unblock_endpoint_validates_snapshot_and_writes_trace(client):
 
 
 def test_approve_unblock_endpoint_stale_snapshot_returns_409_without_trace(client):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="Current title", initial_status="blocked")
 
     response = client.post(
@@ -379,7 +381,7 @@ def test_approve_unblock_endpoint_stale_snapshot_returns_409_without_trace(clien
 
     assert response.status_code == 409
     assert "refresh" in response.json()["detail"]
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task = kb.get_task(conn, tid)
         assert task is not None
         assert task.status == "blocked"
@@ -422,7 +424,7 @@ def test_create_task_appears_on_board(client):
 
 
 def test_board_and_detail_keep_epics_separate_from_dependency_relations(client):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         epic_id = kb.create_task(
             conn, title="Portfolio outcome", work_item_kind="epic"
         )
@@ -495,7 +497,7 @@ def test_strict_board_post_tasks_returns_intake_without_task(client):
     assert body["intake_status"] == "pending"
     assert body["intake_id"].startswith("qi_")
     assert "task" not in body
-    with kb.connect(board="strict") as conn:
+    with kbc.connect(board="strict") as conn:
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
         record = kb.get_qualification_intake(conn, body["intake_id"])
     assert "dashboard request" in record["raw_request"]
@@ -522,7 +524,7 @@ def test_official_intake_api_returns_receipt_filtered_inbox_and_detail(client):
     assert receipt["status"] == "qualification_required"
     intake_id = receipt["intake_id"]
 
-    with kb.connect(board="strict") as conn:
+    with kbc.connect(board="strict") as conn:
         intake.submit_intake(
             conn,
             request={"title": "Migrated intake"},
@@ -572,7 +574,7 @@ def test_official_intake_api_returns_receipt_filtered_inbox_and_detail(client):
 
 def test_operator_intake_detail_exposes_only_bounded_contract_failure_path(client):
     kb.ensure_product_board_defaults("strict")
-    with kb.connect(board="strict") as conn:
+    with kbc.connect(board="strict") as conn:
         intake_id = kb.create_qualification_intake(
             conn,
             raw_request=json.dumps({"title": "Operator-visible intake"}),
@@ -653,7 +655,7 @@ def test_task_and_epic_detail_expose_safe_work_contract_views(client):
             secret=secret,
         )
 
-    with kb.connect(board="strict") as conn:
+    with kbc.connect(board="strict") as conn:
         epic_intake = kb.create_qualification_intake(
             conn, raw_request="Epic request", source="hermes"
         )
@@ -716,7 +718,7 @@ def test_task_and_epic_detail_expose_safe_work_contract_views(client):
 
 def test_strict_board_rejects_client_contract_and_routing_mutations(client):
     kb.ensure_product_board_defaults("strict")
-    with kb.connect(board="strict") as conn:
+    with kbc.connect(board="strict") as conn:
         first = kb.create_task(conn, title="Legacy first", assignee="developer")
         second = kb.create_task(conn, title="Legacy second", assignee="developer")
     metadata_path = kb.board_metadata_path("strict")
@@ -754,7 +756,7 @@ def test_strict_board_rejects_client_contract_and_routing_mutations(client):
     )
     assert bulk_lifecycle.status_code == 409
     assert "run-scoped" in bulk_lifecycle.text
-    with kb.connect(board="strict") as conn:
+    with kbc.connect(board="strict") as conn:
         assert kb.get_task(conn, first).status != "done"
 
     for field, value in (
@@ -763,7 +765,7 @@ def test_strict_board_rejects_client_contract_and_routing_mutations(client):
         ("summary", "bulk-forged summary"),
         ("metadata", {"forged": True}),
     ):
-        with kb.connect(board="strict") as conn:
+        with kbc.connect(board="strict") as conn:
             before = kb.get_task(conn, first)
             runs_before = [
                 tuple(row)
@@ -783,7 +785,7 @@ def test_strict_board_rejects_client_contract_and_routing_mutations(client):
         )
         assert bulk_contract.status_code == 409, field
         assert "Work Contract" in bulk_contract.text, field
-        with kb.connect(board="strict") as conn:
+        with kbc.connect(board="strict") as conn:
             after = kb.get_task(conn, first)
             runs_after = [
                 tuple(row)
@@ -806,7 +808,7 @@ def test_strict_board_rejects_client_contract_and_routing_mutations(client):
     )
     assert deletion.status_code == 409
     assert "Work Contract" in deletion.text
-    with kb.connect(board="strict") as conn:
+    with kbc.connect(board="strict") as conn:
         assert kb.get_task(conn, first) is not None
 
     dependency = client.post(
@@ -911,7 +913,7 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
         json={"title": "wait for indexed data", "assignee": "ops"},
     ).json()["task"]
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with kb.write_txn(conn):
             conn.execute(
@@ -955,7 +957,7 @@ def test_board_query_param_default_overrides_current_board_pointer(client):
     ).json()["task"]
 
     kb.create_board("other")
-    other_conn = kb.connect(board="other")
+    other_conn = kbc.connect(board="other")
     try:
         kb.create_task(other_conn, title="other-only")
     finally:
@@ -1312,7 +1314,7 @@ def test_dispatch_dry_run(client):
 def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
     """Loopback mode: a missing or wrong ?token= must be rejected with
     policy-violation; the correct token is accepted. The kanban WS now
-    delegates to web_server._ws_auth_ok, so we stub that with the real
+    delegates to web_server_chat._ws_auth_ok, so we stub that with the real
     loopback-token semantics (auth_required False → constant-time token
     compare)."""
     home = tmp_path / ".hermes"
@@ -1321,7 +1323,7 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
 
-    # Stub web_server with a loopback-mode _ws_auth_ok (auth_required False →
+    # Stub web_server_chat with a loopback-mode _ws_auth_ok (auth_required False →
     # accept only the correct ?token=). Mirrors the real gate's loopback path.
     import hermes_cli
     import types
@@ -1333,8 +1335,8 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
         _SESSION_TOKEN="secret-xyz",
         _ws_auth_ok=_fake_ws_auth_ok,
     )
-    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
-    monkeypatch.setattr(hermes_cli, "web_server", stub, raising=False)
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server_chat", stub)
+    monkeypatch.setattr(hermes_cli, "web_server_chat", stub, raising=False)
 
     app = FastAPI()
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
@@ -1408,7 +1410,7 @@ def test_bulk_status_done_forwards_completion_summary(client):
 
     assert r.status_code == 200
     assert all(r["ok"] for r in r.json()["results"])
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         for tid in (a["id"], b["id"]):
             task = kb.get_task(conn, tid)
@@ -1638,7 +1640,7 @@ def test_event_dict_includes_run_id(client):
     r = client.post("/api/plugins/kanban/tasks", json={"title": "e", "assignee": "worker"})
     tid = r.json()["task"]["id"]
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         kb.claim_task(conn, tid)
         run_id = kb.latest_run(conn, tid).id
@@ -1744,9 +1746,9 @@ def test_home_subscribe_creates_notify_sub_row(client, with_home_channels):
     assert r.status_code == 200
     assert r.json()["ok"] is True
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
-        subs = kb.list_notify_subs(conn, t["id"])
+        subs = kbn.list_notify_subs(conn, t["id"])
     finally:
         conn.close()
     assert len(subs) == 1
@@ -1774,9 +1776,9 @@ def test_home_subscribe_is_idempotent(client, with_home_channels):
     client.post(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
     client.post(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
     client.post(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
-        assert len(kb.list_notify_subs(conn, t["id"])) == 1
+        assert len(kbn.list_notify_subs(conn, t["id"])) == 1
     finally:
         conn.close()
 
@@ -1786,9 +1788,9 @@ def test_home_subscribe_backfills_owner_on_legacy_row(client, with_home_channels
     from hermes_cli import kanban_db as kb
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn,
             task_id=t["id"],
             platform="telegram",
@@ -1801,9 +1803,9 @@ def test_home_subscribe_backfills_owner_on_legacy_row(client, with_home_channels
     r = client.post(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
     assert r.status_code == 200
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
-        subs = kb.list_notify_subs(conn, t["id"])
+        subs = kbn.list_notify_subs(conn, t["id"])
     finally:
         conn.close()
 
@@ -1832,9 +1834,9 @@ def test_home_unsubscribe_removes_notify_sub_row(client, with_home_channels):
     r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
     assert r.status_code == 200
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
-        assert kb.list_notify_subs(conn, t["id"]) == []
+        assert kbn.list_notify_subs(conn, t["id"]) == []
     finally:
         conn.close()
 
@@ -1847,18 +1849,18 @@ def test_home_subscribe_multiple_platforms_independent(client, with_home_channel
     client.post(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
     client.post(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/discord")
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
-        subs = {s["platform"]: s for s in kb.list_notify_subs(conn, t["id"])}
+        subs = {s["platform"]: s for s in kbn.list_notify_subs(conn, t["id"])}
     finally:
         conn.close()
     assert set(subs) == {"telegram", "discord"}
 
     # Unsubscribe telegram only.
     client.delete(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
-        subs = {s["platform"]: s for s in kb.list_notify_subs(conn, t["id"])}
+        subs = {s["platform"]: s for s in kbn.list_notify_subs(conn, t["id"])}
     finally:
         conn.close()
     assert set(subs) == {"discord"}
@@ -1873,7 +1875,7 @@ def test_home_subscribe_rejects_stale_snapshot_without_subscription(
         json={"title": "Stale subscription target"},
     ).json()["task"]["id"]
     expected = _expected_operator_snapshot(task_id)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET title = 'Current subscription target' WHERE id = ?",
@@ -1887,8 +1889,8 @@ def test_home_subscribe_rejects_stale_snapshot_without_subscription(
 
     assert response.status_code == 409, response.text
     assert response.json()["current"]["title"] == "Current subscription target"
-    with kb.connect() as conn:
-        assert kb.list_notify_subs(conn, task_id) == []
+    with kbc.connect() as conn:
+        assert kbn.list_notify_subs(conn, task_id) == []
 
 
 def test_home_channels_empty_when_no_homes_configured(client, monkeypatch):
@@ -1914,7 +1916,7 @@ def test_reclaim_endpoint_releases_running_claim(client):
     """POST /tasks/<id>/reclaim drops the claim, returns ok, and emits
     a manual reclaimed event."""
     import secrets
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         t = kb.create_task(conn, title="running", assignee="x")
         lock = secrets.token_hex(8)
@@ -1945,7 +1947,7 @@ def test_reclaim_endpoint_releases_running_claim(client):
     assert body["task_id"] == t
 
     # Confirm the task is back to ready.
-    conn2 = kb.connect()
+    conn2 = kbc.connect()
     try:
         row = conn2.execute(
             "SELECT status, claim_lock FROM tasks WHERE id=?", (t,),
@@ -1958,7 +1960,7 @@ def test_reclaim_endpoint_releases_running_claim(client):
 
 def test_reclaim_endpoint_409_for_non_running_task(client):
     """Reclaiming a task that's already ready returns 409."""
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         t = kb.create_task(conn, title="ready", assignee="x")
     finally:
@@ -1974,7 +1976,7 @@ def test_reclaim_endpoint_409_for_non_running_task(client):
 
 def test_reassign_endpoint_switches_profile(client):
     """POST /tasks/<id>/reassign changes the assignee field."""
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         t = kb.create_task(conn, title="task", assignee="orig")
     finally:
@@ -1987,7 +1989,7 @@ def test_reassign_endpoint_switches_profile(client):
     assert r.status_code == 200, r.text
     assert r.json()["assignee"] == "newbie"
 
-    conn2 = kb.connect()
+    conn2 = kbc.connect()
     try:
         row = conn2.execute(
             "SELECT assignee FROM tasks WHERE id=?", (t,),
@@ -2003,7 +2005,7 @@ def test_reassign_endpoint_switches_profile(client):
 
 
 def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         parent = kb.create_task(conn, title="parent", assignee="alice")
         real = kb.create_task(conn, title="real", assignee="x", created_by="alice")
@@ -2239,7 +2241,7 @@ def test_dashboard_create_accepts_workflow_fields_at_creation(client):
 
 def test_dashboard_lifecycle_patch_uses_selected_product_board_context(client):
     kb.ensure_product_board_defaults("prod", name="Product")
-    with kb.connect(board="prod") as conn:
+    with kbc.connect(board="prod") as conn:
         tid = kb.create_task(
             conn,
             title="User story: finish via dashboard",
@@ -2262,7 +2264,7 @@ def test_dashboard_lifecycle_patch_uses_selected_product_board_context(client):
 
 def test_dashboard_rejects_invalid_product_workflow_patch_without_mutation(client):
     kb.ensure_product_board_defaults("prod-invalid-patch", name="Product")
-    with kb.connect(board="prod-invalid-patch") as conn:
+    with kbc.connect(board="prod-invalid-patch") as conn:
         task_id = kb.create_task(
             conn,
             title="User story: preserve valid state",
@@ -2284,7 +2286,7 @@ def test_dashboard_rejects_invalid_product_workflow_patch_without_mutation(clien
 
     assert response.status_code == 400, response.text
     assert response.json()["current"] == before
-    with kb.connect(board="prod-invalid-patch") as conn:
+    with kbc.connect(board="prod-invalid-patch") as conn:
         after = kb.task_snapshot_from_row(
             conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         )
@@ -2297,7 +2299,7 @@ def test_dashboard_custom_column_cannot_create_arbitrary_product_step(client):
     metadata = kb.read_board_metadata(board)
     metadata["columns"].insert(-1, {"name": "qa_hold", "status": "review"})
     kb.board_metadata_path(board).write_text(json.dumps(metadata), encoding="utf-8")
-    with kb.connect(board=board) as conn:
+    with kbc.connect(board=board) as conn:
         task_id = kb.create_task(
             conn,
             title="User story: valid backlog",
@@ -2316,7 +2318,7 @@ def test_dashboard_custom_column_cannot_create_arbitrary_product_step(client):
 
     assert response.status_code == 400, response.text
     assert response.json()["current"] == before
-    with kb.connect(board=board) as conn:
+    with kbc.connect(board=board) as conn:
         after = kb.task_snapshot_from_row(
             conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         )
@@ -2324,7 +2326,7 @@ def test_dashboard_custom_column_cannot_create_arbitrary_product_step(client):
 
 
 def _task_status(task_id: str) -> str:
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task = kb.get_task(conn, task_id)
         assert task is not None
@@ -2334,7 +2336,7 @@ def _task_status(task_id: str) -> str:
 
 
 def _task_assignee(task_id: str):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task = kb.get_task(conn, task_id)
         assert task is not None
@@ -2344,7 +2346,7 @@ def _task_assignee(task_id: str):
 
 
 def _operator_snapshot(task_id: str) -> dict:
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         assert row is not None
@@ -2379,7 +2381,7 @@ def test_conditional_operator_writes_reject_stale_snapshot_without_mutation(
     stale_field,
     current_value,
 ):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(
             conn,
             title="Snapshot title",
@@ -2395,7 +2397,7 @@ def test_conditional_operator_writes_reject_stale_snapshot_without_mutation(
             )
 
     expected = _expected_operator_snapshot(task_id)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         with kb.write_txn(conn):
             conn.execute(
                 f"UPDATE tasks SET {stale_field} = ? WHERE id = ?",
@@ -2450,7 +2452,7 @@ def test_conditional_operator_writes_reject_stale_snapshot_without_mutation(
     assert "refresh" in body["detail"]
     assert body["current"] == current_before
     assert _operator_snapshot(task_id) == current_before
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert len(kb.list_comments(conn, task_id)) == comments_before
         assert len(kb.list_events(conn, task_id)) == events_before
 
@@ -2467,7 +2469,7 @@ def test_conditional_comment_applies_when_snapshot_matches(client):
     )
 
     assert response.status_code == 200, response.text
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         comments = kb.list_comments(conn, task_id)
     assert [comment.body for comment in comments] == ["Fresh operator note"]
 
@@ -2515,7 +2517,7 @@ def test_remaining_operator_writes_reject_stale_snapshot_without_mutation(
     tmp_path,
     action,
 ):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(
             conn,
             title="Operator target",
@@ -2562,7 +2564,7 @@ def test_remaining_operator_writes_reject_stale_snapshot_without_mutation(
                 )
 
     expected = _expected_operator_snapshot(task_id)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET title = 'Current operator target' WHERE id = ?",
@@ -2635,7 +2637,7 @@ def test_remaining_operator_writes_reject_stale_snapshot_without_mutation(
     assert response.status_code == 409, response.text
     assert response.json()["current"] == current_before
     assert _operator_snapshot(task_id) == current_before
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert len(kb.list_comments(conn, task_id)) == comments_before
         assert len(kb.list_events(conn, task_id)) == events_before
         assert kb.get_task(conn, task_id).priority == priority_before
@@ -2670,7 +2672,7 @@ def test_conditional_bulk_requires_snapshot_for_every_task(client):
     )
 
     assert response.status_code == 400, response.text
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert kb.get_task(conn, first).priority == 0
         assert kb.get_task(conn, second).priority == 0
 
@@ -2692,7 +2694,7 @@ def test_conditional_manual_block_accepts_todo_and_review_cards(client):
         json={"title": "review block target"},
     ).json()["task"]["id"]
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (todo_id,))
@@ -2731,7 +2733,7 @@ def test_conditional_manual_block_rejects_stale_status_snapshot(client):
         json={"title": "stale block target"},
     ).json()["task"]["id"]
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
@@ -2758,7 +2760,7 @@ def test_conditional_manual_block_rejects_active_current_run_even_when_snapshot_
         json={"title": "active run block target"},
     ).json()["task"]["id"]
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with kb.write_txn(conn):
             run_cur = conn.execute(
@@ -2796,7 +2798,7 @@ def test_conditional_manual_block_clears_stale_failure_state(client):
         json={"title": "failure state block target"},
     ).json()["task"]["id"]
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with kb.write_txn(conn):
             conn.execute(
@@ -2817,7 +2819,7 @@ def test_conditional_manual_block_clears_stale_failure_state(client):
     )
 
     assert resp.status_code == 200, resp.text
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         row = conn.execute(
             "SELECT status, consecutive_failures, last_failure_error FROM tasks WHERE id=?",
@@ -2856,7 +2858,7 @@ def test_conditional_manual_block_fires_hook_and_stays_blocked(
     assert event == "kanban_task_blocked"
     assert fired_task_id == task_id
     assert fields["reason"] == "waiting for operator"
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert kb.recompute_ready(conn) == 0
         task = kb.get_task(conn, task_id)
     assert task is not None
@@ -2874,7 +2876,7 @@ def test_conditional_manual_block_preserves_product_preflight_routing(client):
             "current_step_key": "backlog",
         },
     ).json()["task"]["id"]
-    with kb.connect(board="prod") as conn:
+    with kbc.connect(board="prod") as conn:
         task = kb.get_task(conn, task_id)
         assert task is not None
         expected = {
@@ -2891,7 +2893,7 @@ def test_conditional_manual_block_preserves_product_preflight_routing(client):
     )
 
     assert response.status_code == 200, response.text
-    with kb.connect(board="prod") as conn:
+    with kbc.connect(board="prod") as conn:
         task = kb.get_task(conn, task_id)
     assert task is not None
     assert task.status == "ready"
@@ -2906,7 +2908,7 @@ def test_conditional_reassign_rejects_stale_assignee_snapshot(client):
         json={"title": "stale reassign target", "assignee": "architect"},
     ).json()["task"]["id"]
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET assignee='tester' WHERE id=?", (task_id,))
@@ -2930,11 +2932,11 @@ def test_conditional_reassign_rejects_stale_assignee_snapshot(client):
 
 
 def test_conditional_reassign_with_reclaim_rejects_stale_snapshot(client):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="running", assignee="architect")
         assert kb.claim_task(conn, task_id) is not None
     expected = _expected_operator_snapshot(task_id)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET title='changed elsewhere' WHERE id=?",
@@ -2962,7 +2964,7 @@ def test_conditional_reassign_rejects_active_current_run_even_when_snapshot_matc
         json={"title": "active run reassign target", "assignee": "architect"},
     ).json()["task"]["id"]
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with kb.write_txn(conn):
             run_cur = conn.execute(
@@ -3031,7 +3033,7 @@ def test_conditional_reassign_holds_write_lock_through_canonical_mutation(
     race = {"blocked": False}
 
     def assign_with_competing_writer(conn, target_id, profile):
-        competing = kb.connect()
+        competing = kbc.connect()
         try:
             competing.execute("PRAGMA busy_timeout = 0")
             with pytest.raises(sqlite3.OperationalError, match="locked|busy"):
@@ -3083,7 +3085,7 @@ def _member_task(conn, epic_id, story_id="story-e07"):
 
 
 def test_release_state_endpoint_epic_collecting_members(client):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         epic_id = _epic_task(conn)
 
     resp = client.get(f"/api/plugins/kanban/tasks/{epic_id}/release-state")
@@ -3101,7 +3103,7 @@ def test_release_state_endpoint_404_for_unknown_task(client):
 
 
 def test_release_state_endpoint_epic_ci_failed(client):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         epic_id = _epic_task(conn)
         conn.execute(
             "INSERT INTO epic_release_snapshots (epic_id, epic_tip_sha, target_branch, "
@@ -3133,7 +3135,7 @@ def test_release_state_endpoint_epic_ci_failed(client):
 
 
 def test_release_state_endpoint_member_integrating(client):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         epic_id = _epic_task(conn)
         member_id = _member_task(conn, epic_id)
         conn.execute(
@@ -3167,7 +3169,7 @@ def test_release_state_endpoint_actionable_requires_e06_target_check(
     client, monkeypatch
 ):
     """Actionable=True is granted only after the E06 target re-check passes."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         epic_id = _epic_task(conn)
         conn.execute(
             "INSERT INTO epic_release_snapshots (epic_id, epic_tip_sha, target_branch, "
@@ -3219,7 +3221,7 @@ def test_release_state_endpoint_actionable_requires_e06_target_check(
 
 
 def test_task_detail_surfaces_named_release_state_for_epic(client):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         epic_id = _epic_task(conn)
         member_id = _member_task(conn, epic_id)
 
@@ -3260,7 +3262,7 @@ def test_bulk_review_assignment_preserves_implementer_provenance(client):
     )
     assert response.status_code == 200, response.text
     assert all(item["ok"] for item in response.json()["results"])
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         for task in tasks:
             current = kb.get_task(conn, task["id"])
             assert current is not None
@@ -3328,7 +3330,7 @@ def test_dashboard_confirm_dispatches_expected_patch_body(client):
 
 
 def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="active review", assignee="reviewer")
         implementation = kb.claim_task(conn, task_id)
         assert implementation is not None
@@ -3348,7 +3350,7 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
     assert response.status_code == 200, response.text
     assert response.json()["task"]["status"] == "review"
     assert response.json()["task"]["assignee"] == "reviewer"
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         run = kb.latest_run(conn, task_id)
         assert run is not None
         assert run.outcome == "reclaimed"
@@ -3373,7 +3375,7 @@ def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
     )
     assert response.status_code == 200, response.text
     assert response.json()["task"]["status"] == "review"
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         run = kb.latest_run(conn, task["id"])
         assert run is not None
         assert run.outcome == "review_requested"
@@ -3397,7 +3399,7 @@ def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
     assert response.status_code == 200, response.text
     assert response.json()["task"]["status"] == "ready"
     assert response.json()["task"]["assignee"] == "builder"
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert any(
             event.kind == "review_reopened"
             for event in kb.list_events(conn, task["id"])
@@ -3405,7 +3407,7 @@ def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
 
 
 def test_reopening_parent_recursively_retracts_done_and_running_descendants(client):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parent_id = kb.create_task(conn, title="root", assignee="planner")
         assert kb.complete_task(conn, parent_id)
         child_id = kb.create_task(
@@ -3430,7 +3432,7 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
     )
     assert response.status_code == 200, response.text
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         child = kb.get_task(conn, child_id)
         grandchild = kb.get_task(conn, grandchild_id)
         assert child is not None and child.status == "todo"
@@ -3446,7 +3448,7 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
         json={"status": "done"},
     )
     assert response.status_code == 200, response.text
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         child = kb.get_task(conn, child_id)
         grandchild = kb.get_task(conn, grandchild_id)
         assert child is not None and child.status == "ready"
@@ -3454,7 +3456,7 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
 
 
 def test_reopening_parent_retracts_review_and_blocks_approval(client):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parent_id = kb.create_task(conn, title="parent", assignee="planner")
         assert kb.complete_task(conn, parent_id)
         child_id = kb.create_task(
@@ -3486,7 +3488,7 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
     )
     assert response.status_code == 200, response.text
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         child = kb.get_task(conn, child_id)
         assert child is not None
         assert child.status == "todo"
@@ -3505,7 +3507,7 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
     )
     assert response.status_code == 200, response.text
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         child = kb.get_task(conn, child_id)
         assert child is not None
         assert child.status == "review"
@@ -3520,4 +3522,3 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
         grandchild = kb.get_task(conn, grandchild_id)
         assert grandchild is not None
         assert grandchild.status == "ready"
-

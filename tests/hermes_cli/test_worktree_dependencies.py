@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 from hermes_cli import worktree_dependencies as wd
 
 
@@ -103,7 +104,7 @@ def _task_for(repo: Path, conn, *, branch: str = "wt/fixture") -> tuple[str, Pat
 
 def test_matching_manifests_copy_isolated_node_modules(kanban_home, tmp_path):
     repo = _repo_with_node_dependencies(tmp_path)
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id, target = _task_for(repo, conn)
         task = kb.get_task(conn, task_id)
         assert task is not None
@@ -136,7 +137,7 @@ def test_trailing_slash_node_modules_ignore_is_accepted(kanban_home, tmp_path):
     _git(repo, "add", ".gitignore")
     _git(repo, "commit", "-m", "Use conventional directory ignore")
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id, _target = _task_for(repo, conn)
         task = kb.get_task(conn, task_id)
         workspace, _branch = kb._resolve_worktree_workspace(task, conn=conn)
@@ -173,7 +174,7 @@ def test_stale_primary_dependency_is_installed_instead_of_certified(
         )
 
     monkeypatch.setattr(wd, "_run_real_install", install)
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id, _target = _task_for(repo, conn)
         task = kb.get_task(conn, task_id)
         workspace, _branch = kb._resolve_worktree_workspace(task, conn=conn)
@@ -239,7 +240,7 @@ def test_manifest_mismatch_runs_real_install_in_dispatcher_context(
     monkeypatch.setattr(wd.subprocess, "run", fake_run)
     monkeypatch.setenv("HERMES_KANBAN_TASK", "worker-must-not-install")
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id, target = _task_for(repo, conn, branch="feature")
         task = kb.get_task(conn, task_id)
         assert task is not None
@@ -315,7 +316,7 @@ def test_real_fallback_refuses_other_dependency_install_scripts(
 
 def test_worktree_cleanup_removes_provisioned_dependencies(kanban_home, tmp_path):
     repo = _repo_with_node_dependencies(tmp_path)
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id, _target = _task_for(repo, conn)
         task = kb.get_task(conn, task_id)
         assert task is not None
@@ -330,7 +331,7 @@ def test_worktree_cleanup_removes_provisioned_dependencies(kanban_home, tmp_path
 
 def test_running_task_blocks_shared_worktree_reprovisioning(kanban_home, tmp_path):
     repo = _repo_with_node_dependencies(tmp_path)
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         first_id, target = _task_for(repo, conn)
         first = kb.get_task(conn, first_id)
         assert first is not None
@@ -359,7 +360,7 @@ def test_completion_keeps_dependencies_for_other_running_consumer(
     kanban_home, tmp_path
 ):
     repo = _repo_with_node_dependencies(tmp_path)
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         first_id, target = _task_for(repo, conn)
         first = kb.get_task(conn, first_id)
         assert first is not None

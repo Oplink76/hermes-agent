@@ -5,6 +5,7 @@ import json
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 from hermes_cli import kanban_qualifier as qualifier
 from hermes_cli.kanban_intake import WorkContractError
 from tools.kanban_tools import KANBAN_CREATE_SCHEMA
@@ -72,7 +73,7 @@ def test_override_is_not_exposed_on_ordinary_kanban_create_schema():
 
 
 def test_override_rejects_forged_or_incomplete_authority(tmp_path, monkeypatch):
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = kanban_db_connect.connect(tmp_path / "kanban.db")
     intake_id = kb.create_qualification_intake(
         conn,
         raw_request='{"request":{"title":"Recover approved work"}}',
@@ -101,7 +102,7 @@ def test_override_rejects_forged_or_incomplete_authority(tmp_path, monkeypatch):
 def test_authenticated_direct_ole_instruction_can_override_without_fake_evidence(
     tmp_path, monkeypatch
 ):
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = kanban_db_connect.connect(tmp_path / "kanban.db")
     intake_id = kb.create_qualification_intake(
         conn,
         raw_request='{"request":{"title":"Recover approved work"}}',

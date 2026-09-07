@@ -265,8 +265,10 @@ def test_pre_fetch_flow_has_no_self_lock_preflight(monkeypatch, tmp_path):
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", observe_fetch)
+    from hermes_cli import update_cmd
+
     with pytest.raises(FetchReached):
-        cli_main._cmd_update_impl(SimpleNamespace(yes=True), gateway_mode=False)
+        update_cmd._cmd_update_impl(SimpleNamespace(yes=True), gateway_mode=False)
 
 
 def test_zip_update_guards_dependency_sync():
@@ -331,7 +333,7 @@ class TestUpdateEntrypointImportHygiene:
                 from unittest.mock import patch
                 sys.argv = ["hermes", "update", "--check"]
                 import hermes_cli.main as m
-                with patch("hermes_cli.main._cmd_update_check", lambda *a, **k: 0):
+                with patch("hermes_cli.update_cmd._cmd_update_check", lambda *a, **k: 0):
                     try:
                         m.main()
                     except SystemExit:

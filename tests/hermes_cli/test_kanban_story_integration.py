@@ -12,6 +12,7 @@ import time
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 import hermes_cli.kanban_story_integration as integration_module
 from hermes_cli.kanban_story_integration import (
     IntegrationFact,
@@ -200,7 +201,7 @@ def _insert_intent(conn: sqlite3.Connection, *, status: str = "prepared") -> Non
 def test_story_integration_schema_has_exact_columns_primary_key_and_claim_index(
     tmp_path,
 ):
-    with kb.connect(tmp_path / "fresh.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "fresh.db") as conn:
         info = conn.execute(
             "PRAGMA table_info(story_integration_intents)"
         ).fetchall()
@@ -240,7 +241,7 @@ def test_story_integration_schema_has_exact_columns_primary_key_and_claim_index(
 
 
 def test_story_integration_schema_round_trips_frozen_intent(tmp_path):
-    with kb.connect(tmp_path / "fresh.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "fresh.db") as conn:
         _insert_intent(conn)
         row = conn.execute("SELECT * FROM story_integration_intents").fetchone()
 
@@ -268,7 +269,7 @@ def test_story_integration_schema_round_trips_frozen_intent(tmp_path):
 
 
 def test_story_integration_schema_enforces_composite_uniqueness(tmp_path):
-    with kb.connect(tmp_path / "fresh.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "fresh.db") as conn:
         _insert_intent(conn)
         with pytest.raises(sqlite3.IntegrityError):
             _insert_intent(conn)
@@ -276,7 +277,7 @@ def test_story_integration_schema_enforces_composite_uniqueness(tmp_path):
 
 @pytest.mark.parametrize("status", ["queued", "done", ""])
 def test_story_integration_schema_refuses_illegal_status(tmp_path, status):
-    with kb.connect(tmp_path / "fresh.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "fresh.db") as conn:
         with pytest.raises(sqlite3.IntegrityError):
             _insert_intent(conn, status=status)
 
@@ -392,7 +393,7 @@ def test_integration_enqueued_transaction_is_idempotent_and_uses_zero_git(
         "run",
         lambda *_args, **_kwargs: pytest.fail("enqueue must not spawn Git"),
     )
-    with kb.connect(tmp_path / "enqueue.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "enqueue.db") as conn:
         epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
         story_id = kb.create_task(
             conn,
@@ -502,7 +503,7 @@ def test_claim_next_intent_has_one_winner_across_two_connections(
     db_path = tmp_path / "claim.db"
     board_metadata = _claim_board_metadata(tmp_path)
     monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: board_metadata)
-    with kb.connect(db_path) as conn:
+    with kanban_db_connect.connect(db_path) as conn:
         expected_key = _insert_claimable_intent(conn)
 
     repository_calls = []
@@ -513,7 +514,7 @@ def test_claim_next_intent_has_one_winner_across_two_connections(
         return CandidateEligibility(source_sha=approved.source_sha, non_empty=True)
 
     def claim(owner: str):
-        with kb.connect(db_path) as conn:
+        with kanban_db_connect.connect(db_path) as conn:
             barrier.wait(timeout=5)
             return claim_next_intent(
                 conn,
@@ -531,7 +532,7 @@ def test_claim_next_intent_has_one_winner_across_two_connections(
     assert winners[0].status == "running"
     assert winners[0].attempt_count == 1
     assert len(repository_calls) == 1
-    with kb.connect(db_path) as conn:
+    with kanban_db_connect.connect(db_path) as conn:
         running = conn.execute(
             "SELECT COUNT(*) FROM story_integration_intents WHERE status='running'"
         ).fetchone()[0]
@@ -544,7 +545,7 @@ def test_claim_next_intent_reclaims_expired_intent_before_new_work(
     db_path = tmp_path / "reclaim.db"
     board_metadata = _claim_board_metadata(tmp_path)
     monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: board_metadata)
-    with kb.connect(db_path) as conn:
+    with kanban_db_connect.connect(db_path) as conn:
         _insert_claimable_intent(conn, branch="story/first")
         _insert_claimable_intent(conn, source_sha="5" * 40, branch="story/second")
 
@@ -555,7 +556,7 @@ def test_claim_next_intent_reclaims_expired_intent_before_new_work(
         return CandidateEligibility(source_sha=approved.source_sha, non_empty=True)
 
     monkeypatch.setattr(time, "time", lambda: 100)
-    with kb.connect(db_path) as conn:
+    with kanban_db_connect.connect(db_path) as conn:
         first = claim_next_intent(
             conn,
             "owner-a",
@@ -570,7 +571,7 @@ def test_claim_next_intent_reclaims_expired_intent_before_new_work(
         ) is None
 
     monkeypatch.setattr(time, "time", lambda: 161)
-    with kb.connect(db_path) as conn:
+    with kanban_db_connect.connect(db_path) as conn:
         reclaimed = claim_next_intent(
             conn,
             "owner-b",
@@ -591,7 +592,7 @@ def test_claim_next_intent_fails_closed_on_running_lease_without_expiry(
     db_path = tmp_path / "missing-expiry.db"
     board_metadata = _claim_board_metadata(tmp_path)
     monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: board_metadata)
-    with kb.connect(db_path) as conn:
+    with kanban_db_connect.connect(db_path) as conn:
         first_key = _insert_claimable_intent(conn, branch="story/first")
         _insert_claimable_intent(conn, source_sha="5" * 40, branch="story/second")
         conn.execute(
@@ -602,7 +603,7 @@ def test_claim_next_intent_fails_closed_on_running_lease_without_expiry(
         )
 
     repository_calls = []
-    with kb.connect(db_path) as conn:
+    with kanban_db_connect.connect(db_path) as conn:
         claimed = claim_next_intent(
             conn,
             "owner-new",
@@ -638,7 +639,7 @@ def test_claim_next_intent_refuses_stale_authority_before_repository_access(
     db_path = tmp_path / f"stale-{stale_case}.db"
     board_metadata = _claim_board_metadata(tmp_path)
     monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: board_metadata)
-    with kb.connect(db_path) as conn:
+    with kanban_db_connect.connect(db_path) as conn:
         key = _insert_claimable_intent(conn)
         if stale_case == "membership":
             conn.execute(
@@ -699,7 +700,7 @@ def test_claim_next_intent_refuses_stale_authority_before_repository_access(
         repository_calls.append((contract, approved, passed))
         return CandidateEligibility(source_sha=approved.source_sha, non_empty=True)
 
-    with kb.connect(db_path) as conn:
+    with kanban_db_connect.connect(db_path) as conn:
         claimed = claim_next_intent(
             conn,
             "owner",
@@ -756,7 +757,7 @@ def test_prepare_claimed_candidate_persists_exact_receipt_atomically_without_app
         "_fast_forward_target",
         lambda *_args, **_kwargs: pytest.fail("preparation must not move the target ref"),
     )
-    with kb.connect(db_path) as conn:
+    with kanban_db_connect.connect(db_path) as conn:
         key = _insert_claimable_intent(conn)
         claimed = claim_next_intent(
             conn,
@@ -821,7 +822,7 @@ def test_advance_prepared_intent_forwards_exact_cas_without_db_fact_completion(
     db_path = tmp_path / f"advance-{kind}.db"
     board_metadata = _claim_board_metadata(tmp_path)
     monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: board_metadata)
-    with kb.connect(db_path) as conn:
+    with kanban_db_connect.connect(db_path) as conn:
         key = _insert_claimable_intent(conn)
         claimed = claim_next_intent(
             conn,
@@ -898,7 +899,7 @@ def test_prepare_claimed_candidate_crash_replay_leaves_one_durable_prepared_reco
     db_path = tmp_path / "prepared-replay.db"
     board_metadata = _claim_board_metadata(tmp_path)
     monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: board_metadata)
-    with kb.connect(db_path) as conn:
+    with kanban_db_connect.connect(db_path) as conn:
         key = _insert_claimable_intent(conn)
         claimed = claim_next_intent(
             conn,
@@ -967,7 +968,7 @@ def test_prepare_claimed_candidate_refuses_active_db_transaction(
     db_path = tmp_path / "prepared-transaction.db"
     board_metadata = _claim_board_metadata(tmp_path)
     monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: board_metadata)
-    with kb.connect(db_path) as conn:
+    with kanban_db_connect.connect(db_path) as conn:
         _insert_claimable_intent(conn)
         claimed = claim_next_intent(
             conn,
@@ -998,7 +999,7 @@ def test_prepared_candidate_replay_rejects_mismatched_receipt(
     db_path = tmp_path / "prepared-mismatch.db"
     board_metadata = _claim_board_metadata(tmp_path)
     monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: board_metadata)
-    with kb.connect(db_path) as conn:
+    with kanban_db_connect.connect(db_path) as conn:
         _insert_intent(conn)
         row = conn.execute("SELECT * FROM story_integration_intents").fetchone()
         prepared = integration_intent_from_row(row)
@@ -1069,7 +1070,7 @@ def _insert_active_release_snapshot(conn, epic_id: str) -> int:
 def test_finish_intent_atomically_persists_fact_task_event_and_snapshot_invalidation(
     tmp_path, monkeypatch
 ):
-    with kb.connect(tmp_path / "finish.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "finish.db") as conn:
         key, prepared = _prepared_intent(tmp_path, monkeypatch, conn)
         snapshot_id = _insert_active_release_snapshot(conn, key.epic_id)
         cleanup_observations = []
@@ -1136,7 +1137,7 @@ def test_finish_intent_atomically_persists_fact_task_event_and_snapshot_invalida
 def test_finish_intent_rolls_back_every_state_when_event_write_interrupts(
     tmp_path, monkeypatch
 ):
-    with kb.connect(tmp_path / "finish-rollback.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "finish-rollback.db") as conn:
         key, prepared = _prepared_intent(tmp_path, monkeypatch, conn)
         snapshot_id = _insert_active_release_snapshot(conn, key.epic_id)
         real_append = kb._append_event
@@ -1198,7 +1199,7 @@ def test_finish_intent_rolls_back_every_state_when_event_write_interrupts(
 def test_recover_prepared_intent_handles_each_target_boundary(
     tmp_path, monkeypatch, boundary, current_sha, expected
 ):
-    with kb.connect(tmp_path / f"recover-{boundary}.db") as conn:
+    with kanban_db_connect.connect(tmp_path / f"recover-{boundary}.db") as conn:
         key, prepared = _prepared_intent(tmp_path, monkeypatch, conn)
         monkeypatch.setattr(
             integration_module,
@@ -1264,7 +1265,7 @@ def test_recover_prepared_intent_handles_each_target_boundary(
 def test_integrated_fact_recovery_and_epic_readiness_survive_verification_event_pruning(
     tmp_path, monkeypatch
 ):
-    with kb.connect(tmp_path / "pruning.db") as conn:
+    with kanban_db_connect.connect(tmp_path / "pruning.db") as conn:
         key, prepared = _prepared_intent(tmp_path, monkeypatch, conn)
         monkeypatch.setattr(
             integration_module, "delete_prepared_candidate_ref", lambda *_a, **_k: False
@@ -1328,7 +1329,7 @@ def test_product_owned_integration_failure_uses_existing_development_rework_path
     metadata["product_workflow"]["max_rework_cycles"] = 3
     monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: metadata)
 
-    with kb.connect(tmp_path / f"product-{failure_code}.db") as conn:
+    with kanban_db_connect.connect(tmp_path / f"product-{failure_code}.db") as conn:
         key = _insert_claimable_intent(conn)
         claimed = claim_next_intent(
             conn,
@@ -1397,7 +1398,7 @@ def test_infrastructure_integration_failure_keeps_same_lineage_without_rework(
     metadata = _claim_board_metadata(tmp_path)
     monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: metadata)
 
-    with kb.connect(tmp_path / f"attention-{failure_code}.db") as conn:
+    with kanban_db_connect.connect(tmp_path / f"attention-{failure_code}.db") as conn:
         key = _insert_claimable_intent(conn)
         claimed = claim_next_intent(
             conn,

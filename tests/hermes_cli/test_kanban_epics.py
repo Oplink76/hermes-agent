@@ -8,11 +8,12 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 
 
 @pytest.fixture
 def conn(tmp_path):
-    connection = kb.connect(tmp_path / "kanban.db")
+    connection = kanban_db_connect.connect(tmp_path / "kanban.db")
     try:
         yield connection
     finally:
@@ -89,7 +90,7 @@ def _configured_epic_story(
         default_workdir=str(repo),
         repository=_repository_policy(base_ref),
     )
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         epic_id = kb.create_task(
             connection,
             title="Release outcome",
@@ -201,7 +202,7 @@ def test_configured_epic_base_uses_ref_not_ambient_head(epic_home, tmp_path):
         base_ref="refs/remotes/origin/main",
     )
 
-    with kb.connect(board="configured-epic-base") as connection:
+    with kanban_db_connect.connect(board="configured-epic-base") as connection:
         story = kb.get_task(connection, story_id)
         assert story is not None
         kb._resolve_worktree_workspace(
@@ -230,7 +231,7 @@ def test_missing_or_ambiguous_configured_base_fails_before_epic_mutation(
     )
     board = f"bad-epic-base-{base_ref.split('/')[-1]}"
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         story = kb.get_task(connection, story_id)
         assert story is not None
         with pytest.raises(kb.RepositoryConfigurationError) as exc_info:
@@ -283,7 +284,7 @@ def test_public_epic_readiness_uses_current_durable_fact_not_story_events(
         "review_head_sha": source_sha,
     }
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         connection.execute(
             "INSERT INTO task_runs "
             "(task_id, step_key, status, outcome, metadata, started_at, ended_at) "

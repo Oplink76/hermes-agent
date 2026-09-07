@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 from hermes_cli import projects_db as pdb
 
 
@@ -63,7 +64,7 @@ def governed_workspace(tmp_path, monkeypatch):
             folders=[str(repo)],
             board_slug=board,
         )
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = kb.create_task(
             conn,
             title="Governed task",

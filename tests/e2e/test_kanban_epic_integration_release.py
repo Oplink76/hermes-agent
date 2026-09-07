@@ -31,6 +31,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
+import hermes_cli.kanban_db_workspace as kanban_db_workspace
 from hermes_cli import kanban_v2_migration as migration
 from hermes_cli.kanban_repository import _prepared_ref_sha
 
@@ -407,8 +409,8 @@ def _create_epic_member(
     workspace, branch = kb._resolve_worktree_workspace(
         task, board=board, conn=conn,
     )
-    kb.set_workspace_path(conn, story_id, str(workspace))
-    kb.set_branch_name(conn, story_id, branch)
+    kanban_db_workspace.set_workspace_path(conn, story_id, str(workspace))
+    kanban_db_workspace.set_branch_name(conn, story_id, branch)
     return story_id, workspace, branch
 
 
@@ -437,7 +439,7 @@ def test_full_member_to_epic_lifecycle_release(
 
     from hermes_cli import kanban_repository as repo_module
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id = _create_epic(conn, "Epic: lifecycle proof")
         story_id, worktree, branch = _create_epic_member(
             conn, product_fixture, board, epic_id,
@@ -588,7 +590,7 @@ def test_epic_integration_conflict_refusal(
     repo = product_fixture.repo
     fg = product_fixture.fake_git
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id = _create_epic(conn, "Epic: conflict proof")
         story_id, worktree, branch = _create_epic_member(
             conn, product_fixture, board, epic_id,
@@ -664,7 +666,7 @@ def test_epic_release_cas_and_invalidation(
     repo = product_fixture.repo
     fg = product_fixture.fake_git
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id = _create_epic(conn, "Epic: CAS proof")
         story_id, worktree, branch = _create_epic_member(
             conn, product_fixture, board, epic_id,
@@ -886,7 +888,7 @@ def test_epic_release_pruned_event_recovery(
     board = product_fixture.board
     fg = product_fixture.fake_git
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id = _create_epic(conn, "Epic: prune proof")
         story_id, worktree, branch = _create_epic_member(
             conn, product_fixture, board, epic_id,
@@ -932,7 +934,7 @@ def test_epic_integration_crash_recovery(
     probe.wait(timeout=30)
     dead_pid = probe.pid
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         card_id = kb.create_task(
             conn, title="Crash recovery card", assignee="dev", board=board,
         )
@@ -945,7 +947,7 @@ def test_epic_integration_crash_recovery(
                 (dead_pid, f"{host_prefix}dead", card_id),
             )
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         result = kb.reconcile(conn, board=board, spawn_ready=False)
         assert card_id in result.reclaimed, (
             f"Expected dead-PID card reclaimed, got {result}"

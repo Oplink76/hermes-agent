@@ -7,6 +7,7 @@ import pytest
 
 from hermes_cli import config as hermes_config
 from hermes_cli import main as hermes_main
+from hermes_cli import update_cmd, update_cmd_stash
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +41,34 @@ def _patch_managed_uv(request):
         yield
 
 
+@pytest.fixture(autouse=True)
+def _patch_gateway_discovery(isolated_update_runtime):
+    """Keep cmd_update's gateway auto-restart phase off this machine's gateways.
+
+    Tests in this file that reach the full success path (e.g. the #87694
+    orphan-history rescue-ref tests) would otherwise hit real gateway
+    discovery: an unmocked ``find_gateway_pids`` on a box with a live gateway
+    reaches the conftest live-system guard and turns into a spurious
+    ``sys.exit(1)`` (#78574). Discovery returning nothing makes the phase a
+    clean no-op — none of the tests here assert on gateway restarts.
+
+    ``_purge_stale_hermes_modules`` must also be stubbed: it evicts
+    ``hermes_cli.gateway`` from ``sys.modules`` mid-update, and the restart
+    phase's fresh ``from hermes_cli.gateway import ...`` then loads an
+    UNPATCHED copy of the module — silently discarding every mock here and
+    letting real gateway discovery (and real ``os.kill``) run on the dev box.
+    """
+    with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
+         patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
+         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
+         patch("hermes_cli.update_inventory.collect_runtime_inventory", return_value=None), \
+         patch("hermes_cli.update_inventory.report_unaccounted_runtimes", return_value=False), \
+         patch.object(hermes_main, "_fleet_probe_expected_runtimes", lambda *a, **kw: False), \
+         patch.object(hermes_main, "_purge_stale_hermes_modules", lambda *a, **kw: None), \
+         patch("hermes_cli.update_receipt.collect_fleet_versions", return_value=[]):
+        yield
+
+
 
 
 
@@ -63,7 +92,7 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_main, "_restore_stashed_changes", lambda *a, **kw: True)
     monkeypatch.setattr(hermes_config, "get_missing_env_vars", lambda required_only=True: [])
     monkeypatch.setattr(hermes_config, "get_missing_config_fields", lambda: [])
-    monkeypatch.setattr(hermes_config, "check_config_version", lambda: (5, 5))
+    monkeypatch.setattr(hermes_config, "check_config_version", lambda **_kwargs: (5, 5))
     monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
     monkeypatch.setattr(hermes_main, "_upgrade_pip_before_lazy_refresh", lambda *a, **kw: None)
     monkeypatch.setattr(hermes_main, "_refresh_active_lazy_features", lambda *a, **kw: True)
@@ -278,7 +307,7 @@ def test_restore_stashed_changes_keeps_stash_when_durable_ref_cannot_be_created_
 ):
     """The exact-SHA recovery path remains reachable through main's canonical helper."""
     monkeypatch.setattr(
-        hermes_main,
+        update_cmd_stash,
         "_preserve_stash_commit",
         lambda *args, **kwargs: False,
     )
@@ -437,8 +466,31 @@ def _make_update_side_effect(
     reset_fails=False,
     fetch_fails=False,
     fetch_stderr="",
+    merge_base_exists=True,
+    update_ref_fails=False,
+    pre_pull_sha_unavailable=False,
+    existing_rescue_refs=None,
 ):
-    """Build a subprocess.run side_effect for cmd_update tests."""
+    """Build a subprocess.run side_effect for cmd_update tests.
+
+    ``merge_base_exists`` controls the ``git merge-base HEAD origin/<branch>``
+    probe used by the ff-only-fallback orphan-history guard (#87694): True
+    (default) simulates ordinary divergence (a common ancestor exists, e.g.
+    upstream force-push), False simulates orphan/unrelated-history divergence
+    (no common ancestor at all).
+
+    ``update_ref_fails`` simulates ``git update-ref`` itself failing (disk
+    full, permissions) when writing the orphan rescue ref.
+
+    ``pre_pull_sha_unavailable`` simulates ``_capture_head_sha`` being unable
+    to resolve HEAD before the pull (empty rev-parse output) — the rescue-ref
+    guard requires a truthy ``pre_pull_sha`` and must degrade gracefully
+    without one.
+
+    ``existing_rescue_refs`` simulates the refs already present under
+    ``refs/hermes-update-backups/orphan-<branch>-*`` (oldest first) so the
+    ``_prune_orphan_rescue_refs`` cleanup pass has something to trim.
+    """
     recorded = []
     state = {"merged": False}
 
@@ -452,13 +504,30 @@ def _make_update_side_effect(
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
         if "rev-parse" in joined and cmd[-1] in {"HEAD", "refs/heads/main"}:
-            return SimpleNamespace(stdout=("b" if state["merged"] else "a") * 40, stderr="", returncode=0)
+            return SimpleNamespace(stdout="" if pre_pull_sha_unavailable else ("b" if state["merged"] else "a") * 40, stderr="", returncode=0)
         if "rev-parse" in joined and cmd[-1] == "FETCH_HEAD":
             return SimpleNamespace(stdout="b" * 40, stderr="", returncode=0)
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
             return SimpleNamespace(stdout=f"{commit_count}\n", stderr="", returncode=0)
+        if "merge-base" in joined:
+            if merge_base_exists:
+                return SimpleNamespace(stdout="abc123deadbeef\n", stderr="", returncode=0)
+            return SimpleNamespace(
+                stdout="", stderr="fatal: Not a valid commit name origin/main\n", returncode=1
+            )
+        if "for-each-ref" in joined:
+            refs = existing_rescue_refs or []
+            return SimpleNamespace(stdout="\n".join(refs) + ("\n" if refs else ""), stderr="", returncode=0)
+        if "update-ref" in joined and "-d" in cmd:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if "update-ref" in joined:
+            if update_ref_fails:
+                return SimpleNamespace(
+                    stdout="", stderr="fatal: unable to write ref\n", returncode=128
+                )
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "--ff-only" in joined:
             if ff_only_fails:
                 return SimpleNamespace(
@@ -519,6 +588,48 @@ def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, 
 
 
 # ---------------------------------------------------------------------------
+# Fork contract: unsafe history is refused without reset or recovery-ref cleanup.
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+def test_prune_orphan_rescue_refs_leaves_unparseable_names_alone():
+    """A ref whose timestamp segment doesn't parse must never be age-deleted
+    (it can still fall to the count cap, but not to a guessed age)."""
+    from types import SimpleNamespace as NS
+    from unittest.mock import patch as mock_patch
+
+    weird = "refs/hermes-update-backups/orphan-main-not-a-timestamp-xyz"
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if "for-each-ref" in cmd:
+            return NS(stdout=weird + "\n", stderr="", returncode=0)
+        return NS(stdout="", stderr="", returncode=0)
+
+    with mock_patch.object(hermes_main.subprocess, "run", side_effect=fake_run):
+        update_cmd._prune_orphan_rescue_refs(["git"], ".", "main")
+
+    delete_calls = [c for c in calls if "update-ref" in c and "-d" in c]
+    assert delete_calls == []
+
+
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
 # Non-interactive update.non_interactive_local_changes setting
 # (chat app / gateway): "discard" throws stashed changes away, "stash"
 # (default) restores them. Interactive terminal updates ignore the setting
@@ -557,6 +668,30 @@ def _setup_setting_test(monkeypatch, tmp_path, mode):
 # ---------------------------------------------------------------------------
 # --keep-stash (desktop updater): stash for the update, never re-apply.
 # ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("options", [
+    {"merge_base_exists": False},
+    {"merge_base_exists": True},
+    {"merge_base_exists": False, "update_ref_fails": True},
+    {"merge_base_exists": False, "pre_pull_sha_unavailable": True},
+    {"merge_base_exists": False, "reset_fails": True},
+    {"merge_base_exists": False, "existing_rescue_refs": [
+        "refs/hermes-update-backups/orphan-main-20000101-000000-abc",
+    ]},
+])
+def test_cmd_update_refuses_unsafe_history_without_reset_or_ref_cleanup(
+    monkeypatch, tmp_path, capsys, options,
+):
+    """Fork admission preserves local history and existing recovery refs."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    side_effect, recorded = _make_update_side_effect(ff_only_fails=True, **options)
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+    assert not any("reset" in c and "--hard" in c for c in recorded)
+    assert not any("update-ref" in c for c in recorded)
+    assert "Update refused" in capsys.readouterr().out
+
 
 def _setup_keep_stash_test(monkeypatch, tmp_path):
     """Wiring for --keep-stash tests: stash returns a ref; restore, discard,
@@ -768,6 +903,7 @@ def test_restore_rejects_invalid_python_and_keeps_clean_updated_tree(
     """A cleanly-applied stash must not be allowed to brick every agent turn."""
     import subprocess
     from hermes_cli import update_cmd
+    import hermes_cli.update_cmd_deps as update_cmd_deps
 
     def git(*args, check=True):
         return subprocess.run(
@@ -791,6 +927,7 @@ def test_restore_rejects_invalid_python_and_keeps_clean_updated_tree(
     stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
     assert stash_ref
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ())
+    monkeypatch.setattr(update_cmd_deps, "_UPDATE_CRITICAL_MODULES", ())
 
     with pytest.raises(SystemExit) as exc_info:
         hermes_main._restore_stashed_changes(
@@ -813,6 +950,7 @@ def test_restore_rejects_new_import_time_failure_and_preserves_stash(
     """A valid-Python stash must not introduce a critical import failure."""
     import subprocess
     from hermes_cli import update_cmd
+    import hermes_cli.update_cmd_deps as update_cmd_deps
 
     def git(*args, check=True):
         return subprocess.run(
@@ -835,6 +973,7 @@ def test_restore_rejects_new_import_time_failure_and_preserves_stash(
     stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
     assert stash_ref
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("consumer",))
+    monkeypatch.setattr(update_cmd_deps, "_UPDATE_CRITICAL_MODULES", ("consumer",))
 
     with pytest.raises(SystemExit) as exc_info:
         hermes_main._restore_stashed_changes(
@@ -855,6 +994,7 @@ def test_restore_allows_preexisting_import_time_failure(monkeypatch, tmp_path):
     """A restore may proceed when it does not worsen an environment failure."""
     import subprocess
     from hermes_cli import update_cmd
+    import hermes_cli.update_cmd_deps as update_cmd_deps
 
     def git(*args, check=True):
         return subprocess.run(
@@ -880,6 +1020,7 @@ def test_restore_allows_preexisting_import_time_failure(monkeypatch, tmp_path):
     stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
     assert stash_ref
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("consumer",))
+    monkeypatch.setattr(update_cmd_deps, "_UPDATE_CRITICAL_MODULES", ("consumer",))
 
     assert hermes_main._restore_stashed_changes(
         ["git"], tmp_path, stash_ref, prompt_user=False
@@ -894,6 +1035,7 @@ def test_restore_rejects_later_failure_masked_by_preexisting_failure(
     """Every critical module must be compared, not only the first failure."""
     import subprocess
     from hermes_cli import update_cmd
+    import hermes_cli.update_cmd_deps as update_cmd_deps
 
     def git(*args, check=True):
         return subprocess.run(
@@ -919,6 +1061,7 @@ def test_restore_rejects_later_failure_masked_by_preexisting_failure(
     stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
     assert stash_ref
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("first", "second"))
+    monkeypatch.setattr(update_cmd_deps, "_UPDATE_CRITICAL_MODULES", ("first", "second"))
 
     with pytest.raises(SystemExit) as exc_info:
         hermes_main._restore_stashed_changes(
@@ -941,6 +1084,7 @@ def test_restore_rejects_system_exit_masked_by_preexisting_failure(
     """A terminating import must be compared instead of hiding the marker."""
     import subprocess
     from hermes_cli import update_cmd
+    import hermes_cli.update_cmd_deps as update_cmd_deps
 
     def git(*args, check=True):
         return subprocess.run(
@@ -966,6 +1110,7 @@ def test_restore_rejects_system_exit_masked_by_preexisting_failure(
     stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
     assert stash_ref
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("first", "second"))
+    monkeypatch.setattr(update_cmd_deps, "_UPDATE_CRITICAL_MODULES", ("first", "second"))
 
     with pytest.raises(SystemExit) as exc_info:
         hermes_main._restore_stashed_changes(
@@ -986,6 +1131,7 @@ def test_restore_rejects_probe_termination(monkeypatch, tmp_path, capsys):
     """A stash cannot bypass import validation by terminating the probe."""
     import subprocess
     from hermes_cli import update_cmd
+    import hermes_cli.update_cmd_deps as update_cmd_deps
 
     def git(*args, check=True):
         return subprocess.run(
@@ -1008,6 +1154,7 @@ def test_restore_rejects_probe_termination(monkeypatch, tmp_path, capsys):
     stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
     assert stash_ref
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("consumer",))
+    monkeypatch.setattr(update_cmd_deps, "_UPDATE_CRITICAL_MODULES", ("consumer",))
 
     with pytest.raises(SystemExit) as exc_info:
         hermes_main._restore_stashed_changes(
@@ -1029,8 +1176,10 @@ def test_restore_stays_parked_when_untracked_baseline_is_unknown(
 ):
     """Unknown cleanup scope must not turn into a destructive empty baseline."""
     from hermes_cli import update_cmd
+    import hermes_cli.update_cmd_stash as update_cmd_stash
 
     monkeypatch.setattr(update_cmd, "_git_untracked_paths", lambda *_args: None)
+    monkeypatch.setattr(update_cmd_stash, "_git_untracked_paths", lambda *_args: None)
 
     restored = hermes_main._restore_stashed_changes(
         ["git"], tmp_path, "stash@{0}", prompt_user=False
@@ -1047,8 +1196,10 @@ def test_reject_does_not_claim_cleanup_when_git_state_is_unknown(
 ):
     """Cleanup failures must not be reported as a restored clean tree."""
     from hermes_cli import update_cmd
+    import hermes_cli.update_cmd_stash as update_cmd_stash
 
     monkeypatch.setattr(update_cmd, "_git_untracked_paths", lambda *_args: None)
+    monkeypatch.setattr(update_cmd_stash, "_git_untracked_paths", lambda *_args: None)
 
     with pytest.raises(SystemExit):
         update_cmd._reject_unsafe_stash_restore(
@@ -1066,6 +1217,8 @@ def test_restore_rejects_unknown_restored_python_paths(
     """A failed post-apply path query cannot skip restored syntax validation."""
     import subprocess
     from hermes_cli import update_cmd
+    import hermes_cli.update_cmd_stash as update_cmd_stash
+    import hermes_cli.update_cmd_deps as update_cmd_deps
 
     def git(*args, check=True):
         return subprocess.run(
@@ -1087,7 +1240,9 @@ def test_restore_rejects_unknown_restored_python_paths(
     stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
     assert stash_ref
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ())
+    monkeypatch.setattr(update_cmd_deps, "_UPDATE_CRITICAL_MODULES", ())
     monkeypatch.setattr(update_cmd, "_restored_python_paths", lambda *_args: None)
+    monkeypatch.setattr(update_cmd_stash, "_restored_python_paths", lambda *_args: None)
 
     with pytest.raises(SystemExit) as exc_info:
         hermes_main._restore_stashed_changes(
@@ -1117,3 +1272,123 @@ def test_gateway_restore_prompt_defaults_to_keep_stash(tmp_path, capsys):
     assert restored is False
     assert prompts == [("Restore local changes now? [y/N]", "n")]
     assert "still preserved in git stash" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# #87694: real-git sanity check for the merge-base premise the orphan guard
+# relies on — two independently-initialized repos (no shared history) must
+# report no merge-base, while an ordinary branch divergence must report one.
+# ---------------------------------------------------------------------------
+
+def test_merge_base_detects_orphan_vs_ordinary_divergence_with_real_git(tmp_path):
+    """Anchors the assumption behind the #87694 orphan-history guard: `git
+    merge-base` fails/empties on truly unrelated histories, and succeeds on
+    ordinary (e.g. force-pushed) divergence. If a future git version changes
+    this contract, this test breaks instead of the guard silently going
+    inert."""
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    def git(cwd, *args, check=True):
+        return subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True, check=check
+        )
+
+    # Ordinary divergence: two branches of the SAME repo, one reset to an
+    # earlier point then given a new commit (simulates an upstream force-push).
+    ordinary = tmp_path / "ordinary"
+    ordinary.mkdir()
+    git(ordinary, "init", "-q", "-b", "main")
+    git(ordinary, "config", "user.email", "t@example.com")
+    git(ordinary, "config", "user.name", "t")
+    (ordinary / "f.txt").write_text("v1\n")
+    git(ordinary, "add", "-A")
+    git(ordinary, "commit", "-qm", "init")
+    git(ordinary, "checkout", "-qb", "origin-main")
+    (ordinary / "f.txt").write_text("v2\n")
+    git(ordinary, "add", "-A")
+    git(ordinary, "commit", "-qm", "upstream")
+    git(ordinary, "checkout", "-q", "main")
+    result = git(ordinary, "merge-base", "HEAD", "origin-main", check=False)
+    assert result.returncode == 0
+    assert result.stdout.strip()
+
+    # Orphan divergence: two independently-init'd repos wired as remotes,
+    # sharing zero history.
+    orphan = tmp_path / "orphan"
+    orphan.mkdir()
+    git(orphan, "init", "-q", "-b", "main")
+    git(orphan, "config", "user.email", "t@example.com")
+    git(orphan, "config", "user.name", "t")
+    (orphan / "f.txt").write_text("local\n")
+    git(orphan, "add", "-A")
+    git(orphan, "commit", "-qm", "local init")
+
+    remote = tmp_path / "orphan-remote"
+    remote.mkdir()
+    git(remote, "init", "-q", "-b", "main")
+    git(remote, "config", "user.email", "t@example.com")
+    git(remote, "config", "user.name", "t")
+    (remote / "f.txt").write_text("remote\n")
+    git(remote, "add", "-A")
+    git(remote, "commit", "-qm", "remote init")
+
+    git(orphan, "remote", "add", "origin", str(remote))
+    git(orphan, "fetch", "-q", "origin")
+    result = git(orphan, "merge-base", "HEAD", "origin/main", check=False)
+    assert result.returncode != 0
+    assert not result.stdout.strip()
+
+
+def test_prune_orphan_rescue_refs_with_real_git_unpins_objects(tmp_path):
+    """End-to-end with real git: an orphan rescue ref pins a snapshot's
+    objects against gc; pruning the ref (age-expired) makes them collectable.
+    This is the sabotage/size test for the #87745 bounded-growth mitigation."""
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=check
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    git("config", "gc.auto", "0")
+    (tmp_path / "f.txt").write_text("base\n")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+
+    # Snapshot commit carrying a "large" payload (scaled down for CI).
+    import os
+
+    (tmp_path / "big.bin").write_bytes(os.urandom(512 * 1024))
+    git("add", "-A")
+    git("commit", "-qm", "snapshot")
+    snap_sha = git("rev-parse", "HEAD").stdout.strip()
+
+    # Rewind, park the snapshot behind an AGE-EXPIRED rescue ref.
+    git("reset", "-q", "--hard", "HEAD~1")
+    old_ref = "refs/hermes-update-backups/orphan-main-20200101-000000-" + snap_sha[:12]
+    git("update-ref", old_ref, snap_sha)
+
+    # With the ref present, gc cannot drop the snapshot objects.
+    git("reflog", "expire", "--expire=now", "--all")
+    git("gc", "-q", "--prune=now")
+    assert git("cat-file", "-e", snap_sha, check=False).returncode == 0
+
+    # Prune (the ref's 2020 timestamp is way past the age window) → ref gone.
+    update_cmd._prune_orphan_rescue_refs(["git"], tmp_path, "main")
+    remaining = git("for-each-ref", "refs/hermes-update-backups/").stdout
+    assert old_ref not in remaining
+
+    # And gc can now reclaim the snapshot's objects.
+    git("gc", "-q", "--prune=now")
+    assert git("cat-file", "-e", snap_sha, check=False).returncode != 0

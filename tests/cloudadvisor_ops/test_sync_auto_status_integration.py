@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hermes_cli import web_server
+import hermes_cli.config as hermes_config
 from hermes_cli.upstream_sync_status import SyncStatus
 from ops.cloudadvisor.hermes_ops import cli
 from ops.cloudadvisor.hermes_ops.decision_packet import (
@@ -194,10 +195,11 @@ def test_sync_auto_publishes_status_api_and_deduplicated_alert_decision(
         "_upstream_sync_status_path",
         lambda: tmp_path / "sync-status.json",
     )
+    from hermes_cli import web_server_files
     monkeypatch.setattr(
-        web_server, "_dashboard_local_update_managed_externally", lambda: False
+        web_server_files, "_dashboard_local_update_managed_externally", lambda: False
     )
-    monkeypatch.setattr(web_server, "detect_install_method", lambda root: "git")
+    monkeypatch.setattr(hermes_config, "detect_install_method", lambda root: "git")
     monkeypatch.setattr("hermes_cli.banner.check_for_updates", lambda: 0)
     web_server.app.state.auth_required = False
     client = TestClient(web_server.app)

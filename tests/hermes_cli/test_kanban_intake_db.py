@@ -7,13 +7,15 @@ import subprocess
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
+import shutil as shutil
 from hermes_cli import kanban_intake as intake
 from hermes_cli import projects_db as pdb
 
 
 @pytest.fixture
 def conn(tmp_path):
-    connection = kb.connect(tmp_path / "kanban.db")
+    connection = kanban_db_connect.connect(tmp_path / "kanban.db")
     try:
         yield connection
     finally:
@@ -213,7 +215,7 @@ def test_unblock_restores_assignee_on_strict_materialized_card(
     board = "strict-unblock-restores-assignee"
     _strict_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_card(connection, board)
         _escalate_materialized_card(connection, board, task_id)
 
@@ -232,7 +234,7 @@ def test_approve_unblock_restores_assignee_on_strict_materialized_card(
     board = "strict-approve-unblock-restores-assignee"
     _strict_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_card(connection, board)
         task = kb.get_task(connection, task_id)
         _escalate_materialized_card(connection, board, task_id)
@@ -407,7 +409,7 @@ def test_legacy_intake_schema_migrates_without_losing_rows(tmp_path):
     legacy.close()
 
     kb.init_db(db_path)
-    migrated = kb.connect(db_path)
+    migrated = kanban_db_connect.connect(db_path)
     try:
         row = kb.get_qualification_intake(migrated, "qi_legacy")
         assert row["raw_request"] == "original"
@@ -565,7 +567,7 @@ def test_live_intake_worker_cannot_renew_past_max_runtime(conn):
 
 def test_interrupted_modern_table_migration_recovers_orphaned_legacy_rows(tmp_path):
     db_path = tmp_path / "interrupted.db"
-    conn = kb.connect(db_path)
+    conn = kanban_db_connect.connect(db_path)
     intake_id = kb.create_qualification_intake(
         conn, raw_request="preserve me", source="chat"
     )
@@ -585,7 +587,7 @@ def test_interrupted_modern_table_migration_recovers_orphaned_legacy_rows(tmp_pa
     raw.close()
 
     kb.init_db(db_path)
-    recovered = kb.connect(db_path)
+    recovered = kanban_db_connect.connect(db_path)
     try:
         assert kb.get_qualification_intake(recovered, intake_id)["raw_request"] == "preserve me"
         assert recovered.execute(
@@ -781,7 +783,7 @@ def test_strict_board_rejects_direct_task_insert_and_materializes_atomically(
     metadata["qualification"]["required"] = True
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
-    path_connection = kb.connect(db_path=kb.kanban_db_path(board="strict"))
+    path_connection = kanban_db_connect.connect(db_path=kb.kanban_db_path(board="strict"))
     try:
         with pytest.raises(sqlite3.IntegrityError, match="qualification"):
             kb.create_task(path_connection, title="explicit path bypass")
@@ -790,14 +792,14 @@ def test_strict_board_rejects_direct_task_insert_and_materializes_atomically(
 
     monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board="strict")))
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
-    env_connection = kb.connect()
+    env_connection = kanban_db_connect.connect()
     try:
         with pytest.raises(sqlite3.IntegrityError, match="qualification"):
             kb.create_task(env_connection, title="environment path bypass")
     finally:
         env_connection.close()
 
-    connection = kb.connect(board="strict")
+    connection = kanban_db_connect.connect(board="strict")
     try:
         with pytest.raises(sqlite3.IntegrityError, match="qualification"):
             connection.execute(
@@ -886,7 +888,7 @@ def test_handoff_v2_materializes_executable_card_with_canonical_worktree(
     board = "strict-v2-worktree"
     _strict_v2_product_board(tmp_path, monkeypatch, board)
 
-    connection = kb.connect(board=board)
+    connection = kanban_db_connect.connect(board=board)
     try:
         task_id = _materialized_card(connection, board)
         task = kb.get_task(connection, task_id)
@@ -919,7 +921,7 @@ def test_project_bound_standalone_card_materializes_with_canonical_project_workt
     profile_home.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(profile_home))
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_card(connection, board)
         task = kb.get_task(connection, task_id)
 
@@ -947,7 +949,7 @@ def test_project_bound_epic_story_materializes_with_canonical_project_worktree(
         )
         project = pdb.get_project(project_conn, project_id)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         request_id = kb.create_qualification_intake(
             connection,
             raw_request="qualified epic with a story",
@@ -1003,7 +1005,7 @@ def test_projectless_strict_materialization_remains_unlinked(tmp_path, monkeypat
     board = "strict-projectless-compat"
     _strict_v2_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_card(connection, board)
         task = kb.get_task(connection, task_id)
 
@@ -1026,7 +1028,7 @@ def test_bound_project_without_primary_path_rejects_materialization(
             board_slug=board,
         )
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         request_id = kb.create_qualification_intake(
             connection,
             raw_request="project has no checkout",
@@ -1075,7 +1077,7 @@ def test_ambiguous_project_binding_rejects_materialization_and_rolls_back(
             allow_duplicate_path=True,
         )
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         request_id = kb.create_qualification_intake(
             connection,
             raw_request="ambiguous project binding",
@@ -1106,7 +1108,7 @@ def test_materialized_worker_and_show_receive_the_signed_work_contract(
     board = "strict-work-contract-context"
     _strict_v2_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_card(connection, board)
         task = kb.get_task(connection, task_id)
         context = kb.build_worker_context(connection, task_id)
@@ -1146,7 +1148,7 @@ def test_epic_contract_materializes_as_non_executable_container(tmp_path, monkey
     metadata["qualification"]["required"] = True
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
-    connection = kb.connect(board="strict")
+    connection = kanban_db_connect.connect(board="strict")
     try:
         request_id = kb.create_qualification_intake(
             connection, raw_request="epic outcome", source="hermes"
@@ -1187,7 +1189,7 @@ def test_qualified_epic_does_not_authorize_unrelated_child_contract(
     board = "strict"
     _strict_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         epic_id = _materialized_epic(connection, board)
         epic = kb.get_task(connection, epic_id)
         root_contract = kb.get_work_contract(connection, epic.work_contract_id)
@@ -1225,7 +1227,7 @@ def test_materialization_rolls_back_contract_and_decision_on_invalid_relationshi
     metadata["qualification"]["required"] = True
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
-    connection = kb.connect(board="strict")
+    connection = kanban_db_connect.connect(board="strict")
     try:
         request_id = kb.create_qualification_intake(
             connection,
@@ -1263,7 +1265,7 @@ def test_materialization_revalidates_late_entry_evidence_before_writing(
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     kb.ensure_product_board_defaults("strict")
-    with kb.connect(board="strict") as legacy_connection:
+    with kanban_db_connect.connect(board="strict") as legacy_connection:
         unrelated = kb.create_task(
             legacy_connection, title="Unrelated evidence holder"
         )
@@ -1277,7 +1279,7 @@ def test_materialization_revalidates_late_entry_evidence_before_writing(
     metadata["qualification"]["required"] = True
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
-    connection = kb.connect(board="strict")
+    connection = kanban_db_connect.connect(board="strict")
     try:
         request_id = kb.create_qualification_intake(
             connection, raw_request="late entry", source="hermes"
@@ -1328,7 +1330,7 @@ def test_materialization_revalidates_product_owner_evidence_for_epics(
     metadata["qualification"]["required"] = True
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
-    connection = kb.connect(board="strict")
+    connection = kanban_db_connect.connect(board="strict")
     try:
         request_id = kb.create_qualification_intake(
             connection, raw_request="PO Epic", source="productowner"
@@ -1367,7 +1369,7 @@ def test_requalification_intake_requires_hermes_service_authority(
     board = "strict-requalification-authority"
     _strict_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_scheduled_card(connection, board)
         raw_request = json.dumps(
             {"kind": "task_requalification", "target_task_id": task_id}
@@ -1387,7 +1389,7 @@ def test_requalification_authority_rejects_duplicate_kind_keys(
     board = "strict-requalification-duplicate-kind"
     _strict_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_scheduled_card(connection, board)
         raw_request = (
             '{"kind":"task_create","kind":"task_requalification",'
@@ -1408,7 +1410,7 @@ def test_submit_requalification_is_inert_durable_and_idempotent(
     board = "strict-requalification-intake"
     _strict_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_scheduled_card(connection, board)
 
         first = intake.submit_requalification(
@@ -1442,7 +1444,7 @@ def test_submit_requalification_ignores_legacy_non_json_intake(
     board = "strict-requalification-legacy-intake"
     _strict_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         kb.create_qualification_intake(
             connection,
             raw_request="legacy opaque request",
@@ -1466,7 +1468,7 @@ def test_requalification_captures_complete_history_and_repository_state(
     board = "strict-requalification-evidence"
     _strict_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_scheduled_card(connection, board)
         for number in range(51):
             kb.add_comment(connection, task_id, "test", f"history-{number}")
@@ -1540,7 +1542,7 @@ def test_requalification_captures_current_git_head_and_status(tmp_path, monkeypa
         text=True,
     ).stdout.strip()
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_scheduled_card(connection, board)
         with kb.authorized_governance_write():
             connection.execute(
@@ -1579,14 +1581,14 @@ def test_repository_evidence_is_unavailable_when_git_is_not_installed(
 ):
     board = "strict-requalification-no-git"
     _strict_product_board(tmp_path, monkeypatch, board)
-    monkeypatch.setattr(kb.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
 
     def unexpected_subprocess(*_args, **_kwargs):
         pytest.fail("repository evidence must not shell out when git is unavailable")
 
     monkeypatch.setattr(kb.subprocess, "run", unexpected_subprocess)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_scheduled_card(connection, board)
         with kb.authorized_governance_write():
             connection.execute(
@@ -1612,7 +1614,7 @@ def test_successor_contract_requalifies_same_card_and_preserves_audit(
     board = "strict-requalification-apply"
     _strict_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_scheduled_card(connection, board)
         before_count = connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
         old_contract_id = kb.get_task(connection, task_id).work_contract_id
@@ -1671,7 +1673,7 @@ def test_requalification_refuses_stale_card_evidence(
     board = "strict-requalification-stale-evidence"
     _strict_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_scheduled_card(connection, board)
         old_contract_id = kb.get_task(connection, task_id).work_contract_id
         receipt = intake.submit_requalification(
@@ -1723,7 +1725,7 @@ def test_requalification_replaces_dependencies_and_epic_membership(
     board = "strict-requalification-relationships"
     _strict_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         target_id = _materialized_scheduled_card(connection, board)
         unfinished_parent_id = _materialized_card(connection, board)
         epic_id = _materialized_epic(connection, board)
@@ -1760,7 +1762,7 @@ def test_requalification_treats_archived_dependency_as_satisfied(
     board = "strict-requalification-archived-parent"
     _strict_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         target_id = _materialized_scheduled_card(connection, board)
         parent_id = _materialized_card(connection, board)
         with kb.authorized_governance_write():
@@ -1797,7 +1799,7 @@ def test_requalification_uses_autonomous_release_dependency_policy(
     ] = True
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         target_id = _materialized_scheduled_card(connection, board)
         parent_id = _materialized_card(connection, board)
         with kb.authorized_governance_write():
@@ -1832,7 +1834,7 @@ def test_requalification_rejects_break_glass_and_rolls_back(
     board = "strict-requalification-no-override"
     _strict_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_scheduled_card(connection, board)
         receipt = intake.submit_requalification(
             connection,
@@ -1878,7 +1880,7 @@ def test_reconcile_requests_one_scheduled_requalification_per_pass(
     board = "strict-v2-requalification-bounded"
     _strict_v2_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         first_id = _materialized_scheduled_card(connection, board)
         second_id = _materialized_scheduled_card(connection, board)
         connection.execute(
@@ -1900,7 +1902,7 @@ def test_reconcile_does_not_duplicate_pending_requalification(
     board = "strict-v2-requalification-idempotent"
     _strict_v2_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_scheduled_card(connection, board)
 
         first = kb.reconcile(connection, board=board, spawn_ready=False)
@@ -1919,7 +1921,7 @@ def test_reconcile_does_not_retry_rejected_requalification(
     board = "strict-v2-requalification-rejected"
     _strict_v2_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_scheduled_card(connection, board)
         first = kb.reconcile(connection, board=board, spawn_ready=False)
         intake_id = kb.list_qualification_intakes(connection, status="pending")[0]["id"]
@@ -1953,7 +1955,7 @@ def test_reconcile_retries_rejected_requalification_after_qualifier_revision_cha
     board = "strict-v2-requalification-new-qualifier"
     _strict_v2_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_scheduled_card(connection, board)
         first = kb.reconcile(connection, board=board, spawn_ready=False)
         first_intake = kb.list_qualification_intakes(
@@ -1990,7 +1992,7 @@ def test_reconcile_leaves_scheduled_card_with_unresolved_blocker_untouched(
     board = "strict-v2-requalification-blocked"
     _strict_v2_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_scheduled_card(connection, board)
         with kb.authorized_governance_write():
             connection.execute(
@@ -2016,7 +2018,7 @@ def test_submit_requalification_rejects_an_unresolved_blocker(
     board = "strict-requalification-direct-blocked"
     _strict_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_scheduled_card(connection, board)
         with kb.authorized_governance_write():
             kb._append_event(
@@ -2041,7 +2043,7 @@ def test_reconcile_leaves_non_scheduled_qualified_work_untouched(
     board = f"strict-v2-requalification-{status}"
     _strict_v2_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_scheduled_card(connection, board)
         connection.execute(
             "UPDATE tasks SET status = ? WHERE id = ?", (status, task_id)
@@ -2059,7 +2061,7 @@ def test_reconcile_leaves_release_measure_to_release_evidence_policy(
     board = "strict-v2-requalification-release"
     _strict_v2_product_board(tmp_path, monkeypatch, board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         task_id = _materialized_scheduled_card(connection, board)
         with kb.authorized_governance_write():
             connection.execute(

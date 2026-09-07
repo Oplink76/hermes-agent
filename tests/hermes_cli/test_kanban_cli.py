@@ -12,6 +12,9 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
+from hermes_cli import kanban_db_workspace as kbw
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -60,7 +63,7 @@ def test_run_slash_create_source_policy(kanban_home, policy, required, forbidden
     payload = json.loads(kc.run_slash(
         f"create 'policy task' --source-policy {policy} --json"
     ))
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task = kb.get_task(conn, payload["id"])
     assert task.source_commit_required is required
     assert task.source_commit_forbidden is forbidden
@@ -84,7 +87,7 @@ def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     )
     assert "Created" in out
 
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tasks = kb.list_tasks(conn)
     task = tasks[0]
     assert task.workspace_kind == "worktree"
@@ -147,13 +150,13 @@ def test_run_slash_block_unblock_cycle(kanban_home):
 def test_manual_claim_rolls_back_when_workspace_provisioning_fails(
     kanban_home, monkeypatch, capsys
 ):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id = kb.create_task(conn, title="provisioning failure")
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
         conn.commit()
 
     monkeypatch.setattr(
-        kb,
+        kbw,
         "resolve_workspace",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("unsafe deps")),
     )
@@ -162,7 +165,7 @@ def test_manual_claim_rolls_back_when_workspace_provisioning_fails(
 
     assert result == 1
     assert "workspace provisioning failed" in capsys.readouterr().err
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task = kb.get_task(conn, task_id)
         assert task is not None
         assert task.status == "ready"
@@ -198,7 +201,7 @@ def test_strict_board_create_returns_inert_intake_receipt(kanban_home):
         "intake_status": "pending",
     }
     assert payload["intake_id"].startswith("qi_")
-    with kb.connect(board="strict") as conn:
+    with kanban_db_connect.connect(board="strict") as conn:
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
         record = kb.get_qualification_intake(conn, payload["intake_id"])
     assert "unqualified request" in record["raw_request"]
@@ -211,7 +214,7 @@ def test_run_slash_intake_show_reports_safe_failure_and_budget(kanban_home):
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata["qualification"]["required"] = True
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-    with kb.connect(board="strict") as conn:
+    with kanban_db_connect.connect(board="strict") as conn:
         intake_id = kb.create_qualification_intake(
             conn, raw_request="request", source="cli"
         )
@@ -238,7 +241,7 @@ def test_run_slash_intake_retry_reports_refusal_and_success(kanban_home):
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata["qualification"]["required"] = True
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-    with kb.connect(board="strict") as conn:
+    with kanban_db_connect.connect(board="strict") as conn:
         intake_id = kb.create_qualification_intake(
             conn, raw_request="request", source="cli"
         )
@@ -258,7 +261,7 @@ def test_run_slash_intake_show_honors_board_override(kanban_home):
     kb.ensure_product_board_defaults(current_board, switch=True)
     kb.ensure_product_board_defaults(selected_board)
 
-    with kb.connect(board=selected_board) as conn:
+    with kanban_db_connect.connect(board=selected_board) as conn:
         intake_id = kb.create_qualification_intake(
             conn, raw_request="request", source="cli"
         )
@@ -289,7 +292,7 @@ def test_run_slash_intake_retry_honors_board_override(kanban_home):
     kb.ensure_product_board_defaults(current_board, switch=True)
     kb.ensure_product_board_defaults(selected_board)
 
-    with kb.connect(board=selected_board) as conn:
+    with kanban_db_connect.connect(board=selected_board) as conn:
         intake_id = kb.create_qualification_intake(
             conn, raw_request="request", source="cli"
         )
@@ -303,7 +306,7 @@ def test_run_slash_intake_retry_honors_board_override(kanban_home):
     )
 
     assert f"{intake_id}: pending" in output
-    with kb.connect(board=selected_board) as conn:
+    with kanban_db_connect.connect(board=selected_board) as conn:
         record = kb.get_qualification_intake(conn, intake_id)
         assert record is not None
         assert record["status"] == "pending"
@@ -341,7 +344,8 @@ def test_run_slash_session_filter(kanban_home):
     """`hermes kanban list --session <id>` filters by the originating
     chat session id stamped on tasks created from inside an ACP loop."""
     from hermes_cli import kanban_db as kb
-    with kb.connect() as conn:
+    import hermes_cli.kanban_db_connect as kanban_db_connect
+    with kanban_db_connect.connect() as conn:
         kb.create_task(
             conn, title="from sess-1 a", assignee="alice", session_id="sess-1"
         )
@@ -366,7 +370,9 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     """JSON output exposes `session_id` so external clients (Scarf, web
     dashboards) don't need a side query to filter by chat session."""
     from hermes_cli import kanban_db as kb
-    with kb.connect() as conn:
+    import hermes_cli.kanban_db_connect as kanban_db_connect
+    from hermes_cli import kanban_db_connect as kbc
+    with kbc.connect() as conn:
         kb.create_task(
             conn, title="acp task", assignee="alice", session_id="acp-x"
         )
@@ -380,7 +386,7 @@ def test_kanban_list_json_includes_session_id(kanban_home):
 
 
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")
         child_id = kb.create_task(conn, title="child task")
         kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
@@ -429,9 +435,9 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
 
     assert failures == []
 
-    with kb.connect_closing(board="alpha") as conn:
+    with kbc.connect_closing(board="alpha") as conn:
         alpha_titles = [row.title for row in kb.list_tasks(conn, limit=100)]
-    with kb.connect_closing(board="beta") as conn:
+    with kbc.connect_closing(board="beta") as conn:
         beta_titles = [row.title for row in kb.list_tasks(conn, limit=100)]
 
     assert alpha_titles == ["alpha-task"]
@@ -456,6 +462,8 @@ def test_run_slash_reclaim_running_task(kanban_home):
     import time
     import secrets
     from hermes_cli import kanban_db as kb
+    import hermes_cli.kanban_db_connect as kanban_db_connect
+    from hermes_cli import kanban_db_connect as kbc
 
     out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model")
     m = re.search(r"(t_[a-f0-9]+)", out1)
@@ -463,7 +471,7 @@ def test_run_slash_reclaim_running_task(kanban_home):
     tid = m.group(1)
 
     # Simulate a running claim outside TTL.
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         lock = secrets.token_hex(4)
         conn.execute(
@@ -573,7 +581,7 @@ def _cli_d4_board(name: str) -> None:
 
 
 def _cli_d4_escalated(board: str) -> str:
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = kb.create_task(
             conn,
             title="Story: CLI D4",
@@ -625,7 +633,7 @@ def test_answer_escalation_cli_success_accepts_leading_dash_and_writes_no_commen
         out = kc.run_slash(f"answer-escalation {task_id} -- --use-vendored-fixture")
     assert "Answered" in out
     assert "fresh Resolver" in out
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         comments = kb.list_comments(conn, task_id)
         events = kb.list_events(conn, task_id)
     assert not [comment for comment in comments if "use-vendored" in comment.body]
@@ -655,7 +663,7 @@ def test_answer_escalation_cli_stale_conflict_is_concise_and_public(kanban_home)
 def _cli_clear_terminal_card(board: str) -> tuple[str, int, int]:
     _cli_d4_board(board)
     completed_at = 1_700_000_456
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = kb.create_task(
             conn,
             title="Story: clear terminal state",
@@ -726,7 +734,7 @@ def test_clear_terminal_state_cli_success_has_structured_non_evidence_output(kan
         "completed_at": None,
     }
     assert "preserve CLI evidence" not in out
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task = kb.get_task(conn, task_id)
         assert task is not None and task.status == "ready" and task.completed_at is None
 
@@ -744,6 +752,6 @@ def test_clear_terminal_state_cli_refuses_lost_cas_without_evidence_payload(kanb
         )
     assert "cannot clear terminal state" in out
     assert "preserve CLI evidence" not in out
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task = kb.get_task(conn, task_id)
         assert task is not None and task.status == "done" and task.completed_at == completed_at

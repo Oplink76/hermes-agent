@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hermes_cli import web_server
+from hermes_cli.web_routers import actions
 from hermes_cli.upstream_sync_status import SyncStatus
 from ops.cloudadvisor.hermes_ops.sync_deployment_checkpoint import (
     PendingDeploymentCheckpoint,
@@ -59,11 +60,11 @@ def test_installed_current_does_not_hide_upstream_backlog(
     _write_status(status_file, upstream_behind=54)
     monkeypatch.setattr(web_server, "_upstream_sync_status_path", lambda: status_file)
     monkeypatch.setattr(
-        web_server, "_dashboard_local_update_managed_externally", lambda: False
+        actions, "_dashboard_local_update_managed_externally", lambda: False
     )
-    monkeypatch.setattr(web_server, "detect_install_method", lambda root: "git")
+    monkeypatch.setattr(actions, "detect_install_method", lambda root: "git")
     monkeypatch.setattr("hermes_cli.banner.check_for_updates", lambda: 0)
-    monkeypatch.setattr(web_server, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(actions, "get_hermes_home", lambda: tmp_path)
 
     payload = _client().get("/api/hermes/update/check?force=true").json()
 
@@ -86,11 +87,11 @@ def test_missing_status_file_keeps_existing_update_contract(
         lambda: tmp_path / "missing.json",
     )
     monkeypatch.setattr(
-        web_server, "_dashboard_local_update_managed_externally", lambda: False
+        actions, "_dashboard_local_update_managed_externally", lambda: False
     )
-    monkeypatch.setattr(web_server, "detect_install_method", lambda root: "git")
+    monkeypatch.setattr(actions, "detect_install_method", lambda root: "git")
     monkeypatch.setattr("hermes_cli.banner.check_for_updates", lambda: 3)
-    monkeypatch.setattr(web_server, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(actions, "get_hermes_home", lambda: tmp_path)
 
     payload = _client().get("/api/hermes/update/check").json()
 
@@ -108,9 +109,9 @@ def test_needs_ole_status_does_not_claim_upstream_is_syncing(
     _write_status(status_file, upstream_behind=54, sync_state="NEEDS_OLE")
     monkeypatch.setattr(web_server, "_upstream_sync_status_path", lambda: status_file)
     monkeypatch.setattr(
-        web_server, "_dashboard_local_update_managed_externally", lambda: False
+        actions, "_dashboard_local_update_managed_externally", lambda: False
     )
-    monkeypatch.setattr(web_server, "detect_install_method", lambda root: "git")
+    monkeypatch.setattr(actions, "detect_install_method", lambda root: "git")
     monkeypatch.setattr("hermes_cli.banner.check_for_updates", lambda: 0)
 
     payload = _client().get("/api/hermes/update/check").json()
@@ -135,9 +136,9 @@ def test_safe_rollback_suppresses_update_action_and_shows_recovery(
     )
     monkeypatch.setattr(web_server, "_upstream_sync_status_path", lambda: status_file)
     monkeypatch.setattr(
-        web_server, "_dashboard_local_update_managed_externally", lambda: False
+        actions, "_dashboard_local_update_managed_externally", lambda: False
     )
-    monkeypatch.setattr(web_server, "detect_install_method", lambda root: "git")
+    monkeypatch.setattr(actions, "detect_install_method", lambda root: "git")
     monkeypatch.setattr("hermes_cli.banner.check_for_updates", lambda: 1)
 
     payload = _client().get("/api/hermes/update/check").json()
@@ -155,11 +156,11 @@ def test_needs_ole_blocks_direct_update_endpoint(
     _write_status(status_file, upstream_behind=2, sync_state="NEEDS_OLE")
     monkeypatch.setattr(web_server, "_upstream_sync_status_path", lambda: status_file)
     monkeypatch.setattr(
-        web_server, "_dashboard_local_update_managed_externally", lambda: False
+        actions, "_dashboard_local_update_managed_externally", lambda: False
     )
     spawned: list[object] = []
     monkeypatch.setattr(
-        web_server,
+        actions,
         "_spawn_hermes_action",
         lambda *args, **kwargs: spawned.append((args, kwargs)),
     )
@@ -184,13 +185,13 @@ def test_pending_deployment_blocks_check_and_direct_update(
         lambda: tmp_path / "missing-status.json",
     )
     monkeypatch.setattr(
-        web_server, "_dashboard_local_update_managed_externally", lambda: False
+        actions, "_dashboard_local_update_managed_externally", lambda: False
     )
-    monkeypatch.setattr(web_server, "detect_install_method", lambda root: "git")
+    monkeypatch.setattr(actions, "detect_install_method", lambda root: "git")
     monkeypatch.setattr("hermes_cli.banner.check_for_updates", lambda: 1)
     spawned: list[object] = []
     monkeypatch.setattr(
-        web_server,
+        actions,
         "_spawn_hermes_action",
         lambda *args, **kwargs: spawned.append((args, kwargs)),
     )

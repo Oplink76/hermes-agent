@@ -11,6 +11,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
+import hermes_cli.kanban_db_workspace as kanban_db_workspace
 from hermes_cli import kanban_intake as intake
 from hermes_cli import kanban_qualifier as qualifier
 from hermes_cli import plugins, web_server
@@ -63,7 +65,7 @@ def _contracted_running_card(board: str, tmp_path: Path) -> tuple[str, str, int,
     subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.test"], check=True)
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "Work Inbox Test"], check=True)
     (repo / "delivered.txt").write_text("delivered\n", encoding="utf-8")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         intake_id = kb.create_qualification_intake(
             conn,
             raw_request=json.dumps({"kind": "task_create", "request": {"title": "Assigned change"}}),
@@ -109,7 +111,7 @@ def _contracted_running_card(board: str, tmp_path: Path) -> tuple[str, str, int,
         task_id = intake.materialize_contract(
             conn, board=board, signed_contract=signed, secret=b"test-only-secret",
         )
-        kb.set_workspace_path(conn, task_id, str(repo))
+        kanban_db_workspace.set_workspace_path(conn, task_id, str(repo))
         task = kb.claim_task(conn, task_id, board=board, claimer="work-inbox-test")
         assert task is not None and task.current_run_id is not None
         return board, task_id, task.current_run_id, str(task.work_contract_id)
@@ -206,7 +208,7 @@ def test_new_work_delegates_to_existing_intake(app_client, strict_board, strong_
 
     assert response.status_code == 202
     assert response.json()["status"] == "qualification_required"
-    with kb.connect(board=strict_board) as conn:
+    with kanban_db_connect.connect(board=strict_board) as conn:
         assert len(kb.list_qualification_intakes(conn, status="pending")) == 1
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
 
@@ -242,7 +244,7 @@ def test_work_inbox_credential_can_observe_its_intake_status_only(
         "attempts_limit": 3,
     }
 
-    with kb.connect(board=strict_board) as conn:
+    with kanban_db_connect.connect(board=strict_board) as conn:
         result = qualifier.qualify_intake(
             conn,
             board=strict_board,
@@ -291,7 +293,7 @@ def test_work_inbox_status_exposes_only_bounded_contract_failure_path(
         },
     )
     intake_id = submitted.json()["intake_id"]
-    with kb.connect(board=strict_board) as conn:
+    with kanban_db_connect.connect(board=strict_board) as conn:
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE qualification_intake SET status = 'attention_required' WHERE id = ?",
@@ -338,7 +340,7 @@ def test_same_credential_can_answer_clarification_and_retry_attention(
         },
     )
     intake_id = submitted.json()["intake_id"]
-    with kb.connect(board=strict_board) as conn:
+    with kanban_db_connect.connect(board=strict_board) as conn:
         run = kb.claim_qualification_intake(
             conn,
             intake_id,
@@ -385,7 +387,7 @@ def test_same_credential_can_answer_clarification_and_retry_attention(
         },
     )
     assert response.status_code == 202, response.text
-    with kb.connect(board=strict_board) as conn:
+    with kanban_db_connect.connect(board=strict_board) as conn:
         record = kb.get_qualification_intake(conn, intake_id)
         assert record["status"] == "pending"
         assert record["attachments"] == [{"name": "original.md"}]
@@ -404,7 +406,7 @@ def test_same_credential_can_answer_clarification_and_retry_attention(
         json={"version": 2, "kind": "retry", "intake_id": intake_id},
     )
     assert retried.status_code == 202, retried.text
-    with kb.connect(board=strict_board) as conn:
+    with kanban_db_connect.connect(board=strict_board) as conn:
         assert kb.get_qualification_intake(conn, intake_id)["status"] == "pending"
         assert kb.list_qualification_intake_events(conn, intake_id)[-1][
             "kind"
@@ -425,7 +427,7 @@ def test_work_inbox_status_exposes_retry_only_when_server_authorizes_it(
         },
     )
     intake_id = submitted.json()["intake_id"]
-    with kb.connect(board=strict_board) as conn:
+    with kanban_db_connect.connect(board=strict_board) as conn:
         run = kb.claim_qualification_intake(
             conn,
             intake_id,
@@ -486,7 +488,7 @@ def test_work_inbox_status_hides_retry_when_attempt_budget_is_exhausted(
         },
     )
     intake_id = submitted.json()["intake_id"]
-    with kb.connect(board=strict_board) as conn:
+    with kanban_db_connect.connect(board=strict_board) as conn:
         for now in (10, 20, 30):
             run = kb.claim_qualification_intake(
                 conn,
@@ -534,7 +536,7 @@ def test_clarification_question_is_redacted_before_external_status_response(
         },
     )
     intake_id = submitted.json()["intake_id"]
-    with kb.connect(board=strict_board) as conn:
+    with kanban_db_connect.connect(board=strict_board) as conn:
         conn.execute(
             "UPDATE qualification_intake SET status = 'needs_clarification' "
             "WHERE id = ?",
@@ -579,7 +581,7 @@ def test_decision_reason_is_redacted_before_external_status_response(
         },
     )
     intake_id = submitted.json()["intake_id"]
-    with kb.connect(board=strict_board) as conn:
+    with kanban_db_connect.connect(board=strict_board) as conn:
         kb.record_qualification_decision(
             conn,
             intake_id=intake_id,
@@ -609,7 +611,7 @@ def test_decision_reason_is_redacted_before_external_status_response(
 def test_clarification_response_cannot_cross_intake_source(
     app_client, strict_board, strong_secret,
 ):
-    with kb.connect(board=strict_board) as conn:
+    with kanban_db_connect.connect(board=strict_board) as conn:
         intake_id = kb.create_qualification_intake(
             conn,
             raw_request='{"kind":"task_create","request":{"title":"Foreign"}}',
@@ -633,7 +635,7 @@ def test_clarification_response_cannot_cross_intake_source(
     )
     assert response.status_code == 404
 
-    with kb.connect(board=strict_board) as conn:
+    with kanban_db_connect.connect(board=strict_board) as conn:
         private_intake = kb.create_qualification_intake(
             conn,
             raw_request="private",
@@ -664,7 +666,7 @@ def test_new_work_patch_evidence_creates_only_pending_intake(
     )
 
     assert response.status_code == 202
-    with kb.connect(board=strict_board) as conn:
+    with kanban_db_connect.connect(board=strict_board) as conn:
         intakes = kb.list_qualification_intakes(conn, status="pending")
         assert len(intakes) == 1
         assert json.loads(intakes[0]["raw_request"])["request"]["evidence"] == [
@@ -699,7 +701,7 @@ def test_exact_assigned_completion_uses_normal_handover(
         "run_id": run_id,
         "status": "handover_applied",
     }
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         assert kb.get_task(conn, task_id).current_step_key == "test"
 
 
@@ -725,7 +727,7 @@ def test_exact_assigned_blocking_uses_normal_handover(
         "run_id": run_id,
         "status": "blocked",
     }
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         assert kb.get_run(conn, run_id).ended_at is not None
 
 
@@ -742,7 +744,7 @@ def test_ineligible_assigned_delivery_does_not_mutate_task_or_events(
     app_client, strict_board, strong_secret, tmp_path, sql, params,
 ):
     board, task_id, run_id, contract_id = _contracted_running_card(strict_board, tmp_path)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         with kb.authorized_governance_write():
             conn.execute(sql, params(task_id))
         before = kb.get_task(conn, task_id)
@@ -759,7 +761,7 @@ def test_ineligible_assigned_delivery_does_not_mutate_task_or_events(
     )
 
     assert response.status_code == 409
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         assert kb.get_task(conn, task_id) == before
         assert len(kb.list_events(conn, task_id)) == before_events
 
@@ -782,7 +784,7 @@ def test_rejected_assigned_delivery_does_not_mutate_task_or_events(
     app_client, strict_board, strong_secret, mutate, expected_status, tmp_path,
 ):
     board, task_id, run_id, contract_id = _contracted_running_card(strict_board, tmp_path)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         before = kb.get_task(conn, task_id)
         before_events = len(kb.list_events(conn, task_id))
     body = _assigned_completion_body(task_id, run_id, contract_id)
@@ -794,7 +796,7 @@ def test_rejected_assigned_delivery_does_not_mutate_task_or_events(
     )
 
     assert response.status_code == expected_status
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         after = kb.get_task(conn, task_id)
         assert after == before
         assert len(kb.list_events(conn, task_id)) == before_events
@@ -805,7 +807,7 @@ def test_task_mismatched_assignment_does_not_mutate_task_or_events(
 ):
     board, task_id, run_id, contract_id = _contracted_running_card(strict_board, tmp_path)
     _, other_task_id, _, other_contract_id = _contracted_running_card(strict_board, tmp_path)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         before = kb.get_task(conn, other_task_id)
         before_events = len(kb.list_events(conn, other_task_id))
 
@@ -816,7 +818,7 @@ def test_task_mismatched_assignment_does_not_mutate_task_or_events(
     )
 
     assert response.status_code == 409
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         assert kb.get_task(conn, other_task_id) == before
         assert len(kb.list_events(conn, other_task_id)) == before_events
         assert kb.get_task(conn, task_id).current_run_id == run_id
@@ -827,7 +829,7 @@ def test_unknown_task_assignment_returns_not_found_without_mutation(
     app_client, strict_board, strong_secret, tmp_path,
 ):
     board, task_id, run_id, contract_id = _contracted_running_card(strict_board, tmp_path)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         before = kb.get_task(conn, task_id)
         before_events = len(kb.list_events(conn, task_id))
 
@@ -838,7 +840,7 @@ def test_unknown_task_assignment_returns_not_found_without_mutation(
     )
 
     assert response.status_code == 404
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         assert kb.get_task(conn, task_id) == before
         assert len(kb.list_events(conn, task_id)) == before_events
 
@@ -848,7 +850,7 @@ def test_malformed_redacted_metadata_is_rejected_without_persisting_secret(
 ):
     board, task_id, run_id, contract_id = _contracted_running_card(strict_board, tmp_path)
     secret = "unredacted-metadata-secret"
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         before = kb.get_task(conn, task_id)
         before_events = len(kb.list_events(conn, task_id))
     monkeypatch.setattr(
@@ -866,7 +868,7 @@ def test_malformed_redacted_metadata_is_rejected_without_persisting_secret(
 
     assert response.status_code == 422
     assert secret not in response.text
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         assert kb.get_task(conn, task_id) == before
         assert len(kb.list_events(conn, task_id)) == before_events
 
@@ -884,7 +886,7 @@ def test_handover_policy_errors_use_bounded_public_detail(
     app_client, strict_board, strong_secret, tmp_path, monkeypatch, error_factory,
 ):
     board, task_id, run_id, contract_id = _contracted_running_card(strict_board, tmp_path)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         before = kb.get_task(conn, task_id)
         before_events = len(kb.list_events(conn, task_id))
 
@@ -901,7 +903,7 @@ def test_handover_policy_errors_use_bounded_public_detail(
     assert response.status_code == 409
     assert response.json()["detail"] == "handover policy rejected this delivery"
     assert "private" not in response.text
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         assert kb.get_task(conn, task_id) == before
         assert len(kb.list_events(conn, task_id)) == before_events
 
@@ -910,7 +912,7 @@ def test_ended_run_assignment_does_not_mutate_task_or_events(
     app_client, strict_board, strong_secret, tmp_path,
 ):
     board, task_id, run_id, contract_id = _contracted_running_card(strict_board, tmp_path)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         assert kb.reclaim_task(conn, task_id, reason="test ended run")
         before = kb.get_task(conn, task_id)
         before_events = len(kb.list_events(conn, task_id))
@@ -922,6 +924,6 @@ def test_ended_run_assignment_does_not_mutate_task_or_events(
     )
 
     assert response.status_code == 409
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         assert kb.get_task(conn, task_id) == before
         assert len(kb.list_events(conn, task_id)) == before_events

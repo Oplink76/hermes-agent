@@ -22,6 +22,8 @@ from typing import Any, Mapping, Optional
 
 from hermes_constants import get_default_hermes_root
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_intake
 
 
@@ -446,7 +448,7 @@ def _make_read_only(root: Path) -> None:
 
 @contextlib.contextmanager
 def _quiescent_board(board: str):
-    with kb._dispatch_tick_lock(kb.kanban_db_path(board)) as held:
+    with kbc._dispatch_tick_lock(kb.kanban_db_path(board)) as held:
         if not held:
             raise MigrationBlocked(
                 f"board {board!r} has an active dispatch tick; retry migration"
@@ -483,7 +485,7 @@ def _apply_board_quiescent(
         board, recovery_root=recovery_root, audit=audit
     )
     changed = 0
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         with kb.write_txn(conn):
             refreshed = _audit_from_connection(
                 conn, board=board, metadata=kb.read_board_metadata(board)
@@ -710,7 +712,7 @@ def _rollback_receipt_quiescent(
     # Re-open after metadata restoration so the mirrored DB gate matches the
     # restored policy. SQLite's backup API coordinates with any open WAL
     # connections instead of replacing files underneath them.
-    with kb.connect_closing(board=board) as restored:
+    with kanban_db_connect.connect_closing(board=board) as restored:
         integrity = str(restored.execute("PRAGMA integrity_check").fetchone()[0])
     if integrity != "ok":
         raise MigrationBlocked(f"rollback integrity check failed: {integrity}")

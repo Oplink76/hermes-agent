@@ -156,6 +156,7 @@ def test_gateway_tick_real_kanban_db_never_spawns_past_max_spawn(monkeypatch):
     after dispatch_once), this spawns 2.
     """
     from hermes_cli import kanban_db as real_kb
+    import hermes_cli.kanban_db_connect as kanban_db_connect
     from hermes_cli import profiles
 
     board = "v2-gateway-max-spawn"
@@ -178,9 +179,10 @@ def test_gateway_tick_real_kanban_db_never_spawns_past_max_spawn(monkeypatch):
     # it here means the fake applies uniformly to whichever of the two
     # actually ends up spawning a given card, without depending on whether
     # the gateway wrapper threads a spawn_fn through to reconcile.
-    monkeypatch.setattr(real_kb, "_default_spawn", fake_spawn)
+    from hermes_cli import kanban_db_dispatch
+    monkeypatch.setattr(kanban_db_dispatch, "_default_spawn", fake_spawn)
 
-    with real_kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         t1 = real_kb.create_task(conn, title="Story 1", assignee="developer")
         t2 = real_kb.create_task(conn, title="Story 2", assignee="developer")
 

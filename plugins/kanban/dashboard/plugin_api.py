@@ -52,8 +52,17 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from hermes_cli import kanban_db
+import hermes_cli.kanban_db_connect as kanban_db_connect
+import hermes_cli.kanban_db_dispatch as kanban_db_dispatch
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_intake
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.kanban_db import (
+    KANBAN_ATTACHMENT_MAX_BYTES,
+    _collision_free_path,
+    _safe_attachment_name,
+)
 from agent.redact import redact_sensitive_text
 
 log = logging.getLogger(__name__)
@@ -94,7 +103,7 @@ def _ws_upgrade_authorized(ws: "WebSocket") -> bool:
     the prior behaviour.
     """
     try:
-        from hermes_cli import web_server as _ws
+        from hermes_cli import web_server_chat as _ws
     except Exception:
         # No dashboard context (tests). Accept so the tail loop is still
         # testable; in production the dashboard module always imports
@@ -141,7 +150,7 @@ def _conn(board: Optional[str] = None):
         kanban_db.init_db(board=board)
     except Exception as exc:
         log.warning("kanban init_db failed: %s", exc)
-    return kanban_db.connect(board=board)
+    return kbc.connect(board=board)
 
 
 def _release_state_payload(
@@ -1410,7 +1419,6 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
-    project_id: Optional[str] = None
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
     model_override: Optional[str] = None
@@ -3462,7 +3470,7 @@ def get_home_channels(
         board = _resolve_board(board)
         conn = _conn(board=board)
         try:
-            subs = kanban_db.list_notify_subs(conn, task_id)
+            subs = kbn.list_notify_subs(conn, task_id)
         finally:
             conn.close()
         for sub in subs:
@@ -3512,7 +3520,7 @@ def subscribe_home(
             ) as row:
                 if row is None:
                     raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-                kanban_db.add_notify_sub(
+                kbn.add_notify_sub(
                     conn,
                     task_id=task_id,
                     platform=platform,
@@ -3554,7 +3562,7 @@ def unsubscribe_home(
             ) as row:
                 if row is None:
                     raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-                kanban_db.remove_notify_sub(
+                kbn.remove_notify_sub(
                     conn,
                     task_id=task_id,
                     platform=platform,
@@ -3658,7 +3666,7 @@ def dispatch(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        result = kanban_db.dispatch_once(
+        result = kanban_db_dispatch.dispatch_once(
             conn, dry_run=dry_run, max_spawn=max_n, board=board,
         )
         # DispatchResult is a dataclass.
@@ -3799,7 +3807,7 @@ def _board_counts(slug: str) -> dict[str, int]:
         path = kanban_db.kanban_db_path(board=slug)
         if not path.exists():
             return {}
-        conn = kanban_db.connect(board=slug)
+        conn = kanban_db_connect.connect(board=slug)
         try:
             rows = conn.execute(
                 "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
@@ -4404,7 +4412,7 @@ async def stream_events(ws: WebSocket):
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
             nonlocal event_conn
             if event_conn is None:
-                event_conn = kanban_db.connect(board=ws_board)
+                event_conn = kanban_db_connect.connect(board=ws_board)
             rows = event_conn.execute(
                 "SELECT id, task_id, run_id, kind, payload, created_at "
                 "FROM task_events WHERE id > ? ORDER BY id ASC LIMIT 200",

@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 from hermes_cli import kanban_legacy_reconcile as reconcile
 from hermes_cli import kanban as kc
 
@@ -57,7 +58,7 @@ def _write_approval(path: Path, manifest_path: Path) -> None:
 
 
 def _table_rows(board: str, table: str) -> list[dict[str, Any]]:
-    with kb.connect_closing(board=board) as conn:
+    with kanban_db_connect.connect_closing(board=board) as conn:
         return [
             dict(row)
             for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid")
@@ -65,14 +66,14 @@ def _table_rows(board: str, table: str) -> list[dict[str, Any]]:
 
 
 def _task_row(board: str, task_id: str) -> dict[str, Any]:
-    with kb.connect_closing(board=board) as conn:
+    with kanban_db_connect.connect_closing(board=board) as conn:
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     assert row is not None
     return dict(row)
 
 
 def _event_payloads(board: str, task_id: str, kind: str) -> list[dict[str, Any]]:
-    with kb.connect_closing(board=board) as conn:
+    with kanban_db_connect.connect_closing(board=board) as conn:
         rows = conn.execute(
             "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id",
             (task_id, kind),
@@ -139,7 +140,7 @@ def exact_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
 
     for board in BOARDS:
-        with kb.connect_closing(board=board):
+        with kanban_db_connect.connect_closing(board=board):
             pass
 
     card_specs = [
@@ -194,7 +195,7 @@ def exact_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         card_disposition,
         qualification_disposition,
     ) in card_specs:
-        with kb.connect_closing(board=board) as conn:
+        with kanban_db_connect.connect_closing(board=board) as conn:
             task_id = kb.create_task(
                 conn,
                 title=title,
@@ -271,7 +272,7 @@ def test_audit_is_read_only_and_reports_exact_counts(
     manifest_path, _manifest = exact_manifest
     before = {board: _sha(kb.kanban_db_path(board)) for board in BOARDS}
     monkeypatch.setattr(
-        kb,
+        kanban_db_connect,
         "connect",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("dry-run must use a direct query-only connection")
@@ -319,7 +320,7 @@ def test_audit_fails_closed_on_invalid_or_changed_inventory(
     manifest = copy.deepcopy(original)
     if mutation == "status":
         card = manifest["cards"][0]
-        with kb.connect_closing(board=card["board"]) as conn:
+        with kanban_db_connect.connect_closing(board=card["board"]) as conn:
             with kb.write_txn(conn):
                 conn.execute(
                     "UPDATE tasks SET status = 'review' WHERE id = ?",
@@ -534,7 +535,7 @@ def test_active_mutation_target_blocks_before_snapshots_or_writes(
         for card in manifest["cards"]
         if card["card_disposition"] == "legacy_reconciled"
     )
-    with kb.connect_closing(board=target["board"]) as conn:
+    with kanban_db_connect.connect_closing(board=target["board"]) as conn:
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET running = 1 WHERE id = ?",
@@ -574,7 +575,7 @@ def test_every_written_card_with_an_active_state_blocks_before_snapshots(
         and card["qualification_disposition"]
         == "migration_artifact_not_qualification"
     )
-    with kb.connect_closing(board=target["board"]) as conn:
+    with kanban_db_connect.connect_closing(board=target["board"]) as conn:
         with kb.write_txn(conn):
             if active_state == "qualification_only":
                 conn.execute(
@@ -617,7 +618,7 @@ def test_partial_event_without_success_receipt_fails_closed(
         if card["card_disposition"] == "legacy_reconciled"
     )
     digest = _sha(manifest_path)
-    with kb.connect_closing(board=target["board"]) as conn:
+    with kanban_db_connect.connect_closing(board=target["board"]) as conn:
         with kb.write_txn(conn):
             kb._append_event(
                 conn,
@@ -650,7 +651,7 @@ def test_repeat_rejects_tampered_canonical_event(exact_manifest, tmp_path: Path)
         for card in manifest["cards"]
         if card["card_disposition"] == "legacy_reconciled"
     )
-    with kb.connect_closing(board=target["board"]) as conn:
+    with kanban_db_connect.connect_closing(board=target["board"]) as conn:
         with kb.write_txn(conn):
             row = conn.execute(
                 "SELECT id, payload FROM task_events "

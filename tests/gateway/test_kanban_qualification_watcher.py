@@ -10,6 +10,7 @@ from gateway.kanban_watchers import (
     _qualify_then_dispatch,
 )
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 from hermes_cli import kanban_intake
 from hermes_cli.config import DEFAULT_CONFIG
 
@@ -131,7 +132,7 @@ def test_default_watcher_routes_pending_record_through_direct_intake_router(
 
 
 def test_new_intake_emits_process_local_wake_after_durable_write(tmp_path):
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = kanban_db_connect.connect(tmp_path / "kanban.db")
     observed = []
 
     def wake():
@@ -183,6 +184,7 @@ class _OverrideRunner(GatewayKanbanWatchersMixin):
 @pytest.mark.asyncio
 async def test_override_requires_authenticated_home_channel_direct_message(monkeypatch):
     from hermes_cli import kanban_db as kb
+    import hermes_cli.kanban_db_connect as kanban_db_connect
     from hermes_cli import kanban_qualifier as qualifier
 
     runner = _OverrideRunner()
@@ -222,6 +224,7 @@ async def test_override_requires_authenticated_home_channel_direct_message(monke
 @pytest.mark.asyncio
 async def test_authenticated_ole_gateway_instruction_reaches_private_override(monkeypatch):
     from hermes_cli import kanban_db as kb
+    import hermes_cli.kanban_db_connect as kanban_db_connect
     from hermes_cli import kanban_qualifier as qualifier
 
     runner = _OverrideRunner()
@@ -248,7 +251,7 @@ async def test_authenticated_ole_gateway_instruction_reaches_private_override(mo
     )
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr(kb, "list_boards", lambda include_archived: [{"slug": "strict"}])
-    monkeypatch.setattr(kb, "connect", lambda board: conn)
+    monkeypatch.setattr(kanban_db_connect, "connect", lambda board: conn)
     monkeypatch.setattr(
         kb,
         "get_qualification_intake",

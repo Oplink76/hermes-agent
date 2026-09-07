@@ -5,7 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from hermes_cli import kanban_db_dispatch
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 
 
 def _strict_board(tmp_path, monkeypatch, board="po-intake"):
@@ -179,7 +181,7 @@ def test_new_work_launches_configured_product_owner_without_waiting(
 ):
     from hermes_cli import kanban_po_intake
 
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = kanban_db_connect.connect(tmp_path / "kanban.db")
     intake_id = kb.create_qualification_intake(
         conn,
         raw_request=json.dumps(
@@ -252,7 +254,7 @@ def test_spawn_is_detached_intake_scoped_and_disables_provider_fallback(
             self.pid = 5150
 
     monkeypatch.setattr(kanban_po_intake.subprocess, "Popen", _Popen)
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["/opt/hermes"])
+    monkeypatch.setattr(kanban_db_dispatch, "_resolve_hermes_argv", lambda: ["/opt/hermes"])
     monkeypatch.setattr(kb, "kanban_db_path", lambda board=None: tmp_path / "kanban.db")
     monkeypatch.setattr(
         kb, "workspaces_root", lambda board=None: tmp_path / "workspaces"
@@ -373,7 +375,7 @@ def test_accepted_po_decision_is_signed_and_materialized_at_architecture(
     from hermes_cli import kanban_po_intake
 
     board = _strict_board(tmp_path, monkeypatch)
-    conn = kb.connect(board=board)
+    conn = kanban_db_connect.connect(board=board)
     intake_id, run = _active_intake(conn, monkeypatch)
     try:
         result = kanban_po_intake.decide_product_owner_intake(
@@ -401,7 +403,7 @@ def test_accepted_po_decision_is_signed_and_materialized_at_architecture(
         "run_id": run["id"],
         "issued_at": contract["issuer"]["issued_at"],
     }
-    check = kb.connect(board=board)
+    check = kanban_db_connect.connect(board=board)
     try:
         assert kb.get_qualification_intake(check, intake_id)["status"] == "qualified"
         assert kb.get_qualification_intake_run(check, run["id"])["status"] == "completed"
@@ -415,7 +417,7 @@ def test_po_sizing_rationale_is_durable_and_handoff_shape_is_advisory(
     from hermes_cli import kanban_po_intake
 
     board = _strict_board(tmp_path, monkeypatch, "po-intake-sizing")
-    conn = kb.connect(board=board)
+    conn = kanban_db_connect.connect(board=board)
     intake_id = kb.create_qualification_intake(
         conn,
         raw_request=json.dumps(
@@ -581,7 +583,7 @@ def test_po_requires_achievability_basis_for_every_binding_requirement(
     from hermes_cli import kanban_po_intake
 
     board = _strict_board(tmp_path, monkeypatch, "po-intake-feasibility-gate")
-    conn = kb.connect(board=board)
+    conn = kanban_db_connect.connect(board=board)
     _active_intake(conn, monkeypatch, title="Unproven requirement")
     proposal = _proposal()
     proposal["requirement_feasibility"]["achievable_requirements"] = []
@@ -608,7 +610,7 @@ def test_po_defers_unachievable_test_finding_instead_of_contractualizing(
     from hermes_cli import kanban_po_intake
 
     board = _strict_board(tmp_path, monkeypatch, "po-intake-feasibility-deferral")
-    conn = kb.connect(board=board)
+    conn = kanban_db_connect.connect(board=board)
     _active_intake(conn, monkeypatch, title="Attachment projection")
     impossible = "Verify authentic attachment bytes with Range support"
     proposal = _proposal()
@@ -672,7 +674,7 @@ def test_po_rejects_a_card_that_does_not_fit_configured_development_budget(
     from hermes_cli import kanban_po_intake
 
     board = _strict_board(tmp_path, monkeypatch, "po-intake-budget-gate")
-    conn = kb.connect(board=board)
+    conn = kanban_db_connect.connect(board=board)
     intake_id, _run = _active_intake(conn, monkeypatch, title="Too large")
     proposal = _proposal()
     proposal["sizing"] = {
@@ -706,7 +708,7 @@ def test_real_budget_exit_creates_product_owner_requalification_intake(
     from hermes_cli import kanban_po_intake
 
     board = _strict_board(tmp_path, monkeypatch, "po-intake-budget-e2e")
-    conn = kb.connect(board=board)
+    conn = kanban_db_connect.connect(board=board)
     _intake_id, _run = _active_intake(conn, monkeypatch, title="Budgeted card")
     try:
         result = kanban_po_intake.decide_product_owner_intake(
@@ -740,7 +742,7 @@ def test_budget_exhaustion_routing_rolls_back_as_one_transaction(
     from hermes_cli import kanban_intake, kanban_po_intake
 
     board = _strict_board(tmp_path, monkeypatch, "po-intake-budget-atomic")
-    conn = kb.connect(board=board)
+    conn = kanban_db_connect.connect(board=board)
     _active_intake(conn, monkeypatch, title="Atomic budget card")
     try:
         result = kanban_po_intake.decide_product_owner_intake(
@@ -782,7 +784,7 @@ def test_valid_second_decision_after_invalid_qualifies(tmp_path, monkeypatch):
     from hermes_cli import kanban_po_intake
 
     board = _strict_board(tmp_path, monkeypatch, "po-intake-corrected")
-    conn = kb.connect(board=board)
+    conn = kanban_db_connect.connect(board=board)
     intake_id, run = _active_intake(conn, monkeypatch)
     try:
         first = kanban_po_intake.decide_product_owner_intake(
@@ -818,7 +820,7 @@ def test_clarification_stays_inert_and_two_invalid_decisions_need_attention(
     from hermes_cli import kanban_po_intake
 
     board = _strict_board(tmp_path, monkeypatch, "po-intake-invalid")
-    conn = kb.connect(board=board)
+    conn = kanban_db_connect.connect(board=board)
     intake_id, run = _active_intake(conn, monkeypatch)
     try:
         first = kanban_po_intake.decide_product_owner_intake(
@@ -842,7 +844,7 @@ def test_clarification_stays_inert_and_two_invalid_decisions_need_attention(
     finally:
         conn.close()
 
-    conn = kb.connect(board=board)
+    conn = kanban_db_connect.connect(board=board)
     second_id = kb.create_qualification_intake(
         conn,
         raw_request='{"kind":"task_create","request":{"title":"Clarify"}}',
@@ -886,7 +888,7 @@ def test_accepted_epic_materializes_all_stories_ready_at_architecture(
     from hermes_cli import kanban_po_intake
 
     board = _strict_board(tmp_path, monkeypatch, "po-intake-epic")
-    conn = kb.connect(board=board)
+    conn = kanban_db_connect.connect(board=board)
     _intake_id, _run = _active_intake(conn, monkeypatch)
     proposal = _proposal()
     proposal["work"]["item_kind"] = "epic"
@@ -972,7 +974,7 @@ def test_dependency_is_ignored_at_architecture_then_reapplied_at_development(
     from hermes_cli import kanban_po_intake
 
     board = _strict_board(tmp_path, monkeypatch, "po-intake-dependencies")
-    conn = kb.connect(board=board)
+    conn = kanban_db_connect.connect(board=board)
     _active_intake(conn, monkeypatch, session_id="parent", title="Parent")
     parent_proposal = _proposal()
     parent_proposal["work"]["title"] = "Parent"
@@ -1035,7 +1037,7 @@ def test_materialization_failure_rolls_back_every_governance_write(
     from hermes_cli import kanban_intake, kanban_po_intake
 
     board = _strict_board(tmp_path, monkeypatch, "po-intake-rollback")
-    conn = kb.connect(board=board)
+    conn = kanban_db_connect.connect(board=board)
     intake_id, run = _active_intake(conn, monkeypatch)
     monkeypatch.setattr(
         kanban_intake,
@@ -1067,7 +1069,7 @@ def test_explicit_rejection_is_terminal_and_creates_no_card(tmp_path, monkeypatc
     from hermes_cli import kanban_po_intake
 
     board = _strict_board(tmp_path, monkeypatch, "po-intake-rejected")
-    conn = kb.connect(board=board)
+    conn = kanban_db_connect.connect(board=board)
     intake_id, _run = _active_intake(conn, monkeypatch)
     result = kanban_po_intake.decide_product_owner_intake(
         conn,

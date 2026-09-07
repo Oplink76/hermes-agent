@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 
 
 @pytest.fixture
@@ -65,7 +66,7 @@ def _board(board: str, repo: Path) -> None:
 
 def _story_card(board: str, repo: Path, step: str = "architecture") -> tuple[str, str, Path, str]:
     epic_branch: str
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id = kb.create_task(
             conn,
             title="Epic: refresh fixture",
@@ -202,7 +203,7 @@ def test_dispatch_refreshes_clean_story_before_claiming(
     _git(repo, "checkout", "main")
     monkeypatch.setattr(kb, "_stamp_run_executor_identity", lambda *_args, **_kwargs: None)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         spawned = kb._spawn_one_v2(
             conn,
             story_id,
@@ -235,7 +236,7 @@ def test_dispatch_holds_dirty_story_without_claiming(
     (story_worktree / "operator-note.txt").write_text("preserve\n", encoding="utf-8")
     monkeypatch.setattr(kb, "_stamp_run_executor_identity", lambda *_args, **_kwargs: None)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         spawned = kb._spawn_one_v2(
             conn,
             story_id,
@@ -278,7 +279,7 @@ def test_dispatch_prioritizes_recorded_recovery_assignee_before_story_refresh(
     monkeypatch.setattr(
         kb, "_stamp_run_executor_identity", _stamp_executor_event
     )
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         ordinary = kb.claim_task(conn, story_id)
         assert ordinary is not None and ordinary.current_run_id is not None
         (story_worktree / "worker-change.txt").write_text(
@@ -332,7 +333,7 @@ def test_dispatch_claims_original_worker_after_fresh_resolver_resume(
     monkeypatch.setattr(
         kb, "_stamp_run_executor_identity", _stamp_executor_event
     )
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         _resolve_story_preflight(conn, story_id, board)
         kb.add_comment(conn, story_id, "resolver", "The dirty evidence was reviewed.")
         pid = kb._spawn_one_v2(conn, story_id, board=board, spawn_fn=fake_spawn)
@@ -389,7 +390,7 @@ def test_dispatch_retries_resumed_dirty_story_after_post_claim_spawn_failure(
         return 4242
 
     monkeypatch.setattr(kb, "_stamp_run_executor_identity", stamp_or_fail)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         _resolve_story_preflight(conn, story_id, board)
         first = kb._spawn_one_v2(conn, story_id, board=board, spawn_fn=flaky_spawn)
         after_failure = kb.get_task(conn, story_id)
@@ -425,7 +426,7 @@ def test_dispatch_does_not_revive_invalidated_resume_after_spawn_failure(
     monkeypatch.setattr(kb, "_stamp_run_executor_identity", _stamp_executor_event)
     attempts: list[str] = []
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         _resolve_story_preflight(conn, story_id, board)
         assert kb.assign_task(conn, story_id, "developer")
 
@@ -497,7 +498,7 @@ def test_dispatch_refreshes_when_resolver_resume_provenance_is_not_current(
         kb, "_stamp_run_executor_identity", _stamp_executor_event
     )
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         decision = (
             "escalate" if mutation == "escalate"
             else "repair" if mutation == "repair"
@@ -683,7 +684,7 @@ def test_dispatch_does_not_bypass_refresh_after_recovery_card_is_reassigned(
         kb, "_stamp_run_executor_identity", _stamp_executor_event
     )
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         ordinary = kb.claim_task(conn, story_id)
         assert ordinary is not None and ordinary.current_run_id is not None
         assert kb.block_task(
@@ -733,7 +734,7 @@ def test_dispatch_routes_isolated_conflict_to_development_rework(
     _git(repo, "checkout", "main")
     monkeypatch.setattr(kb, "_stamp_run_executor_identity", lambda *_args, **_kwargs: None)
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         spawned = kb._spawn_one_v2(
             conn,
             story_id,
