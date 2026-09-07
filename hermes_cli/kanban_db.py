@@ -8937,7 +8937,15 @@ def complete_task(
             raise _SourceCommitError("missing_receipt")
         metadata = dict(metadata or {})
         metadata.update(source_metadata)
+    from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
+
+    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
+    if acceptance is False:
+        return False
     with authorized_governance_write(), write_txn(conn):
+        # Bind the PR evidence and terminal write to the same run ownership.
+        if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
+            return False
         # Pre-transition status: a task approved straight out of the review
         # lane has no active run, so the handoff must be synthesized below.
         _prior = conn.execute(

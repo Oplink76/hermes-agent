@@ -24,6 +24,7 @@ OLD_CHAIN_COMMANDS = [
     "export", "import", "stop", "agents", "journey", "bg", "btw", "queue",
     "steer", "goal", "heartbeat", "refine", "review", "loop", "plan", "moa",
     "subgoal", "skin", "voice", "wake", "busy", "indicator",
+    "project-create", "project-import",  # Fork project workflow commands.
 ]
 
 
