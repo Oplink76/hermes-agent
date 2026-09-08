@@ -68,7 +68,7 @@ def repo(tmp_path: Path) -> Path:
 
 def _make_worktree(repo: Path, task_id: str, branch: str | None = None) -> Path:
     target = repo / ".worktrees" / task_id
-    kbw._ensure_git_worktree(repo, target, branch or f"wt/{task_id}")
+    kb._ensure_git_worktree(repo, target, branch or f"wt/{task_id}")
     return target
 
 

@@ -100,6 +100,65 @@ Default preset:
 - reference: `openrouter:deepseek/deepseek-v4-pro`
 - aggregator / acting model: `openrouter:anthropic/claude-opus-4.8`
 
+### Use authenticated Claude Code or Codex CLIs
+
+Hermes can use an already authenticated local `claude` or `codex` executable
+inside MoA through provider IDs `claude-cli` and `codex-cli`. Both are also
+normal primary local-agent providers; their primary acting mode is separate
+from the advisory-safe MoA path described here.
+
+```yaml
+providers:
+  codex-cli:
+    # Required because Codex has no verified no-tools mode. See the warning below.
+    allow_agentic_advisor: true
+
+moa:
+  presets:
+    local-review:
+      reference_models:
+        - provider: claude-cli
+          model: default
+      aggregator:
+        provider: codex-cli
+        model: default
+```
+
+`model: default` uses the CLI's configured default model. You may provide an
+explicit CLI model ID instead. Hermes checks the installed executable's safety
+flags before each executable version is first used and fails closed when the
+required flags are unavailable.
+
+Claude runs in safe mode with tools disabled and session persistence off. Codex
+runs ephemerally with a read-only sandbox and approvals disabled, but its CLI
+does not currently expose a verified "disable every tool" mode. It is therefore
+classified as a **read-only agent**: it may execute read-only commands and read
+files visible to the local account. Hermes denies `codex-cli` unless you set the
+explicit `allow_agentic_advisor: true` acknowledgement shown above.
+
+CLI aggregators are text-only. Hermes does not forward its tool
+schemas to them, so they can write the final MoA answer but cannot emit Hermes
+tool calls. Use an HTTP/API model as aggregator when the acting turn must call
+Hermes tools.
+
+Each completion starts one bounded process group in a fresh empty working
+directory. Timeout and cancellation terminate that process group. Streaming is
+synthetic: Hermes waits for the CLI to finish and then emits compatible chunks
+rather than exposing token-by-token subprocess output.
+The CLIs do not provide canonical token usage, so usage and cost remain
+unavailable instead of being reported as zero.
+
+Cowork is never a MoA reference or aggregator. It is intentionally absent from
+every MoA slot picker, and hand-written `provider: cowork` slots are rejected
+with an error. Cowork remains available in every normal primary model picker.
+
+When no preset or provider timeout is configured, Hermes uses a 300-second
+Claude deadline and a 600-second Codex deadline. An explicit preset timeout and
+`providers.<id>.request_timeout_seconds` are both honored, with the tighter
+deadline winning. Temperature is not forwarded to CLI providers because neither
+installed CLI exposes a portable, verified equivalent. MoA output limits follow
+the provider policy described below.
+
 ### Advisor output
 
 MoA uses provider-owned output limits. Preset and per-slot output-token cap
