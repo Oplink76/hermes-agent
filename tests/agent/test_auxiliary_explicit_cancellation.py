@@ -143,7 +143,8 @@ def _cancel_silent_request(
 
     worker = threading.Thread(target=_worker, daemon=True)
     worker.start()
-    assert started.wait(timeout=1), "request never entered its silent transport"
+    # Cold imports and worker scheduling are setup, not cancellation latency.
+    assert started.wait(timeout=10), "request never entered its silent transport"
     cancelled_at = time.monotonic()
     cancel_event.set()
     worker.join(timeout=1)
