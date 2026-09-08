@@ -810,6 +810,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
     with kbc.connect_closing() as conn:
+        if kanban_intake.qualification_required(kb.read_board_metadata(kb.get_current_board())):
+            print("kanban: strict-board assignees are owned by the Work Contract", file=sys.stderr)
+            return 2
         ok = kb.assign_task(conn, args.task_id, profile)
     return _ok_or_err(ok, f"no such task: {args.task_id}",
                       f"Assigned {args.task_id} to {profile or '(unassigned)'}")
@@ -846,6 +849,9 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
     reclaim = bool(getattr(args, "reclaim", False))
     with kbc.connect_closing() as conn:
+        if kanban_intake.qualification_required(kb.read_board_metadata(kb.get_current_board())):
+            print("kanban: strict-board assignees are owned by the Work Contract", file=sys.stderr)
+            return 2
         ok = kb.reassign_task(conn, args.task_id, profile, reclaim_first=reclaim, reason=getattr(args, "reason", None))
     return _ok_or_err(
         ok,
@@ -936,6 +942,9 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
 def _cmd_link(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
+        if kanban_intake.qualification_required(kb.read_board_metadata(kb.get_current_board())):
+            print("kanban: strict-board dependencies are owned by the Work Contract", file=sys.stderr)
+            return 2
         kb.link_tasks(conn, args.parent_id, args.child_id)
     print(f"Linked {args.parent_id} -> {args.child_id}")
     return 0
@@ -943,6 +952,9 @@ def _cmd_link(args: argparse.Namespace) -> int:
 
 def _cmd_unlink(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
+        if kanban_intake.qualification_required(kb.read_board_metadata(kb.get_current_board())):
+            print("kanban: strict-board dependencies are owned by the Work Contract", file=sys.stderr)
+            return 2
         ok = kb.unlink_tasks(conn, args.parent_id, args.child_id)
     return _ok_or_err(ok, f"No such link: {args.parent_id} -> {args.child_id}",
                       f"Unlinked {args.parent_id} -> {args.child_id}")

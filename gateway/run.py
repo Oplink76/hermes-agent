@@ -5518,6 +5518,12 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
             stream.flush()
     def _release_locks() -> None:
         # BEFORE the log drain (bounded, but could take its full timeout on a wedged disk); idempotent.
+        try:
+            from gateway.runtime_identity import remove_runtime_identity
+
+            remove_runtime_identity()
+        except Exception:
+            logger.debug("runtime identity cleanup error during exit", exc_info=True)
         from gateway.status import remove_pid_file, release_gateway_runtime_lock
         remove_pid_file()
         release_gateway_runtime_lock()
