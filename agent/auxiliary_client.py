@@ -6645,6 +6645,12 @@ def _prepare_aux_request(
     back to the resolved base_url when the client exposes none."""
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    if task not in {"moa_reference", "moa_aggregator"} and (
+        resolved_provider in CLI_EMULATED_ROUTES or str(resolved_base_url or "").startswith("cli://")
+    ):
+        raise RuntimeError(
+            f"Provider '{resolved_provider}' is available only to MoA reference and aggregator slots"
+        )
     if api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)

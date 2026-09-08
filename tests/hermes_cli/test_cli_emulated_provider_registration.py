@@ -50,6 +50,15 @@ def test_local_agents_appear_in_primary_model_picker() -> None:
     assert {"claude-cli", "codex-cli", "cowork"} <= slugs
 
 
+@pytest.mark.parametrize("provider", ["claude-cli", "codex-cli", "cowork"])
+def test_local_agents_have_external_process_picker_overlays(provider):
+    from hermes_cli.providers import HERMES_OVERLAYS
+
+    overlay = HERMES_OVERLAYS[provider]
+    assert overlay.auth_type == "external_process"
+    assert overlay.base_url_override == get_provider_profile(provider).base_url
+
+
 def test_cowork_provider_profile_and_primary_runtime() -> None:
     profile = get_provider_profile("cowork")
     assert profile is not None

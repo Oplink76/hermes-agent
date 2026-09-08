@@ -29,6 +29,9 @@ class HermesOverlay:
 
 HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
     "moa": HermesOverlay(auth_type="virtual", base_url_override="moa://local"),
+    "claude-cli": HermesOverlay(auth_type="external_process", base_url_override=CLI_EMULATED_ROUTES["claude-cli"]),
+    "codex-cli": HermesOverlay(auth_type="external_process", base_url_override=CLI_EMULATED_ROUTES["codex-cli"]),
+    "cowork": HermesOverlay(auth_type="external_process", base_url_override="cli://cowork"),
     "openrouter": HermesOverlay(is_aggregator=True, base_url_env_var="OPENROUTER_BASE_URL"),
     "nous": HermesOverlay(auth_type="oauth_device_code", base_url_override="https://inference-api.nousresearch.com/v1"),
     "openai-codex": HermesOverlay(transport="codex_responses", auth_type="oauth_external",

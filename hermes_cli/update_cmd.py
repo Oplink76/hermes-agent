@@ -3133,6 +3133,7 @@ class _CheckoutPlan:
     switch_block_reason: "str | None"
     upstream_checked: bool
     admitted_merge_head: str
+    upstream_moved: bool = False
 
 
 
@@ -3248,12 +3249,15 @@ def _prepare_checkout_for_update(
     # "Already up to date!" and verified nothing). Non-fork checkouts have no upstream question: origin IS
     # the official repo, so "Already up to date!" is fully verified there.
     upstream_checked = True
+    upstream_moved = False
     if commit_count == 0 and is_fork and branch == "main":
         pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
         upstream_checked = _m()._sync_with_upstream_if_needed(
             git_cmd, _m().PROJECT_ROOT, assume_yes=assume_yes, input_fn=gw_input_fn)
         post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
         if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
+            upstream_moved = True
+            admitted_merge_head = post_sync_sha
             synced_count = _count_commits_between(
                 git_cmd, _m().PROJECT_ROOT, pre_sync_sha, post_sync_sha)
             # HEAD moving is proof of an update even if the count can't be read.
@@ -3262,7 +3266,8 @@ def _prepare_checkout_for_update(
     return _CheckoutPlan(
         auto_stash_ref=auto_stash_ref, commit_count=commit_count, in_place_update=in_place_update,
         parked_branch_switched=parked_branch_switched, prompt_for_restore=prompt_for_restore,
-        switch_block_reason=switch_block_reason, upstream_checked=upstream_checked, admitted_merge_head=admitted_merge_head)
+        switch_block_reason=switch_block_reason, upstream_checked=upstream_checked,
+        admitted_merge_head=admitted_merge_head, upstream_moved=upstream_moved)
 
 
 @dataclass
@@ -3398,7 +3403,8 @@ def _prepare_git_command() -> tuple[bool, list, bool]:
 
 
 def _verify_head_after_pull(
-    git_cmd, branch: str, pre_pull_sha, *, in_place_update: bool, _windows_gateway_resume
+    git_cmd, branch: str, pre_pull_sha, *, in_place_update: bool, _windows_gateway_resume,
+    upstream_moved: bool = False,
 ) -> str | None:
     """Return the post-pull HEAD SHA; ``sys.exit(1)`` if the pull was a no-op or landed off-branch."""
     # A detached checkout pinned to a SHA can report "N new commit(s)" and a successful
@@ -3411,7 +3417,7 @@ def _verify_head_after_pull(
     # doctor`` healthy. Compare pre-pull and post-pull HEAD; if they match, surface the no-op instead of
     # claiming success.
     post_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-    if pre_pull_sha and post_pull_sha == pre_pull_sha:
+    if pre_pull_sha and post_pull_sha == pre_pull_sha and not upstream_moved:
         print()
         print("✗ Code did not move — update was a no-op.")
         print(
@@ -3534,7 +3540,7 @@ def _apply_pulled_update(
     _invalidate_update_cache()
     post_pull_sha = _verify_head_after_pull(
         git_cmd, branch, pre_pull_sha, in_place_update=_plan.in_place_update,
-        _windows_gateway_resume=_windows_gateway_resume)
+        _windows_gateway_resume=_windows_gateway_resume, upstream_moved=_plan.upstream_moved)
 
     # Gateways still serve pre-pull modules until the restart phase; an interrupt before a
     # completed restart leaves this marker so the next update catches up even when git is

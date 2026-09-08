@@ -94,6 +94,9 @@ def handle_outer_loop_error(
     _is_local_processing_error = bool(tb_module_names & _LOCAL_PROCESSING_MODULES) and not (
         tb_module_names & _API_CALL_MODULES
     )
+    from agent.cli_emulated_provider import CliInvocationError
+
+    _is_terminal_cli_error = isinstance(e, CliInvocationError)
 
     if _is_local_processing_error:
         error_msg = f"Error during local message processing after OpenAI-compatible API call #{api_call_count}: {str(e)}"
@@ -144,12 +147,16 @@ def handle_outer_loop_error(
     _outer_error_cap = min(_MAX_OUTER_LOOP_ERRORS, max(1, agent.max_iterations))
     if (
         _is_local_processing_error
+        or _is_terminal_cli_error
         or api_call_count >= agent.max_iterations - 1
         or _outer_error_count >= _outer_error_cap
     ):
         if _is_local_processing_error:
             _turn_exit_reason = f"local_processing_error({error_msg[:80]})"
             final_response = f"I apologize, but I encountered an error while processing the model response: {error_msg}"
+        elif _is_terminal_cli_error:
+            _turn_exit_reason = f"cli_invocation_error({error_msg[:80]})"
+            final_response = f"CLI-backed MoA invocation failed: {e}"
         elif _outer_error_count >= _outer_error_cap:
             failed = True
             _turn_exit_reason = f"repeated_outer_errors({error_msg[:80]})"

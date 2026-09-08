@@ -147,8 +147,17 @@ def spawn_async_diagnostic(log_path: Path, signal_name: str, *,
     except OSError:
         return None
     try:  # start_new_session: outlive systemd killing our cgroup (KillMode=control-group) to flush
+        # Stock macOS has no GNU timeout command; use the active Python runtime.
+        helper = (
+            "import subprocess\n"
+            "try:\n"
+            f"    subprocess.run(['bash', '-c', {script!r}], "
+            f"timeout={timeout_seconds!r}, check=False)\n"
+            "except subprocess.TimeoutExpired:\n"
+            "    pass\n"
+        )
         return subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script], stdout=fd,
+            [sys.executable, "-c", helper], stdout=fd,
             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
             close_fds=True).pid
     except OSError:

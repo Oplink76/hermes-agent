@@ -474,10 +474,10 @@ class TestCmdUpdateBranchFallback:
         finalize_receipt.assert_called_once_with("partial")
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_fork_upstream_sync_that_moves_head_refuses_stale_admission(
+    def test_fork_upstream_sync_that_moves_head_runs_post_update_steps(
         self, mock_run, _mock_which, mock_args, capsys
     ):
-        """A head moved outside the frozen admission must refuse post-update work."""
+        """The updater's own upstream sync is a real update even if the later pull is a no-op."""
         from hermes_cli import main as hm
         from hermes_cli import update_cmd
 
@@ -538,10 +538,10 @@ class TestCmdUpdateBranchFallback:
             with pytest.raises(SystemExit) as exit_info:
                 cmd_update(mock_args)
 
-        assert exit_info.value.code == 1
-        post_update_step.assert_not_called()
+        assert exit_info.value.code == 0
+        post_update_step.assert_called_once()
         captured = capsys.readouterr()
-        assert "checkout_changed" in captured.out
+        assert "Already up to date!" not in captured.out
 
     def test_update_non_interactive_runs_safe_config_migrations(self, mock_args, capsys):
         """Dashboard/web updates apply non-interactive migrations before restart."""
