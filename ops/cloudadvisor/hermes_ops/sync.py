@@ -404,6 +404,8 @@ def _verify(worktree: Path, runner: CommandRunner) -> list[CheckResult]:
                 bash,
                 "scripts/run_tests.sh",
                 "tests/hermes_cli/test_kanban_db.py",
+                "tests/hermes_cli/test_kanban_db_workflows.py",
+                "tests/hermes_cli/test_kanban_db_verification.py",
                 "tests/hermes_cli/test_update_autostash.py",
                 "tests/hermes_cli/test_update_venv_health.py",
                 "tests/cloudadvisor_ops",
