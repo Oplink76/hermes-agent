@@ -23,6 +23,9 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
+import hermes_cli.kanban_db_dispatch as kanban_db_dispatch
+import hermes_cli.kanban_db_workspace as kanban_db_workspace
 from hermes_cli.kanban_repository import (
     PreparedRefCASResult,
     VerificationResult,
@@ -117,9 +120,9 @@ def test_ready_loop_materialization_creates_the_epic_base_branch(
     board = "epic-ready-loop"
     _v2_board(board, repo)
     base_sha = _git(repo, "rev-parse", "HEAD")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id, story_id = _epic_with_story(conn, board, repo, "Story one")
-        kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None, board=board)
+        kanban_db_dispatch.dispatch_once(conn, spawn_fn=lambda *a, **k: None, board=board)
         story = kb.get_task(conn, story_id)
 
     epic_branch = kb.epic_branch_for(epic_id)
@@ -142,9 +145,9 @@ def test_sibling_materialization_does_not_move_the_epic_base_branch(
     repo = _repo(tmp_path)
     board = "epic-sibling"
     _v2_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id, _first = _epic_with_story(conn, board, repo, "Story one")
-        kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None, board=board)
+        kanban_db_dispatch.dispatch_once(conn, spawn_fn=lambda *a, **k: None, board=board)
     epic_branch = kb.epic_branch_for(epic_id)
     pinned = _git(repo, "rev-parse", epic_branch)
 
@@ -154,9 +157,9 @@ def test_sibling_materialization_does_not_move_the_epic_base_branch(
     _git(repo, "commit", "-m", "main moves on")
     assert _git(repo, "rev-parse", "HEAD") != pinned
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         sibling_id = _add_story(conn, board, repo, epic_id, "Story two")
-        kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None, board=board)
+        kanban_db_dispatch.dispatch_once(conn, spawn_fn=lambda *a, **k: None, board=board)
         sibling = kb.get_task(conn, sibling_id)
 
     assert _git(repo, "rev-parse", epic_branch) == pinned
@@ -174,7 +177,7 @@ def test_resolve_workspace_derives_the_epic_base_without_an_explicit_argument(
     board = "epic-generic-resolver"
     _v2_board(board, repo)
     base_sha = _git(repo, "rev-parse", "HEAD")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id, story_id = _epic_with_story(conn, board, repo, "Story one")
         story = kb.get_task(conn, story_id)
         assert story is not None
@@ -196,7 +199,7 @@ def test_reusing_a_story_worktree_recovers_the_pinned_epic_base(
     repo = _repo(tmp_path)
     board = "epic-reuse-recovers"
     _v2_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id, story_id = _epic_with_story(conn, board, repo, "Story one")
         story = kb.get_task(conn, story_id)
         assert story is not None
@@ -213,8 +216,8 @@ def test_reusing_a_story_worktree_recovers_the_pinned_epic_base(
         _git(repo, "commit", "-m", "main moves on")
         assert _git(repo, "rev-parse", "HEAD") != original
 
-        kb.set_workspace_path(conn, story_id, str(workspace))
-        kb.set_branch_name(conn, story_id, branch)
+        kanban_db_workspace.set_workspace_path(conn, story_id, str(workspace))
+        kanban_db_workspace.set_branch_name(conn, story_id, branch)
         reused = kb.get_task(conn, story_id)
         assert reused is not None
         kb._resolve_worktree_workspace(reused, board=board, conn=conn)
@@ -229,7 +232,7 @@ def test_mature_epic_recovers_after_every_local_ref_is_removed(
     repo = _repo(tmp_path)
     board = "epic-reclone"
     _v2_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id, story_id = _epic_with_story(conn, board, repo, "Story one")
         story = kb.get_task(conn, story_id)
         assert story is not None
@@ -262,7 +265,7 @@ def test_legacy_epic_without_a_pin_fails_closed(epic_home, tmp_path):
     repo = _repo(tmp_path)
     board = "epic-legacy-no-pin"
     _v2_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id, first_id = _epic_with_story(conn, board, repo, "Story one")
         sibling_id = _add_story(conn, board, repo, epic_id, "Story two")
         # A legacy epic: the first story really ran, but predates base pinning.
@@ -288,7 +291,7 @@ def test_missing_epic_base_fails_materialization_loudly(
     repo = _repo(tmp_path)
     board = "epic-loud-failure"
     _v2_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         _epic_id, story_id = _epic_with_story(conn, board, repo, "Story one")
         story = kb.get_task(conn, story_id)
         assert story is not None
@@ -452,7 +455,7 @@ def test_integration_moves_the_pin_so_recovery_restores_the_epic_tip(
     repo = _repo(tmp_path)
     board = "epic-pin-follows-tip"
     _v2_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id, story_id = _epic_with_story(conn, board, repo, "Story one")
         story = kb.get_task(conn, story_id)
         assert story is not None
@@ -507,7 +510,7 @@ def test_refused_resolver_routing_runs_before_any_other_claim_mutation(
     """The refusal is the first statement in the claim transaction, so the
     metadata-repair preflight and the parents demotion never touch a card that
     can never dispatch."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         tid = kb.create_task(conn, title="Ordinary goal", assignee="developer")
         conn.execute("UPDATE tasks SET assignee='resolver' WHERE id=?", (tid,))
         conn.commit()
@@ -539,7 +542,7 @@ def test_repeated_integration_of_the_same_tip_writes_one_pin(
     repo = _repo(tmp_path)
     board = "epic-pin-dedupe"
     _v2_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id, story_id = _epic_with_story(conn, board, repo, "Story one")
         story = kb.get_task(conn, story_id)
         assert story is not None

@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_qualification_migrate as migrate
 
@@ -25,7 +27,7 @@ def product_board(tmp_path, monkeypatch):
 
 
 def _create_legacy_fixture(board: str) -> dict[str, str]:
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic = kb.create_task(
             conn, title="Epic: Release Alpha", body="Explicit legacy Epic.",
             initial_status="running",
@@ -123,7 +125,7 @@ def test_apply_preserves_evidence_and_converts_only_explicit_epic_links(
 ):
     _home, board = product_board
     ids = _create_legacy_fixture(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_before = dict(conn.execute(
             "SELECT id, branch_name, project_id, created_at, started_at FROM tasks WHERE id = ?",
             (ids["ordinary_child"],),
@@ -145,7 +147,7 @@ def test_apply_preserves_evidence_and_converts_only_explicit_epic_links(
 
     assert result["strict_enabled"] is True
     assert Path(result["receipt_path"]).is_file()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_after = dict(conn.execute(
             "SELECT id, branch_name, project_id, created_at, started_at FROM tasks WHERE id = ?",
             (ids["ordinary_child"],),
@@ -212,7 +214,7 @@ def test_apply_preserves_evidence_and_converts_only_explicit_epic_links(
 
 def test_running_work_blocks_apply_without_mutating_board(product_board, tmp_path):
     _home, board = product_board
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task = kb.create_task(
             conn, title="Running task", assignee="developer", initial_status="running",
             workflow_template_id="product", current_step_key="development",
@@ -234,7 +236,7 @@ def test_running_work_blocks_apply_without_mutating_board(product_board, tmp_pat
 
     assert _sha(kb.kanban_db_path(board)) == db_before
     assert kb.read_board_metadata(board)["qualification"]["required"] is False
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         row = conn.execute(
             "SELECT work_contract_id, current_run_id, running FROM tasks WHERE id = ?", (task,)
         ).fetchone()
@@ -243,7 +245,7 @@ def test_running_work_blocks_apply_without_mutating_board(product_board, tmp_pat
 
 def test_ambiguous_epic_membership_is_reported_not_guessed(product_board, tmp_path):
     _home, board = product_board
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_a = kb.create_task(
             conn, title="Epic: Alpha", initial_status="running"
         )
@@ -302,7 +304,7 @@ def test_rollback_restores_snapshot_and_keeps_immutable_receipt(product_board, t
     assert receipt.stat().st_mode & 0o222 == 0
     assert kb.board_metadata_path(board).read_text(encoding="utf-8") == metadata_before
     assert not (home / "kanban" / "work_contract_signing.key").exists()
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task = conn.execute(
             "SELECT work_contract_id FROM tasks WHERE id = ?", (ids["ordinary_child"],)
         ).fetchone()
@@ -318,7 +320,7 @@ def test_rollback_refuses_while_dispatcher_owns_board_lock(product_board, tmp_pa
     _create_legacy_fixture(board)
     result = migrate.apply_board(board, recovery_root=tmp_path / "recovery")
 
-    with kb._dispatch_tick_lock(kb.kanban_db_path(board)) as held:
+    with kbc._dispatch_tick_lock(kb.kanban_db_path(board)) as held:
         assert held is True
         with pytest.raises(migrate.MigrationBlocked, match="dispatch"):
             migrate.rollback_receipt(Path(result["receipt_path"]))

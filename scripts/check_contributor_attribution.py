@@ -81,12 +81,18 @@ def check_contributors(
     exempt_upstream_commits: list[str] = []
     missing: list[MissingContributor] = []
 
+    upstream_commits: set[str] = set()
+    if upstream is not None:
+        # Same reachability rule as merge-base --is-ancestor, with one graph walk
+        # for the complete sync instead of one subprocess per mirrored commit.
+        ancestry = _run_git(repo, "rev-list", upstream)
+        if ancestry.returncode == 0:
+            upstream_commits = set(ancestry.stdout.splitlines())
+
     for commit in commits:
-        if upstream is not None:
-            ancestry = _run_git(repo, "merge-base", "--is-ancestor", commit, upstream)
-            if ancestry.returncode == 0:
-                exempt_upstream_commits.append(commit)
-                continue
+        if commit in upstream_commits:
+            exempt_upstream_commits.append(commit)
+            continue
 
         metadata = _git_output(repo, "show", "-s", "--format=%H%x00%ae%x00%an", commit)
         sha, email, author = metadata.rstrip("\n").split("\0", 2)

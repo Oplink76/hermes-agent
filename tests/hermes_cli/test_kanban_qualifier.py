@@ -5,6 +5,7 @@ import json
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 from hermes_cli import kanban_intake as intake
 from hermes_cli import kanban_qualifier as qualifier
 
@@ -12,7 +13,7 @@ from hermes_cli import kanban_qualifier as qualifier
 
 @pytest.fixture
 def conn(tmp_path):
-    connection = kb.connect(tmp_path / "kanban.db")
+    connection = kanban_db_connect.connect(tmp_path / "kanban.db")
     try:
         yield connection
     finally:
@@ -801,7 +802,7 @@ def test_epic_qualification_materializes_signed_member_stories_and_dependencies(
     metadata["qualification"]["required"] = True
     kb.board_metadata_path(board).write_text(json.dumps(metadata), encoding="utf-8")
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         receipt = qualifier.submit_request(
             connection,
             request={
@@ -869,7 +870,7 @@ def test_auxiliary_po_qualification_persists_sizing_and_feasibility(
     board = "strict-po-auxiliary"
     kb.ensure_product_board_defaults(board)
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         receipt = qualifier.submit_request(
             connection,
             request={"title": "Qualified maintenance"},
@@ -942,7 +943,7 @@ def test_materialization_verification_failure_marks_intake_attention_required(
     metadata["qualification"]["required"] = True
     kb.board_metadata_path(board).write_text(json.dumps(metadata), encoding="utf-8")
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         receipt = qualifier.submit_request(
             connection,
             request={"title": "Contract verification failure"},
@@ -994,7 +995,7 @@ def test_invalid_model_decision_retries_once_then_stores_rejection_without_card(
     ]
     kb.board_metadata_path(board).write_text(json.dumps(metadata), encoding="utf-8")
 
-    with kb.connect(board=board) as connection:
+    with kanban_db_connect.connect(board=board) as connection:
         receipt = qualifier.submit_request(
             connection,
             request={"title": "Ambiguous request"},

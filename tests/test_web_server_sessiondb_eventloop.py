@@ -4,6 +4,11 @@ import threading
 from pathlib import Path
 
 from hermes_cli import web_server
+import hermes_cli.web_models as _web_models
+import hermes_cli.web_routers.sessions as _rt_sessions
+import hermes_cli.web_server_sessions as _web_server_sessions
+from hermes_cli import web_server_sessions
+from hermes_cli.web_routers import analytics as web_analytics
 from hermes_cli.web_routers import sessions as web_sessions
 
 
@@ -34,12 +39,13 @@ def _call_name(call: ast.Call) -> str | None:
 
 
 def test_sessiondb_handlers_open_connections_inside_executor_helpers():
-    # The session route handlers were extracted to web_routers/sessions.py
-    # (wave 2); the analytics handlers and the executor helpers still live in
-    # web_server.py — scan both modules' top-level bodies.
+    # The session and analytics route handlers were extracted to
+    # web_routers/{sessions,analytics}.py; the executor helpers live in
+    # web_server_sessions.py (and any left in web_server.py) — scan all
+    # four modules' top-level bodies.
     handlers: dict[str, ast.AsyncFunctionDef] = {}
     top_level_helpers: dict[str, ast.FunctionDef] = {}
-    for mod in (web_server, web_sessions):
+    for mod in (web_server, web_server_sessions, web_sessions, web_analytics):
         tree = ast.parse(Path(mod.__file__).read_text(encoding="utf-8"))
         for node in tree.body:
             if isinstance(node, ast.AsyncFunctionDef) and node.name in TARGET_HANDLERS:
@@ -79,7 +85,7 @@ def test_sessiondb_handlers_open_connections_inside_executor_helpers():
 
 
 def test_sessiondb_opens_declare_access_mode():
-    for mod in (web_server, web_sessions):
+    for mod in (web_server_sessions, web_sessions):
         tree = ast.parse(Path(mod.__file__).read_text(encoding="utf-8"))
         calls = [
             node
@@ -111,11 +117,11 @@ def test_bulk_delete_sessiondb_work_runs_off_event_loop(monkeypatch):
         db_modes.append(read_only)
         return _DB()
 
-    monkeypatch.setattr(web_server, "_open_session_db_for_profile", _open_db)
+    monkeypatch.setattr(_web_server_sessions, "_open_session_db_for_profile", _open_db)
 
     result = asyncio.run(
-        web_server.bulk_delete_sessions_endpoint(
-            web_server.BulkDeleteSessions(ids=["one", "two"])
+        _rt_sessions.bulk_delete_sessions_endpoint(
+            _web_models.BulkDeleteSessions(ids=["one", "two"])
         )
     )
 
@@ -142,12 +148,11 @@ def test_get_session_stats_sessiondb_work_runs_off_event_loop(monkeypatch):
             db_threads.append(threading.get_ident())
             return 41
 
-        def list_sessions_rich(self, limit=None, include_archived=None, compact_rows=None):
+        def session_count_by_source(self, *, include_archived, exclude_children):
             db_threads.append(threading.get_ident())
-            assert limit == 10000
             assert include_archived is True
-            assert compact_rows is True
-            return [{"source": "cli"}, {"source": "web"}, {"source": None}]
+            assert exclude_children is True
+            return {"cli": 2, "web": 1}
 
         def close(self):
             db_threads.append(threading.get_ident())
@@ -157,9 +162,9 @@ def test_get_session_stats_sessiondb_work_runs_off_event_loop(monkeypatch):
         db_threads.append(threading.get_ident())
         return _DB()
 
-    monkeypatch.setattr(web_server, "_open_session_db_for_profile", _open)
+    monkeypatch.setattr(web_server_sessions, "_open_session_db_for_profile", _open)
 
-    result = asyncio.run(web_server.get_session_stats())
+    result = asyncio.run(web_sessions.get_session_stats())
 
     assert result == {
         "total": 9,
@@ -172,7 +177,7 @@ def test_get_session_stats_sessiondb_work_runs_off_event_loop(monkeypatch):
     assert all(thread_id != loop_thread for thread_id in db_threads)
 
 
-def test_get_session_stats_swallows_list_sessions_rich_error_off_event_loop(monkeypatch):
+def test_get_session_stats_swallows_source_count_error_off_event_loop(monkeypatch):
     loop_thread = threading.get_ident()
     db_threads: list[int] = []
     closed: list[bool] = []
@@ -190,7 +195,7 @@ def test_get_session_stats_swallows_list_sessions_rich_error_off_event_loop(monk
             db_threads.append(threading.get_ident())
             return 12
 
-        def list_sessions_rich(self, limit=None, include_archived=None, compact_rows=None):
+        def session_count_by_source(self, *, include_archived, exclude_children):
             db_threads.append(threading.get_ident())
             raise RuntimeError("boom")
 
@@ -203,9 +208,9 @@ def test_get_session_stats_swallows_list_sessions_rich_error_off_event_loop(monk
         db_threads.append(threading.get_ident())
         return _DB()
 
-    monkeypatch.setattr(web_server, "_open_session_db_for_profile", _open)
+    monkeypatch.setattr(web_server_sessions, "_open_session_db_for_profile", _open)
 
-    result = asyncio.run(web_server.get_session_stats())
+    result = asyncio.run(web_sessions.get_session_stats())
 
     assert result == {
         "total": 5,

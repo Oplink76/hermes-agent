@@ -13,6 +13,7 @@ import pytest
 
 from hermes_cli import backup
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 from hermes_cli import kanban_intake as intake
 
 
@@ -236,7 +237,7 @@ def test_po_materialization_failure_finishes_run_with_only_a_safe_path(
     metadata["qualification"]["required"] = True
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
-    conn = kb.connect(board=board)
+    conn = kanban_db_connect.connect(board=board)
     intake_id = kb.create_qualification_intake(
         conn,
         raw_request=json.dumps({"kind": "task_create", "request": {"title": "sentinel-request"}}),
@@ -504,7 +505,7 @@ def test_generic_board_preserves_caller_fields_without_contract():
 def test_existing_requalification_intake_treats_all_active_statuses_as_active(
     tmp_path, status
 ):
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = kanban_db_connect.connect(tmp_path / "kanban.db")
     try:
         intake_id = kb.create_qualification_intake(
             conn,
@@ -539,7 +540,7 @@ def test_existing_requalification_intake_treats_all_active_statuses_as_active(
 
 def test_submit_requalification_is_atomic_across_sqlite_connections(tmp_path):
     db_path = tmp_path / "kanban.db"
-    setup = kb.connect(db_path)
+    setup = kanban_db_connect.connect(db_path)
     task_id = kb.create_task(
         setup,
         title="Scheduled card",
@@ -552,7 +553,7 @@ def test_submit_requalification_is_atomic_across_sqlite_connections(tmp_path):
     barrier = threading.Barrier(2)
 
     def submit_once():
-        conn = kb.connect(db_path)
+        conn = kanban_db_connect.connect(db_path)
         try:
             barrier.wait()
             return intake.submit_requalification(
@@ -570,7 +571,7 @@ def test_submit_requalification_is_atomic_across_sqlite_connections(tmp_path):
     assert results[0]["intake_id"] == results[1]["intake_id"]
     assert sorted(result["created"] for result in results) == [False, True]
 
-    check = kb.connect(db_path)
+    check = kanban_db_connect.connect(db_path)
     try:
         rows = check.execute(
             "SELECT id, status FROM qualification_intake "

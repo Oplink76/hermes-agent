@@ -23,6 +23,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 import hermes_cli.kanban_story_integration as integration_module
 from hermes_cli.kanban_product_outcomes import CandidateEligibility
 from hermes_cli import projects_db as pdb
@@ -186,7 +187,7 @@ def test_governed_product_story_recovers_through_release_and_done(
             board_slug=board,
         )
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = kb.create_task(
             conn,
             title="Story: recover governed product flow",
@@ -243,7 +244,7 @@ def test_governed_product_story_recovers_through_release_and_done(
     assert not unauthorized.exists()
     monkeypatch.delenv("HERMES_KANBAN_TASK")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         old_claim = _claim(conn, task_id, board=board, claimer="old-product-owner")
         assert kb.reclaim_task(conn, task_id, reason="exercise stale completion")
         new_claim = _claim(conn, task_id, board=board, claimer="new-product-owner")
@@ -621,7 +622,7 @@ def test_public_reconcile_routes_integration_failure_without_approval_or_graph_g
     source_sha = "1" * 40
     base_sha = "2" * 40
     branch = "story/owned-failure"
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
         story_id = kb.create_task(
             conn,
@@ -816,7 +817,7 @@ def test_no_push_boundary_across_all_public_paths(
         fake_git=fake_git, initial_sha=initial_sha,
     )
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id = _create_epic(conn, "Epic: no-push proof")
         story_id, worktree, branch = _create_epic_member(
             conn, product, board, epic_id,

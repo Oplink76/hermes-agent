@@ -9,6 +9,9 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
+import hermes_cli.kanban_db_dispatch as kanban_db_dispatch
+import hermes_cli.kanban_db_workspace as kanban_db_workspace
 from hermes_cli import projects_db as pdb
 from tools import kanban_tools as kt
 from tests.e2e.test_kanban_epic_integration_release import (
@@ -132,7 +135,7 @@ def test_framework_classifier_defect_only_escalates(
     board = "resolver-framework-incident"
     kb.ensure_product_board_defaults(board, name="Resolver Framework Incident")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         dependency_id = kb.create_task(conn, title="Verified dependency", board=board)
         assert kb.complete_task(conn, dependency_id, summary="Dependency satisfied")
         task_id = kb.create_task(
@@ -162,7 +165,7 @@ def test_framework_classifier_defect_only_escalates(
         repair={"workflow": {"phase": "development"}},
     )))
     assert "framework faults must escalate" in rejected["error"]
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         assert _resolver_state(conn, task_id) == before_failed_repair
 
     escalated = json.loads(kt._handle_resolve(_resolver_args(
@@ -175,7 +178,7 @@ def test_framework_classifier_defect_only_escalates(
     )))
     assert escalated["ok"] is True
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task = kb.get_task(conn, task_id)
         events = kb.list_events(conn, task_id)
         links = kb.parent_ids(conn, task_id)
@@ -218,7 +221,7 @@ def test_legacy_project_card_repairs_then_uses_normal_evidence_gates(
             board_slug=board,
         )
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = kb.create_task(
             conn,
             title="Legacy card with recoverable task-local state",
@@ -230,8 +233,8 @@ def test_legacy_project_card_repairs_then_uses_normal_evidence_gates(
         )
         task = kb.get_task(conn, task_id)
         assert task is not None
-        workspace = kb.resolve_workspace(task, board=board)
-        kb.set_workspace_path(conn, task_id, workspace)
+        workspace = kanban_db_workspace.resolve_workspace(task, board=board)
+        kanban_db_workspace.set_workspace_path(conn, task_id, workspace)
         (workspace / "feature.py").write_text("value = 1\n", encoding="utf-8")
         _git(workspace, "add", "feature.py")
         _git(workspace, "commit", "-m", "feat: preserve recovered work")
@@ -273,7 +276,7 @@ def test_legacy_project_card_repairs_then_uses_normal_evidence_gates(
     )))
     assert repaired["ok"] is True
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         repaired_task = kb.get_task(conn, task_id)
         resolver_run = kb.get_run(conn, resolver_run_id)
         resolver_events = [
@@ -385,7 +388,7 @@ def test_recovered_story_review_and_integration(
                 "effort": "high", "surface": "hermes-primary", "source": "dispatcher", "version": 1}
 
     monkeypatch.setattr(kb, "_resolve_worker_runtime_identity", identity)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic = _create_epic(conn, "Epic: recovered story proof")
         tid, workspace, branch = _create_epic_member(conn, product, board, epic)
         _claim_and_complete(conn, tid, "po", board, summary="Accepted")
@@ -466,7 +469,7 @@ def test_failed_custom_recovery_journey(
                 "effort": "high", "surface": "hermes-primary", "source": "dispatcher", "version": 1}
 
     monkeypatch.setattr(kb, "_resolve_worker_runtime_identity", identity)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic = _create_epic(conn, "Epic: custom recovery authority")
         tid, workspace, branch = _create_epic_member(conn, product, board, epic)
         _claim_and_complete(conn, tid, "po", board, summary="Accepted")
@@ -513,8 +516,8 @@ def test_failed_custom_recovery_journey(
         kb._set_worker_pid(conn, tid, 987654321)
         monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
         monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
-        monkeypatch.setattr(kb, "_classify_worker_exit", lambda pid: ("nonzero_exit", 1))
-        assert kb.detect_crashed_workers(conn) == [tid]
+        monkeypatch.setattr(kanban_db_dispatch, "_classify_worker_exit", lambda pid: ("nonzero_exit", 1))
+        assert kanban_db_dispatch.detect_crashed_workers(conn) == [tid]
         failed_before = kb.get_run(conn, failed.current_run_id)
         assert failed_before.outcome == "crashed"
         assert kb._latest_product_step_executor(conn, tid, "development")["provider"] == "codex"

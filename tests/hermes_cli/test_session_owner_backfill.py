@@ -144,7 +144,7 @@ def test_backfill_treats_empty_string_profile_as_legacy(client):
 
 def test_backfill_runs_sessiondb_write_on_dedicated_executor(client, monkeypatch):
     from hermes_constants import get_hermes_home
-    from hermes_cli import web_server
+    from hermes_cli.web_routers import sessions as web_server
 
     db_path = get_hermes_home() / "state.db"
     _seed(db_path, [("legacy-thread", None)])

@@ -14,6 +14,8 @@ from typing import Any
 
 from hermes_constants import get_default_hermes_root
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_qualification_migrate as migration
 
 
@@ -502,7 +504,7 @@ def _apply_board(
     now: int,
 ) -> Counter[str]:
     changed: Counter[str] = Counter()
-    with kb.connect_closing(board=board) as conn:
+    with kanban_db_connect.connect_closing(board=board) as conn:
         with kb.authorized_governance_write(), kb.write_txn(conn):
             for entry in entries:
                 task_id = entry["task_id"]
@@ -767,7 +769,7 @@ def apply_manifest(
     with contextlib.ExitStack() as stack:
         for board in sorted(manifest["boards"]):
             held = stack.enter_context(
-                kb._dispatch_tick_lock(kb.kanban_db_path(board))
+                kbc._dispatch_tick_lock(kb.kanban_db_path(board))
             )
             if not held:
                 raise ReconciliationBlocked(

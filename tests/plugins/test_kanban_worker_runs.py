@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +80,7 @@ def _insert_run(conn, task_id, *, worker_pid=None, ended_at=None):
 
 
 def _expected_snapshot(task_id: str) -> dict:
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return {
         f"expected_{field}": value
@@ -172,7 +173,7 @@ def test_terminate_run_404_unknown_id_without_body(client):
 
 def test_terminate_run_409_already_ended(client):
     """POST against a run with ended_at set returns 409."""
-    conn = kb.connect()
+    conn = kanban_db_connect.connect()
     try:
         task_id = kb.create_task(conn, title="ended-terminate", assignee="ivy")
         run_id = _insert_run(
@@ -191,7 +192,7 @@ def test_terminate_run_409_already_ended(client):
 
 def test_terminate_run_ok(client, monkeypatch):
     """Happy path: live run is terminated, signal fn invoked, reason recorded."""
-    conn = kb.connect()
+    conn = kanban_db_connect.connect()
     try:
         task_id, run_id = _setup_running_task_with_run(
             conn, title="kill-me", assignee="jane", worker_pid=33333,
@@ -219,7 +220,7 @@ def test_terminate_run_ok(client, monkeypatch):
     assert sent[0][1] is not None  # claim_lock was non-null
 
     # Task is back to ready, claim cleared.
-    conn = kb.connect()
+    conn = kanban_db_connect.connect()
     try:
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid FROM tasks WHERE id=?",
@@ -234,7 +235,7 @@ def test_terminate_run_ok(client, monkeypatch):
 
 def test_terminate_run_409_task_not_reclaimable(client, monkeypatch):
     """Open run row whose task is no longer claimable returns 409."""
-    conn = kb.connect()
+    conn = kanban_db_connect.connect()
     try:
         task_id = kb.create_task(conn, title="ghost-run", assignee="ken")
         # Task left in default 'ready' state with no claim_lock — task_run
@@ -270,7 +271,7 @@ def test_terminate_run_accepts_empty_body(client):
 
 
 def test_terminate_existing_run_without_snapshot_is_422(client):
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         task_id, run_id = _setup_running_task_with_run(
             conn, title="snapshot-required", assignee="ivy", worker_pid=55555,
         )

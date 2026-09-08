@@ -17,6 +17,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 from hermes_cli.kanban_epic_release import (
     EpicReadiness,
     EpicReadinessMember,
@@ -63,7 +64,7 @@ def _direct_task_seed(conn, task_id: str, title: str,
 
 def test_collecting_members(release_home):
     """Fresh epic with no members → collecting_members."""
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         epic_id = kb.create_task(conn, title="Epic: new", work_item_kind="epic")
     state = _json_state(epic_id)
     assert state["kind"] == "epic"
@@ -76,7 +77,7 @@ def test_awaiting_final_release(release_home, tmp_path, monkeypatch):
     board = "e07-afr"
     repo, _, _ = _repo(tmp_path)
     _release_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id = kb.create_task(conn, title="Epic: AFR", board=board,
                                   work_item_kind="epic")
         _seed_snapshot(conn, epic_id, status="awaiting_push")
@@ -110,7 +111,7 @@ def test_ci_pending(release_home, tmp_path, monkeypatch):
     board = "e07-cip"
     repo, _, _ = _repo(tmp_path)
     _release_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id = kb.create_task(conn, title="Epic: CIP", board=board,
                                   work_item_kind="epic")
         _seed_snapshot(conn, epic_id, status="ci_pending", pushed_sha="6" * 40)
@@ -129,7 +130,7 @@ def test_ci_failed(release_home, tmp_path, monkeypatch):
     board = "e07-cif"
     repo, _, _ = _repo(tmp_path)
     _release_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id = kb.create_task(conn, title="Epic: CIF", board=board,
                                   work_item_kind="epic")
         _seed_snapshot(conn, epic_id, status="ci_failed", pushed_sha="6" * 40)
@@ -156,7 +157,7 @@ def test_aggregate_verification(release_home, tmp_path, monkeypatch):
     board = "e07-av"
     repo, _, _ = _repo(tmp_path)
     _release_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id = kb.create_task(conn, title="Epic: AV", board=board,
                                   work_item_kind="epic")
 
@@ -174,7 +175,7 @@ def test_done(release_home, tmp_path, monkeypatch):
     board = "e07-done"
     repo, _, _ = _repo(tmp_path)
     _release_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic_id = kb.create_task(conn, title="Epic: DONE", board=board,
                                   work_item_kind="epic")
         _seed_snapshot(conn, epic_id, status="released")
@@ -195,7 +196,7 @@ def test_member_integrating(release_home):
     """Member with active intent → integrating."""
     epic_id = "epic-int-1"
     story_id = "story-int-1"
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         _direct_task_seed(conn, epic_id, "Epic", "epic")
         _direct_task_seed(conn, story_id, "Story")
         conn.execute(
@@ -224,7 +225,7 @@ def test_member_integration_failed(release_home):
     """Member whose latest intent carries a safe failure code → integration_failed."""
     epic_id = "epic-fail-1"
     story_id = "story-fail-1"
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         _direct_task_seed(conn, epic_id, "Epic", "epic")
         _direct_task_seed(conn, story_id, "Story")
         conn.execute(
@@ -251,7 +252,7 @@ def test_member_integrated(release_home):
     """Member with durable integration fact → integrated."""
     epic_id = "epic-fact-1"
     story_id = "story-fact-1"
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         _direct_task_seed(conn, epic_id, "Epic", "epic")
         _direct_task_seed(conn, story_id, "Story")
         conn.execute(
@@ -275,7 +276,7 @@ def test_member_not_integrated(release_home):
     """Member with no intent or fact → not_integrated."""
     epic_id = "epic-no-1"
     story_id = "story-no-1"
-    with kb.connect() as conn:
+    with kanban_db_connect.connect() as conn:
         _direct_task_seed(conn, epic_id, "Epic", "epic")
         _direct_task_seed(conn, story_id, "Story")
         conn.execute(

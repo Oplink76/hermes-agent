@@ -14,9 +14,10 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 from hermes_cli import projects_db as pdb
 from hermes_constants import get_default_hermes_root, get_hermes_home
-from tools.approval import (
+from tools.approval_detection import (
     shell_command_argvs,
     shell_command_has_redirection,
     shell_command_output_paths,
@@ -940,7 +941,7 @@ def _load_worker_task(task_id: str):
     board = str(os.getenv("HERMES_KANBAN_BOARD") or "").strip()
     if not board:
         raise ValueError("worker has no pinned Kanban board")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task = kb.get_task(conn, task_id)
     if task is None:
         raise ValueError("worker task does not exist on its pinned board")

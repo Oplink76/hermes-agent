@@ -18,6 +18,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli.plugins import get_plugin_manager
 
 
@@ -67,7 +69,7 @@ def captured_updates():
 
 
 def _make_task(title="t"):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         return kb.create_task(conn, title=title, assignee="alice")
     finally:
@@ -82,7 +84,7 @@ def _expected_snapshot(task_id: str) -> dict:
     moved underneath the operator. Upstream's dashboard has no such
     requirement, hence this helper is fork-local.
     """
-    conn = kb.connect()
+    conn = kanban_db_connect.connect()
     try:
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         assert row is not None

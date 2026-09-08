@@ -143,7 +143,8 @@ def _cancel_silent_request(
 
     worker = threading.Thread(target=_worker, daemon=True)
     worker.start()
-    assert started.wait(timeout=1), "request never entered its silent transport"
+    # Cold imports and worker scheduling are setup, not cancellation latency.
+    assert started.wait(timeout=10), "request never entered its silent transport"
     cancelled_at = time.monotonic()
     cancel_event.set()
     worker.join(timeout=1)
@@ -552,11 +553,8 @@ def test_isolated_provider_worker_inherits_protection_and_progress_hook() -> Non
 
 
 def test_isolated_provider_worker_inherits_caller_contextvars() -> None:
-    from tools.approval import (
-        get_current_session_key,
-        reset_current_session_key,
-        set_current_session_key,
-    )
+    from tools.approval import get_current_session_key
+    from tools.approval_context import reset_current_session_key, set_current_session_key
 
     arbitrary = contextvars.ContextVar("isolated-provider-test", default="missing")
     arbitrary_token = arbitrary.set("caller-value")

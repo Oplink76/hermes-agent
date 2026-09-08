@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 
 
 @pytest.fixture
@@ -197,7 +198,7 @@ def test_release_rejects_missing_or_untrustworthy_run_evidence(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = f"release-missing-{missing.replace('_', '-')}"
     _release_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         _seed_structured_evidence(
             conn, task_id, branch, source_sha, **seed_overrides,
@@ -226,7 +227,7 @@ def test_release_evidence_prefers_dispatcher_pinned_review_commit(
     board = "release-pinned-review-head"
     _release_board(board, repo)
     claimed_sha = "b" * 40
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         run_ids = _seed_structured_evidence(
             conn, task_id, branch, pinned_sha, reviewed_commit=claimed_sha,
@@ -251,7 +252,7 @@ def test_release_evidence_rejects_test_branch_mismatch(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = "release-test-branch-mismatch"
     _release_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         _seed_structured_evidence(
             conn,
@@ -280,7 +281,7 @@ def test_release_evidence_latest_rejection_invalidates_older_authority(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = f"release-latest-rejection-{phase}"
     _release_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         _seed_structured_evidence(conn, task_id, branch, source_sha)
         with kb.write_txn(conn):
@@ -317,7 +318,7 @@ def test_release_evidence_rejects_historical_unpinned_review_shapes(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = f"release-historical-{len(review_facts(branch, source_sha))}"
     _release_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         run_ids = _seed_structured_evidence(conn, task_id, branch, source_sha)
         historical = {
@@ -342,7 +343,7 @@ def test_review_canonicalization_records_dispatcher_pinned_commit(
     board = "review-canonical-pinned-head"
     _release_board(board, repo)
     claimed_sha = "c" * 40
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = kb.create_task(
             conn,
             title="Review canonicalization",
@@ -398,7 +399,7 @@ def test_standalone_release_integrates_before_done_and_attaches_terminal_evidenc
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = "release-standalone-order"
     _release_board(board, repo, policy="manual")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         run_ids = _seed_structured_evidence(conn, task_id, branch, source_sha)
 
@@ -446,7 +447,7 @@ def test_stale_release_run_cannot_integrate_record_events_or_deploy(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = f"release-stale-{stale_state}-entry"
     _release_board(board, repo, policy="required")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         _seed_structured_evidence(conn, task_id, branch, source_sha)
         assert kb.assign_task(conn, task_id, "default")
@@ -490,7 +491,7 @@ def test_release_rechecks_run_ownership_before_integration_apply(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = "release-run-race-before-apply"
     _release_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         _seed_structured_evidence(conn, task_id, branch, source_sha)
         assert kb.assign_task(conn, task_id, "default")
@@ -540,7 +541,7 @@ def test_release_rechecks_run_ownership_before_deployment(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = "release-run-race-before-deploy"
     _release_board(board, repo, policy="required")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         _seed_structured_evidence(conn, task_id, branch, source_sha)
         assert kb.assign_task(conn, task_id, "default")
@@ -607,7 +608,7 @@ def test_terminal_done_validation_rechecks_reviewed_integration_source(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = "release-source-recheck"
     _release_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         _seed_structured_evidence(conn, task_id, branch, source_sha)
         result = kb.release_product_task(
@@ -662,7 +663,7 @@ def test_terminal_done_validation_rechecks_materialized_release_chain(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = f"release-chain-{field.replace('_', '-')}"
     _release_board(board, repo, policy="manual")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         _seed_structured_evidence(conn, task_id, branch, source_sha)
         result = kb.release_product_task(
@@ -694,7 +695,7 @@ def test_non_deploy_policy_is_recorded_without_fake_deployment(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = f"release-policy-{policy_name.replace('_', '-')}"
     _release_board(board, repo, policy=policy_name)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         _seed_structured_evidence(conn, task_id, branch, source_sha)
         result = kb.release_product_task(
@@ -716,7 +717,7 @@ def test_required_deployment_without_adapter_stays_in_release_measure(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = "release-adapter-missing"
     _release_board(board, repo, policy="required")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         _seed_structured_evidence(conn, task_id, branch, source_sha)
 
@@ -808,7 +809,7 @@ def test_required_deployment_records_runtime_evidence_before_done(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = "release-adapter-success"
     _release_board(board, repo, policy="required")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         _seed_structured_evidence(conn, task_id, branch, source_sha)
         adapter = _SuccessfulReleaseAdapter()
@@ -837,7 +838,7 @@ def test_terminal_done_validation_rechecks_positive_deployment_results(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = "release-terminal-revalidation"
     _release_board(board, repo, policy="required")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         _seed_structured_evidence(conn, task_id, branch, source_sha)
         result = kb.release_product_task(
@@ -876,7 +877,7 @@ def test_required_pull_request_is_referenced_by_terminal_evidence(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = "release-pr-required"
     _release_board(board, repo, pull_request_required=True)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         _seed_structured_evidence(conn, task_id, branch, source_sha)
 
@@ -901,7 +902,7 @@ def test_required_deployment_rejects_missing_smoke_or_rollback_evidence(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = "release-adapter-incomplete"
     _release_board(board, repo, policy="required")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         _seed_structured_evidence(conn, task_id, branch, source_sha)
         adapter = _ReleaseAdapter(
@@ -939,7 +940,7 @@ def test_required_deployment_rejects_explicitly_failed_evidence(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = f"release-failed-{missing}-{type(smoke_result).__name__}"
     _release_board(board, repo, policy="required")
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         task_id = _release_task(conn, board, repo, branch)
         _seed_structured_evidence(conn, task_id, branch, source_sha)
         adapter = _EvidenceReleaseAdapter(
@@ -970,7 +971,7 @@ def test_dependency_edges_do_not_turn_a_reviewed_story_into_an_epic(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = "release-dependency-graph"
     _release_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         dependency = kb.create_task(
             conn, title="Story: completed prerequisite", board=board,
         )
@@ -1010,7 +1011,7 @@ def test_dependency_edges_do_not_turn_a_reviewed_story_into_an_epic(
 def test_dependency_parent_does_not_change_story_worktree_base(release_home):
     board = "dependency-story-base"
     kb.ensure_product_board_defaults(board)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         dependency = kb.create_task(
             conn, title="Story: completed prerequisite", board=board,
         )
@@ -1036,7 +1037,7 @@ def test_epic_release_requires_every_child_done_and_integrated(
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = "release-epic"
     _release_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic = _release_task(
             conn,
             board,
@@ -1111,7 +1112,7 @@ def test_epic_release_evidence_binds_to_derived_integration_branch(
     repo, task_branch, _task_sha = _repo_with_story_branch(tmp_path)
     board = "release-epic-reviewed-branch"
     _release_board(board, repo)
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         epic = _release_task(
             conn,
             board,

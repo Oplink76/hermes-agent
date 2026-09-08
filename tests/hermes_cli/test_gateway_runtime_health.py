@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from hermes_cli.gateway import _runtime_health_lines
-from hermes_cli import doctor
+from hermes_cli import doctor_platform as doctor
 
 
 def _iso_age(seconds_ago: float) -> str:
@@ -122,9 +122,8 @@ def test_doctor_reports_runtime_identity_for_the_live_gateway(monkeypatch):
         "check_warn",
         lambda text, detail="": events.append(("warn", text, detail)),
     )
-    issues = []
-
-    doctor._check_gateway_runtime_identity(issues)
+    finding = doctor._check_gateway_runtime_identity(False)
+    issues = finding.manual_issues
 
     assert issues == []
     assert ("section", "Gateway Runtime Identity") in events
@@ -148,9 +147,8 @@ def test_doctor_warns_when_a_live_gateway_has_no_runtime_identity(monkeypatch):
         "check_warn",
         lambda text, detail="": warnings.append((text, detail)),
     )
-    issues = []
-
-    doctor._check_gateway_runtime_identity(issues)
+    finding = doctor._check_gateway_runtime_identity(False)
+    issues = finding.manual_issues
 
     assert warnings
     assert issues == ["Restart the gateway so it publishes runtime identity"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.kanban_db_connect as kanban_db_connect
 from hermes_cli import kanban_intake as intake
 from hermes_cli import kanban_qualifier as qualifier
 
@@ -86,7 +87,7 @@ def test_real_entry_shapes_qualify_or_reject_without_bypassing_routing(
     monkeypatch.setattr(kb, "resolve_profile_iteration_budget", lambda _profile: 10)
 
     brief_path = "/tmp/product-brief.md"
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         discovery_id = kb.create_task(conn, title="PO discovery")
         cursor = conn.execute(
             """
@@ -111,7 +112,7 @@ def test_real_entry_shapes_qualify_or_reject_without_bypassing_routing(
         ("Documentation operations", "development", "ops", "hermes"),
     ]
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         materialized = []
         for title, phase, work_type, path in cases:
             decision = _decision(title, phase, work_type, path=path)
@@ -216,7 +217,7 @@ def test_requalification_uses_existing_qualifier_and_same_card(tmp_path, monkeyp
     metadata["qualification"]["required"] = True
     kb.board_metadata_path(board).write_text(json.dumps(metadata), encoding="utf-8")
 
-    with kb.connect(board=board) as conn:
+    with kanban_db_connect.connect(board=board) as conn:
         initial_decision = _decision(
             "Resume the existing card", "development", "maintenance"
         )
